@@ -136,6 +136,12 @@ Tool envelopes report `persistence_error` or `persistence_outcome_unknown`, with
 `store.reconcile(runId, operationId)` and acknowledge an observed receipt. Neither
 reconciliation nor acknowledgement resumes an external action.
 
+Session writes return an explicit committed result for ordinary state or tracked
+run state. Tracked results include the run ID, operation ID, and revision;
+`confirmation` distinguishes a direct acknowledgement from a reconciled receipt.
+Revision-checked transitions return `committed` or `conflict`. Unknown outcomes
+remain errors until reconciliation establishes commit.
+
 ### Embedded and SDK usage
 
 CLI/core/SDK roots open and close their selected session automatically. An embedded

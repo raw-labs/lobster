@@ -26,8 +26,8 @@ import {
 } from "../input_request.js";
 import { parsePipeline } from "../parser.js";
 import { PersistenceError } from "../persistence/backend.js";
+import { bindRecorder, recorderFromEnv } from "../persistence/context.js";
 import { withExecution } from "../persistence/execution.js";
-import { recorderFromEnv, bindRecorder } from "../persistence/session.js";
 import { readLineFromStream } from "../read_line.js";
 import { runPipeline } from "../runtime.js";
 import {

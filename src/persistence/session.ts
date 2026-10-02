@@ -2,7 +2,8 @@ import { randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import { ensureDirectory, writeFileAtomic } from "../state/atomic_file.js";
-import { defaultStateDir, keyToPath, withFileLock } from "../state/store.js";
+import { withFileLock } from "../state/file_lock.js";
+import { normalizeStateKey, resolveStateDirectory } from "../state/paths.js";
 import {
 	PersistenceError,
 	PersistenceOutcomeUnknown,
@@ -11,6 +12,7 @@ import {
 	type StateWriteOptions,
 	type StateWriteResult,
 } from "./backend.js";
+import { sessionFromEnv } from "./context.js";
 import { FileBackend } from "./files.js";
 import {
 	canRetain,
@@ -29,42 +31,14 @@ import {
 	type TransitionResult,
 } from "./model.js";
 
-const SESSION = Symbol("lobster.storeSession");
-const RECORDER = Symbol("lobster.executionRecorder");
-
-export type StoreEnvironment = Record<string, string | undefined> & {
-	[SESSION]?: StoreSession;
-	[RECORDER]?: ExecutionRecorder;
-};
-
-export function sessionFromEnv(env: StoreEnvironment | undefined): StoreSession | undefined {
-	return env?.[SESSION];
-}
-
-export function recorderFromEnv(env: StoreEnvironment | undefined): ExecutionRecorder | undefined {
-	return env?.[RECORDER];
-}
-
-export function normalizedKey(key: string): string {
-	return path.basename(keyToPath(".", key), ".json");
-}
-
-export function bindStoreSession(env: StoreEnvironment, session: StoreSession): StoreEnvironment {
-	const bound: StoreEnvironment = {
-		...env,
-		LOBSTER_STATE_DIR: session.directory,
-		LOBSTER_BACKEND: session.backend.kind,
-		[SESSION]: session,
-	};
-	if (bound[RECORDER]?.session !== session) {
-		delete bound[RECORDER];
-	}
-	return bound;
-}
-
-export function bindRecorder(env: StoreEnvironment, recorder: ExecutionRecorder): StoreEnvironment {
-	return { ...env, [RECORDER]: recorder };
-}
+export {
+	bindRecorder,
+	bindStoreSession,
+	recorderFromEnv,
+	sessionFromEnv,
+	type StoreEnvironment,
+} from "./context.js";
+export { normalizeStateKey as normalizedKey } from "../state/paths.js";
 
 export type StoreOptions = {
 	directory?: string;
@@ -109,47 +83,54 @@ export class StoreSession {
 	}
 
 	async read(key: string): Promise<StateRecord> {
-		return this.request(() => this.backend.read(normalizedKey(key)));
+		return this.request(() => this.backend.read(normalizeStateKey(key)));
 	}
 
 	async write(
 		key: string,
 		text: string | null,
 		options: StateWriteOptions = {},
-	): Promise<StateWriteResult | undefined> {
+	): Promise<StateWriteResult> {
 		return this.request(async () => {
 			try {
-				const result = await this.backend.write(normalizedKey(key), text, options);
-				if (result?.runId && result?.operationId) {
+				const result = await this.backend.write(normalizeStateKey(key), text, options);
+				if (result.kind === "run") {
 					await this.acknowledgeObserved(result.runId, result.operationId);
 				}
-				return result
-					? {
-							...result,
-							signalAbortedAfterCommit:
-								options.signal?.aborted === true || result.signalAbortedAfterCommit === true,
-						}
-					: result;
+				return {
+					...result,
+					signalAbortedAfterCommit:
+						options.signal?.aborted === true || result.signalAbortedAfterCommit,
+				};
 			} catch (error) {
 				if (!(error instanceof PersistenceOutcomeUnknown)) {
 					throw error;
 				}
 				// Replacement waits for the old worker to stop. While the caller still owns
 				// the publication barrier, reconcile the mutation before releasing readers.
-				const current = await this.backend.read(normalizedKey(key));
+				const current = await this.backend.read(normalizeStateKey(key));
 				if (current.runId) {
 					const run = await this.backend.getRun(current.runId);
 					const receipt = run?.receipts[error.operationId];
 					if (receipt) {
 						await this.acknowledgeObserved(current.runId, error.operationId);
 						return {
+							status: "committed",
+							kind: "run",
+							runId: current.runId,
+							operationId: error.operationId,
 							revision: receipt.revision,
-							reconciled: true,
+							confirmation: "reconciled",
 							signalAbortedAfterCommit: options.signal?.aborted === true,
 						};
 					}
 				} else if (!options.exclusive && current.text === text) {
-					return { reconciled: true, signalAbortedAfterCommit: options.signal?.aborted === true };
+					return {
+						status: "committed",
+						kind: "state",
+						confirmation: "reconciled",
+						signalAbortedAfterCommit: options.signal?.aborted === true,
+					};
 				}
 				throw error;
 			}
@@ -214,7 +195,7 @@ export class StoreSession {
 			return undefined;
 		}
 		const recorder = await this.createRun("legacy", undefined, true);
-		await recorder.action({ kind: "state", key: normalizedKey(key), text: record.text });
+		await recorder.action({ kind: "state", key: normalizeStateKey(key), text: record.text });
 		return recorder;
 	}
 
@@ -288,7 +269,7 @@ export class StoreSession {
 	async transition(request: Transition, signal?: AbortSignal): Promise<TransitionResult> {
 		return this.request(async () => {
 			const result = await this.backend.transition(request, signal);
-			if (!result.conflict) {
+			if (result.status === "committed") {
 				await this.acknowledgeObserved(request.runId, request.operationId);
 			}
 			return result;
@@ -381,7 +362,9 @@ export class ExecutionRecorder {
 
 export async function openStoreSession(options: StoreOptions = {}): Promise<StoreSession> {
 	const env = options.env ?? process.env;
-	const directory = path.resolve(options.directory ?? defaultStateDir(env));
+	const directory = path.resolve(
+		options.directory ?? sessionFromEnv(env)?.directory ?? resolveStateDirectory(env),
+	);
 	const open = async () => {
 		options.signal?.throwIfAborted();
 		let selected: { version: number; backend: string } | undefined;

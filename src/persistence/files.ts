@@ -6,7 +6,8 @@ import {
 	writeFileAtomic,
 	writeFileAtomicExclusive,
 } from "../state/atomic_file.js";
-import { withFileLock } from "../state/store.js";
+import type { AtomicExclusiveWriteOptions, AtomicWriteOptions } from "../state/atomic_file.js";
+import { withFileLock } from "../state/file_lock.js";
 import type { Backend, StateWriteOptions, StateWriteResult } from "./backend.js";
 import {
 	applyTransition,
@@ -22,6 +23,12 @@ import {
 	type Transition,
 	type TransitionResult,
 } from "./model.js";
+
+// Legacy state callers can supply filesystem publication hooks. They are local
+// to this adapter; the common backend and SQLite worker never depend on them.
+export type FileWriteOptions = StateWriteOptions & {
+	atomicWriteOptions?: AtomicWriteOptions & AtomicExclusiveWriteOptions;
+};
 
 async function readText(file: string): Promise<string | null> {
 	try {
@@ -141,8 +148,8 @@ export class FileBackend implements Backend {
 	async write(
 		key: string,
 		text: string | null,
-		options: StateWriteOptions = {},
-	): Promise<StateWriteResult | undefined> {
+		options: FileWriteOptions = {},
+	): Promise<StateWriteResult> {
 		if (this.readOnly) {
 			throw new Error("Persistence session is read-only");
 		}
@@ -163,11 +170,18 @@ export class FileBackend implements Backend {
 				},
 				options.signal,
 			);
+			if (result.status === "conflict") {
+				throw new Error("Unexpected conflict while publishing continuation state");
+			}
+
 			this.locators.set(key, id);
 			return {
-				...result,
-				operationId,
+				status: "committed",
+				kind: "run",
 				runId: id,
+				operationId,
+				revision: result.revision,
+				confirmation: "acknowledged",
 				signalAbortedAfterCommit: options.signal?.aborted === true,
 			};
 		}
@@ -178,15 +192,24 @@ export class FileBackend implements Backend {
 					throw error;
 				}
 			});
-			return;
-		}
-		await ensureDirectory(this.directory);
-		if (options.exclusive) {
-			await writeFileAtomicExclusive(file, text, options.atomicWriteOptions);
-			return undefined;
+		} else {
+			await ensureDirectory(this.directory);
+			if (options.exclusive) {
+				await writeFileAtomicExclusive(file, text, options.atomicWriteOptions);
+			} else {
+				await writeFileAtomic(file, text, {
+					...options.atomicWriteOptions,
+					signal: options.signal,
+				});
+			}
 		}
 
-		return writeFileAtomic(file, text, { ...options.atomicWriteOptions, signal: options.signal });
+		return {
+			status: "committed",
+			kind: "state",
+			confirmation: "acknowledged",
+			signalAbortedAfterCommit: options.signal?.aborted === true,
+		};
 	}
 
 	async transition(request: Transition, signal?: AbortSignal): Promise<TransitionResult> {
@@ -199,13 +222,13 @@ export class FileBackend implements Backend {
 			task: async () => {
 				signal?.throwIfAborted();
 				const current = await this.getRun(request.runId);
-				const { run, result } = applyTransition(current, request);
-				if (!result.conflict && run && run !== current) {
-					await writeFileAtomic(this.runPath(request.runId), JSON.stringify(run) + "\n", {
+				const applied = applyTransition(current, request);
+				if (applied.status === "committed" && applied.run !== current) {
+					await writeFileAtomic(this.runPath(request.runId), JSON.stringify(applied.run) + "\n", {
 						signal,
 					});
 				}
-				return result;
+				return { status: applied.status, revision: applied.revision };
 			},
 		});
 	}

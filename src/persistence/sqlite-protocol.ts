@@ -1,4 +1,4 @@
-import type { StateWriteResult } from "./backend.js";
+import type { StateWriteCommit } from "./backend.js";
 import type {
 	HistoryPage,
 	LogicalArchive,
@@ -21,7 +21,7 @@ type WriteRequest = {
 type Operations = {
 	read: { args: { key: string }; result: StateRecord };
 	listState: { args: { prefix: string }; result: Record<string, string> };
-	write: { args: WriteRequest; result: StateWriteResult };
+	write: { args: WriteRequest; result: StateWriteCommit };
 	transition: { args: Transition; result: TransitionResult };
 	acknowledge: { args: { runId: string; operationId: string }; result: void };
 	getRun: { args: { id: string }; result: RunRecord | null };

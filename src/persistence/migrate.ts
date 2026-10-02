@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import { ensureDirectory, writeFileAtomic } from "../state/atomic_file.js";
-import { withFileLock } from "../state/store.js";
+import { withFileLock } from "../state/file_lock.js";
 import type { Backend, BackendKind } from "./backend.js";
 import { FileBackend } from "./files.js";
 import {

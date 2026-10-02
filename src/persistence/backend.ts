@@ -1,4 +1,3 @@
-import type { AtomicExclusiveWriteOptions, AtomicWriteOptions } from "../state/atomic_file.js";
 import type {
 	HistoryPage,
 	LogicalArchive,
@@ -16,16 +15,16 @@ export type StateWriteOptions = {
 	runId?: string;
 	decision?: unknown;
 	signal?: AbortSignal;
-	atomicWriteOptions?: AtomicWriteOptions & AtomicExclusiveWriteOptions;
 };
 
-export type StateWriteResult = {
-	revision?: number;
-	conflict?: boolean;
-	operationId?: string;
-	runId?: string;
-	signalAbortedAfterCommit?: boolean;
-	reconciled?: boolean;
+export type StateWriteCommit =
+	| { kind: "state" }
+	| { kind: "run"; runId: string; operationId: string; revision: number };
+
+export type StateWriteResult = StateWriteCommit & {
+	status: "committed";
+	confirmation: "acknowledged" | "reconciled";
+	signalAbortedAfterCommit: boolean;
 };
 
 export interface Backend {
@@ -33,11 +32,7 @@ export interface Backend {
 
 	read(key: string): Promise<StateRecord>;
 	listState(prefix: string): Promise<Record<string, string>>;
-	write(
-		key: string,
-		text: string | null,
-		options?: StateWriteOptions,
-	): Promise<StateWriteResult | undefined>;
+	write(key: string, text: string | null, options?: StateWriteOptions): Promise<StateWriteResult>;
 
 	transition(request: Transition, signal?: AbortSignal): Promise<TransitionResult>;
 	acknowledge(runId: string, operationId: string): Promise<void>;

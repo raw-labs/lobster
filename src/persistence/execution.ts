@@ -1,18 +1,17 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
-import { defaultStateDir, withFileLock } from "../state/store.js";
+import { withFileLock } from "../state/file_lock.js";
+import { resolveStateDirectory } from "../state/paths.js";
 import { PersistenceOutcomeUnknown } from "./backend.js";
-import { fingerprint, type RunMetadata } from "./model.js";
 import {
 	bindRecorder,
 	bindStoreSession,
-	openStoreSession,
 	recorderFromEnv,
 	sessionFromEnv,
-	type ExecutionRecorder,
 	type StoreEnvironment,
-	type StoreSession,
-} from "./session.js";
+} from "./context.js";
+import { fingerprint, type RunMetadata } from "./model.js";
+import { openStoreSession, type ExecutionRecorder, type StoreSession } from "./session.js";
 
 type ExecutionContext = {
 	env?: StoreEnvironment;
@@ -44,7 +43,7 @@ export async function withStoreContext<C extends ExecutionContext, T>(
 
 	let selected = false;
 	try {
-		await fs.access(path.join(defaultStateDir(env), ".backend"));
+		await fs.access(path.join(resolveStateDirectory(env), ".backend"));
 		selected = true;
 	} catch (error) {
 		if (error.code !== "ENOENT") {

@@ -1,8 +1,9 @@
 import { randomUUID } from "node:crypto";
 import { validateCommandInputState, type CommandInputState } from "../input_request.js";
 import { runtimeErrorDetails } from "../persistence/backend.js";
+import { recorderFromEnv, sessionFromEnv } from "../persistence/context.js";
 import { withExecution } from "../persistence/execution.js";
-import { sessionFromEnv, recorderFromEnv, type StoreSession } from "../persistence/session.js";
+import type { StoreSession } from "../persistence/session.js";
 import {
 	consumeResumeState,
 	restoreConsumedResumeState,

@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { validateCommandInputState, type CommandInputState } from "./input_request.js";
-import { recorderFromEnv } from "./persistence/session.js";
+import { recorderFromEnv } from "./persistence/context.js";
 import {
 	cleanupApprovalIndexByStateKey,
 	consumeResumeState,

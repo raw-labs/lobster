@@ -90,7 +90,13 @@ export type Transition = {
 	action: RunAction;
 };
 
-export type TransitionResult = { revision: number; conflict?: boolean };
+export type TransitionResult =
+	| { status: "committed"; revision: number }
+	| { status: "conflict"; revision: number };
+
+type TransitionApplication =
+	| { status: "committed"; revision: number; run: RunRecord }
+	| { status: "conflict"; revision: number; run: RunRecord | null };
 
 export type LogicalArchive = { version: 1; states: Record<string, string>; runs: RunRecord[] };
 
@@ -150,7 +156,7 @@ export function applyTransition(
 	current: RunRecord | null,
 	request: Transition,
 	projection: { previousAttempts?: number } = {},
-): { run: RunRecord | null; result: TransitionResult } {
+): TransitionApplication {
 	if (
 		!/^[a-zA-Z0-9._-]{1,128}$/.test(request.operationId) ||
 		!/^[a-zA-Z0-9_-]{1,128}$/.test(request.runId)
@@ -175,13 +181,13 @@ export function applyTransition(
 		if (receipt.fingerprint !== hash) {
 			throw new Error("Operation ID reused with different input");
 		}
-		return { run: current, result: { revision: receipt.revision } };
+		return { status: "committed", revision: receipt.revision, run: current };
 	}
 	if (
 		request.expectedRevision !== undefined &&
 		request.expectedRevision !== (current?.revision ?? 0)
 	) {
-		return { run: current, result: { revision: current?.revision ?? 0, conflict: true } };
+		return { status: "conflict", revision: current?.revision ?? 0, run: current };
 	}
 	const action = request.action;
 	if (action.kind === "create" && current) {
@@ -271,7 +277,7 @@ export function applyTransition(
 		revision: run.revision,
 		acknowledged: false,
 	};
-	return { run, result: { revision: run.revision } };
+	return { status: "committed", revision: run.revision, run };
 }
 
 export function validateArchive(value: unknown): asserts value is LogicalArchive {

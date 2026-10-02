@@ -16,7 +16,7 @@ import type { SqliteBackend } from "../src/persistence/sqlite.js";
 import { bindStoreSession, openStoreSession } from "../src/persistence/session.js";
 import { decodeResumeToken } from "../src/resume.js";
 import { Lobster } from "../src/sdk/Lobster.js";
-import { diffAndStore, readStateJsonWithLock } from "../src/state/store.js";
+import { diffAndStore, readStateJsonWithLock, writeStateJson } from "../src/state/store.js";
 
 const exec = promisify(execFile);
 
@@ -28,6 +28,141 @@ async function processCall(mode: string, value: string, env: NodeJS.ProcessEnv) 
 	);
 	return JSON.parse(stdout);
 }
+
+for (const backend of ["files", "sqlite"] as const) {
+	test(`${backend}: writes expose complete state and run commit identities`, async (t) => {
+		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "lobster-write-outcomes-"));
+		t.after(() => fs.rm(directory, { recursive: true, force: true }));
+		const store = await openStoreSession({ directory, backend, history: true });
+		try {
+			const stateCommit = {
+				status: "committed",
+				kind: "state",
+				confirmation: "acknowledged",
+				signalAbortedAfterCommit: false,
+			};
+			assert.deepEqual(await store.write("fixture", "42"), stateCommit);
+			await assert.rejects(store.write("fixture", "99", { exclusive: true }), { code: "EEXIST" });
+			assert.equal((await store.read("fixture")).text, "42");
+			assert.deepEqual(await store.write("fixture", null), stateCommit);
+			assert.equal((await store.read("fixture")).text, null);
+
+			const recorder = await store.createRun("fixture");
+			const key = `pipeline_resume_${randomUUID()}`;
+			const pending = JSON.stringify({ pipeline: [], items: [], resumeAtIndex: 0 });
+			const tracked = await store.write(key, pending, { runId: recorder.runId });
+			assert.ok(tracked.kind === "run");
+			assert.match(tracked.operationId, /^[a-f0-9-]{36}$/);
+			assert.deepEqual(tracked, {
+				status: "committed",
+				kind: "run",
+				runId: recorder.runId,
+				operationId: tracked.operationId,
+				revision: 2,
+				confirmation: "acknowledged",
+				signalAbortedAfterCommit: false,
+			});
+			const receipt = await store.reconcile(tracked.runId, tracked.operationId);
+			assert.equal(receipt.revision, tracked.revision);
+			assert.equal(receipt.acknowledged, true);
+
+			const retired = await store.write(key, null);
+			assert.ok(retired.kind === "run");
+			assert.equal(retired.runId, recorder.runId);
+			assert.equal(retired.revision, 3);
+			assert.equal((await store.getRun(recorder.runId)).waits[key].status, "retired");
+		} finally {
+			await store.close();
+		}
+	});
+
+	test(`${backend}: a lost write reply returns the reconciled original run receipt`, async (t) => {
+		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "lobster-write-reconcile-"));
+		t.after(() => fs.rm(directory, { recursive: true, force: true }));
+		const store = await openStoreSession({ directory, backend, history: true });
+		try {
+			const recorder = await store.createRun("fixture");
+			const write = store.backend.write.bind(store.backend);
+			let operationId: string;
+			const fault = t.mock.method(store.backend, "write", async (...args) => {
+				const committed = await write(...args);
+				assert.ok(committed.kind === "run");
+				operationId = committed.operationId;
+				throw new PersistenceOutcomeUnknown(
+					operationId,
+					new Error("fixture lost reply"),
+					committed.runId,
+				);
+			});
+			const key = `pipeline_resume_${randomUUID()}`;
+			const pending = JSON.stringify({ pipeline: [], items: [], resumeAtIndex: 0 });
+			assert.deepEqual(await store.write(key, pending, { runId: recorder.runId }), {
+				status: "committed",
+				kind: "run",
+				runId: recorder.runId,
+				operationId,
+				revision: 2,
+				confirmation: "reconciled",
+				signalAbortedAfterCommit: false,
+			});
+			assert.equal(fault.mock.callCount(), 1);
+			assert.equal((await store.getRun(recorder.runId)).revision, 2);
+			assert.equal((await store.reconcile(recorder.runId, operationId)).acknowledged, true);
+		} finally {
+			await store.close();
+		}
+	});
+}
+
+test("selected file sessions preserve legacy publication hooks and cancellation results", async (t) => {
+	const directory = await fs.mkdtemp(path.join(os.tmpdir(), "lobster-file-publication-hooks-"));
+	t.after(() => fs.rm(directory, { recursive: true, force: true }));
+	const store = await openStoreSession({ directory, backend: "files", history: true });
+	try {
+		const controller = new AbortController();
+		let publications = 0;
+		const result = await writeStateJson({
+			env: bindStoreSession(process.env, store),
+			key: "fixture",
+			value: { value: 42 },
+			signal: controller.signal,
+			atomicWriteOptions: {
+				async renameFile(from, to) {
+					await fs.rename(from, to);
+					publications++;
+					controller.abort(new Error("fixture cancelled after commit"));
+				},
+			},
+		});
+		assert.equal(publications, 1);
+		assert.deepEqual(result, { signalAbortedAfterCommit: true });
+		assert.deepEqual(JSON.parse((await store.read("fixture")).text), { value: 42 });
+	} finally {
+		await store.close();
+	}
+});
+
+test("SQLite sessions keep filesystem publication functions out of worker messages", async (t) => {
+	const directory = await fs.mkdtemp(path.join(os.tmpdir(), "lobster-sqlite-hook-boundary-"));
+	t.after(() => fs.rm(directory, { recursive: true, force: true }));
+	const store = await openStoreSession({ directory, backend: "sqlite" });
+	try {
+		const result = await writeStateJson({
+			env: bindStoreSession(process.env, store),
+			key: "fixture",
+			value: 42,
+			atomicWriteOptions: {
+				async renameFile() {
+					assert.fail("SQLite must not call filesystem publication hooks");
+				},
+			},
+		});
+		assert.deepEqual(result, { signalAbortedAfterCommit: false });
+		assert.equal(JSON.parse((await store.read("fixture")).text), 42);
+	} finally {
+		await store.close();
+	}
+});
 
 for (const backend of ["files", "sqlite"] as const) {
 	test(`${backend}: actual workflow pause/reopen/resume keeps run and attempts`, async (t) => {
@@ -359,12 +494,13 @@ for (const backend of ["files", "sqlite"] as const) {
 				action: { kind: "definition" as const, fingerprint: "fixture" },
 			};
 			const committed = await session.backend.transition(operation);
+			assert.deepEqual(committed, { status: "committed", revision: 2 });
 			await session.acknowledge(recorder.runId, operation.operationId);
 			assert.deepEqual(await session.backend.transition(operation), committed);
 			assert.equal((await session.getRun(recorder.runId)).events.length, 2);
 			assert.equal(
-				(await session.backend.transition({ ...operation, operationId: randomUUID() })).conflict,
-				true,
+				(await session.backend.transition({ ...operation, operationId: randomUUID() })).status,
+				"conflict",
 			);
 			await assert.rejects(
 				session.backend.transition({
@@ -458,7 +594,10 @@ test("SQLite lost acknowledgement reconciles a receipt after real worker termina
 		);
 		const receipt = await session.reconcile(recorder.runId, operation.operationId);
 		assert.equal(receipt.revision, 2);
-		assert.deepEqual(await session.backend.transition(operation), { revision: 2 });
+		assert.deepEqual(await session.backend.transition(operation), {
+			status: "committed",
+			revision: 2,
+		});
 		assert.equal((await session.getRun(recorder.runId)).events.length, 2);
 	} finally {
 		await session.close();

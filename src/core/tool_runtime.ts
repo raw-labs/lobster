@@ -3,8 +3,9 @@ import { Writable } from "node:stream";
 import { createDefaultRegistry } from "../commands/registry.js";
 import { parsePipeline } from "../parser.js";
 import { runtimeErrorDetails } from "../persistence/backend.js";
+import { recorderFromEnv } from "../persistence/context.js";
 import { withExecution, withStoreContext } from "../persistence/execution.js";
-import { recorderFromEnv, type StoreSession } from "../persistence/session.js";
+import type { StoreSession } from "../persistence/session.js";
 import {
 	finalizePipelineToolRun,
 	loadPipelineResumeState,

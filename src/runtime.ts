@@ -7,7 +7,7 @@ import {
 	createStageRequestInput,
 	type CommandInputResume,
 } from "./input_request.js";
-import { recorderFromEnv } from "./persistence/session.js";
+import { recorderFromEnv } from "./persistence/context.js";
 import { createJsonRenderer } from "./renderers/json.js";
 
 export async function runPipeline({

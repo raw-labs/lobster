@@ -236,11 +236,11 @@ function transition(request: Transition): TransitionResult {
 		}
 	}
 
-	const { run, result } = applyTransition(current, request, { previousAttempts });
-	if (!result.conflict && run && run !== current) {
-		saveRun(run);
+	const applied = applyTransition(current, request, { previousAttempts });
+	if (applied.status === "committed" && applied.run !== current) {
+		saveRun(applied.run);
 	}
-	return result;
+	return { status: applied.status, revision: applied.revision };
 }
 
 function handle(request: WorkerRequest): WorkerResult<WorkerMethod> {
@@ -269,19 +269,25 @@ function handle(request: WorkerRequest): WorkerResult<WorkerMethod> {
 					| undefined;
 				const runId = row?.run_id ?? args.runId;
 				if (runId) {
-					return {
-						...transition({
-							operationId: args.operationId,
-							runId,
-							action: {
-								kind: "state",
-								key: args.key,
-								text: args.text,
-								...(args.decision ? { decision: args.decision } : {}),
-							},
-						}),
+					const result = transition({
+						operationId: args.operationId,
 						runId,
-					};
+						action: {
+							kind: "state",
+							key: args.key,
+							text: args.text,
+							...(args.decision ? { decision: args.decision } : {}),
+						},
+					});
+					if (result.status === "conflict") {
+						throw new Error("Unexpected conflict while publishing continuation state");
+					}
+					return {
+						kind: "run",
+						runId,
+						operationId: args.operationId,
+						revision: result.revision,
+					} satisfies WorkerResult<"write">;
 				}
 
 				if (args.exclusive && prepare("SELECT key FROM state WHERE key=?").get(args.key)) {
@@ -294,7 +300,7 @@ function handle(request: WorkerRequest): WorkerResult<WorkerMethod> {
 						"INSERT INTO state(key,text) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET text=excluded.text",
 					).run(args.key, args.text);
 				}
-				return {};
+				return { kind: "state" } satisfies WorkerResult<"write">;
 			});
 		case "transition":
 			return transaction(() => transition(args));

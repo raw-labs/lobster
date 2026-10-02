@@ -216,7 +216,12 @@ export class SqliteBackend implements Backend {
 			},
 			options.signal,
 		);
-		return { ...result, operationId, signalAbortedAfterCommit: options.signal?.aborted === true };
+		return {
+			...result,
+			status: "committed",
+			confirmation: "acknowledged",
+			signalAbortedAfterCommit: options.signal?.aborted === true,
+		};
 	}
 
 	transition(request: Transition, signal?: AbortSignal): Promise<TransitionResult> {

@@ -1,9 +1,9 @@
 import { randomBytes } from "node:crypto";
 import { promises as fsp } from "node:fs";
-import os from "node:os";
 import path from "node:path";
+import { recorderFromEnv, sessionFromEnv } from "../persistence/context.js";
 import { withStoreContext } from "../persistence/execution.js";
-import { sessionFromEnv, recorderFromEnv } from "../persistence/session.js";
+import type { FileWriteOptions } from "../persistence/files.js";
 import {
 	atomicWriteWasPublished,
 	ensureDirectory,
@@ -12,6 +12,11 @@ import {
 	writeFileAtomicExclusive,
 } from "./atomic_file.js";
 import type { AtomicWriteOptions, AtomicExclusiveWriteOptions } from "./atomic_file.js";
+import { FILE_LOCK_RETRY_MS, withFileLock } from "./file_lock.js";
+import { keyToPath, resolveStateDirectory } from "./paths.js";
+
+export { withFileLock } from "./file_lock.js";
+export { keyToPath } from "./paths.js";
 
 export {
 	atomicWriteWasPublished,
@@ -38,26 +43,8 @@ export function isConsumedResumeState(value: unknown): value is ConsumedResumeSt
 	);
 }
 
-export function defaultStateDir(env) {
-	const session = sessionFromEnv(env);
-	if (session) {
-		return session.directory;
-	}
-	return (
-		(env?.LOBSTER_STATE_DIR && String(env.LOBSTER_STATE_DIR).trim()) ||
-		path.join(os.homedir(), ".lobster", "state")
-	);
-}
-
-export function keyToPath(stateDir, key) {
-	let safe = String(key)
-		.toLowerCase()
-		.replace(/[^a-z0-9._-]+/g, "_")
-		.replace(/_+/g, "_");
-	if (safe.startsWith("_")) safe = safe.slice(1);
-	if (safe.endsWith("_")) safe = safe.slice(0, -1);
-	if (!safe) throw new Error("state key is empty/invalid");
-	return path.join(stateDir, `${safe}.json`);
+export function defaultStateDir(env: Record<string, string | undefined>): string {
+	return sessionFromEnv(env)?.directory ?? resolveStateDirectory(env);
 }
 
 export function stableStringify(value) {
@@ -73,194 +60,10 @@ export function stableStringify(value) {
 	});
 }
 
-const STATE_LOCK_RETRY_MS = 10;
-const STATE_LOCK_ORPHAN_MS = 30_000;
-const STATE_LOCK_HEARTBEAT_MS = 250;
-const TERMINAL_RESUME_CLEANUP_TIMEOUT_MS = STATE_LOCK_RETRY_MS * 10;
+const TERMINAL_RESUME_CLEANUP_TIMEOUT_MS = FILE_LOCK_RETRY_MS * 10;
 
 export function isJsonSyntaxError(err) {
 	return err instanceof SyntaxError;
-}
-
-async function waitForStateLock(signal?: AbortSignal) {
-	await new Promise<void>((resolve, reject) => {
-		const onAbort = () => {
-			clearTimeout(timer);
-			try {
-				signal?.throwIfAborted();
-			} catch (err) {
-				reject(err);
-			}
-		};
-		const timer = setTimeout(() => {
-			signal?.removeEventListener("abort", onAbort);
-			resolve();
-		}, STATE_LOCK_RETRY_MS);
-		if (signal?.aborted) {
-			onAbort();
-			return;
-		}
-		signal?.addEventListener("abort", onAbort, { once: true });
-	});
-}
-
-function isProcessAlive(pid: number) {
-	try {
-		process.kill(pid, 0);
-		return true;
-	} catch (err: any) {
-		return err?.code !== "ESRCH";
-	}
-}
-
-type StateLockOwner = {
-	pid: number;
-	processStartIdentity: string | null;
-	nonce: string;
-};
-
-function parseStateLockOwner(ownerText: string): StateLockOwner | null {
-	const parts = ownerText.trim().split(":");
-	if (parts.length !== 3) return null;
-	const pid = Number(parts[0]);
-	const processStartIdentity = parts[1] || null;
-	const nonce = parts[2];
-	if (!Number.isInteger(pid) || pid <= 0 || !nonce) return null;
-	return { pid, processStartIdentity, nonce };
-}
-
-async function readProcessStartIdentity(pid: number): Promise<string | null> {
-	if (process.platform !== "linux") return null;
-	try {
-		const stat = await fsp.readFile(`/proc/${pid}/stat`, "utf8");
-		const closeParen = stat.lastIndexOf(")");
-		if (closeParen < 0) return null;
-		// The remainder starts at procfs field 3; starttime is field 22.
-		const fields = stat
-			.slice(closeParen + 1)
-			.trim()
-			.split(/\s+/);
-		return fields[19] || null;
-	} catch {
-		return null;
-	}
-}
-
-async function isStateLockOld(lockPath: string) {
-	try {
-		const stat = await fsp.stat(lockPath);
-		return Date.now() - stat.mtimeMs >= STATE_LOCK_ORPHAN_MS;
-	} catch (err: any) {
-		if (err?.code === "ENOENT") return true;
-		throw err;
-	}
-}
-
-async function hasExpiredStateLockLease(lockPath: string) {
-	let first;
-	try {
-		first = await fsp.stat(lockPath);
-	} catch (err: any) {
-		if (err?.code === "ENOENT") return true;
-		throw err;
-	}
-	if (Date.now() - first.mtimeMs < STATE_LOCK_ORPHAN_MS) return false;
-
-	await new Promise<void>((resolve) => setTimeout(resolve, STATE_LOCK_HEARTBEAT_MS));
-	try {
-		const second = await fsp.stat(lockPath);
-		return second.mtimeMs === first.mtimeMs && Date.now() - second.mtimeMs >= STATE_LOCK_ORPHAN_MS;
-	} catch (err: any) {
-		if (err?.code === "ENOENT") return true;
-		throw err;
-	}
-}
-
-async function reclaimOrphanedStateLock(lockPath: string) {
-	let observedLock: { dev: number; ino: number };
-	try {
-		const stat = await fsp.lstat(lockPath);
-		observedLock = { dev: stat.dev, ino: stat.ino };
-	} catch (err: any) {
-		if (err?.code === "ENOENT") return true;
-		throw err;
-	}
-
-	const ownerPath = path.join(lockPath, "owner");
-	let observedOwner: string | undefined;
-	let stale = false;
-	try {
-		observedOwner = await fsp.readFile(ownerPath, "utf8");
-		const owner = parseStateLockOwner(observedOwner);
-		if (owner && isProcessAlive(owner.pid)) {
-			const processStartIdentity = await readProcessStartIdentity(owner.pid);
-			if (owner.processStartIdentity && processStartIdentity) {
-				stale = owner.processStartIdentity !== processStartIdentity;
-			} else {
-				// A live PID without a matching process-instance identity may have
-				// been reused. Require a conservative expired lease and a second
-				// unchanged observation before reclaiming it.
-				stale = await hasExpiredStateLockLease(ownerPath);
-			}
-		} else if (owner) {
-			stale = true;
-		} else {
-			stale = await isStateLockOld(lockPath);
-		}
-	} catch (err: any) {
-		if (err?.code === "ENOENT") {
-			stale = await isStateLockOld(lockPath);
-		} else {
-			throw err;
-		}
-	}
-	if (!stale) return false;
-
-	// Claim reclamation inside the observed directory before removing it. Renaming
-	// `lockPath` directly is unsafe: another reclaimer can replace that pathname
-	// with a live lock after the stale observation, and a later recursive cleanup
-	// would then delete the new owner's lock while it is in use.
-	const reclaimPath = path.join(lockPath, ".reclaiming");
-	try {
-		await fsp.mkdir(reclaimPath, { mode: 0o700 });
-	} catch (err: any) {
-		if (err?.code === "ENOENT") return true;
-		if (err?.code === "EEXIST") return false;
-		throw err;
-	}
-
-	try {
-		const currentLock = await fsp.lstat(lockPath);
-		if (currentLock.dev !== observedLock.dev || currentLock.ino !== observedLock.ino) {
-			return false;
-		}
-		// A replacement directory can reuse the inode; its owner must still match too.
-		let currentOwner: string | undefined;
-		try {
-			currentOwner = await fsp.readFile(ownerPath, "utf8");
-		} catch (err: any) {
-			if (err?.code !== "ENOENT") throw err;
-		}
-		if (currentOwner !== observedOwner) return false;
-		await fsp.rm(lockPath, { recursive: true, force: true });
-	} finally {
-		// If the path changed before the reclamation marker was claimed, leave the
-		// replacement lock intact and only remove our harmless marker.
-		await fsp.rmdir(reclaimPath).catch(() => {});
-	}
-	return true;
-}
-
-async function stillOwnsStateLock(ownerPath: string, owner: string) {
-	for (let attempt = 0; attempt < 2; attempt++) {
-		try {
-			return (await fsp.readFile(ownerPath, "utf8")) === owner;
-		} catch (err: any) {
-			if (err?.code === "ENOENT" || attempt === 1) return false;
-			await new Promise<void>((resolve) => setTimeout(resolve, STATE_LOCK_RETRY_MS));
-		}
-	}
-	return false;
 }
 
 async function withStateKeyLock<T>({
@@ -280,76 +83,6 @@ async function withStateKeyLock<T>({
 		signal,
 		task,
 	});
-}
-
-/**
- * Serialize a transition for an arbitrary durable file. Readers that need a
- * publish-or-rollback decision use the same lock as writers, rather than
- * observing an atomic rename that cancellation may still need to undo.
- */
-export async function withFileLock<T>({
-	filePath,
-	signal,
-	task,
-}: {
-	filePath: string;
-	signal?: AbortSignal;
-	task: () => Promise<T>;
-}): Promise<T> {
-	await ensureDirectory(path.dirname(filePath));
-	const lockPath = `${filePath}.lock`;
-	let acquired = false;
-	let owner: string | undefined;
-	let ownerWritten = false;
-	let heartbeat: ReturnType<typeof setInterval> | undefined;
-	try {
-		while (!acquired) {
-			signal?.throwIfAborted();
-			try {
-				await fsp.mkdir(lockPath, { mode: 0o700 });
-				acquired = true;
-				const processStartIdentity = await readProcessStartIdentity(process.pid);
-				owner = `${process.pid}:${processStartIdentity ?? ""}:${randomBytes(6).toString("hex")}\n`;
-				await fsp.writeFile(path.join(lockPath, "owner"), owner, {
-					encoding: "utf8",
-					mode: 0o600,
-				});
-				ownerWritten = true;
-				const ownerPath = path.join(lockPath, "owner");
-				heartbeat = setInterval(() => {
-					void fsp.utimes(ownerPath, new Date(), new Date()).catch(() => {});
-				}, STATE_LOCK_HEARTBEAT_MS);
-				heartbeat.unref?.();
-			} catch (err: any) {
-				if (acquired) throw err;
-				if (err?.code !== "EEXIST") throw err;
-				if (!(await reclaimOrphanedStateLock(lockPath))) {
-					await waitForStateLock(signal);
-				}
-			}
-		}
-		return await task();
-	} finally {
-		if (heartbeat) clearInterval(heartbeat);
-		if (acquired) {
-			const ownerPath = path.join(lockPath, "owner");
-			if (!ownerWritten || !owner || (await stillOwnsStateLock(ownerPath, owner))) {
-				// Detach an owned lock before best-effort cleanup. If a filesystem error
-				// prevents removing the detached directory, the canonical lock path is
-				// already free for a subsequent operation; leaving it in place would
-				// instead look like a live lock owned by this still-running process.
-				const cleanupPath = `${lockPath}.release-${process.pid}-${randomBytes(6).toString("hex")}`;
-				try {
-					await fsp.rename(lockPath, cleanupPath);
-					await fsp.rm(cleanupPath, { recursive: true, force: true }).catch(() => {});
-				} catch (err: any) {
-					if (err?.code !== "ENOENT") {
-						await fsp.rm(lockPath, { recursive: true, force: true }).catch(() => {});
-					}
-				}
-			}
-		}
-	}
 }
 
 function isOptionalApprovalIndexPersistenceError(err: any): boolean {
@@ -476,18 +209,19 @@ async function writeStateJsonUnlocked({
 	const session = sessionFromEnv(env);
 	if (session) {
 		const recorder = recorderFromEnv(env);
-		const result = await session.write(key, JSON.stringify(value, null, 2) + "\n", {
+		const writeOptions: FileWriteOptions = {
 			signal,
 			atomicWriteOptions,
 			...(recorder?.decisionKey === key.replace("workflow-resume_", "workflow_resume_")
 				? { decision: recorder.decision }
 				: {}),
 			...(isContinuationValue(key, value) && recorder ? { runId: recorder.runId } : {}),
-		});
+		};
+		const result = await session.write(key, JSON.stringify(value, null, 2) + "\n", writeOptions);
 		if (recorder && isConsumedResumeState(value)) {
 			recorder.ownsExecution = true;
 		}
-		return result;
+		return { signalAbortedAfterCommit: result.signalAbortedAfterCommit };
 	}
 	await ensureDirectory(stateDir);
 	return writeFileAtomic(filePath, JSON.stringify(value, null, 2) + "\n", {
@@ -857,10 +591,11 @@ async function writeApprovalIndexInternal({
 	const indexPath = path.join(stateDir, `approval_${safe}.json`);
 	const session = sessionFromEnv(env);
 	if (session) {
+		const writeOptions: FileWriteOptions = { exclusive: true, atomicWriteOptions: options };
 		await session.write(
 			`approval_${safe}`,
 			JSON.stringify({ stateKey, createdAt: new Date().toISOString() }) + "\n",
-			{ exclusive: true, atomicWriteOptions: options },
+			writeOptions,
 		);
 		return;
 	}
