@@ -163,16 +163,19 @@ function handle(method: string, args: any) {
 				const row = prepare("SELECT run_id FROM state WHERE key=?").get(args.key) as any;
 				const runId = row?.run_id ?? args.runId;
 				if (runId) {
-					return transition({
-						operationId: args.operationId,
+					return {
+						...transition({
+							operationId: args.operationId,
+							runId,
+							action: {
+								kind: "state",
+								key: args.key,
+								text: args.text,
+								...(args.decision ? { decision: args.decision } : {}),
+							},
+						}),
 						runId,
-						action: {
-							kind: "state",
-							key: args.key,
-							text: args.text,
-							...(args.decision ? { decision: args.decision } : {}),
-						},
-					});
+					};
 				}
 				if (args.exclusive) {
 					if (prepare("SELECT key FROM state WHERE key=?").get(args.key)) {
@@ -191,6 +194,22 @@ function handle(method: string, args: any) {
 		case "transition":
 			return transaction(() => {
 				return transition(args);
+			});
+		case "acknowledge":
+			return transaction(() => {
+				const row = prepare("SELECT record FROM receipts WHERE run_id=? AND operation_id=?").get(
+					args.runId,
+					args.operationId,
+				) as any;
+				if (row) {
+					const receipt = JSON.parse(row.record);
+					receipt.acknowledged = true;
+					prepare("UPDATE receipts SET record=? WHERE run_id=? AND operation_id=?").run(
+						JSON.stringify(receipt),
+						args.runId,
+						args.operationId,
+					);
+				}
 			});
 		case "getRun":
 			return getRun(args.id);

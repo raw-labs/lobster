@@ -424,6 +424,22 @@ async function readStateJsonWithLockInternal({
 	}
 }
 
+function isContinuationValue(key: string, value: any) {
+	if (!value || typeof value !== "object") return false;
+	if (key.startsWith("pipeline_resume_"))
+		return Array.isArray(value.pipeline) && Number.isInteger(value.resumeAtIndex);
+	if (key.startsWith("workflow_resume_"))
+		return (
+			typeof value.filePath === "string" && value.steps && Number.isInteger(value.resumeAtIndex)
+		);
+	if (key.startsWith("sdk_resume_"))
+		return (
+			value.type === "lobster.sdk-tracked.v1" ||
+			(value.commandInput && Number.isInteger(value.resumeAtIndex))
+		);
+	return false;
+}
+
 async function writeStateJsonUnlocked({
 	env,
 	key,
@@ -449,9 +465,7 @@ async function writeStateJsonUnlocked({
 			...(recorder?.decisionKey === key.replace("workflow-resume_", "workflow_resume_")
 				? { decision: recorder.decision }
 				: {}),
-			...(/^(pipeline_resume_|workflow_resume_|sdk_resume_)/.test(key) && recorder
-				? { runId: recorder.runId }
-				: {}),
+			...(isContinuationValue(key, value) && recorder ? { runId: recorder.runId } : {}),
 		});
 		if (recorder && isConsumedResumeState(value)) recorder.ownsExecution = true;
 		return result;
@@ -509,7 +523,10 @@ async function consumeResumeStateInternal({
 			// A resume snapshot is loaded before command/workflow setup. Re-check it
 			// while holding the state lock so two callers cannot both turn the same
 			// approval into an executable invocation.
-			if (stableStringify(currentState) !== stableStringify(expectedState)) {
+			if (
+				isConsumedResumeState(currentState) ||
+				stableStringify(currentState) !== stableStringify(expectedState)
+			) {
 				return { consumed: false as const };
 			}
 			const claimId = randomBytes(16).toString("hex");
@@ -534,6 +551,8 @@ async function consumeResumeStateInternal({
 					const latest = await readStateJson({ env, key });
 					if (isConsumedResumeState(latest) && latest.claimId === claimId) {
 						await writeStateJsonUnlocked({ env, key, value: expectedState });
+						const recorder = recorderFromEnv(env);
+						if (recorder) recorder.ownsExecution = false;
 					}
 				}
 				throw err;
@@ -567,6 +586,8 @@ async function restoreConsumedResumeStateInternal({
 				return false;
 			}
 			await writeStateJsonUnlocked({ env, key, value: expectedState });
+			const recorder = recorderFromEnv(env);
+			if (recorder) recorder.ownsExecution = false;
 			return true;
 		},
 	});
@@ -635,6 +656,8 @@ async function deleteResumeStateWithRollbackInternal({
 						(isConsumedResumeState(latest) && latest.claimId === claimId)
 					) {
 						await writeStateJsonUnlocked({ env, key, value: expectedState });
+						const recorder = recorderFromEnv(env);
+						if (recorder) recorder.ownsExecution = false;
 					}
 				}
 				throw err;

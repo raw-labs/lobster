@@ -41,7 +41,7 @@ export type RunRecord = {
 	>;
 	// Continuation payloads are executable state, not bounded history summaries.
 	states: Record<string, string | null>;
-	receipts: Record<string, { fingerprint: string; revision: number }>;
+	receipts: Record<string, { fingerprint: string; revision: number; acknowledged?: boolean }>;
 };
 export type RunAction =
 	| { kind: "create"; run: RunRecord }
@@ -60,7 +60,19 @@ export type TransitionResult = { revision: number; conflict?: boolean };
 export type LogicalArchive = { version: 1; states: Record<string, string>; runs: RunRecord[] };
 
 export function fingerprint(value: unknown): string {
-	return createHash("sha256").update(JSON.stringify(value)).digest("hex");
+	return createHash("sha256")
+		.update(
+			JSON.stringify(value, (_key, item) =>
+				item && typeof item === "object" && !Array.isArray(item)
+					? Object.fromEntries(
+							Object.keys(item)
+								.sort()
+								.map((key) => [key, item[key]]),
+						)
+					: item,
+			),
+		)
+		.digest("hex");
 }
 
 // Default history contains shape/counts, never arbitrary output, arguments, environment,
@@ -83,6 +95,21 @@ export function applyTransition(
 	current: RunRecord | null,
 	request: Transition,
 ): { run: RunRecord; result: TransitionResult } {
+	if (
+		!/^[a-zA-Z0-9._-]{1,128}$/.test(request.operationId) ||
+		!/^[a-zA-Z0-9_-]{1,128}$/.test(request.runId)
+	)
+		throw new Error("Invalid persistence operation identity");
+	if (
+		request.expectedRevision !== undefined &&
+		(!Number.isSafeInteger(request.expectedRevision) || request.expectedRevision < 0)
+	)
+		throw new Error("Invalid expected revision");
+	if (
+		(current && current.id !== request.runId) ||
+		(request.action.kind === "create" && request.action.run.id !== request.runId)
+	)
+		throw new Error("Run identity mismatch");
 	const hash = fingerprint(request);
 	const receipt = current?.receipts[request.operationId];
 	if (receipt) {
@@ -139,7 +166,13 @@ export function applyTransition(
 			} else {
 				run.waits[action.key] = {
 					status: "pending",
-					kind: value.haltType ?? (value.inputStepId ? "input_request" : "approval_request"),
+					kind:
+						value.haltType ??
+						(value.inputStepId ||
+						value.inputSchema !== undefined ||
+						value.payload?.inputSchema !== undefined
+							? "input_request"
+							: "approval_request"),
 				};
 				run.status = "waiting";
 			}
@@ -160,7 +193,11 @@ export function applyTransition(
 		at,
 		...(payload === undefined ? {} : { payload }),
 	});
-	run.receipts[request.operationId] = { fingerprint: hash, revision: run.revision };
+	run.receipts[request.operationId] = {
+		fingerprint: hash,
+		revision: run.revision,
+		acknowledged: false,
+	};
 	return { run, result: { revision: run.revision } };
 }
 
@@ -175,6 +212,7 @@ export function validateArchive(value: unknown): asserts value is LogicalArchive
 	)
 		throw new Error("Unsupported persistence archive");
 	const ids = new Set<string>();
+	const stateKeys = new Set(Object.keys(data.states));
 	for (const [key, text] of Object.entries(data.states)) {
 		if (!/^[a-z0-9._-]+$/.test(key) || typeof text !== "string")
 			throw new Error("Invalid state archive entry");
@@ -238,6 +276,8 @@ export function validateArchive(value: unknown): asserts value is LogicalArchive
 			previous = event.sequence;
 		}
 		for (const [key, text] of Object.entries(run.states)) {
+			if (stateKeys.has(key)) throw new Error("Duplicate state association in archive");
+			stateKeys.add(key);
 			if (!/^[a-z0-9._-]+$/.test(key) || (text !== null && typeof text !== "string"))
 				throw new Error("Invalid continuation archive entry");
 			if (text !== null) JSON.parse(text);
@@ -251,7 +291,8 @@ export function canRetain(run: RunRecord, before: string) {
 		Date.parse(run.updatedAt) < Date.parse(before) &&
 		!Object.values(run.states).some((text) => text !== null) &&
 		!Object.values(run.waits).some((wait) => wait.status === "pending") &&
-		!run.attempts.some((attempt) => attempt.status === "started")
+		!run.attempts.some((attempt) => attempt.status === "started") &&
+		!Object.values(run.receipts).some((receipt) => receipt.acknowledged !== true)
 	);
 }
 
@@ -281,4 +322,50 @@ export function historyPage(run: RunRecord, afterSequence: number, limit: number
 		attempts: attempts.filter((attempt) => ids.has(attempt.id)),
 		nextCursor: page.at(-1)?.sequence ?? afterSequence,
 	};
+}
+
+export function validateContinuations(data: LogicalArchive) {
+	const entries = data.runs.flatMap((run) => Object.entries(run.states));
+	for (const [key, text] of entries) {
+		if (text === null || !/^(pipeline_resume_|workflow[-_]resume_|sdk_resume_)/.test(key)) continue;
+		const value = JSON.parse(text);
+		if (value?.type === "lobster.consumed-resume-state.v1") {
+			if (typeof value.claimId !== "string" || !Number.isFinite(Date.parse(value.consumedAt)))
+				throw new Error("Invalid consumed continuation");
+		} else if (key.startsWith("pipeline_resume_")) {
+			if (
+				!value ||
+				!Array.isArray(value.pipeline) ||
+				!Array.isArray(value.items) ||
+				!Number.isInteger(value.resumeAtIndex) ||
+				value.resumeAtIndex < 0 ||
+				value.resumeAtIndex > value.pipeline.length ||
+				value.pipeline.some(
+					(stage) =>
+						typeof stage?.name !== "string" ||
+						!stage.name ||
+						!stage.args ||
+						typeof stage.args !== "object" ||
+						Array.isArray(stage.args),
+				)
+			)
+				throw new Error("Invalid pipeline continuation");
+		} else if (key.startsWith("sdk_resume_")) {
+			const frame = value?.type === "lobster.sdk-tracked.v1" ? value.payload : value;
+			if (!frame || !Number.isInteger(frame.resumeAtIndex) || frame.resumeAtIndex < 0)
+				throw new Error("Invalid SDK continuation");
+		} else if (
+			!value ||
+			typeof value.filePath !== "string" ||
+			!value.steps ||
+			typeof value.steps !== "object" ||
+			Array.isArray(value.steps) ||
+			!value.args ||
+			typeof value.args !== "object" ||
+			Array.isArray(value.args) ||
+			!Number.isInteger(value.resumeAtIndex) ||
+			value.resumeAtIndex < 0
+		)
+			throw new Error("Invalid workflow continuation");
+	}
 }

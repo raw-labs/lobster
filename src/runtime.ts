@@ -100,10 +100,6 @@ export async function runPipeline({
 		if (!command) {
 			throw new Error(`Unknown command: ${stage.name}`);
 		}
-		if (command.meta?.resumeSafeBeforeInput !== true) {
-			await markExecutionStarted();
-		}
-
 		const history = recorderFromEnv(env);
 		const attemptId = await history?.start(
 			`pipeline/${history.pipelineOffset + idx}`,
@@ -125,6 +121,7 @@ export async function runPipeline({
 			inputTracker.disableReplay();
 			try {
 				await inputTracker.close({ suppressErrors: suppressCloseErrors });
+				if (assertResume) assertRequestInputResumeConsumed(stageResume);
 			} catch (error) {
 				historyError = error;
 				throw error;
@@ -142,7 +139,6 @@ export async function runPipeline({
 						historyError,
 					);
 			}
-			if (assertResume) assertRequestInputResumeConsumed(stageResume);
 		}
 		const stageStdout = trackWritableOutput(stdout, () => {
 			pipelineOutputStarted = true;
@@ -172,6 +168,8 @@ export async function runPipeline({
 
 		let result;
 		try {
+			if (haltAfterStageOnAbort) signal?.throwIfAborted();
+			if (command.meta?.resumeSafeBeforeInput !== true) await markExecutionStarted();
 			result = await command.run({ input: inputTracker.iterable, args: stage.args, ctx: stageCtx });
 		} catch (err) {
 			historyError = err;

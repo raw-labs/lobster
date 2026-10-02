@@ -1,4 +1,5 @@
 import { recorderFromEnv } from "../persistence/session.js";
+import { runtimeErrorDetails } from "../persistence/backend.js";
 import { withExecution, withStoreContext } from "../persistence/execution.js";
 import type { StoreSession } from "../persistence/session.js";
 import { Writable } from "node:stream";
@@ -28,10 +29,11 @@ import {
 	validatePipelineInputResponse,
 } from "../pipeline_resume_state.js";
 
-type ToolRunContext = {
+export type ToolRunContext = {
 	_resumeSignalAborted?: boolean;
 	storeSession?: StoreSession;
 	history?: boolean;
+	runMetadata?: { hostRunId?: string; hostTaskId?: string; callerId?: string };
 	cwd?: string;
 	env?: Record<string, string | undefined>;
 	mode?: "tool" | "human" | "sdk";
@@ -46,6 +48,7 @@ type ToolRunContext = {
 
 type ToolEnvelope = {
 	protocolVersion: 1;
+	runId?: string;
 	ok: boolean;
 	status?: "ok" | "needs_approval" | "needs_input" | "cancelled";
 	output?: unknown[];
@@ -68,18 +71,24 @@ type ToolEnvelope = {
 	error?: {
 		type: string;
 		message: string;
+		operationId?: string;
+		runId?: string;
 	};
 };
 
 export async function runToolRequest(
 	options: Parameters<typeof runToolRequestInternal>[0],
 ): Promise<ToolEnvelope> {
-	return withExecution(
-		createToolContext(options.ctx),
-		options.filePath ? "workflow" : "pipeline",
-		undefined,
-		(ctx) => runToolRequestInternal({ ...options, ctx }),
-	);
+	try {
+		return await withExecution(
+			createToolContext(options.ctx),
+			options.filePath ? "workflow" : "pipeline",
+			undefined,
+			(ctx) => runToolRequestInternal({ ...options, ctx }),
+		);
+	} catch (error) {
+		return errorEnvelope("runtime_error", error);
+	}
 }
 
 async function runToolRequestInternal({
@@ -130,7 +139,7 @@ async function runToolRequestInternal({
 			}
 			return okEnvelope("ok", output.output, null, null);
 		} catch (err: any) {
-			return errorEnvelope("runtime_error", err?.message ?? String(err));
+			return errorEnvelope("runtime_error", err);
 		}
 	}
 
@@ -172,7 +181,7 @@ async function runToolRequestInternal({
 			finalized.requiresInput,
 		);
 	} catch (err: any) {
-		return errorEnvelope("runtime_error", err?.message ?? String(err));
+		return errorEnvelope("runtime_error", err);
 	}
 }
 
@@ -181,23 +190,32 @@ export async function resumeToolRequest(
 ): Promise<ToolEnvelope> {
 	const entry = createToolContext(options.ctx);
 	entry._resumeSignalAborted = entry.signal?.aborted === true;
-	return withStoreContext(entry, async (ctx) => {
-		let key: string | undefined;
-		try {
-			const payload = options.token
-				? decodeResumeToken(options.token)
-				: options.approvalId
-					? decodeResumeToken(await resolveApprovalId(options.approvalId, ctx.env))
-					: undefined;
-			key = payload?.stateKey;
-		} catch {
-			/* normal parser reports the error */
-		}
-		if (!key) return resumeToolRequestInternal({ ...options, ctx });
-		return withExecution({ ...ctx, _decision: options }, "resume", key, (runtime) =>
-			resumeToolRequestInternal({ ...options, ctx: runtime }),
-		);
-	});
+	try {
+		return await withStoreContext(entry, async (ctx) => {
+			let key: string | undefined;
+			try {
+				const payload = options.token
+					? decodeResumeToken(options.token)
+					: options.approvalId
+						? decodeResumeToken(await resolveApprovalId(options.approvalId, ctx.env))
+						: undefined;
+				key = payload?.stateKey;
+			} catch {
+				/* normal parser reports the error */
+			}
+			if (!key) return resumeToolRequestInternal({ ...options, ctx });
+			return withExecution({ ...ctx, _decision: options }, "resume", key, (runtime) =>
+				resumeToolRequestInternal({ ...options, ctx: runtime }),
+			);
+		});
+	} catch (error) {
+		if (
+			entry.signal?.aborted &&
+			(options.cancel === true || (options.approved === false && !entry._resumeSignalAborted))
+		)
+			throw error;
+		return errorEnvelope("runtime_error", error);
+	}
 }
 
 async function resumeToolRequestInternal({
@@ -322,7 +340,7 @@ async function resumeToolRequestInternal({
 				return errorEnvelope("parse_error", err.message);
 			}
 			// Non-abort failures and cancellations before step execution remain retryable.
-			return errorEnvelope("runtime_error", err?.message ?? String(err));
+			return errorEnvelope("runtime_error", err);
 		}
 	}
 
@@ -346,7 +364,7 @@ async function resumeToolRequestInternal({
 		// below. Keep its direct cancellation propagation while other resume modes
 		// retain their structured tool envelope.
 		if (runtime.signal?.aborted && approved === false) throw err;
-		return errorEnvelope("runtime_error", err?.message ?? String(err));
+		return errorEnvelope("runtime_error", err);
 	}
 
 	if (resumeState.haltType === "input_request") {
@@ -501,7 +519,7 @@ async function resumeToolRequestInternal({
 			await cleanupIndex().catch(() => {});
 		}
 		// Non-abort failures and pre-aborted resumes remain retryable by token or approval ID.
-		return errorEnvelope("runtime_error", err?.message ?? String(err));
+		return errorEnvelope("runtime_error", err);
 	}
 }
 
@@ -519,6 +537,7 @@ export function createToolContext(ctx: ToolRunContext = {}) {
 		llmAdapters: ctx.llmAdapters,
 		storeSession: ctx.storeSession,
 		history: ctx.history,
+		runMetadata: ctx.runMetadata,
 		_resumeSignalAborted: ctx._resumeSignalAborted,
 	};
 }
@@ -547,11 +566,11 @@ function okEnvelope(
 	};
 }
 
-function errorEnvelope(type: string, message: string): ToolEnvelope {
+function errorEnvelope(type: string, error: unknown): ToolEnvelope {
 	return {
 		protocolVersion: 1,
 		ok: false,
-		error: { type, message },
+		error: runtimeErrorDetails(error, type),
 	};
 }
 

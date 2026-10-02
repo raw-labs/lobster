@@ -62,11 +62,25 @@ export class FileBackend implements Backend {
 		return runs;
 	}
 	async listRunSummaries(after: string, limit: number) {
-		return (await this.listRuns())
-			.filter((run) => run.id > after)
-			.sort((a, b) => a.id.localeCompare(b.id))
-			.slice(0, limit)
-			.map(runSummary);
+		let names: string[];
+		try {
+			names = await fs.readdir(path.join(this.directory, ".history"));
+		} catch (error) {
+			if (error.code === "ENOENT") return [];
+			throw error;
+		}
+		const summaries: ReturnType<typeof runSummary>[] = [];
+		const ids = names
+			.filter((name) => name.endsWith(".json"))
+			.map((name) => name.slice(0, -5))
+			.filter((id) => id > after)
+			.sort();
+		for (const id of ids) {
+			const run = await this.getRun(id);
+			if (run) summaries.push(runSummary(run));
+			if (summaries.length === limit) break;
+		}
+		return summaries;
 	}
 	async inspectRun(id: string, afterSequence: number, limit: number) {
 		const run = await this.getRun(id);
@@ -77,7 +91,12 @@ export class FileBackend implements Backend {
 		let id = this.locators.get(key);
 		if (!id && /^(pipeline_resume_|workflow[-_]resume_|sdk_resume_)/.test(key)) {
 			for (const run of await this.listRuns()) {
-				for (const stateKey of Object.keys(run.states)) this.locators.set(stateKey, run.id);
+				for (const stateKey of Object.keys(run.states)) {
+					const existing = this.locators.get(stateKey);
+					if (existing && existing !== run.id)
+						throw new Error("Continuation associated with multiple runs");
+					this.locators.set(stateKey, run.id);
+				}
 			}
 			id = this.locators.get(key);
 		}
@@ -103,9 +122,10 @@ export class FileBackend implements Backend {
 		const existing = await this.read(key);
 		const id = existing.runId ?? options.runId;
 		if (id) {
+			const operationId = randomUUID();
 			const result = await this.transition(
 				{
-					operationId: randomUUID(),
+					operationId,
 					runId: id,
 					action: {
 						kind: "state",
@@ -117,7 +137,12 @@ export class FileBackend implements Backend {
 				options.signal,
 			);
 			this.locators.set(key, id);
-			return { ...result, signalAbortedAfterCommit: options.signal?.aborted === true };
+			return {
+				...result,
+				operationId,
+				runId: id,
+				signalAbortedAfterCommit: options.signal?.aborted === true,
+			};
 		}
 		const file = path.join(this.directory, `${key}.json`);
 		if (text === null) {
@@ -198,6 +223,20 @@ export class FileBackend implements Backend {
 			await writeFileAtomic(this.runPath(run.id), JSON.stringify(run) + "\n");
 		}
 	}
+	async acknowledge(runId: string, operationId: string) {
+		if (this.readOnly) throw new Error("Persistence session is read-only");
+		await withFileLock({
+			filePath: this.runPath(runId),
+			task: async () => {
+				const run = await this.getRun(runId);
+				const receipt = run?.receipts[operationId];
+				if (!receipt || receipt.acknowledged) return;
+				receipt.acknowledged = true;
+				await writeFileAtomic(this.runPath(runId), JSON.stringify(run) + "\n");
+			},
+		});
+	}
+
 	async removeRun(id: string, before: string) {
 		if (this.readOnly) throw new Error("Persistence session is read-only");
 		return withFileLock({

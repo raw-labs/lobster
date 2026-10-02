@@ -1,4 +1,5 @@
 import { withExecution } from "../persistence/execution.js";
+import { PersistenceError } from "../persistence/backend.js";
 import { recorderFromEnv, bindRecorder } from "../persistence/session.js";
 import { dryRunWorkflow } from "./dry_run.js";
 import {
@@ -637,6 +638,7 @@ async function runWorkflowFileInternal({
 				result: WorkflowStepResult;
 				parallelBranchResults: Record<string, WorkflowStepResult> | null;
 			}> => {
+				ctx.signal?.throwIfAborted();
 				const recorder = recorderFromEnv(ctx.env);
 				const historyAttempt = await recorder?.start(`step/${idx}`, step.id, idx);
 				let attemptHadNonRetryableSideEffect = false;
@@ -644,7 +646,7 @@ async function runWorkflowFileInternal({
 					attemptHadNonRetryableSideEffect = true;
 					ctx._onNonRetryableSideEffect?.();
 				};
-				ctx.signal?.throwIfAborted();
+
 				// Combine external cancellation and optional per-step timeout into one signal.
 				let stepSignal: AbortSignal | undefined = ctx.signal;
 				let timeoutId: ReturnType<typeof setTimeout> | undefined;
@@ -666,6 +668,7 @@ async function runWorkflowFileInternal({
 				let result: WorkflowStepResult;
 				let parallelBranchResults: Record<string, WorkflowStepResult> | null = null;
 				try {
+					ctx.signal?.throwIfAborted();
 					if (typeof step.for_each === "string" && Array.isArray(step.steps)) {
 						const itemsRef = resolveInputValue(step.for_each, resolvedArgs, results);
 						if (!Array.isArray(itemsRef)) {
@@ -778,7 +781,7 @@ async function runWorkflowFileInternal({
 												_onNonRetryableSideEffect: markNonRetryableSideEffect,
 											},
 											llmSpendLedger,
-											env: subEnv,
+											env: itemRecorder ? bindRecorder(subEnv, itemRecorder) : subEnv,
 											cwd: subCwd,
 											requestInputEnabled: false,
 											onExecutionStart: () => markExecutionStarted(stepSignal),
@@ -794,6 +797,7 @@ async function runWorkflowFileInternal({
 
 									if (subAttempt) await itemRecorder.finish(subAttempt, "completed", subResult);
 								} catch (error) {
+									if (error instanceof PersistenceError) throw error;
 									if (subAttempt) await itemRecorder.finish(subAttempt, "failed", error);
 									throw error;
 								}
@@ -913,7 +917,9 @@ async function runWorkflowFileInternal({
 										_onNonRetryableSideEffect: markNonRetryableSideEffect,
 									},
 									llmSpendLedger: ledgerFor(branch.id),
-									env: branchEnv,
+									env: recorder
+										? bindRecorder(branchEnv, recorder.child(`step/${idx}/branch/${branch.id}`))
+										: branchEnv,
 									cwd: branchCwd,
 									requestInputEnabled: false,
 									onExecutionStart: () => markExecutionStarted(branchSignal),
@@ -933,6 +939,7 @@ async function runWorkflowFileInternal({
 									await branchRecorder.finish(branchAttempt, "completed", result.result);
 								return result;
 							} catch (error) {
+								if (error instanceof PersistenceError) throw error;
 								if (branchAttempt) await branchRecorder.finish(branchAttempt, "failed", error);
 								throw error;
 							}
@@ -957,6 +964,7 @@ async function runWorkflowFileInternal({
 
 						const branchPromises = parallel.branches.map((branch) => runBranch(branch));
 						const branchesSettled = Promise.allSettled(branchPromises);
+						let parallelFailure: { error: unknown } | undefined;
 						try {
 							if (wait === "any") {
 								const winner = (await (timeoutPromise
@@ -979,6 +987,7 @@ async function runWorkflowFileInternal({
 								parallelBranchResults = createRecord();
 								for (const entry of settled) {
 									if (entry.status === "rejected") {
+										if (entry.reason instanceof PersistenceError) throw entry.reason;
 										throw new Error(
 											`Parallel branch failed: ${entry.reason?.message ?? String(entry.reason)}`,
 										);
@@ -986,6 +995,8 @@ async function runWorkflowFileInternal({
 									parallelBranchResults[entry.value.branchId] = entry.value.result;
 								}
 							}
+						} catch (error) {
+							parallelFailure = { error };
 						} finally {
 							if (parallelTimeoutId !== undefined) clearTimeout(parallelTimeoutId);
 							const branchesCancelled = wait === "any" || parallelSignal.aborted;
@@ -993,6 +1004,10 @@ async function runWorkflowFileInternal({
 							if (branchesCancelled) await waitForCancelledParallelBranches(branchesSettled);
 							else await branchesSettled;
 						}
+						for (const entry of await branchesSettled)
+							if (entry.status === "rejected" && entry.reason instanceof PersistenceError)
+								throw entry.reason;
+						if (parallelFailure) throw parallelFailure.error;
 
 						const merged = Object.fromEntries(
 							Object.entries(parallelBranchResults ?? {}).map(([branchId, branchResult]) => [
@@ -1132,6 +1147,7 @@ async function runWorkflowFileInternal({
 					if (historyAttempt) await recorder.finish(historyAttempt, "completed", result);
 					return { result, parallelBranchResults };
 				} catch (error) {
+					if (error instanceof PersistenceError) throw error;
 					if (historyAttempt)
 						await recorder.finish(
 							historyAttempt,
@@ -1156,6 +1172,7 @@ async function runWorkflowFileInternal({
 								signal: ctx.signal,
 								shouldRetry: (error) => {
 									if (
+										error instanceof PersistenceError ||
 										error instanceof WorkflowPipelineInputSuspension ||
 										error instanceof RequestInputResumeError ||
 										error instanceof CostLimitExceededError
@@ -1186,6 +1203,7 @@ async function runWorkflowFileInternal({
 				result = attemptResult.result;
 				parallelBranchResults = attemptResult.parallelBranchResults;
 			} catch (err: any) {
+				if (err instanceof PersistenceError) throw err;
 				if (err instanceof WorkflowPipelineInputSuspension) {
 					const inputRequest = buildNeedsInputRequest({
 						stepId: err.stepId,
@@ -2422,15 +2440,15 @@ async function runPipelineStep({
 
 	const pipelineStartIndex = resume ? resume.pipelineInput.resumeAtIndex : 0;
 	const remainingPipeline = pipeline.slice(pipelineStartIndex);
+	const pipelineRecorder = recorderFromEnv(env)?.child(`step/${stepId}`);
+	if (pipelineRecorder) pipelineRecorder.pipelineOffset = pipelineStartIndex;
 	const result = await runPipeline({
 		pipeline: remainingPipeline,
 		registry: ctx.registry,
 		stdin: ctx.stdin,
 		stdout,
 		stderr: ctx.stderr,
-		env: recorderFromEnv(env)
-			? bindRecorder(env, recorderFromEnv(env).child(`step/${stepId}`))
-			: env,
+		env: pipelineRecorder ? bindRecorder(env, pipelineRecorder) : env,
 		mode: ctx.mode,
 		cwd,
 		signal: ctx.signal,

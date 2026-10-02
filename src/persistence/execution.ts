@@ -33,7 +33,12 @@ export async function withStoreContext<T>(ctx: any, task: (ctx: any) => Promise<
 	}
 	if (!selected && !env.LOBSTER_BACKEND && env.LOBSTER_HISTORY !== "1" && !ctx.history)
 		return task(ctx);
-	const session = await openStoreSession({ env, history: ctx.history, readOnly: ctx.readOnly });
+	const session = await openStoreSession({
+		env,
+		history: ctx.history,
+		readOnly: ctx.readOnly,
+		signal: ctx.signal,
+	});
 	try {
 		return await task({ ...ctx, env: bindStoreSession(env, session) });
 	} finally {
@@ -47,6 +52,7 @@ export async function withExecution<T>(
 	resumeKey: string | undefined,
 	task: (ctx: any) => Promise<T>,
 ): Promise<T> {
+	if (ctx.dryRun) return task(ctx);
 	return withStoreContext(ctx, async (runtime) => {
 		const session = sessionFromEnv(runtime.env);
 		if (
@@ -67,7 +73,7 @@ export async function withExecution<T>(
 				task: () => session.recorderForState(resumeKey),
 			});
 			if (!recorder) return task(runtime);
-		} else recorder = await session.createRun(kind);
+		} else recorder = await session.createRun(kind, runtime.runMetadata);
 		if (resumeKey && runtime._decision) {
 			const decision = runtime._decision;
 			recorder.decisionKey = resumeKey.replace("workflow-resume_", "workflow_resume_");
@@ -86,7 +92,9 @@ export async function withExecution<T>(
 			const pending = Object.values(run?.waits ?? {}).some(
 				(wait: any) => wait.status === "pending",
 			);
-			if (result?.ok === false) {
+			if (result?.error?.type === "persistence_outcome_unknown") {
+				// Reconcile the admitted mutation before assigning an execution outcome.
+			} else if (result?.ok === false) {
 				if ((!resumeKey || recorder.ownsExecution) && !pending && run?.status === "running")
 					await recorder.settle(runtime.signal?.aborted ? "cancelled" : "failed");
 			} else if (["needs_approval", "needs_input"].includes(result?.status)) {
@@ -96,6 +104,8 @@ export async function withExecution<T>(
 					result?.status === "cancelled" ? "cancelled" : "completed",
 					result?.output,
 				);
+			if (result && typeof result === "object" && Object.isExtensible(result))
+				Object.assign(result, { runId: recorder.runId });
 			return result;
 		} catch (error) {
 			if (error instanceof PersistenceOutcomeUnknown) throw error;

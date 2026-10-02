@@ -3,7 +3,12 @@ import { promises as fs } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { withFileLock, writeFileAtomic, ensureDirectory } from "../state/store.js";
 import { FileBackend } from "./files.js";
-import { fingerprint, validateArchive, type LogicalArchive } from "./model.js";
+import {
+	fingerprint,
+	validateArchive,
+	validateContinuations,
+	type LogicalArchive,
+} from "./model.js";
 import type { Backend } from "./backend.js";
 
 async function assertOffline(directory: string) {
@@ -67,6 +72,13 @@ export async function migrateStore({
 			const from = selected?.backend ?? "files";
 			if (!["files", "sqlite"].includes(from) || (selected && selected.version !== 1))
 				throw new Error("Unsupported backend selection");
+			if (from === "sqlite") {
+				try {
+					await fs.access(path.join(directory, "lobster.sqlite"));
+				} catch {
+					throw new Error("Selected SQLite database is missing; restore a verified backup");
+				}
+			}
 			if (from === backend) return { changed: false, backend };
 			const source = await backendFor(from, directory);
 			let archive: LogicalArchive;
@@ -76,6 +88,7 @@ export async function migrateStore({
 				await source.close();
 			}
 			validateArchive(archive);
+			validateContinuations(archive);
 			const digest = fingerprint(canonical(archive));
 			const backup = path.join(directory, `.backup-${digest}.archive`);
 			await writeFileAtomic(backup, JSON.stringify(archive) + "\n");

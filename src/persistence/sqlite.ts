@@ -14,6 +14,7 @@ export class SqliteBackend implements Backend {
 			reject: (error: any) => void;
 			mutation: boolean;
 			operationId: string;
+			runId?: string;
 		}
 	>();
 	private ready: Promise<void>;
@@ -24,8 +25,21 @@ export class SqliteBackend implements Backend {
 		readonly databasePath: string,
 		readonly readOnly = false,
 		readonly maxPending = 256,
+		startupSignal?: AbortSignal,
 	) {
+		if (!Number.isInteger(maxPending) || maxPending < 1 || maxPending > 4096)
+			throw new Error("Persistence admission limit must be 1..4096");
 		this.connect();
+		if (startupSignal) {
+			const abort = () => {
+				void this.worker.terminate();
+			};
+			startupSignal.addEventListener("abort", abort, { once: true });
+			void this.ready
+				.finally(() => startupSignal.removeEventListener("abort", abort))
+				.catch(() => {});
+			if (startupSignal.aborted) abort();
+		}
 	}
 	private connect() {
 		const readOnly = this.readOnly;
@@ -62,7 +76,9 @@ export class SqliteBackend implements Backend {
 			this.failed = error;
 			for (const request of this.pending.values())
 				request.reject(
-					request.mutation ? new PersistenceOutcomeUnknown(request.operationId, error) : error,
+					request.mutation
+						? new PersistenceOutcomeUnknown(request.operationId, error, request.runId)
+						: error,
 				);
 			this.pending.clear();
 		};
@@ -100,14 +116,21 @@ export class SqliteBackend implements Backend {
 				reject,
 				mutation: ["write", "transition", "import", "removeRun"].includes(method),
 				operationId,
+				runId: args.runId,
 			});
 		});
 		this.worker.ref();
-		this.worker.postMessage({
-			id,
-			method,
-			args: { ...args, ...(method === "write" ? { operationId } : {}) },
-		});
+		try {
+			this.worker.postMessage({
+				id,
+				method,
+				args: { ...args, ...(method === "write" ? { operationId } : {}) },
+			});
+		} catch (error) {
+			this.pending.delete(id);
+			if (!this.pending.size) this.worker.unref();
+			throw error;
+		}
 		// Once admitted, await the acknowledgement. Cancellation is not proof of rollback.
 		return result;
 	}
@@ -122,15 +145,26 @@ export class SqliteBackend implements Backend {
 		text: string | null,
 		options: { exclusive?: boolean; runId?: string; decision?: unknown; signal?: AbortSignal } = {},
 	) {
+		const operationId = randomUUID();
 		const result = await this.request(
 			"write",
-			{ key, text, exclusive: options.exclusive, runId: options.runId, decision: options.decision },
+			{
+				key,
+				text,
+				operationId,
+				exclusive: options.exclusive,
+				runId: options.runId,
+				decision: options.decision,
+			},
 			options.signal,
 		);
-		return { ...result, signalAbortedAfterCommit: options.signal?.aborted === true };
+		return { ...result, operationId, signalAbortedAfterCommit: options.signal?.aborted === true };
 	}
 	transition(request: Transition, signal?: AbortSignal): Promise<TransitionResult> {
 		return this.request("transition", request, signal);
+	}
+	acknowledge(runId: string, operationId: string) {
+		return this.request("acknowledge", { runId, operationId });
 	}
 	getRun(id: string): Promise<RunRecord | null> {
 		return this.request("getRun", { id });

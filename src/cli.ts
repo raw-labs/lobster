@@ -1,4 +1,6 @@
+import { recorderFromEnv } from "./persistence/session.js";
 import { withExecution } from "./persistence/execution.js";
+import { runtimeErrorDetails } from "./persistence/backend.js";
 import { openStoreSession } from "./persistence/session.js";
 import { migrateStore } from "./persistence/migrate.js";
 import { parsePipeline } from "./parser.js";
@@ -30,10 +32,6 @@ async function runCliWithSignal(
 	forceTerminationSignal: AbortSignal = signal,
 ) {
 	const registry = createDefaultRegistry();
-	if (argv[0] === "history" || argv[0] === "storage") {
-		await handlePersistence(argv);
-		return;
-	}
 
 	if (argv[0] === "graph") {
 		await handleGraph({ argv: argv.slice(1) });
@@ -63,6 +61,11 @@ async function runCliWithSignal(
 
 	if (argv[0] === "version" || argv[0] === "--version" || argv[0] === "-v") {
 		process.stdout.write(`${await readVersion()}\n`);
+		return;
+	}
+
+	if (argv[0] === "history" || argv[0] === "storage") {
+		await handlePersistence(argv);
 		return;
 	}
 
@@ -188,12 +191,29 @@ function isWorkflowGraphFormat(value: string): value is WorkflowGraphFormat {
 
 async function handleRun(options: Parameters<typeof handleRunInternal>[0] | any) {
 	const parsed = parseRunArgs(options.argv);
-	return withExecution(
-		{ env: process.env, signal: options.signal, dryRun: parsed.dryRun },
-		"cli",
-		undefined,
-		(ctx) => handleRunInternal({ ...options, env: ctx.env }),
-	);
+	const prepared = await prepareRunTarget(parsed).catch(() => undefined);
+	if (!prepared) return handleRunInternal({ ...options, env: process.env });
+	let envelope: any;
+	try {
+		const result = await withExecution(
+			{ env: process.env, signal: options.signal, dryRun: prepared.dryRun },
+			"cli",
+			undefined,
+			(ctx) =>
+				handleRunInternal({
+					...options,
+					env: ctx.env,
+					onEnvelope: (value) => {
+						envelope = value;
+					},
+				}),
+		);
+		if (envelope) writeToolEnvelope(envelope);
+		return result;
+	} catch (error) {
+		reportRunError(normalizeMode(parsed.mode), "runtime_error", error);
+		return { ok: false };
+	}
 }
 
 async function handleRunInternal({
@@ -201,6 +221,7 @@ async function handleRunInternal({
 	registry,
 	signal,
 	forceTerminationSignal,
+	onEnvelope,
 	env,
 }: {
 	argv;
@@ -208,7 +229,13 @@ async function handleRunInternal({
 	registry;
 	signal: AbortSignal;
 	forceTerminationSignal: AbortSignal;
+	onEnvelope?: (envelope: any) => void;
 }) {
+	const emit = (envelope: any) =>
+		(onEnvelope ?? writeToolEnvelope)({
+			...envelope,
+			...(recorderFromEnv(env) ? { runId: recorderFromEnv(env).runId } : {}),
+		});
 	const parsed = parseRunArgs(argv);
 	const { mode, argsJson } = parsed;
 	const normalizedMode = normalizeMode(mode);
@@ -216,8 +243,8 @@ async function handleRunInternal({
 	try {
 		target = await prepareRunTarget(parsed);
 	} catch (err) {
-		reportRunError(normalizedMode, "parse_error", err);
-		return;
+		reportRunError(normalizedMode, "parse_error", err, undefined, emit);
+		return { ok: false };
 	}
 	const { rest, workflowFile, dryRun } = target;
 	if (workflowFile) {
@@ -231,8 +258,9 @@ async function handleRunInternal({
 					"parse_error",
 					new Error("run --args-json must be valid JSON"),
 					"",
+					emit,
 				);
-				return;
+				return { ok: false };
 			}
 		}
 
@@ -255,7 +283,7 @@ async function handleRunInternal({
 
 			if (normalizedMode === "tool") {
 				if (output.status === "needs_approval") {
-					writeToolEnvelope({
+					emit({
 						ok: true,
 						status: "needs_approval",
 						output: [],
@@ -266,7 +294,7 @@ async function handleRunInternal({
 				}
 
 				if (output.status === "needs_input") {
-					writeToolEnvelope({
+					emit({
 						ok: true,
 						status: "needs_input",
 						output: [],
@@ -276,7 +304,7 @@ async function handleRunInternal({
 					return output;
 				}
 
-				writeToolEnvelope({
+				emit({
 					ok: true,
 					status: "ok",
 					output: output.output,
@@ -309,8 +337,8 @@ async function handleRunInternal({
 			}
 			return output;
 		} catch (err) {
-			reportRunError(normalizedMode, "runtime_error", err);
-			return { ok: false };
+			reportRunError(normalizedMode, "runtime_error", err, undefined, emit);
+			return { ok: false, error: runtimeErrorDetails(err) };
 		}
 	}
 
@@ -320,8 +348,8 @@ async function handleRunInternal({
 	try {
 		pipeline = parsePipeline(pipelineString);
 	} catch (err) {
-		reportRunError(normalizedMode, "parse_error", err);
-		return;
+		reportRunError(normalizedMode, "parse_error", err, undefined, emit);
+		return { ok: false };
 	}
 
 	try {
@@ -348,7 +376,7 @@ async function handleRunInternal({
 				output,
 				signal,
 			});
-			writeToolEnvelope({
+			emit({
 				ok: true,
 				status: finalized.status,
 				output: finalized.output,
@@ -369,8 +397,8 @@ async function handleRunInternal({
 		}
 		return { status: "ok", output: output.items };
 	} catch (err) {
-		reportRunError(normalizedMode, "runtime_error", err);
-		return { ok: false };
+		reportRunError(normalizedMode, "runtime_error", err, undefined, emit);
+		return { ok: false, error: runtimeErrorDetails(err) };
 	}
 }
 
@@ -379,9 +407,10 @@ function reportRunError(
 	type: "parse_error" | "runtime_error",
 	error: unknown,
 	prefix = type === "parse_error" ? "Parse error: " : "Error: ",
+	emit = writeToolEnvelope,
 ) {
 	const message = (error as { message?: string })?.message ?? String(error);
-	if (mode === "tool") writeToolEnvelope({ ok: false, error: { type, message } });
+	if (mode === "tool") emit({ ok: false, error: runtimeErrorDetails(error, type) });
 	else process.stderr.write(`${prefix}${message}\n`);
 	process.exitCode = type === "parse_error" ? 2 : 1;
 }
@@ -627,7 +656,7 @@ async function handleResume({
 	} catch (err: any) {
 		envelope = {
 			ok: false,
-			error: { type: "runtime_error", message: err?.message ?? String(err) },
+			error: runtimeErrorDetails(err),
 		};
 	}
 	writeToolEnvelope(envelope);
@@ -731,6 +760,11 @@ function helpText() {
 		`  lobster resume --token <token> --approve yes|no\n` +
 		`  lobster resume --token <token> --response-json '{...}'\n` +
 		`  lobster resume --token <token> --cancel\n` +
+		`  lobster history list\n` +
+		`  lobster history show <runId> [afterSequence]\n` +
+		`  lobster history prune <before> [--apply]\n` +
+		`  lobster storage export\n` +
+		`  lobster storage migrate files|sqlite --offline\n` +
 		`  lobster doctor\n` +
 		`  lobster version\n` +
 		`  lobster help <command>\n\n` +
@@ -774,7 +808,10 @@ async function handlePersistence(argv: string[]) {
 		process.stdout.write(JSON.stringify(result) + "\n");
 		return;
 	}
-	const session = await openStoreSession({ env: process.env });
+	const session = await openStoreSession({
+		env: process.env,
+		readOnly: !(argv[0] === "history" && argv[1] === "prune" && argv.includes("--apply")),
+	});
 	try {
 		let result: unknown;
 		if (argv[0] === "history" && (!argv[1] || argv[1] === "list"))

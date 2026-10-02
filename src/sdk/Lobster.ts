@@ -1,4 +1,5 @@
 import { withExecution } from "../persistence/execution.js";
+import { runtimeErrorDetails } from "../persistence/backend.js";
 import { sessionFromEnv, recorderFromEnv, type StoreSession } from "../persistence/session.js";
 import {
 	consumeResumeState,
@@ -89,7 +90,14 @@ export class Lobster {
 				const result = await instance.#runStages(instance.#stages, initialInput);
 				return instance.#trackPause(result);
 			},
-		);
+		).catch((err) => ({
+			ok: false,
+			status: "error",
+			output: [],
+			requiresApproval: null,
+			requiresInput: null,
+			error: runtimeErrorDetails(err),
+		}));
 	}
 
 	async #runStages(
@@ -203,10 +211,7 @@ export class Lobster {
 				output: [],
 				requiresApproval: null,
 				requiresInput: null,
-				error: {
-					type: "runtime_error",
-					message: err?.message ?? String(err),
-				},
+				error: runtimeErrorDetails(err),
 			};
 		}
 	}

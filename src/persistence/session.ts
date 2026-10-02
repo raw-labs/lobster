@@ -9,7 +9,7 @@ import {
 	writeFileAtomic,
 } from "../state/store.js";
 import { FileBackend } from "./files.js";
-import { PersistenceOutcomeUnknown, type Backend } from "./backend.js";
+import { PersistenceError, PersistenceOutcomeUnknown, type Backend } from "./backend.js";
 import {
 	fingerprint,
 	canRetain,
@@ -18,6 +18,7 @@ import {
 	type RunAction,
 	type RunStatus,
 	type AttemptStatus,
+	type Transition,
 } from "./model.js";
 
 const SESSION = Symbol("lobster.storeSession");
@@ -32,8 +33,16 @@ export function normalizedKey(key: string) {
 	return path.basename(keyToPath(".", key), ".json");
 }
 export function bindStoreSession(env: Record<string, string | undefined>, session: StoreSession) {
-	return { ...env, LOBSTER_STATE_DIR: session.directory, [SESSION]: session };
+	const bound = {
+		...env,
+		LOBSTER_STATE_DIR: session.directory,
+		LOBSTER_BACKEND: session.backend.kind,
+		[SESSION]: session,
+	};
+	if ((bound as any)[RECORDER]?.session !== session) delete (bound as any)[RECORDER];
+	return bound;
 }
+
 export function bindRecorder(env: Record<string, string | undefined>, recorder: ExecutionRecorder) {
 	return { ...env, [RECORDER]: recorder };
 }
@@ -44,10 +53,13 @@ export type StoreOptions = {
 	readOnly?: boolean;
 	history?: boolean;
 	maxPending?: number;
+	signal?: AbortSignal;
 };
 export class StoreSession {
 	readonly history: boolean;
 	private closed = false;
+	private pending = new Set<Promise<unknown>>();
+	private closePromise?: Promise<void>;
 	constructor(
 		readonly directory: string,
 		readonly backend: Backend,
@@ -57,37 +69,57 @@ export class StoreSession {
 	) {
 		this.history = history;
 	}
-	async read(key: string) {
+	private assertOpen(write = false) {
 		if (this.closed) throw new Error("Persistence session is closed");
-		return this.backend.read(normalizedKey(key));
+		if (write && this.readOnly) throw new Error("Persistence session is read-only");
+	}
+	private request<T>(task: () => Promise<T>, write = false): Promise<T> {
+		this.assertOpen(write);
+		const result = task();
+		this.pending.add(result);
+		return result.finally(() => this.pending.delete(result));
+	}
+	async read(key: string) {
+		return this.request(() => this.backend.read(normalizedKey(key)));
 	}
 	async write(key: string, text: string | null, options: any = {}) {
-		if (this.closed) throw new Error("Persistence session is closed");
-		if (this.readOnly) throw new Error("Persistence session is read-only");
-		try {
-			return await this.backend.write(normalizedKey(key), text, options);
-		} catch (error) {
-			if (!(error instanceof PersistenceOutcomeUnknown)) throw error;
-			// Replacement waits for the old worker to stop. While the caller still owns
-			// the publication barrier, reconcile the mutation before releasing readers.
-			const current = await this.backend.read(normalizedKey(key));
-			if (current.runId) {
-				const run = await this.backend.getRun(current.runId);
-				const receipt = run?.receipts[error.operationId];
-				if (receipt)
-					return {
-						revision: receipt.revision,
-						reconciled: true,
-						signalAbortedAfterCommit: options.signal?.aborted === true,
-					};
-			} else if (current.text === text) {
-				return { reconciled: true, signalAbortedAfterCommit: options.signal?.aborted === true };
+		return this.request(async () => {
+			try {
+				const result = await this.backend.write(normalizedKey(key), text, options);
+				if (result?.runId && result?.operationId)
+					await this.acknowledgeObserved(result.runId, result.operationId);
+				return result
+					? {
+							...result,
+							signalAbortedAfterCommit:
+								options.signal?.aborted === true || result.signalAbortedAfterCommit === true,
+						}
+					: result;
+			} catch (error) {
+				if (!(error instanceof PersistenceOutcomeUnknown)) throw error;
+				// Replacement waits for the old worker to stop. While the caller still owns
+				// the publication barrier, reconcile the mutation before releasing readers.
+				const current = await this.backend.read(normalizedKey(key));
+				if (current.runId) {
+					const run = await this.backend.getRun(current.runId);
+					const receipt = run?.receipts[error.operationId];
+					if (receipt) {
+						await this.acknowledgeObserved(current.runId, error.operationId);
+						return {
+							revision: receipt.revision,
+							reconciled: true,
+							signalAbortedAfterCommit: options.signal?.aborted === true,
+						};
+					}
+				} else if (!options.exclusive && current.text === text) {
+					return { reconciled: true, signalAbortedAfterCommit: options.signal?.aborted === true };
+				}
+				throw error;
 			}
-			throw error;
-		}
+		}, true);
 	}
 	async createRun(kind: string, metadata?: unknown, partialHistory = false) {
-		if (this.readOnly) throw new Error("Persistence session is read-only");
+		this.assertOpen(true);
 		const id = randomUUID();
 		const at = new Date().toISOString();
 		const run: RunRecord = {
@@ -100,19 +132,26 @@ export class StoreSession {
 			updatedAt: at,
 			partialHistory,
 			definitions: [],
-			metadata: summarize(metadata),
+			metadata:
+				metadata && typeof metadata === "object"
+					? Object.fromEntries(
+							Object.entries(metadata).filter(
+								([key, value]) =>
+									["hostRunId", "hostTaskId", "callerId"].includes(key) &&
+									typeof value === "string" &&
+									value.length <= 256,
+							),
+						)
+					: undefined,
 			attempts: [],
 			events: [],
 			waits: {},
 			states: {},
 			receipts: {},
 		};
-		await this.backend.transition({
-			operationId: randomUUID(),
-			runId: id,
-			action: { kind: "create", run },
-		});
-		return new ExecutionRecorder(this, id);
+		const recorder = new ExecutionRecorder(this, id);
+		await recorder.action({ kind: "create", run });
+		return recorder;
 	}
 	async recorderForState(key: string) {
 		let record = await this.read(key);
@@ -127,23 +166,21 @@ export class StoreSession {
 		if (!this.history || JSON.parse(record.text)?.type === "lobster.consumed-resume-state.v1")
 			return undefined;
 		const recorder = await this.createRun("legacy", undefined, true);
-		await this.backend.transition({
-			operationId: randomUUID(),
-			runId: recorder.runId,
-			action: { kind: "state", key: normalizedKey(key), text: record.text },
-		});
+		await recorder.action({ kind: "state", key: normalizedKey(key), text: record.text });
 		return recorder;
 	}
 	async getRun(id: string) {
-		return this.backend.getRun(id);
+		return this.request(() => this.backend.getRun(id));
 	}
 	async listRuns({ limit = 20, after = "" } = {}) {
+		this.assertOpen();
 		if (!Number.isInteger(limit) || limit < 1 || limit > 100)
 			throw new Error("History limit must be 1..100");
-		const runs = await this.backend.listRunSummaries(after, limit);
+		const runs = await this.request(() => this.backend.listRunSummaries(after, limit));
 		return { runs, nextCursor: runs.at(-1)?.id ?? null };
 	}
 	async inspect(id: string, { afterSequence = 0, limit = 50 } = {}) {
+		this.assertOpen();
 		if (
 			!Number.isInteger(limit) ||
 			limit < 1 ||
@@ -152,33 +189,58 @@ export class StoreSession {
 			afterSequence < 0
 		)
 			throw new Error("Invalid history page");
-		return this.backend.inspectRun(id, afterSequence, limit);
+		return this.request(() => this.backend.inspectRun(id, afterSequence, limit));
 	}
 	async retain({ before, dryRun = true }: { before: string; dryRun?: boolean }) {
-		if (!Number.isFinite(Date.parse(before))) throw new Error("Invalid retention date");
-		const removed: string[] = [];
-		for (const run of await this.backend.listRuns()) {
-			if (!canRetain(run, before)) continue;
-			if (dryRun || (await this.backend.removeRun(run.id, before))) removed.push(run.id);
-		}
-		return removed;
+		return this.request(async () => {
+			if (!Number.isFinite(Date.parse(before))) throw new Error("Invalid retention date");
+			const removed: string[] = [];
+			for (const run of await this.backend.listRuns()) {
+				if (!canRetain(run, before)) continue;
+				if (dryRun || (await this.backend.removeRun(run.id, before))) removed.push(run.id);
+			}
+			return removed;
+		}, !dryRun);
 	}
+	async acknowledge(runId: string, operationId: string) {
+		return this.request(() => this.acknowledgeObserved(runId, operationId), true);
+	}
+	private async acknowledgeObserved(runId: string, operationId: string) {
+		try {
+			await this.backend.acknowledge(runId, operationId);
+			return true;
+		} catch {
+			return false;
+		} // The original commit is known. Keep its receipt protected.
+	}
+
 	async reconcile(runId: string, operationId: string) {
 		const run = await this.getRun(runId);
 		return run?.receipts[operationId] ?? null;
 	}
+	async transition(request: Transition, signal?: AbortSignal) {
+		return this.request(async () => {
+			const result = await this.backend.transition(request, signal);
+			if (!result.conflict) await this.acknowledgeObserved(request.runId, request.operationId);
+			return result;
+		}, true);
+	}
 
 	async close() {
-		if (this.closed) return;
+		if (this.closePromise) return this.closePromise;
 		this.closed = true;
-		try {
-			await this.backend.close();
-		} finally {
-			if (this.lease)
-				await fs.unlink(this.lease).catch((error) => {
-					if (error.code !== "ENOENT") throw error;
-				});
-		}
+		this.closePromise = (async () => {
+			await Promise.allSettled(this.pending);
+			try {
+				await this.backend.close();
+			} finally {
+				if (this.lease)
+					await fs.unlink(this.lease).catch((error) => {
+						if (error.code !== "ENOENT") throw error;
+					});
+			}
+		})();
+		return this.closePromise;
 	}
 }
 export class ExecutionRecorder {
@@ -195,12 +257,17 @@ export class ExecutionRecorder {
 		return new ExecutionRecorder(this.session, this.runId, this.prefix + path + "/");
 	}
 	async action(action: RunAction) {
-		return this.session.backend.transition({
-			operationId: randomUUID(),
-			runId: this.runId,
-			action,
-		});
+		const operationId = randomUUID();
+		let result;
+		try {
+			result = await this.session.transition({ operationId, runId: this.runId, action });
+		} catch (error) {
+			if (error instanceof PersistenceError) throw error;
+			throw new PersistenceError(operationId, this.runId, error);
+		}
+		return result;
 	}
+
 	async definition(value: unknown) {
 		await this.action({ kind: "definition", fingerprint: fingerprint(value) });
 	}
@@ -233,6 +300,7 @@ export async function openStoreSession(options: StoreOptions = {}) {
 	const env = options.env ?? process.env;
 	const directory = path.resolve(options.directory ?? defaultStateDir(env));
 	const open = async () => {
+		options.signal?.throwIfAborted();
 		let selected: any;
 		try {
 			selected = JSON.parse(await fs.readFile(path.join(directory, ".backend"), "utf8"));
@@ -251,51 +319,68 @@ export async function openStoreSession(options: StoreOptions = {}) {
 		if (selected && selected.backend !== kind)
 			throw new Error("Backend change requires verified migration");
 		const history = options.history ?? env.LOBSTER_HISTORY === "1";
-		let backend: Backend;
-		if (kind === "sqlite") {
-			const [major, minor] = process.versions.node.split(".").map(Number);
-			if (major < 22 || (major === 22 && minor < 13) || (major === 23 && minor < 4))
-				throw new Error("SQLite backend requires Node >=22.13");
-			if (!selected) {
-				const legacy = await new FileBackend(directory).export();
-				if (Object.keys(legacy.states).length || legacy.runs.length)
-					throw new Error("Existing file state requires migration before SQLite selection");
-			}
-			await ensureDirectory(directory);
-			const databasePath = path.join(directory, "lobster.sqlite");
-			if (selected) {
-				try {
-					await fs.access(databasePath);
-				} catch {
-					throw new Error("Selected SQLite database is missing; restore a verified backup");
+		let backend: Backend | undefined;
+		let lease: string | undefined;
+		try {
+			if (kind === "sqlite") {
+				const [major, minor] = process.versions.node.split(".").map(Number);
+				if (major < 22 || (major === 22 && minor < 13) || (major === 23 && minor < 4))
+					throw new Error("SQLite backend requires Node >=22.13");
+				if (!selected) {
+					const legacy = await new FileBackend(directory).export();
+					if (Object.keys(legacy.states).length || legacy.runs.length)
+						throw new Error("Existing file state requires migration before SQLite selection");
 				}
-			}
-			if (!options.readOnly) {
-				const handle = await fs.open(databasePath, "a", 0o600);
-				await handle.close();
-			}
-			const { SqliteBackend } = await import("./sqlite.js");
-			backend = new SqliteBackend(databasePath, options.readOnly, options.maxPending);
-			try {
-				await backend.listRuns();
-			} catch (error) {
-				await backend.close();
-				throw error;
-			}
-			if (!selected && !options.readOnly)
+				await ensureDirectory(directory);
+				const databasePath = path.join(directory, "lobster.sqlite");
+				if (selected) {
+					try {
+						await fs.access(databasePath);
+					} catch {
+						throw new Error("Selected SQLite database is missing; restore a verified backup");
+					}
+				}
+				if (!options.readOnly) {
+					const handle = await fs.open(databasePath, "a", 0o600);
+					await handle.close();
+				}
+				const { SqliteBackend } = await import("./sqlite.js");
+				backend = new SqliteBackend(
+					databasePath,
+					options.readOnly,
+					options.maxPending,
+					options.signal,
+				);
+				await backend.listRunSummaries("", 1);
+				options.signal?.throwIfAborted();
+				if (!selected && !options.readOnly)
+					await writeFileAtomic(
+						path.join(directory, ".backend"),
+						JSON.stringify({ version: 1, backend: kind }) + "\n",
+					);
+			} else backend = new FileBackend(directory, options.readOnly);
+			if (!selected && kind === "files" && history && !options.readOnly)
 				await writeFileAtomic(
 					path.join(directory, ".backend"),
-					JSON.stringify({ version: 1, backend: kind }) + "\n",
+					JSON.stringify({ version: 1, backend: "files" }) + "\n",
 				);
-		} else backend = new FileBackend(directory, options.readOnly);
-		let lease: string | undefined;
-		if (!options.readOnly) {
-			lease = path.join(directory, `.session-${process.pid}-${randomUUID()}`);
-			await fs.writeFile(lease, JSON.stringify({ pid: process.pid }), { mode: 0o600 });
+			if (!options.readOnly) {
+				lease = path.join(directory, `.session-${process.pid}-${randomUUID()}`);
+				await fs.writeFile(lease, JSON.stringify({ pid: process.pid }), { mode: 0o600 });
+			}
+			return new StoreSession(directory, backend, history, lease, options.readOnly);
+		} catch (error) {
+			await backend?.close();
+			if (lease) await fs.unlink(lease).catch(() => {});
+			if (options.signal?.aborted) options.signal.throwIfAborted();
+			throw error;
 		}
-		return new StoreSession(directory, backend, history, lease, options.readOnly);
 	};
 	return options.readOnly
 		? open()
-		: withFileLock({ filePath: path.join(directory, ".backend-selection"), task: open });
+		: withFileLock({
+				filePath: path.join(directory, ".backend-selection"),
+				task: open,
+				signal: options.signal,
+			});
 }

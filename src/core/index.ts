@@ -12,3 +12,6 @@ export {
 	type StoreOptions,
 } from "../persistence/session.js";
 export { migrateStore } from "../persistence/migrate.js";
+export { PersistenceError, PersistenceOutcomeUnknown } from "../persistence/backend.js";
+
+export type { ToolRunContext } from "./tool_runtime.js";
