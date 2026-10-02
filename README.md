@@ -39,6 +39,142 @@ Requires Node.js 22 or newer and the pnpm version pinned in `package.json`. From
 - `bin/lobster.js` runs the compiled entrypoint in `dist/`; build after changing source files.
 Invalid explicit workflow file paths are reported as input errors (exit code 2). In `--mode tool`, these failures use the same JSON error envelope as other parsing errors.
 
+## Persistence and run history
+
+File storage remains the default. Existing state keys, approval IDs, and saved
+continuations keep their readers. Retained history is opt-in on either backend:
+
+```sh
+LOBSTER_HISTORY=1 lobster run --mode tool --file workflow.lobster
+lobster history list
+lobster history show <runId>                    # first 50 events
+lobster history show <runId> <afterSequence>    # next page
+```
+
+For a **fresh state directory**, select SQLite explicitly:
+
+```sh
+LOBSTER_STATE_DIR=/path/to/new/state LOBSTER_BACKEND=sqlite LOBSTER_HISTORY=1 \
+  lobster run --mode tool --file workflow.lobster
+```
+
+SQLite requires Node 22.13+ on the Node 22 line, 23.4+ on Node 23, or Node 24+.
+The file backend retains Node >=22 support and does not load `node:sqlite`.
+A worker owns the SQLite connection, prepared statements, and short transactions;
+embedded hosts receive promises. The database uses WAL, a 5-second busy timeout,
+and FULL durability. A session admits at most 256 outstanding worker requests
+(configurable through `maxPending`); overflow fails before dispatch.
+
+A tracked execution keeps one run ID through approvals and structured-input
+pauses. History records step occurrences, attempts, retries, loop item ordinals,
+parallel branches, and child-workflow paths. Lazy stages finish when their
+iterators finish, fail, or close early; recording does not drain an unused stream.
+Workflow files retain their current reload-on-resume behavior. Definition hashes
+record what was supplied in each execution segment; they do not freeze execution.
+
+Default output summaries contain types and counts rather than raw outputs, error
+messages, prompts, arguments, or environment variables. Summary payloads are
+limited to 4 KiB. Inspection returns at most 100 events per page (50 by default),
+with related attempts and waits, and excludes executable continuation payloads
+and operation receipts. A logical export includes full authoritative state, so
+store exports and backups privately. Continuations retain their existing full
+payloads and existing output limits; history capture adds no execution truncation.
+
+New tracked file continuations live with their events in one atomically replaced
+per-run record under `.history`. SQLite commits continuation transitions and their
+events together in indexed tables. The file backend rewrites its aggregate when
+history changes; SQLite avoids that cost. Legacy JSON values keep their layout
+until migration or association with a tracked continuation. New tracked tokens
+require this runtime; compatibility means reading existing tokens, not making
+older binaries understand new storage. Disabling history stops tracking new runs
+and preserves the ability to resume already tracked waits.
+
+### Migrating existing state
+
+A storage directory has one selected backend. SQLite selection refuses to create
+an empty authoritative database over existing file state. Coordinate all writers,
+including older binaries, then migrate explicitly:
+
+```sh
+LOBSTER_STATE_DIR=/path/to/state lobster storage migrate sqlite --offline
+```
+
+`--offline` declares that the caller has stopped all writers. Migration rejects
+live persistence sessions and outstanding state locks, writes a private logical
+backup, imports into a staging store, verifies it, closes it, and atomically
+activates backend selection. Retrying an interrupted conversion before activation
+keeps the source authoritative. After activation, stale files are never a fallback.
+The `.backup-*.archive` files contain full private state. Migration never scans or
+modifies OpenClaw's databases.
+
+The same command can migrate back to `files`, preserving the logical state and
+history. This is a backend round trip, not a binary downgrade. Source JSON must be
+valid; malformed authoritative input aborts conversion. Legacy runs have absent
+history until a stored continuation is associated with a new, explicitly partial
+record. Self-contained legacy SDK tokens remain usable with supplied SDK stages
+and cannot be discovered by scanning a directory. An owning host can build
+coordinated upgrade-time conversion on this API; automatic conversion is not enabled.
+
+```sh
+lobster storage export                         # versioned logical archive
+lobster history prune 2026-01-01T00:00:00Z      # dry run
+lobster history prune 2026-01-01T00:00:00Z --apply
+```
+
+Retention removes only terminal runs older than the cutoff with no live
+continuation, pending wait, started attempt, or unacknowledged operation receipt.
+Committed transitions have stable operation IDs and receipts. A lost reply is an
+unknown outcome until reconciled; it does not authorize replaying an external
+side effect. Receipts are acknowledged only after the executor observes commit,
+and remain protected otherwise. Started attempts are history, not automatic
+restart checkpoints. Crash recovery and external-service idempotency remain
+separate executor work.
+
+History persistence errors bypass workflow retry and `on_error` continuation.
+Tool envelopes report `persistence_error` or `persistence_outcome_unknown`, with
+`error.runId` and `error.operationId`. Embedded callers can query
+`store.reconcile(runId, operationId)` and acknowledge an observed receipt. Neither
+reconciliation nor acknowledgement resumes an external action.
+
+### Embedded and SDK usage
+
+CLI/core/SDK roots open and close their selected session automatically. An embedded
+host can reuse a session and own its lifecycle:
+
+```ts
+import { openStoreSession, runToolRequest } from '@clawdbot/lobster/core';
+
+const store = await openStoreSession({
+  directory: '/path/to/state', backend: 'sqlite', history: true,
+});
+try {
+  const result = await runToolRequest({
+    filePath: '/path/to/workflow.lobster',
+    ctx: { storeSession: store, runMetadata: { hostRunId: 'trigger-123' } },
+  });
+  const page = await store.listRuns({ limit: 20 });
+  const history = await store.inspect(page.runs[0].id, { limit: 50 });
+} finally {
+  await store.close();
+}
+```
+
+`close()` rejects new requests and waits for admitted operations before closing
+the backend and releasing the session's migration fence.
+
+Session injection takes precedence over environment configuration. Correlation
+metadata accepts bounded `hostRunId`, `hostTaskId`, and `callerId` strings; these are
+records, not credentials or continuing authorization. Listing uses lexical run
+IDs as cursors, so new IDs before an existing cursor appear on a fresh scan.
+Event pagination uses committed run-local sequence numbers and reads current
+attempt/wait status for the returned references.
+
+`new Lobster({ storeSession: store })` or `new Lobster({ history: true, stateDir })`
+tracks SDK runs with additive stored tokens. Resume still requires an instance
+with the original JavaScript stages; closures are not serialized. Untracked
+legacy SDK tokens retain their decoder and behavior. Applications must obtain a
+user decision before resuming any approval, as before.
+
 ## Process output limits
 
 Captured process stdout and stderr remain unlimited by default. Set
