@@ -23,3 +23,11 @@ export { exec } from "./primitives/exec.js";
 export { stateGet, stateSet, state } from "./primitives/state.js";
 export { diffLast } from "./primitives/diff.js";
 export { runPipeline } from "./runtime.js";
+
+export {
+	openStoreSession,
+	bindStoreSession,
+	type StoreSession,
+	type StoreOptions,
+} from "../persistence/session.js";
+export { migrateStore } from "../persistence/migrate.js";

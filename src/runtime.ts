@@ -1,3 +1,4 @@
+import { recorderFromEnv } from "./persistence/session.js";
 import { createJsonRenderer } from "./renderers/json.js";
 import type { LlmSpendLedger } from "./core/llm_accounting.js";
 import {
@@ -56,6 +57,7 @@ export async function runPipeline({
 		return dryRunPipeline({ pipeline, registry, stderr });
 	}
 
+	await recorderFromEnv(env)?.definition(pipeline);
 	let stream = input ?? [];
 	let rendered = false;
 	const renderedItems: unknown[] = [];
@@ -102,6 +104,14 @@ export async function runPipeline({
 			await markExecutionStarted();
 		}
 
+		const history = recorderFromEnv(env);
+		const attemptId = await history?.start(
+			`pipeline/${history.pipelineOffset + idx}`,
+			stage.name,
+			history.pipelineOffset + idx,
+		);
+		let historyError: unknown;
+		let historyWaiting = false;
 		const inputTracker = createInputTracker(stream);
 		const stageResume = idx === 0 ? requestInputResume : undefined;
 		let commandActive = true;
@@ -113,7 +123,25 @@ export async function runPipeline({
 			stageFinished = true;
 			commandActive = false;
 			inputTracker.disableReplay();
-			await inputTracker.close({ suppressErrors: suppressCloseErrors });
+			try {
+				await inputTracker.close({ suppressErrors: suppressCloseErrors });
+			} catch (error) {
+				historyError = error;
+				throw error;
+			} finally {
+				if (attemptId)
+					await history.finish(
+						attemptId,
+						historyWaiting
+							? "waiting"
+							: historyError
+								? "failed"
+								: assertResume
+									? "completed"
+									: "closed",
+						historyError,
+					);
+			}
 			if (assertResume) assertRequestInputResumeConsumed(stageResume);
 		}
 		const stageStdout = trackWritableOutput(stdout, () => {
@@ -146,6 +174,8 @@ export async function runPipeline({
 		try {
 			result = await command.run({ input: inputTracker.iterable, args: stage.args, ctx: stageCtx });
 		} catch (err) {
+			historyError = err;
+			historyWaiting = err instanceof InputRequestSuspension;
 			await finishStage({ assertResume: false, suppressCloseErrors: true });
 			if (haltForInputRequest(err)) break;
 			assertNoUnconsumedResumeAfterError(stageResume, err);
@@ -157,6 +187,7 @@ export async function runPipeline({
 		}
 
 		const terminalOutput = Boolean(result?.halt);
+		historyWaiting = terminalOutput;
 		let stageHalted = Boolean(terminalOutput || (haltAfterStageOnAbort && signal?.aborted));
 		const output = result?.output;
 		if (Array.isArray(output)) {
@@ -172,7 +203,10 @@ export async function runPipeline({
 					commandOutputStarted = true;
 				},
 				() => assertRequestInputResumeConsumed(stageResume),
-				(err) => assertNoUnconsumedResumeAfterError(stageResume, err),
+				(err) => {
+					historyError = err;
+					assertNoUnconsumedResumeAfterError(stageResume, err);
+				},
 				finishStage,
 			);
 			stream = haltAfterStageOnAbort
@@ -186,7 +220,10 @@ export async function runPipeline({
 						commandOutputStarted = true;
 					},
 					() => assertRequestInputResumeConsumed(stageResume),
-					(err) => assertNoUnconsumedResumeAfterError(stageResume, err),
+					(err) => {
+						historyError = err;
+						assertNoUnconsumedResumeAfterError(stageResume, err);
+					},
 					finishStage,
 				);
 				// Terminal output is drained after the stage loop as well. It needs the
@@ -425,8 +462,8 @@ function trackCommandOutput(
 			}
 			completed = true;
 		} catch (err) {
-			await finishStage({ assertResume: false, suppressCloseErrors: true });
 			assertNoUnconsumedResumeAfterError(err);
+			await finishStage({ assertResume: false, suppressCloseErrors: true });
 			throw err;
 		} finally {
 			await finishStage({ assertResume: completed });

@@ -1,3 +1,5 @@
+import { withExecution } from "../persistence/execution.js";
+import { recorderFromEnv, bindRecorder } from "../persistence/session.js";
 import { dryRunWorkflow } from "./dry_run.js";
 import {
 	createRecord,
@@ -236,7 +238,13 @@ export function resolveWorkflowArgs(
 	return resolved;
 }
 
-export async function runWorkflowFile({
+export async function runWorkflowFile(options: Parameters<typeof runWorkflowFileInternal>[0]) {
+	return withExecution(options.ctx, "workflow", options.resume?.stateKey, (ctx) =>
+		runWorkflowFileInternal({ ...options, ctx }),
+	);
+}
+
+async function runWorkflowFileInternal({
 	filePath,
 	args,
 	ctx,
@@ -368,6 +376,7 @@ export async function runWorkflowFile({
 	ctx._activeWorkflows.add(canonicalFilePath);
 	try {
 		const workflow = await loadWorkflowFile(resolvedFilePath);
+		await recorderFromEnv(ctx.env)?.definition(workflow);
 		const resolvedArgs = resolveWorkflowArgs(workflow.args, args ?? resumeState?.args);
 		const steps = workflow.steps;
 		const stepIndexById = new Map(steps.map((step, idx) => [step.id, idx]));
@@ -506,10 +515,17 @@ export async function runWorkflowFile({
 
 			if (!evaluateCondition(step.when ?? step.condition, results)) {
 				results[step.id] = { id: step.id, skipped: true };
+				const recorder = recorderFromEnv(ctx.env);
+				if (recorder) {
+					const id = await recorder.start(`step/${idx}`, step.id, idx);
+					await recorder.finish(id, "skipped");
+				}
 				continue;
 			}
 
 			if (isInputStep(step.input)) {
+				const gateRecorder = recorderFromEnv(ctx.env);
+				const gateAttempt = await gateRecorder?.start(`step/${idx}`, step.id, idx);
 				const subject = resolveInputSubject({
 					step,
 					args: resolvedArgs,
@@ -518,6 +534,7 @@ export async function runWorkflowFile({
 				});
 
 				if (ctx.mode === "tool" || !isInteractive(ctx.stdin)) {
+					if (gateAttempt) await gateRecorder.finish(gateAttempt, "waiting");
 					const inputRequest = buildNeedsInputRequest({
 						stepId: step.id,
 						prompt: step.input.prompt,
@@ -607,6 +624,7 @@ export async function runWorkflowFile({
 					response: parsed,
 				};
 				lastStepId = step.id;
+				if (gateAttempt) await gateRecorder.finish(gateAttempt, "completed");
 				continue;
 			}
 
@@ -619,6 +637,8 @@ export async function runWorkflowFile({
 				result: WorkflowStepResult;
 				parallelBranchResults: Record<string, WorkflowStepResult> | null;
 			}> => {
+				const recorder = recorderFromEnv(ctx.env);
+				const historyAttempt = await recorder?.start(`step/${idx}`, step.id, idx);
 				let attemptHadNonRetryableSideEffect = false;
 				const markNonRetryableSideEffect = () => {
 					attemptHadNonRetryableSideEffect = true;
@@ -699,56 +719,84 @@ export async function runWorkflowFile({
 									resolveCwd(subStep.cwd ?? step.cwd ?? workflow.cwd, resolvedArgs) ?? ctx.cwd;
 								const subExecution = getStepExecution(subStep);
 
+								const itemRecorder = recorder?.child(`step/${idx}/item/${itemIdx}`);
+								const subAttempt = await itemRecorder?.start(
+									`step/${subStep.id}`,
+									subStep.id,
+									itemIdx,
+								);
 								let subResult: WorkflowStepResult;
-								if (subExecution.kind === "shell") {
-									const command = resolveTemplate(subExecution.value, resolvedArgs, scopedResults);
-									const stdinValue = resolveShellStdin(subStep.stdin, resolvedArgs, scopedResults);
-									await markExecutionStarted(stepSignal);
-									const { stdout } = await runShellCommand({
-										command,
-										stdin: stdinValue,
-										env: subEnv,
-										cwd: subCwd,
-										signal: stepSignal,
-										forceTerminationSignal: ctx.forceTerminationSignal,
-										killSignal: () =>
-											stepTimeoutController?.signal.aborted
-												? ("SIGKILL" as NodeJS.Signals)
-												: undefined,
-									});
-									subResult = { id: subStep.id, stdout, json: parseJson(stdout) };
-								} else if (subExecution.kind === "pipeline") {
-									if (!ctx.registry) {
-										throw new Error(
-											`Workflow step ${step.id} for_each sub-step ${subStep.id} requires a command registry for pipeline execution`,
+								try {
+									if (subExecution.kind === "shell") {
+										const command = resolveTemplate(
+											subExecution.value,
+											resolvedArgs,
+											scopedResults,
 										);
-									}
-									const pipelineText = resolveTemplate(
-										subExecution.value,
-										resolvedArgs,
-										scopedResults,
-									);
-									const inputValue = resolveInputValue(subStep.stdin, resolvedArgs, scopedResults);
-									subResult = await runPipelineStep({
-										stepId: subStep.id,
-										pipelineText,
-										inputValue,
-										ctx: {
-											...ctx,
+										const stdinValue = resolveShellStdin(
+											subStep.stdin,
+											resolvedArgs,
+											scopedResults,
+										);
+										await markExecutionStarted(stepSignal);
+										const { stdout } = await runShellCommand({
+											command,
+											stdin: stdinValue,
+											env: itemRecorder ? bindRecorder(subEnv, itemRecorder) : subEnv,
+											cwd: subCwd,
 											signal: stepSignal,
-											_onNonRetryableSideEffect: markNonRetryableSideEffect,
-										},
-										llmSpendLedger,
-										env: subEnv,
-										cwd: subCwd,
-										requestInputEnabled: false,
-										onExecutionStart: () => markExecutionStarted(stepSignal),
-									});
-								} else {
-									const inputValue = resolveInputValue(subStep.stdin, resolvedArgs, scopedResults);
-									subResult = createSyntheticStepResult(subStep.id, inputValue);
-								}
+											forceTerminationSignal: ctx.forceTerminationSignal,
+											killSignal: () =>
+												stepTimeoutController?.signal.aborted
+													? ("SIGKILL" as NodeJS.Signals)
+													: undefined,
+										});
+										subResult = { id: subStep.id, stdout, json: parseJson(stdout) };
+									} else if (subExecution.kind === "pipeline") {
+										if (!ctx.registry) {
+											throw new Error(
+												`Workflow step ${step.id} for_each sub-step ${subStep.id} requires a command registry for pipeline execution`,
+											);
+										}
+										const pipelineText = resolveTemplate(
+											subExecution.value,
+											resolvedArgs,
+											scopedResults,
+										);
+										const inputValue = resolveInputValue(
+											subStep.stdin,
+											resolvedArgs,
+											scopedResults,
+										);
+										subResult = await runPipelineStep({
+											stepId: subStep.id,
+											pipelineText,
+											inputValue,
+											ctx: {
+												...ctx,
+												signal: stepSignal,
+												_onNonRetryableSideEffect: markNonRetryableSideEffect,
+											},
+											llmSpendLedger,
+											env: subEnv,
+											cwd: subCwd,
+											requestInputEnabled: false,
+											onExecutionStart: () => markExecutionStarted(stepSignal),
+										});
+									} else {
+										const inputValue = resolveInputValue(
+											subStep.stdin,
+											resolvedArgs,
+											scopedResults,
+										);
+										subResult = createSyntheticStepResult(subStep.id, inputValue);
+									}
 
+									if (subAttempt) await itemRecorder.finish(subAttempt, "completed", subResult);
+								} catch (error) {
+									if (subAttempt) await itemRecorder.finish(subAttempt, "failed", error);
+									throw error;
+								}
 								scopedResults[subStep.id] = subResult;
 								trackStepCost(costTracker, `${step.id}.${subStep.id}`, subResult, llmSpendLedger);
 								// Before the next step runs: a charge no item carried is spend the step really made,
@@ -805,7 +853,7 @@ export async function runWorkflowFile({
 							}
 							return buffered;
 						};
-						const runBranch = async (
+						const runBranchInternal = async (
 							branch: ParallelBranch,
 						): Promise<{ branchId: string; result: WorkflowStepResult }> => {
 							const mergedBranchEnv = { ...step.env, ...branch.env };
@@ -833,7 +881,9 @@ export async function runWorkflowFile({
 								const { stdout } = await runShellCommand({
 									command,
 									stdin: stdinValue,
-									env: branchEnv,
+									env: recorder
+										? bindRecorder(branchEnv, recorder.child(`step/${idx}/branch/${branch.id}`))
+										: branchEnv,
 									cwd: branchCwd,
 									signal: branchSignal,
 									forceTerminationSignal: ctx.forceTerminationSignal,
@@ -874,6 +924,19 @@ export async function runWorkflowFile({
 							return { branchId: branch.id, result: { id: branch.id } };
 						};
 
+						const runBranch = async (branch: ParallelBranch) => {
+							const branchRecorder = recorder?.child(`step/${idx}/branch/${branch.id}`);
+							const branchAttempt = await branchRecorder?.start("branch", branch.id);
+							try {
+								const result = await runBranchInternal(branch);
+								if (branchAttempt)
+									await branchRecorder.finish(branchAttempt, "completed", result.result);
+								return result;
+							} catch (error) {
+								if (branchAttempt) await branchRecorder.finish(branchAttempt, "failed", error);
+								throw error;
+							}
+						};
 						let parallelTimeoutId: ReturnType<typeof setTimeout> | undefined;
 						const timeoutPromise = parallel.timeout_ms
 							? new Promise<never>((_resolve, reject) => {
@@ -973,10 +1036,10 @@ export async function runWorkflowFile({
 							args: subArgs,
 							ctx: {
 								...ctx,
-								env,
 								cwd,
 								signal: stepSignal,
 								_activeWorkflows: childActive,
+								env: recorder ? bindRecorder(env, recorder.child(`step/${idx}/child`)) : env,
 								_llmSpendLedger: stepScopedLedger(llmSpendLedger, step.id),
 								_onExecutionStarted: async () => {
 									await markExecutionStarted(stepSignal);
@@ -1066,8 +1129,15 @@ export async function runWorkflowFile({
 						result = createSyntheticStepResult(step.id, inputValue);
 					}
 
+					if (historyAttempt) await recorder.finish(historyAttempt, "completed", result);
 					return { result, parallelBranchResults };
 				} catch (error) {
+					if (historyAttempt)
+						await recorder.finish(
+							historyAttempt,
+							error instanceof WorkflowPipelineInputSuspension ? "waiting" : "failed",
+							error,
+						);
 					if (attemptHadNonRetryableSideEffect) {
 						throw markStepErrorNonRetryable(error);
 					}
@@ -2358,7 +2428,9 @@ async function runPipelineStep({
 		stdin: ctx.stdin,
 		stdout,
 		stderr: ctx.stderr,
-		env,
+		env: recorderFromEnv(env)
+			? bindRecorder(env, recorderFromEnv(env).child(`step/${stepId}`))
+			: env,
 		mode: ctx.mode,
 		cwd,
 		signal: ctx.signal,

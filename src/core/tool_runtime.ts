@@ -1,3 +1,6 @@
+import { recorderFromEnv } from "../persistence/session.js";
+import { withExecution, withStoreContext } from "../persistence/execution.js";
+import type { StoreSession } from "../persistence/session.js";
 import { Writable } from "node:stream";
 import path from "node:path";
 
@@ -26,6 +29,9 @@ import {
 } from "../pipeline_resume_state.js";
 
 type ToolRunContext = {
+	_resumeSignalAborted?: boolean;
+	storeSession?: StoreSession;
+	history?: boolean;
 	cwd?: string;
 	env?: Record<string, string | undefined>;
 	mode?: "tool" | "human" | "sdk";
@@ -65,7 +71,18 @@ type ToolEnvelope = {
 	};
 };
 
-export async function runToolRequest({
+export async function runToolRequest(
+	options: Parameters<typeof runToolRequestInternal>[0],
+): Promise<ToolEnvelope> {
+	return withExecution(
+		createToolContext(options.ctx),
+		options.filePath ? "workflow" : "pipeline",
+		undefined,
+		(ctx) => runToolRequestInternal({ ...options, ctx }),
+	);
+}
+
+async function runToolRequestInternal({
 	pipeline,
 	filePath,
 	args,
@@ -159,7 +176,31 @@ export async function runToolRequest({
 	}
 }
 
-export async function resumeToolRequest({
+export async function resumeToolRequest(
+	options: Parameters<typeof resumeToolRequestInternal>[0],
+): Promise<ToolEnvelope> {
+	const entry = createToolContext(options.ctx);
+	entry._resumeSignalAborted = entry.signal?.aborted === true;
+	return withStoreContext(entry, async (ctx) => {
+		let key: string | undefined;
+		try {
+			const payload = options.token
+				? decodeResumeToken(options.token)
+				: options.approvalId
+					? decodeResumeToken(await resolveApprovalId(options.approvalId, ctx.env))
+					: undefined;
+			key = payload?.stateKey;
+		} catch {
+			/* normal parser reports the error */
+		}
+		if (!key) return resumeToolRequestInternal({ ...options, ctx });
+		return withExecution({ ...ctx, _decision: options }, "resume", key, (runtime) =>
+			resumeToolRequestInternal({ ...options, ctx: runtime }),
+		);
+	});
+}
+
+async function resumeToolRequestInternal({
 	token,
 	approvalId,
 	approved,
@@ -286,6 +327,7 @@ export async function resumeToolRequest({
 	}
 
 	if (runtime.signal?.aborted) {
+		if (approved === false && runtime._resumeSignalAborted === false) throw runtime.signal.reason;
 		return errorEnvelope(
 			"runtime_error",
 			runtime.signal.reason instanceof Error
@@ -345,6 +387,9 @@ export async function resumeToolRequest({
 
 	const isSameStageInput =
 		resumeState.haltType === "input_request" && resumeState.resumeMode === "same_stage";
+	const history = recorderFromEnv(runtime.env);
+	if (history)
+		history.pipelineOffset = (resumeState.historyOffset ?? 0) + resumeState.resumeAtIndex;
 	const remaining = resumeState.pipeline.slice(resumeState.resumeAtIndex);
 	const input = isSameStageInput
 		? resumeState.items
@@ -472,6 +517,9 @@ export function createToolContext(ctx: ToolRunContext = {}) {
 		forceTerminationSignal: ctx.forceTerminationSignal,
 		registry: ctx.registry ?? createDefaultRegistry(),
 		llmAdapters: ctx.llmAdapters,
+		storeSession: ctx.storeSession,
+		history: ctx.history,
+		_resumeSignalAborted: ctx._resumeSignalAborted,
 	};
 }
 

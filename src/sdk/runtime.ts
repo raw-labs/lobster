@@ -117,6 +117,7 @@ export async function runPipelineInternal({
 		signal: runtimeCtx.signal,
 		input: normalizeSdkOutput(input),
 		requestInputResume,
+		onExecutionStart: runtimeCtx._onExecutionStart,
 	});
 }
 

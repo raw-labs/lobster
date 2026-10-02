@@ -1,3 +1,6 @@
+import { withExecution } from "./persistence/execution.js";
+import { openStoreSession } from "./persistence/session.js";
+import { migrateStore } from "./persistence/migrate.js";
 import { parsePipeline } from "./parser.js";
 import { createDefaultRegistry } from "./commands/registry.js";
 import { runPipeline } from "./runtime.js";
@@ -27,6 +30,10 @@ async function runCliWithSignal(
 	forceTerminationSignal: AbortSignal = signal,
 ) {
 	const registry = createDefaultRegistry();
+	if (argv[0] === "history" || argv[0] === "storage") {
+		await handlePersistence(argv);
+		return;
+	}
 
 	if (argv[0] === "graph") {
 		await handleGraph({ argv: argv.slice(1) });
@@ -179,13 +186,25 @@ function isWorkflowGraphFormat(value: string): value is WorkflowGraphFormat {
 	return value === "mermaid" || value === "dot" || value === "ascii";
 }
 
-async function handleRun({
+async function handleRun(options: Parameters<typeof handleRunInternal>[0] | any) {
+	const parsed = parseRunArgs(options.argv);
+	return withExecution(
+		{ env: process.env, signal: options.signal, dryRun: parsed.dryRun },
+		"cli",
+		undefined,
+		(ctx) => handleRunInternal({ ...options, env: ctx.env }),
+	);
+}
+
+async function handleRunInternal({
 	argv,
 	registry,
 	signal,
 	forceTerminationSignal,
+	env,
 }: {
 	argv;
+	env;
 	registry;
 	signal: AbortSignal;
 	forceTerminationSignal: AbortSignal;
@@ -225,7 +244,7 @@ async function handleRun({
 					stdin: process.stdin,
 					stdout: process.stdout,
 					stderr: process.stderr,
-					env: process.env,
+					env: env,
 					mode: normalizedMode,
 					registry,
 					dryRun,
@@ -243,7 +262,7 @@ async function handleRun({
 						requiresApproval: output.requiresApproval ?? null,
 						requiresInput: null,
 					});
-					return;
+					return output;
 				}
 
 				if (output.status === "needs_input") {
@@ -254,7 +273,7 @@ async function handleRun({
 						requiresApproval: null,
 						requiresInput: output.requiresInput ?? null,
 					});
-					return;
+					return output;
 				}
 
 				writeToolEnvelope({
@@ -264,7 +283,7 @@ async function handleRun({
 					requiresApproval: null,
 					requiresInput: null,
 				});
-				return;
+				return output;
 			}
 
 			if (output.status === "needs_approval" || output.status === "needs_input") {
@@ -281,17 +300,17 @@ async function handleRun({
 					),
 				);
 				process.stdout.write("\n");
-				return;
+				return output;
 			}
 
 			if (output.status === "ok" && output.output.length) {
 				process.stdout.write(JSON.stringify(output.output, null, 2));
 				process.stdout.write("\n");
 			}
-			return;
+			return output;
 		} catch (err) {
 			reportRunError(normalizedMode, "runtime_error", err);
-			return;
+			return { ok: false };
 		}
 	}
 
@@ -313,7 +332,7 @@ async function handleRun({
 			stdin: process.stdin,
 			stdout: process.stdout,
 			stderr: process.stderr,
-			env: process.env,
+			env: env,
 			mode: normalizedMode,
 			renderOutput: normalizedMode !== "tool",
 			dryRun,
@@ -324,7 +343,7 @@ async function handleRun({
 
 		if (normalizedMode === "tool") {
 			const finalized = await finalizePipelineToolRun({
-				env: process.env,
+				env: env,
 				pipeline,
 				output,
 				signal,
@@ -336,7 +355,7 @@ async function handleRun({
 				requiresApproval: finalized.requiresApproval,
 				requiresInput: finalized.requiresInput,
 			});
-			return;
+			return finalized;
 		}
 
 		if (output.halted && isPipelineInputRequest(output.items)) {
@@ -348,8 +367,10 @@ async function handleRun({
 			process.stdout.write(JSON.stringify(output.items, null, 2));
 			process.stdout.write("\n");
 		}
+		return { status: "ok", output: output.items };
 	} catch (err) {
 		reportRunError(normalizedMode, "runtime_error", err);
+		return { ok: false };
 	}
 }
 
@@ -737,4 +758,38 @@ function graphHelpText() {
 		`  --format     Output format: mermaid (default), dot, ascii\n` +
 		`  --args-json  JSON object used to resolve workflow args for labels\n`
 	);
+}
+
+async function handlePersistence(argv: string[]) {
+	if (argv[0] === "storage" && argv[1] === "migrate") {
+		const backend = argv[2];
+		if (backend !== "files" && backend !== "sqlite")
+			throw new Error("storage migrate files|sqlite --offline");
+		const { defaultStateDir } = await import("./state/store.js");
+		const result = await migrateStore({
+			directory: defaultStateDir(process.env),
+			backend,
+			offline: argv.includes("--offline"),
+		});
+		process.stdout.write(JSON.stringify(result) + "\n");
+		return;
+	}
+	const session = await openStoreSession({ env: process.env });
+	try {
+		let result: unknown;
+		if (argv[0] === "history" && (!argv[1] || argv[1] === "list"))
+			result = await session.listRuns({ after: argv[2] ?? "" });
+		else if (argv[0] === "history" && argv[1] === "show" && argv[2])
+			result = await session.inspect(argv[2], { afterSequence: Number(argv[3] ?? 0) });
+		else if (argv[0] === "history" && argv[1] === "prune" && argv[2])
+			result = await session.retain({ before: argv[2], dryRun: !argv.includes("--apply") });
+		else if (argv[0] === "storage" && argv[1] === "export") result = await session.backend.export();
+		else
+			throw new Error(
+				"history list|show <runId> [afterSequence]|prune <before> [--apply]; storage export|migrate files|sqlite --offline",
+			);
+		process.stdout.write(JSON.stringify(result) + "\n");
+	} finally {
+		await session.close();
+	}
 }

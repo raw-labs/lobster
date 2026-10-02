@@ -21,6 +21,8 @@ export function mergeEnv(
 	results: Record<string, WorkflowStepResult>,
 ) {
 	const env = createRecord(base);
+	for (const symbol of Object.getOwnPropertySymbols(base))
+		(env as any)[symbol] = (base as any)[symbol];
 
 	// Expose resolved args as env vars so shell commands can safely reference them
 	// without embedding raw values into the command string.

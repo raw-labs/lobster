@@ -1,3 +1,4 @@
+import { recorderFromEnv } from "./persistence/session.js";
 import { randomUUID } from "node:crypto";
 
 import { encodeToken } from "./token.js";
@@ -16,6 +17,7 @@ import { compileCached } from "./validation.js";
 import { validateCommandInputState, type CommandInputState } from "./input_request.js";
 
 export type PipelineResumeState = {
+	historyOffset?: number;
 	pipeline: Array<{ name: string; args: Record<string, unknown>; raw: string }>;
 	resumeAtIndex: number;
 	items: unknown[];
@@ -277,7 +279,15 @@ export async function savePipelineResumeState(
 	const stateKey = `pipeline_resume_${randomUUID()}`;
 	try {
 		signal?.throwIfAborted();
-		await writeStateJson({ env, key: stateKey, value: state, signal });
+		await writeStateJson({
+			env,
+			key: stateKey,
+			value: {
+				...state,
+				...(recorderFromEnv(env) ? { historyOffset: recorderFromEnv(env).pipelineOffset } : {}),
+			},
+			signal,
+		});
 		signal?.throwIfAborted();
 		return stateKey;
 	} catch (err) {

@@ -1,3 +1,5 @@
+import { withStoreContext } from "../persistence/execution.js";
+import { sessionFromEnv, recorderFromEnv } from "../persistence/session.js";
 import {
 	atomicWriteWasPublished,
 	ensureDirectory,
@@ -36,6 +38,8 @@ export function isConsumedResumeState(value: unknown): value is ConsumedResumeSt
 }
 
 export function defaultStateDir(env) {
+	const session = sessionFromEnv(env);
+	if (session) return session.directory;
 	return (
 		(env?.LOBSTER_STATE_DIR && String(env.LOBSTER_STATE_DIR).trim()) ||
 		path.join(os.homedir(), ".lobster", "state")
@@ -352,7 +356,25 @@ function isOptionalApprovalIndexPersistenceError(err: any): boolean {
 	);
 }
 
-export async function readStateJson({
+/** Backend-neutral committed bytes, used to retain trusted in-process provenance. */
+async function readStateTextInternal({
+	env,
+	key,
+}: {
+	env: Record<string, string | undefined>;
+	key: string;
+}): Promise<string | null> {
+	const session = sessionFromEnv(env);
+	if (session) return (await session.read(key)).text;
+	try {
+		return await fsp.readFile(keyToPath(defaultStateDir(env), key), "utf8");
+	} catch (error) {
+		if (error.code === "ENOENT") return null;
+		throw error;
+	}
+}
+
+async function readStateJsonInternal({
 	env,
 	key,
 	signal = undefined,
@@ -362,11 +384,10 @@ export async function readStateJson({
 	signal?: AbortSignal;
 }) {
 	signal?.throwIfAborted();
-	const stateDir = defaultStateDir(env);
-	const filePath = keyToPath(stateDir, key);
 
 	try {
-		const text = await fsp.readFile(filePath, "utf8");
+		const text = await readStateText({ env, key });
+		if (text === null) return null;
 		const value = JSON.parse(text);
 		signal?.throwIfAborted();
 		return value;
@@ -381,7 +402,7 @@ export async function readStateJson({
  * for the same key has settled. Callers that compose state with another durable
  * resource use this to avoid observing a value that cancellation may undo.
  */
-export async function readStateJsonWithLock({
+async function readStateJsonWithLockInternal({
 	env,
 	key,
 	signal = undefined,
@@ -419,6 +440,22 @@ async function writeStateJsonUnlocked({
 	const stateDir = defaultStateDir(env);
 	const filePath = keyToPath(stateDir, key);
 
+	const session = sessionFromEnv(env);
+	if (session) {
+		const recorder = recorderFromEnv(env);
+		const result = await session.write(key, JSON.stringify(value, null, 2) + "\n", {
+			signal,
+			atomicWriteOptions,
+			...(recorder?.decisionKey === key.replace("workflow-resume_", "workflow_resume_")
+				? { decision: recorder.decision }
+				: {}),
+			...(/^(pipeline_resume_|workflow_resume_|sdk_resume_)/.test(key) && recorder
+				? { runId: recorder.runId }
+				: {}),
+		});
+		if (recorder && isConsumedResumeState(value)) recorder.ownsExecution = true;
+		return result;
+	}
 	await ensureDirectory(stateDir);
 	return writeFileAtomic(filePath, JSON.stringify(value, null, 2) + "\n", {
 		...atomicWriteOptions,
@@ -426,7 +463,7 @@ async function writeStateJsonUnlocked({
 	});
 }
 
-export async function writeStateJson({
+async function writeStateJsonInternal({
 	env,
 	key,
 	value,
@@ -452,7 +489,7 @@ export async function writeStateJson({
  * replacement is deliberately persistent: a failed later unlink must not make
  * the original token replayable.
  */
-export async function consumeResumeState({
+async function consumeResumeStateInternal({
 	env,
 	key,
 	expectedState,
@@ -510,7 +547,7 @@ export async function consumeResumeState({
  * caller's pre-dispatch claim. This never overwrites a replacement state or a
  * concurrent claimant's marker.
  */
-export async function restoreConsumedResumeState({
+async function restoreConsumedResumeStateInternal({
 	env,
 	key,
 	expectedState,
@@ -542,7 +579,7 @@ export async function restoreConsumedResumeState({
  * that merely observed an earlier snapshot can never recreate a state another
  * resume has already settled.
  */
-export async function deleteResumeStateWithRollback({
+async function deleteResumeStateWithRollbackInternal({
 	env,
 	key,
 	expectedState,
@@ -610,13 +647,15 @@ export async function deleteResumeStateWithRollback({
  * Check physical state presence without parsing it. Cancellation uses this to
  * retain the authoritative workflow spelling even if the state file is corrupt.
  */
-export async function stateJsonExists({
+async function stateJsonExistsInternal({
 	env,
 	key,
 }: {
 	env: Record<string, string | undefined>;
 	key: string;
 }) {
+	const session = sessionFromEnv(env);
+	if (session) return (await session.read(key)).text !== null;
 	const filePath = keyToPath(defaultStateDir(env), key);
 	try {
 		await fsp.access(filePath);
@@ -628,6 +667,23 @@ export async function stateJsonExists({
 }
 
 async function deleteStateJsonUnlocked({ env, key }) {
+	const session = sessionFromEnv(env);
+	if (session) {
+		const before = await session.read(key);
+		const currentRecorder = recorderFromEnv(env);
+		await session.write(
+			key,
+			null,
+			currentRecorder?.decisionKey === key.replace("workflow-resume_", "workflow_resume_")
+				? { decision: currentRecorder.decision }
+				: {},
+		);
+		if (before.runId && before.text !== null) {
+			const recorder = recorderFromEnv(env);
+			if (recorder?.runId === before.runId) recorder.ownsExecution = true;
+		}
+		return;
+	}
 	const stateDir = defaultStateDir(env);
 	const filePath = keyToPath(stateDir, key);
 	try {
@@ -638,7 +694,7 @@ async function deleteStateJsonUnlocked({ env, key }) {
 	}
 }
 
-export async function deleteStateJson({
+async function deleteStateJsonInternal({
 	env,
 	key,
 	signal = undefined,
@@ -660,7 +716,7 @@ export async function deleteStateJson({
  * Give terminal cleanup a small, bounded opportunity to remove that marker,
  * but never let a live state writer turn cancellation into an unbounded wait.
  */
-export async function deleteStateJsonWithBoundedResumeCleanup({
+async function deleteStateJsonWithBoundedResumeCleanupInternal({
 	env,
 	key,
 }: {
@@ -682,7 +738,7 @@ export async function deleteStateJsonWithBoundedResumeCleanup({
  * predecessor-to-successor handoff, so cancellation must not delete it and
  * report success while that successor remains executable.
  */
-export async function deleteUnconsumedResumeState({
+async function deleteUnconsumedResumeStateInternal({
 	env,
 	key,
 	signal = undefined,
@@ -731,7 +787,7 @@ export function generateApprovalId(): string {
  * Write a reverse-index file that maps approvalId → stateKey.
  * Call this after writeStateJson to enable short-ID resume.
  */
-export async function writeApprovalIndex({
+async function writeApprovalIndexInternal({
 	env,
 	stateKey,
 	approvalId,
@@ -747,6 +803,15 @@ export async function writeApprovalIndex({
 	if (!safe) return;
 	await ensureDirectory(stateDir);
 	const indexPath = path.join(stateDir, `approval_${safe}.json`);
+	const session = sessionFromEnv(env);
+	if (session) {
+		await session.write(
+			`approval_${safe}`,
+			JSON.stringify({ stateKey, createdAt: new Date().toISOString() }) + "\n",
+			{ exclusive: true, atomicWriteOptions: options },
+		);
+		return;
+	}
 	await writeFileAtomicExclusive(
 		indexPath,
 		JSON.stringify({ stateKey, createdAt: new Date().toISOString() }) + "\n",
@@ -757,7 +822,7 @@ export async function writeApprovalIndex({
 /**
  * Create a unique approval ID index without ever overwriting an existing mapping.
  */
-export async function createApprovalIndex({
+async function createApprovalIndexInternal({
 	env,
 	stateKey,
 	options,
@@ -784,19 +849,18 @@ export async function createApprovalIndex({
  * Look up a state key by short approval ID.
  * Returns the stateKey string or null if not found.
  */
-export async function findStateKeyByApprovalId({
+async function findStateKeyByApprovalIdInternal({
 	env,
 	approvalId,
 }: {
 	env: Record<string, string | undefined>;
 	approvalId: string;
 }): Promise<string | null> {
-	const stateDir = defaultStateDir(env);
 	const safe = sanitizeApprovalId(approvalId);
 	if (!safe) return null;
-	const indexPath = path.join(stateDir, `approval_${safe}.json`);
 	try {
-		const text = await fsp.readFile(indexPath, "utf8");
+		const text = await readStateText({ env, key: `approval_${safe}` });
+		if (text === null) return null;
 		const data = JSON.parse(text);
 		return typeof data?.stateKey === "string" ? data.stateKey : null;
 	} catch (err: any) {
@@ -809,7 +873,7 @@ export async function findStateKeyByApprovalId({
 /**
  * Delete the approval ID index file (cleanup after resume or cancel).
  */
-export async function deleteApprovalId({
+async function deleteApprovalIdInternal({
 	env,
 	approvalId,
 }: {
@@ -819,6 +883,11 @@ export async function deleteApprovalId({
 	const stateDir = defaultStateDir(env);
 	const safe = sanitizeApprovalId(approvalId);
 	if (!safe) return;
+	const session = sessionFromEnv(env);
+	if (session) {
+		await session.write(`approval_${safe}`, null);
+		return;
+	}
 	const indexPath = path.join(stateDir, `approval_${safe}.json`);
 	try {
 		await fsp.unlink(indexPath);
@@ -833,13 +902,30 @@ export async function deleteApprovalId({
  * Used when resuming via --token (where we don't know the approvalId).
  * Scans index files in the state dir — O(n) but n is tiny in practice.
  */
-export async function cleanupApprovalIndexByStateKey({
+async function cleanupApprovalIndexByStateKeyInternal({
 	env,
 	stateKey,
 }: {
 	env: Record<string, string | undefined>;
 	stateKey: string;
 }) {
+	const session = sessionFromEnv(env);
+	if (session) {
+		for (const [key, text] of Object.entries(await session.backend.listState("approval_"))) {
+			if (!key.startsWith("approval_")) continue;
+			let data: any;
+			try {
+				data = JSON.parse(text);
+			} catch {
+				continue;
+			}
+			if (data?.stateKey === stateKey) {
+				await session.write(key, null);
+				return;
+			}
+		}
+		return;
+	}
 	const stateDir = defaultStateDir(env);
 	let files: string[];
 	try {
@@ -863,7 +949,7 @@ export async function cleanupApprovalIndexByStateKey({
 	}
 }
 
-export async function diffAndStore({
+async function diffAndStoreInternal({
 	env,
 	key,
 	value,
@@ -883,14 +969,7 @@ export async function diffAndStore({
 		key,
 		signal,
 		task: async () => {
-			const filePath = keyToPath(defaultStateDir(env), key);
-			let beforeExists = true;
-			try {
-				await fsp.access(filePath);
-			} catch (err: any) {
-				if (err?.code !== "ENOENT") throw err;
-				beforeExists = false;
-			}
+			const beforeExists = await stateJsonExists({ env, key });
 			const before = await readStateJson({ env, key }).catch((err) => {
 				if (isJsonSyntaxError(err)) return null;
 				throw err;
@@ -921,4 +1000,145 @@ export async function diffAndStore({
 			return snapshot;
 		},
 	});
+}
+
+export async function readStateText(
+	options: Parameters<typeof readStateTextInternal>[0],
+): ReturnType<typeof readStateTextInternal> {
+	return withStoreContext(
+		{ env: options.env, readOnly: true, signal: (options as any).signal },
+		(ctx) => readStateTextInternal({ ...options, env: ctx.env }),
+	);
+}
+
+export async function readStateJson(
+	options: Parameters<typeof readStateJsonInternal>[0],
+): ReturnType<typeof readStateJsonInternal> {
+	return withStoreContext(
+		{ env: options.env, readOnly: true, signal: (options as any).signal },
+		(ctx) => readStateJsonInternal({ ...options, env: ctx.env }),
+	);
+}
+
+export async function readStateJsonWithLock(
+	options: Parameters<typeof readStateJsonWithLockInternal>[0],
+): ReturnType<typeof readStateJsonWithLockInternal> {
+	return withStoreContext(
+		{ env: options.env, readOnly: true, signal: (options as any).signal },
+		(ctx) => readStateJsonWithLockInternal({ ...options, env: ctx.env }),
+	);
+}
+
+export async function writeStateJson(
+	options: Parameters<typeof writeStateJsonInternal>[0],
+): ReturnType<typeof writeStateJsonInternal> {
+	return withStoreContext({ env: options.env, signal: (options as any).signal }, (ctx) =>
+		writeStateJsonInternal({ ...options, env: ctx.env }),
+	);
+}
+
+export async function consumeResumeState(
+	options: Parameters<typeof consumeResumeStateInternal>[0],
+): ReturnType<typeof consumeResumeStateInternal> {
+	return withStoreContext({ env: options.env, signal: (options as any).signal }, (ctx) =>
+		consumeResumeStateInternal({ ...options, env: ctx.env }),
+	);
+}
+
+export async function restoreConsumedResumeState(
+	options: Parameters<typeof restoreConsumedResumeStateInternal>[0],
+): ReturnType<typeof restoreConsumedResumeStateInternal> {
+	return withStoreContext({ env: options.env, signal: (options as any).signal }, (ctx) =>
+		restoreConsumedResumeStateInternal({ ...options, env: ctx.env }),
+	);
+}
+
+export async function deleteResumeStateWithRollback(
+	options: Parameters<typeof deleteResumeStateWithRollbackInternal>[0],
+): ReturnType<typeof deleteResumeStateWithRollbackInternal> {
+	return withStoreContext({ env: options.env, signal: (options as any).signal }, (ctx) =>
+		deleteResumeStateWithRollbackInternal({ ...options, env: ctx.env }),
+	);
+}
+
+export async function stateJsonExists(
+	options: Parameters<typeof stateJsonExistsInternal>[0],
+): ReturnType<typeof stateJsonExistsInternal> {
+	return withStoreContext(
+		{ env: options.env, readOnly: true, signal: (options as any).signal },
+		(ctx) => stateJsonExistsInternal({ ...options, env: ctx.env }),
+	);
+}
+
+export async function deleteStateJson(
+	options: Parameters<typeof deleteStateJsonInternal>[0],
+): ReturnType<typeof deleteStateJsonInternal> {
+	return withStoreContext({ env: options.env, signal: (options as any).signal }, (ctx) =>
+		deleteStateJsonInternal({ ...options, env: ctx.env }),
+	);
+}
+
+export async function deleteStateJsonWithBoundedResumeCleanup(
+	options: Parameters<typeof deleteStateJsonWithBoundedResumeCleanupInternal>[0],
+): ReturnType<typeof deleteStateJsonWithBoundedResumeCleanupInternal> {
+	return withStoreContext({ env: options.env, signal: (options as any).signal }, (ctx) =>
+		deleteStateJsonWithBoundedResumeCleanupInternal({ ...options, env: ctx.env }),
+	);
+}
+
+export async function deleteUnconsumedResumeState(
+	options: Parameters<typeof deleteUnconsumedResumeStateInternal>[0],
+): ReturnType<typeof deleteUnconsumedResumeStateInternal> {
+	return withStoreContext({ env: options.env, signal: (options as any).signal }, (ctx) =>
+		deleteUnconsumedResumeStateInternal({ ...options, env: ctx.env }),
+	);
+}
+
+export async function writeApprovalIndex(
+	options: Parameters<typeof writeApprovalIndexInternal>[0],
+): ReturnType<typeof writeApprovalIndexInternal> {
+	return withStoreContext({ env: options.env, signal: (options as any).signal }, (ctx) =>
+		writeApprovalIndexInternal({ ...options, env: ctx.env }),
+	);
+}
+
+export async function createApprovalIndex(
+	options: Parameters<typeof createApprovalIndexInternal>[0],
+): ReturnType<typeof createApprovalIndexInternal> {
+	return withStoreContext({ env: options.env, signal: (options as any).signal }, (ctx) =>
+		createApprovalIndexInternal({ ...options, env: ctx.env }),
+	);
+}
+
+export async function findStateKeyByApprovalId(
+	options: Parameters<typeof findStateKeyByApprovalIdInternal>[0],
+): ReturnType<typeof findStateKeyByApprovalIdInternal> {
+	return withStoreContext(
+		{ env: options.env, readOnly: true, signal: (options as any).signal },
+		(ctx) => findStateKeyByApprovalIdInternal({ ...options, env: ctx.env }),
+	);
+}
+
+export async function deleteApprovalId(
+	options: Parameters<typeof deleteApprovalIdInternal>[0],
+): ReturnType<typeof deleteApprovalIdInternal> {
+	return withStoreContext({ env: options.env, signal: (options as any).signal }, (ctx) =>
+		deleteApprovalIdInternal({ ...options, env: ctx.env }),
+	);
+}
+
+export async function cleanupApprovalIndexByStateKey(
+	options: Parameters<typeof cleanupApprovalIndexByStateKeyInternal>[0],
+): ReturnType<typeof cleanupApprovalIndexByStateKeyInternal> {
+	return withStoreContext({ env: options.env, signal: (options as any).signal }, (ctx) =>
+		cleanupApprovalIndexByStateKeyInternal({ ...options, env: ctx.env }),
+	);
+}
+
+export async function diffAndStore(
+	options: Parameters<typeof diffAndStoreInternal>[0],
+): ReturnType<typeof diffAndStoreInternal> {
+	return withStoreContext({ env: options.env, signal: (options as any).signal }, (ctx) =>
+		diffAndStoreInternal({ ...options, env: ctx.env }),
+	);
 }
