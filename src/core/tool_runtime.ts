@@ -1,12 +1,15 @@
-import { recorderFromEnv } from "../persistence/session.js";
-import { runtimeErrorDetails } from "../persistence/backend.js";
-import { withExecution, withStoreContext } from "../persistence/execution.js";
-import type { StoreSession } from "../persistence/session.js";
-import { Writable } from "node:stream";
 import path from "node:path";
-
+import { Writable } from "node:stream";
 import { createDefaultRegistry } from "../commands/registry.js";
 import { parsePipeline } from "../parser.js";
+import { runtimeErrorDetails } from "../persistence/backend.js";
+import { withExecution, withStoreContext } from "../persistence/execution.js";
+import { recorderFromEnv, type StoreSession } from "../persistence/session.js";
+import {
+	finalizePipelineToolRun,
+	loadPipelineResumeState,
+	validatePipelineInputResponse,
+} from "../pipeline_resume_state.js";
 import { decodeResumeToken, resolveApprovalId } from "../resume.js";
 import { runPipeline } from "../runtime.js";
 import {
@@ -23,11 +26,6 @@ import {
 	alternateWorkflowResumeStateKey,
 	runWorkflowFile,
 } from "../workflows/file.js";
-import {
-	finalizePipelineToolRun,
-	loadPipelineResumeState,
-	validatePipelineInputResponse,
-} from "../pipeline_resume_state.js";
 
 export type ToolRunContext = {
 	_resumeSignalAborted?: boolean;
@@ -203,7 +201,9 @@ export async function resumeToolRequest(
 			} catch {
 				/* normal parser reports the error */
 			}
-			if (!key) return resumeToolRequestInternal({ ...options, ctx });
+			if (!key) {
+				return resumeToolRequestInternal({ ...options, ctx });
+			}
 			return withExecution({ ...ctx, _decision: options }, "resume", key, (runtime) =>
 				resumeToolRequestInternal({ ...options, ctx: runtime }),
 			);
@@ -212,8 +212,9 @@ export async function resumeToolRequest(
 		if (
 			entry.signal?.aborted &&
 			(options.cancel === true || (options.approved === false && !entry._resumeSignalAborted))
-		)
+		) {
 			throw error;
+		}
 		return errorEnvelope("runtime_error", error);
 	}
 }
@@ -345,7 +346,9 @@ async function resumeToolRequestInternal({
 	}
 
 	if (runtime.signal?.aborted) {
-		if (approved === false && runtime._resumeSignalAborted === false) throw runtime.signal.reason;
+		if (approved === false && runtime._resumeSignalAborted === false) {
+			throw runtime.signal.reason;
+		}
 		return errorEnvelope(
 			"runtime_error",
 			runtime.signal.reason instanceof Error
@@ -406,8 +409,9 @@ async function resumeToolRequestInternal({
 	const isSameStageInput =
 		resumeState.haltType === "input_request" && resumeState.resumeMode === "same_stage";
 	const history = recorderFromEnv(runtime.env);
-	if (history)
+	if (history) {
 		history.pipelineOffset = (resumeState.historyOffset ?? 0) + resumeState.resumeAtIndex;
+	}
 	const remaining = resumeState.pipeline.slice(resumeState.resumeAtIndex);
 	const input = isSameStageInput
 		? resumeState.items

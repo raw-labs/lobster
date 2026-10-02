@@ -1,10 +1,14 @@
-import { openStoreSession } from "../../src/persistence/session.js";
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { openStoreSession } from "../../src/persistence/session.js";
+
 const steps = Number(process.argv[2] ?? 1000);
-if (!Number.isInteger(steps) || steps < 1 || steps > 10000)
+
+if (!Number.isInteger(steps) || steps < 1 || steps > 10000) {
 	throw new Error("steps must be 1..10000");
+}
+
 for (const backend of ["files", "sqlite"] as const) {
 	const directory = await fs.mkdtemp(path.join(os.tmpdir(), "lobster-history-benchmark-"));
 	const store = await openStoreSession({ directory, backend, history: true });

@@ -1,7 +1,6 @@
-import { recorderFromEnv } from "./persistence/session.js";
 import { randomUUID } from "node:crypto";
-
-import { encodeToken } from "./token.js";
+import { validateCommandInputState, type CommandInputState } from "./input_request.js";
+import { recorderFromEnv } from "./persistence/session.js";
 import {
 	cleanupApprovalIndexByStateKey,
 	consumeResumeState,
@@ -13,8 +12,8 @@ import {
 	restoreConsumedResumeState,
 	writeStateJson,
 } from "./state/store.js";
+import { encodeToken } from "./token.js";
 import { compileCached } from "./validation.js";
-import { validateCommandInputState, type CommandInputState } from "./input_request.js";
 
 export type PipelineResumeState = {
 	historyOffset?: number;

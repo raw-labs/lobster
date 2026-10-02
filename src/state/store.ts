@@ -1,3 +1,7 @@
+import { randomBytes } from "node:crypto";
+import { promises as fsp } from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { withStoreContext } from "../persistence/execution.js";
 import { sessionFromEnv, recorderFromEnv } from "../persistence/session.js";
 import {
@@ -8,6 +12,7 @@ import {
 	writeFileAtomicExclusive,
 } from "./atomic_file.js";
 import type { AtomicWriteOptions, AtomicExclusiveWriteOptions } from "./atomic_file.js";
+
 export {
 	atomicWriteWasPublished,
 	ensureDirectory,
@@ -16,10 +21,6 @@ export {
 	writeFileAtomicExclusive,
 	stripExtendedLengthPrefix,
 } from "./atomic_file.js";
-import os from "node:os";
-import path from "node:path";
-import { promises as fsp } from "node:fs";
-import { randomBytes } from "node:crypto";
 
 const CONSUMED_RESUME_STATE_TYPE = "lobster.consumed-resume-state.v1";
 
@@ -39,7 +40,9 @@ export function isConsumedResumeState(value: unknown): value is ConsumedResumeSt
 
 export function defaultStateDir(env) {
 	const session = sessionFromEnv(env);
-	if (session) return session.directory;
+	if (session) {
+		return session.directory;
+	}
 	return (
 		(env?.LOBSTER_STATE_DIR && String(env.LOBSTER_STATE_DIR).trim()) ||
 		path.join(os.homedir(), ".lobster", "state")
@@ -365,11 +368,15 @@ async function readStateTextInternal({
 	key: string;
 }): Promise<string | null> {
 	const session = sessionFromEnv(env);
-	if (session) return (await session.read(key)).text;
+	if (session) {
+		return (await session.read(key)).text;
+	}
 	try {
 		return await fsp.readFile(keyToPath(defaultStateDir(env), key), "utf8");
 	} catch (error) {
-		if (error.code === "ENOENT") return null;
+		if (error.code === "ENOENT") {
+			return null;
+		}
 		throw error;
 	}
 }
@@ -387,7 +394,9 @@ async function readStateJsonInternal({
 
 	try {
 		const text = await readStateText({ env, key });
-		if (text === null) return null;
+		if (text === null) {
+			return null;
+		}
 		const value = JSON.parse(text);
 		signal?.throwIfAborted();
 		return value;
@@ -424,19 +433,27 @@ async function readStateJsonWithLockInternal({
 	}
 }
 
-function isContinuationValue(key: string, value: any) {
-	if (!value || typeof value !== "object") return false;
-	if (key.startsWith("pipeline_resume_"))
-		return Array.isArray(value.pipeline) && Number.isInteger(value.resumeAtIndex);
-	if (key.startsWith("workflow_resume_"))
+function isContinuationValue(key: string, value: unknown): boolean {
+	if (!value || typeof value !== "object") {
+		return false;
+	}
+	const record = value as Record<string, unknown>;
+	if (key.startsWith("pipeline_resume_")) {
+		return Array.isArray(record.pipeline) && Number.isInteger(record.resumeAtIndex);
+	}
+	if (key.startsWith("workflow_resume_")) {
 		return (
-			typeof value.filePath === "string" && value.steps && Number.isInteger(value.resumeAtIndex)
+			typeof record.filePath === "string" &&
+			Boolean(record.steps) &&
+			Number.isInteger(record.resumeAtIndex)
 		);
-	if (key.startsWith("sdk_resume_"))
+	}
+	if (key.startsWith("sdk_resume_")) {
 		return (
-			value.type === "lobster.sdk-tracked.v1" ||
-			(value.commandInput && Number.isInteger(value.resumeAtIndex))
+			record.type === "lobster.sdk-tracked.v1" ||
+			(Boolean(record.commandInput) && Number.isInteger(record.resumeAtIndex))
 		);
+	}
 	return false;
 }
 
@@ -467,7 +484,9 @@ async function writeStateJsonUnlocked({
 				: {}),
 			...(isContinuationValue(key, value) && recorder ? { runId: recorder.runId } : {}),
 		});
-		if (recorder && isConsumedResumeState(value)) recorder.ownsExecution = true;
+		if (recorder && isConsumedResumeState(value)) {
+			recorder.ownsExecution = true;
+		}
 		return result;
 	}
 	await ensureDirectory(stateDir);
@@ -552,7 +571,9 @@ async function consumeResumeStateInternal({
 					if (isConsumedResumeState(latest) && latest.claimId === claimId) {
 						await writeStateJsonUnlocked({ env, key, value: expectedState });
 						const recorder = recorderFromEnv(env);
-						if (recorder) recorder.ownsExecution = false;
+						if (recorder) {
+							recorder.ownsExecution = false;
+						}
 					}
 				}
 				throw err;
@@ -587,7 +608,9 @@ async function restoreConsumedResumeStateInternal({
 			}
 			await writeStateJsonUnlocked({ env, key, value: expectedState });
 			const recorder = recorderFromEnv(env);
-			if (recorder) recorder.ownsExecution = false;
+			if (recorder) {
+				recorder.ownsExecution = false;
+			}
 			return true;
 		},
 	});
@@ -657,7 +680,9 @@ async function deleteResumeStateWithRollbackInternal({
 					) {
 						await writeStateJsonUnlocked({ env, key, value: expectedState });
 						const recorder = recorderFromEnv(env);
-						if (recorder) recorder.ownsExecution = false;
+						if (recorder) {
+							recorder.ownsExecution = false;
+						}
 					}
 				}
 				throw err;
@@ -678,7 +703,9 @@ async function stateJsonExistsInternal({
 	key: string;
 }) {
 	const session = sessionFromEnv(env);
-	if (session) return (await session.read(key)).text !== null;
+	if (session) {
+		return (await session.read(key)).text !== null;
+	}
 	const filePath = keyToPath(defaultStateDir(env), key);
 	try {
 		await fsp.access(filePath);
@@ -703,7 +730,9 @@ async function deleteStateJsonUnlocked({ env, key }) {
 		);
 		if (before.runId && before.text !== null) {
 			const recorder = recorderFromEnv(env);
-			if (recorder?.runId === before.runId) recorder.ownsExecution = true;
+			if (recorder?.runId === before.runId) {
+				recorder.ownsExecution = true;
+			}
 		}
 		return;
 	}
@@ -883,7 +912,9 @@ async function findStateKeyByApprovalIdInternal({
 	if (!safe) return null;
 	try {
 		const text = await readStateText({ env, key: `approval_${safe}` });
-		if (text === null) return null;
+		if (text === null) {
+			return null;
+		}
 		const data = JSON.parse(text);
 		return typeof data?.stateKey === "string" ? data.stateKey : null;
 	} catch (err: any) {
@@ -935,8 +966,10 @@ async function cleanupApprovalIndexByStateKeyInternal({
 	const session = sessionFromEnv(env);
 	if (session) {
 		for (const [key, text] of Object.entries(await session.backend.listState("approval_"))) {
-			if (!key.startsWith("approval_")) continue;
-			let data: any;
+			if (!key.startsWith("approval_")) {
+				continue;
+			}
+			let data: { stateKey?: string } | null;
 			try {
 				data = JSON.parse(text);
 			} catch {
@@ -1028,34 +1061,31 @@ async function diffAndStoreInternal({
 export async function readStateText(
 	options: Parameters<typeof readStateTextInternal>[0],
 ): ReturnType<typeof readStateTextInternal> {
-	return withStoreContext(
-		{ env: options.env, readOnly: true, signal: (options as any).signal },
-		(ctx) => readStateTextInternal({ ...options, env: ctx.env }),
+	return withStoreContext({ env: options.env, readOnly: true }, (ctx) =>
+		readStateTextInternal({ ...options, env: ctx.env }),
 	);
 }
 
 export async function readStateJson(
 	options: Parameters<typeof readStateJsonInternal>[0],
 ): ReturnType<typeof readStateJsonInternal> {
-	return withStoreContext(
-		{ env: options.env, readOnly: true, signal: (options as any).signal },
-		(ctx) => readStateJsonInternal({ ...options, env: ctx.env }),
+	return withStoreContext({ env: options.env, readOnly: true, signal: options.signal }, (ctx) =>
+		readStateJsonInternal({ ...options, env: ctx.env }),
 	);
 }
 
 export async function readStateJsonWithLock(
 	options: Parameters<typeof readStateJsonWithLockInternal>[0],
 ): ReturnType<typeof readStateJsonWithLockInternal> {
-	return withStoreContext(
-		{ env: options.env, readOnly: true, signal: (options as any).signal },
-		(ctx) => readStateJsonWithLockInternal({ ...options, env: ctx.env }),
+	return withStoreContext({ env: options.env, readOnly: true, signal: options.signal }, (ctx) =>
+		readStateJsonWithLockInternal({ ...options, env: ctx.env }),
 	);
 }
 
 export async function writeStateJson(
 	options: Parameters<typeof writeStateJsonInternal>[0],
 ): ReturnType<typeof writeStateJsonInternal> {
-	return withStoreContext({ env: options.env, signal: (options as any).signal }, (ctx) =>
+	return withStoreContext({ env: options.env, signal: options.signal }, (ctx) =>
 		writeStateJsonInternal({ ...options, env: ctx.env }),
 	);
 }
@@ -1063,7 +1093,7 @@ export async function writeStateJson(
 export async function consumeResumeState(
 	options: Parameters<typeof consumeResumeStateInternal>[0],
 ): ReturnType<typeof consumeResumeStateInternal> {
-	return withStoreContext({ env: options.env, signal: (options as any).signal }, (ctx) =>
+	return withStoreContext({ env: options.env, signal: options.signal }, (ctx) =>
 		consumeResumeStateInternal({ ...options, env: ctx.env }),
 	);
 }
@@ -1071,7 +1101,7 @@ export async function consumeResumeState(
 export async function restoreConsumedResumeState(
 	options: Parameters<typeof restoreConsumedResumeStateInternal>[0],
 ): ReturnType<typeof restoreConsumedResumeStateInternal> {
-	return withStoreContext({ env: options.env, signal: (options as any).signal }, (ctx) =>
+	return withStoreContext({ env: options.env }, (ctx) =>
 		restoreConsumedResumeStateInternal({ ...options, env: ctx.env }),
 	);
 }
@@ -1079,7 +1109,7 @@ export async function restoreConsumedResumeState(
 export async function deleteResumeStateWithRollback(
 	options: Parameters<typeof deleteResumeStateWithRollbackInternal>[0],
 ): ReturnType<typeof deleteResumeStateWithRollbackInternal> {
-	return withStoreContext({ env: options.env, signal: (options as any).signal }, (ctx) =>
+	return withStoreContext({ env: options.env, signal: options.signal }, (ctx) =>
 		deleteResumeStateWithRollbackInternal({ ...options, env: ctx.env }),
 	);
 }
@@ -1087,16 +1117,15 @@ export async function deleteResumeStateWithRollback(
 export async function stateJsonExists(
 	options: Parameters<typeof stateJsonExistsInternal>[0],
 ): ReturnType<typeof stateJsonExistsInternal> {
-	return withStoreContext(
-		{ env: options.env, readOnly: true, signal: (options as any).signal },
-		(ctx) => stateJsonExistsInternal({ ...options, env: ctx.env }),
+	return withStoreContext({ env: options.env, readOnly: true }, (ctx) =>
+		stateJsonExistsInternal({ ...options, env: ctx.env }),
 	);
 }
 
 export async function deleteStateJson(
 	options: Parameters<typeof deleteStateJsonInternal>[0],
 ): ReturnType<typeof deleteStateJsonInternal> {
-	return withStoreContext({ env: options.env, signal: (options as any).signal }, (ctx) =>
+	return withStoreContext({ env: options.env, signal: options.signal }, (ctx) =>
 		deleteStateJsonInternal({ ...options, env: ctx.env }),
 	);
 }
@@ -1104,7 +1133,7 @@ export async function deleteStateJson(
 export async function deleteStateJsonWithBoundedResumeCleanup(
 	options: Parameters<typeof deleteStateJsonWithBoundedResumeCleanupInternal>[0],
 ): ReturnType<typeof deleteStateJsonWithBoundedResumeCleanupInternal> {
-	return withStoreContext({ env: options.env, signal: (options as any).signal }, (ctx) =>
+	return withStoreContext({ env: options.env }, (ctx) =>
 		deleteStateJsonWithBoundedResumeCleanupInternal({ ...options, env: ctx.env }),
 	);
 }
@@ -1112,7 +1141,7 @@ export async function deleteStateJsonWithBoundedResumeCleanup(
 export async function deleteUnconsumedResumeState(
 	options: Parameters<typeof deleteUnconsumedResumeStateInternal>[0],
 ): ReturnType<typeof deleteUnconsumedResumeStateInternal> {
-	return withStoreContext({ env: options.env, signal: (options as any).signal }, (ctx) =>
+	return withStoreContext({ env: options.env, signal: options.signal }, (ctx) =>
 		deleteUnconsumedResumeStateInternal({ ...options, env: ctx.env }),
 	);
 }
@@ -1120,7 +1149,7 @@ export async function deleteUnconsumedResumeState(
 export async function writeApprovalIndex(
 	options: Parameters<typeof writeApprovalIndexInternal>[0],
 ): ReturnType<typeof writeApprovalIndexInternal> {
-	return withStoreContext({ env: options.env, signal: (options as any).signal }, (ctx) =>
+	return withStoreContext({ env: options.env }, (ctx) =>
 		writeApprovalIndexInternal({ ...options, env: ctx.env }),
 	);
 }
@@ -1128,7 +1157,7 @@ export async function writeApprovalIndex(
 export async function createApprovalIndex(
 	options: Parameters<typeof createApprovalIndexInternal>[0],
 ): ReturnType<typeof createApprovalIndexInternal> {
-	return withStoreContext({ env: options.env, signal: (options as any).signal }, (ctx) =>
+	return withStoreContext({ env: options.env }, (ctx) =>
 		createApprovalIndexInternal({ ...options, env: ctx.env }),
 	);
 }
@@ -1136,16 +1165,15 @@ export async function createApprovalIndex(
 export async function findStateKeyByApprovalId(
 	options: Parameters<typeof findStateKeyByApprovalIdInternal>[0],
 ): ReturnType<typeof findStateKeyByApprovalIdInternal> {
-	return withStoreContext(
-		{ env: options.env, readOnly: true, signal: (options as any).signal },
-		(ctx) => findStateKeyByApprovalIdInternal({ ...options, env: ctx.env }),
+	return withStoreContext({ env: options.env, readOnly: true }, (ctx) =>
+		findStateKeyByApprovalIdInternal({ ...options, env: ctx.env }),
 	);
 }
 
 export async function deleteApprovalId(
 	options: Parameters<typeof deleteApprovalIdInternal>[0],
 ): ReturnType<typeof deleteApprovalIdInternal> {
-	return withStoreContext({ env: options.env, signal: (options as any).signal }, (ctx) =>
+	return withStoreContext({ env: options.env }, (ctx) =>
 		deleteApprovalIdInternal({ ...options, env: ctx.env }),
 	);
 }
@@ -1153,7 +1181,7 @@ export async function deleteApprovalId(
 export async function cleanupApprovalIndexByStateKey(
 	options: Parameters<typeof cleanupApprovalIndexByStateKeyInternal>[0],
 ): ReturnType<typeof cleanupApprovalIndexByStateKeyInternal> {
-	return withStoreContext({ env: options.env, signal: (options as any).signal }, (ctx) =>
+	return withStoreContext({ env: options.env }, (ctx) =>
 		cleanupApprovalIndexByStateKeyInternal({ ...options, env: ctx.env }),
 	);
 }
@@ -1161,7 +1189,7 @@ export async function cleanupApprovalIndexByStateKey(
 export async function diffAndStore(
 	options: Parameters<typeof diffAndStoreInternal>[0],
 ): ReturnType<typeof diffAndStoreInternal> {
-	return withStoreContext({ env: options.env, signal: (options as any).signal }, (ctx) =>
+	return withStoreContext({ env: options.env, signal: options.signal }, (ctx) =>
 		diffAndStoreInternal({ ...options, env: ctx.env }),
 	);
 }

@@ -1,18 +1,20 @@
-import { withExecution } from "../persistence/execution.js";
+import { randomUUID } from "node:crypto";
+import { validateCommandInputState, type CommandInputState } from "../input_request.js";
 import { runtimeErrorDetails } from "../persistence/backend.js";
+import { withExecution } from "../persistence/execution.js";
 import { sessionFromEnv, recorderFromEnv, type StoreSession } from "../persistence/session.js";
 import {
 	consumeResumeState,
 	restoreConsumedResumeState,
 	deleteUnconsumedResumeState,
+	deleteStateJson,
+	readStateJsonWithLock,
+	writeStateJson,
 } from "../state/store.js";
-import { stateEnv } from "./state_env.js";
-import { randomUUID } from "node:crypto";
-import { runPipelineInternal } from "./runtime.js";
 import { encodeToken, decodeToken } from "../token.js";
 import { compileCached } from "../validation.js";
-import { validateCommandInputState, type CommandInputState } from "../input_request.js";
-import { deleteStateJson, readStateJsonWithLock, writeStateJson } from "../state/store.js";
+import { runPipelineInternal } from "./runtime.js";
+import { stateEnv } from "./state_env.js";
 
 type SdkResumePayload = {
 	protocolVersion: 1;
@@ -25,6 +27,19 @@ type SdkResumePayload = {
 	inputSubject?: unknown;
 	resumeMode?: "next_stage" | "same_stage";
 	stateKey?: string;
+};
+
+type SdkPauseResult = {
+	status?: string;
+	requiresApproval?: { resumeToken: string } | null;
+	requiresInput?: { resumeToken: string } | null;
+};
+
+type SdkTrackedResumePayload = {
+	protocolVersion: 1;
+	v: 2;
+	kind: "sdk-tracked";
+	stateKey: string;
 };
 
 type SdkCommandInputResumeState = {
@@ -46,6 +61,7 @@ export type LobsterOptions = {
 export class Lobster {
 	#stages = [];
 	#options: LobsterOptions;
+	#onExecutionStart?: () => Promise<void>;
 	#meta = null;
 
 	constructor(options: LobsterOptions = {}) {
@@ -109,14 +125,16 @@ export class Lobster {
 	) {
 		const ctx = {
 			env: stateEnv(this.#options),
-			_onExecutionStart: (this.#options as any)._onExecutionStart,
+			_onExecutionStart: this.#onExecutionStart,
 			stateDir: this.#options.stateDir,
 			mode: "sdk",
 			signal: this.#options.signal,
 		};
 
 		const recorder = recorderFromEnv(ctx.env);
-		if (recorder) recorder.pipelineOffset = stageOffset;
+		if (recorder) {
+			recorder.pipelineOffset = stageOffset;
+		}
 		try {
 			const result = await runPipelineInternal({
 				stages,
@@ -220,9 +238,10 @@ export class Lobster {
 		token: string,
 		options: { approved?: boolean; response?: unknown; cancel?: boolean } = {},
 	) {
-		const decoded = decodeToken(token) as any;
-		if (decoded?.v === 2 && decoded.kind === "sdk-tracked")
+		const decoded = decodeToken(token) as SdkResumePayload | SdkTrackedResumePayload;
+		if (decoded?.v === 2 && decoded.kind === "sdk-tracked") {
 			return this.#resumeTracked(decoded.stateKey, options);
+		}
 		const { approved, response, cancel } = options;
 		const intentCount =
 			Number(typeof approved === "boolean") +
@@ -320,18 +339,17 @@ export class Lobster {
 		return this.#runStages(remainingStages, resumeItems, requestInputResume, resumeIndex, 0);
 	}
 
-	async #trackPause(result: any) {
+	async #trackPause<T extends SdkPauseResult>(result: T): Promise<T> {
 		const env = stateEnv(this.#options);
-		if (!recorderFromEnv(env) || !["needs_approval", "needs_input"].includes(result.status))
+		if (!recorderFromEnv(env) || !["needs_approval", "needs_input"].includes(result.status)) {
 			return result;
+		}
 		const request = result.requiresApproval ?? result.requiresInput;
-		const payload = decodeToken(request.resumeToken);
+		const payload = decodeSdkResumePayload(request.resumeToken);
 		const stateKey =
-			(payload as any).resumeMode === "same_stage"
-				? (payload as any).stateKey
-				: `sdk_resume_${randomUUID()}`;
+			payload.resumeMode === "same_stage" ? payload.stateKey : `sdk_resume_${randomUUID()}`;
 		const commandState =
-			(payload as any).resumeMode === "same_stage"
+			payload.resumeMode === "same_stage"
 				? await readStateJsonWithLock({ env, key: stateKey })
 				: {};
 		await writeStateJson({
@@ -342,19 +360,23 @@ export class Lobster {
 		request.resumeToken = encodeToken({ protocolVersion: 1, v: 2, kind: "sdk-tracked", stateKey });
 		return result;
 	}
+
 	async #resumeTracked(
 		key: string,
 		decision: { approved?: boolean; response?: unknown; cancel?: boolean },
 	) {
-		if (typeof key !== "string" || !/^sdk_resume_[a-f0-9-]+$/.test(key))
+		if (typeof key !== "string" || !/^sdk_resume_[a-f0-9-]+$/.test(key)) {
 			throw new Error("Invalid SDK tracked token");
+		}
 		return withExecution(
 			{ ...this.#options, env: stateEnv(this.#options), _decision: decision },
 			"sdk",
 			key,
 			async (ctx) => {
 				const state = await readStateJsonWithLock({ env: ctx.env, key, signal: ctx.signal });
-				if (state?.type !== "lobster.sdk-tracked.v1") throw new Error("SDK resume state not found");
+				if (state?.type !== "lobster.sdk-tracked.v1") {
+					throw new Error("SDK resume state not found");
+				}
 				const instance = new Lobster({
 					...this.#options,
 					env: ctx.env,
@@ -362,15 +384,19 @@ export class Lobster {
 				});
 				instance.#stages = this.#stages;
 				let claimed = false;
-				(instance.#options as any)._onExecutionStart = async () => {
-					if (claimed) return;
+				instance.#onExecutionStart = async () => {
+					if (claimed) {
+						return;
+					}
 					const claim = await consumeResumeState({
 						env: ctx.env,
 						key,
 						expectedState: state,
 						signal: ctx.signal,
 					});
-					if (!claim.consumed) throw new Error("SDK resume state not found");
+					if (!claim.consumed) {
+						throw new Error("SDK resume state not found");
+					}
 					if (claim.signalAbortedAfterCommit) {
 						await restoreConsumedResumeState({
 							env: ctx.env,
@@ -389,10 +415,14 @@ export class Lobster {
 						key,
 						signal: ctx.signal,
 					});
-					if (deletion !== "deleted") throw new Error("SDK resume state not found");
+					if (deletion !== "deleted") {
+						throw new Error("SDK resume state not found");
+					}
 				}
 				const tracked = await instance.#trackPause(result);
-				if (claimed) await deleteStateJson({ env: ctx.env, key });
+				if (claimed) {
+					await deleteStateJson({ env: ctx.env, key });
+				}
 				return tracked;
 			},
 		);

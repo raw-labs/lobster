@@ -1,12 +1,34 @@
-import { fileURLToPath } from "node:url";
-import test from "node:test";
 import assert from "node:assert/strict";
+import { execFile, spawn, type ExecFileException } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import test from "node:test";
+import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
+import type { Worker } from "node:worker_threads";
 import { runToolRequest, resumeToolRequest } from "../src/core/tool_runtime.js";
-import { openStoreSession } from "../src/persistence/session.js";
+import { PersistenceOutcomeUnknown } from "../src/persistence/backend.js";
+import { migrateStore } from "../src/persistence/migrate.js";
+import type { Transition } from "../src/persistence/model.js";
+import type { SqliteBackend } from "../src/persistence/sqlite.js";
+import { bindStoreSession, openStoreSession } from "../src/persistence/session.js";
 import { decodeResumeToken } from "../src/resume.js";
+import { Lobster } from "../src/sdk/Lobster.js";
+import { diffAndStore, readStateJsonWithLock } from "../src/state/store.js";
+
+const exec = promisify(execFile);
+
+async function processCall(mode: string, value: string, env: NodeJS.ProcessEnv) {
+	const { stdout } = await exec(
+		process.execPath,
+		[fileURLToPath(new URL("./fixtures/persistence-process.js", import.meta.url)), mode, value],
+		{ env, timeout: 10000 },
+	);
+	return JSON.parse(stdout);
+}
+
 for (const backend of ["files", "sqlite"] as const) {
 	test(`${backend}: actual workflow pause/reopen/resume keeps run and attempts`, async (t) => {
 		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "lobster-persistence-"));
@@ -54,9 +76,7 @@ for (const backend of ["files", "sqlite"] as const) {
 				["fetch", "review", "finish"],
 			);
 			assert.ok(
-				run.events.some(
-					(event) => event.kind === "state" && (event.payload as any).status === "consumed",
-				),
+				run.events.some((event) => event.kind === "state" && event.payload?.status === "consumed"),
 			);
 			assert.equal((await reopened.listRuns()).runs.length, 1);
 		} finally {
@@ -71,18 +91,6 @@ for (const backend of ["files", "sqlite"] as const) {
 	});
 }
 
-import { promisify } from "node:util";
-import { execFile } from "node:child_process";
-import { migrateStore } from "../src/persistence/migrate.js";
-const exec = promisify(execFile);
-async function processCall(mode: string, value: string, env: any) {
-	const { stdout } = await exec(
-		process.execPath,
-		[fileURLToPath(new URL("./fixtures/persistence-process.js", import.meta.url)), mode, value],
-		{ env, timeout: 10000 },
-	);
-	return JSON.parse(stdout);
-}
 for (const backend of ["files", "sqlite"] as const) {
 	test(`${backend}: different processes compete for one continuation`, async (t) => {
 		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "lobster-persistence-process-"));
@@ -126,6 +134,7 @@ for (const backend of ["files", "sqlite"] as const) {
 		}
 	});
 }
+
 test("legacy pending and consumed state survives interrupted import and activation", async (t) => {
 	const directory = await fs.mkdtemp(path.join(os.tmpdir(), "lobster-persistence-migrate-"));
 	t.after(() => fs.rm(directory, { recursive: true, force: true }));
@@ -156,7 +165,9 @@ test("legacy pending and consumed state survives interrupted import and activati
 			backend: "sqlite",
 			offline: true,
 			onPhase: async (phase) => {
-				if (phase === "prepared") throw new Error("injected interruption");
+				if (phase === "prepared") {
+					throw new Error("injected interruption");
+				}
 			},
 		}),
 		/injected/,
@@ -193,9 +204,6 @@ test("legacy pending and consumed state survives interrupted import and activati
 	}
 });
 
-import { Lobster } from "../src/sdk/Lobster.js";
-import { bindStoreSession } from "../src/persistence/session.js";
-import { diffAndStore, readStateJsonWithLock } from "../src/state/store.js";
 for (const backend of ["files", "sqlite"] as const) {
 	test(`${backend}: lazy failure and early closure are truthful without draining`, async (t) => {
 		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "lobster-history-stream-"));
@@ -225,7 +233,9 @@ for (const backend of ["files", "sqlite"] as const) {
 						}
 					: {
 							async run({ input }) {
-								for await (const item of input) return { output: [item] };
+								for await (const item of input) {
+									return { output: [item] };
+								}
 								return { output: [] };
 							},
 						};
@@ -269,7 +279,9 @@ for (const backend of ["files", "sqlite"] as const) {
 			.pipe({
 				async run({ input }) {
 					const items = [];
-					for await (const item of input) items.push(item);
+					for await (const item of input) {
+						items.push(item);
+					}
 					return { halt: true, output: [{ type: "approval_request", prompt: "Fixture", items }] };
 				},
 			})
@@ -333,8 +345,6 @@ for (const backend of ["files", "sqlite"] as const) {
 	});
 }
 
-import { randomUUID } from "node:crypto";
-import { PersistenceOutcomeUnknown } from "../src/persistence/backend.js";
 for (const backend of ["files", "sqlite"] as const) {
 	test(`${backend}: revisions, receipts, invalid transitions and retention`, async (t) => {
 		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "lobster-history-contract-"));
@@ -414,9 +424,13 @@ for (const backend of ["files", "sqlite"] as const) {
 		const second = await runToolRequest({ pipeline, ctx: { env, llmAdapters: { pi: adapter } } });
 		assert.equal(second.ok, true, JSON.stringify(second));
 		assert.equal(calls, 1);
-		assert.equal((second.output[0] as any).output.data.category, "support");
+		assert.equal(
+			(second.output[0] as { output: { data: { category: string } } }).output.data.category,
+			"support",
+		);
 	});
 }
+
 test("SQLite lost acknowledgement reconciles a receipt after real worker termination", async (t) => {
 	const directory = await fs.mkdtemp(path.join(os.tmpdir(), "lobster-history-worker-"));
 	t.after(() => fs.rm(directory, { recursive: true, force: true }));
@@ -429,7 +443,7 @@ test("SQLite lost acknowledgement reconciles a receipt after real worker termina
 			expectedRevision: 1,
 			action: { kind: "definition" as const, fingerprint: "committed" },
 		};
-		const worker = (session.backend as any).worker;
+		const worker = (session.backend as unknown as { worker: Worker }).worker;
 		// Intercept an actual post-COMMIT reply before the caller's acknowledgement handler.
 		worker.removeAllListeners("message");
 		worker.once("message", () => {
@@ -466,7 +480,9 @@ for (const backend of ["files", "sqlite"] as const) {
 			get() {
 				return {
 					async run() {
-						if (++tries === 1) throw new Error("retry fixture");
+						if (++tries === 1) {
+							throw new Error("retry fixture");
+						}
 						return { output: [1] };
 					},
 				};
@@ -540,6 +556,7 @@ for (const backend of ["files", "sqlite"] as const) {
 		assert.equal(resumed.status, "ok", JSON.stringify(resumed));
 	});
 }
+
 for (const backend of ["files", "sqlite"] as const) {
 	test(`${backend}: retention protects an unacknowledged terminal receipt`, async (t) => {
 		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "lobster-retention-receipt-"));
@@ -564,7 +581,6 @@ for (const backend of ["files", "sqlite"] as const) {
 	});
 }
 
-import { spawn } from "node:child_process";
 test("SQLite admission is bounded while a database lock leaves the caller responsive", async (t) => {
 	const directory = await fs.mkdtemp(path.join(os.tmpdir(), "lobster-admission-"));
 	t.after(() => fs.rm(directory, { recursive: true, force: true }));
@@ -623,6 +639,7 @@ test("SQLite admission is bounded while a database lock leaves the caller respon
 		await session.close();
 	}
 });
+
 test("SQLite worker death before dispatch leaves no committed operation receipt", async (t) => {
 	const directory = await fs.mkdtemp(path.join(os.tmpdir(), "lobster-worker-before-"));
 	t.after(() => fs.rm(directory, { recursive: true, force: true }));
@@ -630,7 +647,7 @@ test("SQLite worker death before dispatch leaves no committed operation receipt"
 	try {
 		const recorder = await session.createRun("fixture");
 		const operationId = randomUUID();
-		const worker = (session.backend as any).worker;
+		const worker = (session.backend as unknown as { worker: Worker }).worker;
 		worker.postMessage = () => {
 			void worker.terminate();
 		};
@@ -648,6 +665,7 @@ test("SQLite worker death before dispatch leaves no committed operation receipt"
 		await session.close();
 	}
 });
+
 for (const backend of ["files", "sqlite"] as const) {
 	test(`${backend}: cancellation during receipt acknowledgement restores the pre-dispatch wait`, async (t) => {
 		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "lobster-ack-cancel-"));
@@ -687,8 +705,9 @@ for (const backend of ["files", "sqlite"] as const) {
 				if (
 					!controller.signal.aborted &&
 					Object.values(run.waits).some((wait) => wait.status === "consumed")
-				)
+				) {
 					controller.abort(new Error("fixture cancel after receipt"));
+				}
 			};
 			const stopped = await resumeToolRequest({
 				token: first.requiresApproval.resumeToken,
@@ -710,6 +729,7 @@ for (const backend of ["files", "sqlite"] as const) {
 		}
 	});
 }
+
 for (const phase of ["backed_up", "imported", "verified", "prepared", "activated"] as const) {
 	test(`migration interrupted at ${phase} keeps exactly one authority`, async (t) => {
 		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "lobster-migration-phase-"));
@@ -721,7 +741,9 @@ for (const phase of ["backed_up", "imported", "verified", "prepared", "activated
 				backend: "sqlite",
 				offline: true,
 				onPhase: async (current) => {
-					if (current === phase) throw new Error("fixture interruption");
+					if (current === phase) {
+						throw new Error("fixture interruption");
+					}
 				},
 			}),
 			/fixture interruption/,
@@ -743,6 +765,7 @@ for (const phase of ["backed_up", "imported", "verified", "prepared", "activated
 		}
 	});
 }
+
 test("corrupt source cannot activate a SQLite migration", async (t) => {
 	const directory = await fs.mkdtemp(path.join(os.tmpdir(), "lobster-migration-corrupt-"));
 	t.after(() => fs.rm(directory, { recursive: true, force: true }));
@@ -750,6 +773,7 @@ test("corrupt source cannot activate a SQLite migration", async (t) => {
 	await assert.rejects(migrateStore({ directory, backend: "sqlite", offline: true }), SyntaxError);
 	await assert.rejects(fs.access(path.join(directory, ".backend")), { code: "ENOENT" });
 });
+
 for (const backend of ["files", "sqlite"] as const) {
 	test(`${backend}: tracked waits survive history being disabled and inspection is read-only`, async (t) => {
 		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "lobster-history-disabled-"));
@@ -804,6 +828,7 @@ for (const backend of ["files", "sqlite"] as const) {
 		assert.deepEqual(resumed.output, [9]);
 	});
 }
+
 for (const backend of ["files", "sqlite"] as const) {
 	test(`${backend}: CLI records history and dry-run does not initialize storage`, async (t) => {
 		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "lobster-cli-history-"));
@@ -851,7 +876,11 @@ for (const backend of ["files", "sqlite"] as const) {
 			LOBSTER_HISTORY: "1",
 		};
 		const fixture = fileURLToPath(new URL("./fixtures/persistence-process.js", import.meta.url));
-		const error: any = await exec(process.execPath, [fixture, "cli-fault", file], { env }).then(
+		const error: ExecFileException & { stdout: string } = await exec(
+			process.execPath,
+			[fixture, "cli-fault", file],
+			{ env },
+		).then(
 			() => assert.fail("fixture should fail"),
 			(error) => error,
 		);
@@ -871,6 +900,7 @@ for (const backend of ["files", "sqlite"] as const) {
 		}
 	});
 }
+
 test("injected sessions keep nested roots in the explicit storage scope", async (t) => {
 	const directory = await fs.mkdtemp(path.join(os.tmpdir(), "lobster-scope-"));
 	t.after(() => fs.rm(directory, { recursive: true, force: true }));
@@ -987,9 +1017,11 @@ test("SQLite opening failure closes its connection and permits a clean retry", a
 	const { SqliteBackend } = await import("../src/persistence/sqlite.js");
 	const originalWrite = fs.writeFile;
 	const close = t.mock.method(SqliteBackend.prototype, "close");
-	const write = t.mock.method(fs, "writeFile", async (...args: any[]) => {
-		if (String(args[0]).includes(".session-")) throw new Error("fixture lease failure");
-		return originalWrite.apply(fs, args as any);
+	const write = t.mock.method(fs, "writeFile", async (...args: Parameters<typeof fs.writeFile>) => {
+		if (String(args[0]).includes(".session-")) {
+			throw new Error("fixture lease failure");
+		}
+		return originalWrite(...args);
 	});
 	await assert.rejects(openStoreSession({ directory, backend: "sqlite" }), /fixture lease failure/);
 	assert.equal(close.mock.callCount(), 1);
@@ -1010,10 +1042,11 @@ test("SQLite rejects an undispatchable request without occupying admission", asy
 	t.after(() => fs.rm(directory, { recursive: true, force: true }));
 	const store = await openStoreSession({ directory, backend: "sqlite", maxPending: 1 });
 	try {
-		await assert.rejects(
-			(store.backend as any).request("read", { key: "fixture", invalid: () => {} }),
-			{ name: "DataCloneError" },
-		);
+		// Extra uncloneable data deliberately exercises failure before worker admission.
+		const request = { key: "fixture", invalid: () => {} };
+		await assert.rejects((store.backend as SqliteBackend).request("read", request), {
+			name: "DataCloneError",
+		});
 		await store.write("fixture", "42");
 		assert.equal((await store.read("fixture")).text, "42");
 	} finally {
@@ -1084,7 +1117,9 @@ for (const backend of ["files", "sqlite"] as const) {
 			let after = "";
 			while (true) {
 				const page = await store.listRuns({ after, limit: 7 });
-				if (!page.runs.length) break;
+				if (!page.runs.length) {
+					break;
+				}
 				assert.ok(page.runs.length <= 7);
 				ids.push(...page.runs.map((run) => run.id));
 				after = page.nextCursor;
@@ -1123,7 +1158,7 @@ for (const backend of ["files", "sqlite"] as const) {
 				}),
 			);
 			const transition = store.backend.transition.bind(store.backend);
-			let failedOperation: any;
+			let failedOperation: Transition | undefined;
 			t.mock.method(store.backend, "transition", async (request, signal) => {
 				if (
 					!failedOperation &&
@@ -1162,7 +1197,9 @@ for (const backend of ["files", "sqlite"] as const) {
 				assert.equal(run.attempts[0].status, unknown ? "completed" : "started");
 				const receipt = await store.reconcile(run.id, failedOperation.operationId);
 				assert.equal(Boolean(receipt), unknown);
-				if (unknown) assert.equal(receipt.acknowledged, false);
+				if (unknown) {
+					assert.equal(receipt.acknowledged, false);
+				}
 			} finally {
 				await store.close();
 			}
@@ -1236,7 +1273,7 @@ for (const backend of ["files", "sqlite"] as const) {
 			get(name) {
 				return {
 					async run({ ctx, input }) {
-						if (name === "choose")
+						if (name === "choose") {
 							return {
 								output: [
 									await ctx.requestInput({
@@ -1245,6 +1282,7 @@ for (const backend of ["files", "sqlite"] as const) {
 									}),
 								],
 							};
+						}
 						return { output: name === "before" ? [1] : input };
 					},
 				};

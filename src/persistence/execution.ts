@@ -1,38 +1,60 @@
-import { fingerprint } from "./model.js";
-import { PersistenceOutcomeUnknown } from "./backend.js";
-import path from "node:path";
 import { promises as fs } from "node:fs";
+import path from "node:path";
+import { defaultStateDir, withFileLock } from "../state/store.js";
+import { PersistenceOutcomeUnknown } from "./backend.js";
+import { fingerprint, type RunMetadata } from "./model.js";
 import {
-	openStoreSession,
-	sessionFromEnv,
-	recorderFromEnv,
-	bindStoreSession,
 	bindRecorder,
+	bindStoreSession,
+	openStoreSession,
+	recorderFromEnv,
+	sessionFromEnv,
+	type ExecutionRecorder,
+	type StoreEnvironment,
 	type StoreSession,
 } from "./session.js";
-import { withFileLock } from "../state/store.js";
 
-export async function withStoreContext<T>(ctx: any, task: (ctx: any) => Promise<T>): Promise<T> {
+type ExecutionContext = {
+	env?: StoreEnvironment;
+	storeSession?: StoreSession;
+	history?: boolean;
+	readOnly?: boolean;
+	signal?: AbortSignal;
+	dryRun?: boolean;
+	runMetadata?: RunMetadata;
+	_decision?: { approved?: boolean; cancel?: boolean; response?: unknown };
+};
+
+type ExecutionOutcome = {
+	ok?: boolean;
+	status?: string;
+	output?: unknown;
+	error?: { type?: string };
+};
+
+export async function withStoreContext<C extends ExecutionContext, T>(
+	ctx: C,
+	task: (ctx: C) => Promise<T>,
+): Promise<T> {
 	const env = ctx.env ?? process.env;
-	const injected: StoreSession | undefined = ctx.storeSession ?? sessionFromEnv(env);
-	if (injected) return task({ ...ctx, env: bindStoreSession(env, injected) });
+	const injected = ctx.storeSession ?? sessionFromEnv(env);
+	if (injected) {
+		return task({ ...ctx, env: bindStoreSession(env, injected) });
+	}
+
 	let selected = false;
 	try {
-		await fs.access(
-			path.join(
-				String(
-					env.LOBSTER_STATE_DIR ??
-						path.join((await import("node:os")).homedir(), ".lobster", "state"),
-				),
-				".backend",
-			),
-		);
+		await fs.access(path.join(defaultStateDir(env), ".backend"));
 		selected = true;
 	} catch (error) {
-		if (error.code !== "ENOENT") throw error;
+		if (error.code !== "ENOENT") {
+			throw error;
+		}
 	}
-	if (!selected && !env.LOBSTER_BACKEND && env.LOBSTER_HISTORY !== "1" && !ctx.history)
+	if (!selected && !env.LOBSTER_BACKEND && env.LOBSTER_HISTORY !== "1" && !ctx.history) {
 		return task(ctx);
+	}
+
 	const session = await openStoreSession({
 		env,
 		history: ctx.history,
@@ -46,13 +68,16 @@ export async function withStoreContext<T>(ctx: any, task: (ctx: any) => Promise<
 	}
 }
 
-export async function withExecution<T>(
-	ctx: any,
+export async function withExecution<C extends ExecutionContext, T>(
+	ctx: C,
 	kind: string,
 	resumeKey: string | undefined,
-	task: (ctx: any) => Promise<T>,
+	task: (ctx: C) => Promise<T>,
 ): Promise<T> {
-	if (ctx.dryRun) return task(ctx);
+	if (ctx.dryRun) {
+		return task(ctx);
+	}
+
 	return withStoreContext(ctx, async (runtime) => {
 		const session = sessionFromEnv(runtime.env);
 		if (
@@ -60,9 +85,11 @@ export async function withExecution<T>(
 			(!session.history && !resumeKey) ||
 			recorderFromEnv(runtime.env) ||
 			runtime.dryRun
-		)
+		) {
 			return task(runtime);
-		let recorder;
+		}
+
+		let recorder: ExecutionRecorder;
 		if (resumeKey) {
 			recorder = await withFileLock({
 				filePath: path.join(
@@ -72,8 +99,13 @@ export async function withExecution<T>(
 				signal: runtime.signal,
 				task: () => session.recorderForState(resumeKey),
 			});
-			if (!recorder) return task(runtime);
-		} else recorder = await session.createRun(kind, runtime.runMetadata);
+			if (!recorder) {
+				return task(runtime);
+			}
+		} else {
+			recorder = await session.createRun(kind, runtime.runMetadata);
+		}
+
 		if (resumeKey && runtime._decision) {
 			const decision = runtime._decision;
 			recorder.decisionKey = resumeKey.replace("workflow-resume_", "workflow_resume_");
@@ -85,36 +117,45 @@ export async function withExecution<T>(
 					: {}),
 			};
 		}
+
 		const bound = { ...runtime, env: bindRecorder(runtime.env, recorder) };
 		try {
-			const result: any = await task(bound);
+			const result = await task(bound);
+			const outcome =
+				result && typeof result === "object" ? (result as ExecutionOutcome) : undefined;
 			const run = await session.getRun(recorder.runId);
-			const pending = Object.values(run?.waits ?? {}).some(
-				(wait: any) => wait.status === "pending",
-			);
-			if (result?.error?.type === "persistence_outcome_unknown") {
+			const pending = Object.values(run?.waits ?? {}).some((wait) => wait.status === "pending");
+			const ownsExecution = !resumeKey || recorder.ownsExecution;
+
+			if (outcome?.error?.type === "persistence_outcome_unknown") {
 				// Reconcile the admitted mutation before assigning an execution outcome.
-			} else if (result?.ok === false) {
-				if ((!resumeKey || recorder.ownsExecution) && !pending && run?.status === "running")
+			} else if (outcome?.ok === false) {
+				if (ownsExecution && !pending && run?.status === "running") {
 					await recorder.settle(runtime.signal?.aborted ? "cancelled" : "failed");
-			} else if (["needs_approval", "needs_input"].includes(result?.status)) {
-				// The continuation publication already committed waiting status with its history.
-			} else if ((!resumeKey || recorder.ownsExecution) && !pending)
+				}
+			} else if (outcome?.status === "needs_approval" || outcome?.status === "needs_input") {
+				// Continuation publication already committed waiting status with its history.
+			} else if (ownsExecution && !pending) {
 				await recorder.settle(
-					result?.status === "cancelled" ? "cancelled" : "completed",
-					result?.output,
+					outcome?.status === "cancelled" ? "cancelled" : "completed",
+					outcome?.output,
 				);
-			if (result && typeof result === "object" && Object.isExtensible(result))
+			}
+
+			if (result && typeof result === "object" && Object.isExtensible(result)) {
 				Object.assign(result, { runId: recorder.runId });
+			}
 			return result;
 		} catch (error) {
-			if (error instanceof PersistenceOutcomeUnknown) throw error;
+			if (error instanceof PersistenceOutcomeUnknown) {
+				throw error;
+			}
+
 			const run = await session.getRun(recorder.runId);
-			if (
-				(!resumeKey || recorder.ownsExecution) &&
-				!Object.values(run?.waits ?? {}).some((wait: any) => wait.status === "pending")
-			)
+			const pending = Object.values(run?.waits ?? {}).some((wait) => wait.status === "pending");
+			if ((!resumeKey || recorder.ownsExecution) && !pending) {
 				await recorder.settle(runtime.signal?.aborted ? "cancelled" : "failed", error);
+			}
 			throw error;
 		}
 	});

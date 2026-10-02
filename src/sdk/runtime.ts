@@ -1,11 +1,11 @@
+import { runPipeline as runCorePipeline } from "../runtime.js";
+
 /**
  * SDK Runtime - Executes Lobster pipelines
  *
  * This adapts SDK stages to the core runtime so command-level suspension rules
  * stay identical across CLI, tool mode, and SDK entry points.
  */
-
-import { runPipeline as runCorePipeline } from "../runtime.js";
 
 /**
  * Collect async iterable to array

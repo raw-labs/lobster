@@ -1,18 +1,17 @@
-import { recorderFromEnv } from "./persistence/session.js";
-import { withExecution } from "./persistence/execution.js";
-import { runtimeErrorDetails } from "./persistence/backend.js";
-import { openStoreSession } from "./persistence/session.js";
-import { migrateStore } from "./persistence/migrate.js";
-import { parsePipeline } from "./parser.js";
+import { forceTerminateAbortableProcesses } from "./abortable_process.js";
 import { createDefaultRegistry } from "./commands/registry.js";
-import { runPipeline } from "./runtime.js";
-import { parseResumeArgs } from "./resume.js";
 import { resumeToolRequest } from "./core/tool_runtime.js";
+import { parsePipeline } from "./parser.js";
+import { runtimeErrorDetails } from "./persistence/backend.js";
+import { withExecution } from "./persistence/execution.js";
+import { migrateStore } from "./persistence/migrate.js";
+import { openStoreSession, recorderFromEnv } from "./persistence/session.js";
+import { finalizePipelineToolRun } from "./pipeline_resume_state.js";
+import { parseResumeArgs } from "./resume.js";
+import { runPipeline } from "./runtime.js";
 import { loadWorkflowFile, resolveWorkflowArgs, runWorkflowFile } from "./workflows/file.js";
 import { renderWorkflowGraph } from "./workflows/graph.js";
 import type { WorkflowGraphFormat } from "./workflows/graph.js";
-import { finalizePipelineToolRun } from "./pipeline_resume_state.js";
-import { forceTerminateAbortableProcesses } from "./abortable_process.js";
 
 export async function runCli(argv) {
 	const cancellation = createCliCancellation();
@@ -189,11 +188,22 @@ function isWorkflowGraphFormat(value: string): value is WorkflowGraphFormat {
 	return value === "mermaid" || value === "dot" || value === "ascii";
 }
 
-async function handleRun(options: Parameters<typeof handleRunInternal>[0] | any) {
+type ToolPayload = Omit<Awaited<ReturnType<typeof resumeToolRequest>>, "protocolVersion">;
+
+type RunOptions = {
+	argv: string[];
+	registry: ReturnType<typeof createDefaultRegistry>;
+	signal: AbortSignal;
+	forceTerminationSignal: AbortSignal;
+};
+
+async function handleRun(options: RunOptions) {
 	const parsed = parseRunArgs(options.argv);
 	const prepared = await prepareRunTarget(parsed).catch(() => undefined);
-	if (!prepared) return handleRunInternal({ ...options, env: process.env });
-	let envelope: any;
+	if (!prepared) {
+		return handleRunInternal({ ...options, env: process.env });
+	}
+	let envelope: ToolPayload | undefined;
 	try {
 		const result = await withExecution(
 			{ env: process.env, signal: options.signal, dryRun: prepared.dryRun },
@@ -208,7 +218,9 @@ async function handleRun(options: Parameters<typeof handleRunInternal>[0] | any)
 					},
 				}),
 		);
-		if (envelope) writeToolEnvelope(envelope);
+		if (envelope) {
+			writeToolEnvelope(envelope);
+		}
 		return result;
 	} catch (error) {
 		reportRunError(normalizeMode(parsed.mode), "runtime_error", error);
@@ -223,15 +235,11 @@ async function handleRunInternal({
 	forceTerminationSignal,
 	onEnvelope,
 	env,
-}: {
-	argv;
-	env;
-	registry;
-	signal: AbortSignal;
-	forceTerminationSignal: AbortSignal;
-	onEnvelope?: (envelope: any) => void;
+}: RunOptions & {
+	env: NodeJS.ProcessEnv;
+	onEnvelope?: (envelope: ToolPayload) => void;
 }) {
-	const emit = (envelope: any) =>
+	const emit = (envelope: ToolPayload) =>
 		(onEnvelope ?? writeToolEnvelope)({
 			...envelope,
 			...(recorderFromEnv(env) ? { runId: recorderFromEnv(env).runId } : {}),
@@ -410,8 +418,11 @@ function reportRunError(
 	emit = writeToolEnvelope,
 ) {
 	const message = (error as { message?: string })?.message ?? String(error);
-	if (mode === "tool") emit({ ok: false, error: runtimeErrorDetails(error, type) });
-	else process.stderr.write(`${prefix}${message}\n`);
+	if (mode === "tool") {
+		emit({ ok: false, error: runtimeErrorDetails(error, type) });
+	} else {
+		process.stderr.write(`${prefix}${message}\n`);
+	}
 	process.exitCode = type === "parse_error" ? 2 : 1;
 }
 
@@ -797,8 +808,9 @@ function graphHelpText() {
 async function handlePersistence(argv: string[]) {
 	if (argv[0] === "storage" && argv[1] === "migrate") {
 		const backend = argv[2];
-		if (backend !== "files" && backend !== "sqlite")
+		if (backend !== "files" && backend !== "sqlite") {
 			throw new Error("storage migrate files|sqlite --offline");
+		}
 		const { defaultStateDir } = await import("./state/store.js");
 		const result = await migrateStore({
 			directory: defaultStateDir(process.env),
@@ -814,17 +826,19 @@ async function handlePersistence(argv: string[]) {
 	});
 	try {
 		let result: unknown;
-		if (argv[0] === "history" && (!argv[1] || argv[1] === "list"))
+		if (argv[0] === "history" && (!argv[1] || argv[1] === "list")) {
 			result = await session.listRuns({ after: argv[2] ?? "" });
-		else if (argv[0] === "history" && argv[1] === "show" && argv[2])
+		} else if (argv[0] === "history" && argv[1] === "show" && argv[2]) {
 			result = await session.inspect(argv[2], { afterSequence: Number(argv[3] ?? 0) });
-		else if (argv[0] === "history" && argv[1] === "prune" && argv[2])
+		} else if (argv[0] === "history" && argv[1] === "prune" && argv[2]) {
 			result = await session.retain({ before: argv[2], dryRun: !argv.includes("--apply") });
-		else if (argv[0] === "storage" && argv[1] === "export") result = await session.backend.export();
-		else
+		} else if (argv[0] === "storage" && argv[1] === "export") {
+			result = await session.backend.export();
+		} else {
 			throw new Error(
 				"history list|show <runId> [afterSequence]|prune <before> [--apply]; storage export|migrate files|sqlite --offline",
 			);
+		}
 		process.stdout.write(JSON.stringify(result) + "\n");
 	} finally {
 		await session.close();

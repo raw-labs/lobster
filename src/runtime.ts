@@ -1,5 +1,3 @@
-import { recorderFromEnv } from "./persistence/session.js";
-import { createJsonRenderer } from "./renderers/json.js";
 import type { LlmSpendLedger } from "./core/llm_accounting.js";
 import {
 	InputRequestSuspension,
@@ -9,6 +7,8 @@ import {
 	createStageRequestInput,
 	type CommandInputResume,
 } from "./input_request.js";
+import { recorderFromEnv } from "./persistence/session.js";
+import { createJsonRenderer } from "./renderers/json.js";
 
 export async function runPipeline({
 	pipeline,
@@ -121,12 +121,14 @@ export async function runPipeline({
 			inputTracker.disableReplay();
 			try {
 				await inputTracker.close({ suppressErrors: suppressCloseErrors });
-				if (assertResume) assertRequestInputResumeConsumed(stageResume);
+				if (assertResume) {
+					assertRequestInputResumeConsumed(stageResume);
+				}
 			} catch (error) {
 				historyError = error;
 				throw error;
 			} finally {
-				if (attemptId)
+				if (attemptId) {
 					await history.finish(
 						attemptId,
 						historyWaiting
@@ -138,6 +140,7 @@ export async function runPipeline({
 									: "closed",
 						historyError,
 					);
+				}
 			}
 		}
 		const stageStdout = trackWritableOutput(stdout, () => {
@@ -168,8 +171,12 @@ export async function runPipeline({
 
 		let result;
 		try {
-			if (haltAfterStageOnAbort) signal?.throwIfAborted();
-			if (command.meta?.resumeSafeBeforeInput !== true) await markExecutionStarted();
+			if (haltAfterStageOnAbort) {
+				signal?.throwIfAborted();
+			}
+			if (command.meta?.resumeSafeBeforeInput !== true) {
+				await markExecutionStarted();
+			}
 			result = await command.run({ input: inputTracker.iterable, args: stage.args, ctx: stageCtx });
 		} catch (err) {
 			historyError = err;

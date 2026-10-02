@@ -1,35 +1,35 @@
-import { withExecution } from "../persistence/execution.js";
-import { PersistenceError } from "../persistence/backend.js";
-import { recorderFromEnv, bindRecorder } from "../persistence/session.js";
-import { dryRunWorkflow } from "./dry_run.js";
-import {
-	createRecord,
-	mergeEnv,
-	resolveCwd,
-	resolveInputValue,
-	resolveShellStdin,
-	resolveWorkflowStepArgs,
-} from "./values.js";
-import { loadWorkflowFile, getStepExecution, isApprovalStep, isInputStep } from "./load.js";
-import { evaluateCondition, resolveTemplate } from "./expressions.js";
-import type {
-	WorkflowFile,
-	ParallelBranch,
-	WorkflowStep,
-	WorkflowApprovalIdentity,
-	WorkflowStepResult,
-	WorkflowRunResult,
-} from "./types.js";
+import { randomUUID } from "node:crypto";
 import { promises as fsp } from "node:fs";
 import path from "node:path";
-
-import { randomUUID } from "node:crypto";
-import { isDeepStrictEqual } from "node:util";
 import { PassThrough } from "node:stream";
-
+import { isDeepStrictEqual } from "node:util";
+import { runAbortableProcess } from "../abortable_process.js";
+import { CostLimitExceededError, CostTracker } from "../core/cost_tracker.js";
+import type { CostSummary } from "../core/cost_tracker.js";
+import {
+	createLlmSpendLedger,
+	carryLlmProvenance,
+	markLlmProvenanceReplayed,
+	llmProvenanceOf,
+	restoreLlmProvenance,
+} from "../core/llm_accounting.js";
+import type {
+	LlmChargeCost,
+	LlmOutstandingCharge,
+	LlmSpendLedger,
+} from "../core/llm_accounting.js";
+import { withRetry, resolveRetryConfig } from "../core/retry.js";
+import {
+	RequestInputResumeError,
+	validateCommandInputState,
+	type CommandInputState,
+} from "../input_request.js";
 import { parsePipeline } from "../parser.js";
+import { PersistenceError } from "../persistence/backend.js";
+import { withExecution } from "../persistence/execution.js";
+import { recorderFromEnv, bindRecorder } from "../persistence/session.js";
+import { readLineFromStream } from "../read_line.js";
 import { runPipeline } from "../runtime.js";
-import { encodeToken, decodeToken } from "../token.js";
 import {
 	cleanupApprovalIndexByStateKey,
 	consumeResumeState,
@@ -44,29 +44,27 @@ import {
 	writeStateJson,
 	stableStringify,
 } from "../state/store.js";
-import { readLineFromStream } from "../read_line.js";
+import { encodeToken, decodeToken } from "../token.js";
 import { compileCached } from "../validation.js";
-import {
-	createLlmSpendLedger,
-	carryLlmProvenance,
-	markLlmProvenanceReplayed,
-	llmProvenanceOf,
-	restoreLlmProvenance,
-} from "../core/llm_accounting.js";
+import { dryRunWorkflow } from "./dry_run.js";
+import { evaluateCondition, resolveTemplate } from "./expressions.js";
+import { loadWorkflowFile, getStepExecution, isApprovalStep, isInputStep } from "./load.js";
 import type {
-	LlmChargeCost,
-	LlmOutstandingCharge,
-	LlmSpendLedger,
-} from "../core/llm_accounting.js";
-import { CostLimitExceededError, CostTracker } from "../core/cost_tracker.js";
-import type { CostSummary } from "../core/cost_tracker.js";
-import { withRetry, resolveRetryConfig } from "../core/retry.js";
+	WorkflowFile,
+	ParallelBranch,
+	WorkflowStep,
+	WorkflowApprovalIdentity,
+	WorkflowStepResult,
+	WorkflowRunResult,
+} from "./types.js";
 import {
-	RequestInputResumeError,
-	validateCommandInputState,
-	type CommandInputState,
-} from "../input_request.js";
-import { runAbortableProcess } from "../abortable_process.js";
+	createRecord,
+	mergeEnv,
+	resolveCwd,
+	resolveInputValue,
+	resolveShellStdin,
+	resolveWorkflowStepArgs,
+} from "./values.js";
 
 export { loadWorkflowFile } from "./load.js";
 export type {
@@ -535,7 +533,9 @@ async function runWorkflowFileInternal({
 				});
 
 				if (ctx.mode === "tool" || !isInteractive(ctx.stdin)) {
-					if (gateAttempt) await gateRecorder.finish(gateAttempt, "waiting");
+					if (gateAttempt) {
+						await gateRecorder.finish(gateAttempt, "waiting");
+					}
 					const inputRequest = buildNeedsInputRequest({
 						stepId: step.id,
 						prompt: step.input.prompt,
@@ -625,7 +625,9 @@ async function runWorkflowFileInternal({
 					response: parsed,
 				};
 				lastStepId = step.id;
-				if (gateAttempt) await gateRecorder.finish(gateAttempt, "completed");
+				if (gateAttempt) {
+					await gateRecorder.finish(gateAttempt, "completed");
+				}
 				continue;
 			}
 
@@ -795,10 +797,16 @@ async function runWorkflowFileInternal({
 										subResult = createSyntheticStepResult(subStep.id, inputValue);
 									}
 
-									if (subAttempt) await itemRecorder.finish(subAttempt, "completed", subResult);
+									if (subAttempt) {
+										await itemRecorder.finish(subAttempt, "completed", subResult);
+									}
 								} catch (error) {
-									if (error instanceof PersistenceError) throw error;
-									if (subAttempt) await itemRecorder.finish(subAttempt, "failed", error);
+									if (error instanceof PersistenceError) {
+										throw error;
+									}
+									if (subAttempt) {
+										await itemRecorder.finish(subAttempt, "failed", error);
+									}
 									throw error;
 								}
 								scopedResults[subStep.id] = subResult;
@@ -935,12 +943,17 @@ async function runWorkflowFileInternal({
 							const branchAttempt = await branchRecorder?.start("branch", branch.id);
 							try {
 								const result = await runBranchInternal(branch);
-								if (branchAttempt)
+								if (branchAttempt) {
 									await branchRecorder.finish(branchAttempt, "completed", result.result);
+								}
 								return result;
 							} catch (error) {
-								if (error instanceof PersistenceError) throw error;
-								if (branchAttempt) await branchRecorder.finish(branchAttempt, "failed", error);
+								if (error instanceof PersistenceError) {
+									throw error;
+								}
+								if (branchAttempt) {
+									await branchRecorder.finish(branchAttempt, "failed", error);
+								}
 								throw error;
 							}
 						};
@@ -987,7 +1000,9 @@ async function runWorkflowFileInternal({
 								parallelBranchResults = createRecord();
 								for (const entry of settled) {
 									if (entry.status === "rejected") {
-										if (entry.reason instanceof PersistenceError) throw entry.reason;
+										if (entry.reason instanceof PersistenceError) {
+											throw entry.reason;
+										}
 										throw new Error(
 											`Parallel branch failed: ${entry.reason?.message ?? String(entry.reason)}`,
 										);
@@ -1004,10 +1019,14 @@ async function runWorkflowFileInternal({
 							if (branchesCancelled) await waitForCancelledParallelBranches(branchesSettled);
 							else await branchesSettled;
 						}
-						for (const entry of await branchesSettled)
-							if (entry.status === "rejected" && entry.reason instanceof PersistenceError)
+						for (const entry of await branchesSettled) {
+							if (entry.status === "rejected" && entry.reason instanceof PersistenceError) {
 								throw entry.reason;
-						if (parallelFailure) throw parallelFailure.error;
+							}
+						}
+						if (parallelFailure) {
+							throw parallelFailure.error;
+						}
 
 						const merged = Object.fromEntries(
 							Object.entries(parallelBranchResults ?? {}).map(([branchId, branchResult]) => [
@@ -1144,16 +1163,21 @@ async function runWorkflowFileInternal({
 						result = createSyntheticStepResult(step.id, inputValue);
 					}
 
-					if (historyAttempt) await recorder.finish(historyAttempt, "completed", result);
+					if (historyAttempt) {
+						await recorder.finish(historyAttempt, "completed", result);
+					}
 					return { result, parallelBranchResults };
 				} catch (error) {
-					if (error instanceof PersistenceError) throw error;
-					if (historyAttempt)
+					if (error instanceof PersistenceError) {
+						throw error;
+					}
+					if (historyAttempt) {
 						await recorder.finish(
 							historyAttempt,
 							error instanceof WorkflowPipelineInputSuspension ? "waiting" : "failed",
 							error,
 						);
+					}
 					if (attemptHadNonRetryableSideEffect) {
 						throw markStepErrorNonRetryable(error);
 					}
@@ -1203,7 +1227,9 @@ async function runWorkflowFileInternal({
 				result = attemptResult.result;
 				parallelBranchResults = attemptResult.parallelBranchResults;
 			} catch (err: any) {
-				if (err instanceof PersistenceError) throw err;
+				if (err instanceof PersistenceError) {
+					throw err;
+				}
 				if (err instanceof WorkflowPipelineInputSuspension) {
 					const inputRequest = buildNeedsInputRequest({
 						stepId: err.stepId,
@@ -2441,7 +2467,9 @@ async function runPipelineStep({
 	const pipelineStartIndex = resume ? resume.pipelineInput.resumeAtIndex : 0;
 	const remainingPipeline = pipeline.slice(pipelineStartIndex);
 	const pipelineRecorder = recorderFromEnv(env)?.child(`step/${stepId}`);
-	if (pipelineRecorder) pipelineRecorder.pipelineOffset = pipelineStartIndex;
+	if (pipelineRecorder) {
+		pipelineRecorder.pipelineOffset = pipelineStartIndex;
+	}
 	const result = await runPipeline({
 		pipeline: remainingPipeline,
 		registry: ctx.registry,
