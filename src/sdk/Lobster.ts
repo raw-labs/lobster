@@ -1,8 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { validateCommandInputState, type CommandInputState } from "../input_request.js";
 import { runtimeErrorDetails } from "../persistence/backend.js";
-import { recorderFromEnv, sessionFromEnv } from "../persistence/context.js";
-import { withExecution } from "../persistence/execution.js";
+import { recorderFromEnv, sessionFromEnv, bindResumeGuard } from "../persistence/context.js";
+import { withExecution, withStoreContext } from "../persistence/execution.js";
 import type { StoreSession } from "../persistence/session.js";
 import {
 	consumeResumeState,
@@ -12,6 +12,7 @@ import {
 	readStateJsonWithLock,
 	writeStateJson,
 } from "../state/store.js";
+import { resolveWait, callerId } from "../persistence/waits.js";
 import { encodeToken, decodeToken } from "../token.js";
 import { compileCached } from "../validation.js";
 import { runPipelineInternal } from "./runtime.js";
@@ -54,6 +55,8 @@ type SdkCommandInputResumeState = {
 export type LobsterOptions = {
 	storeSession?: StoreSession;
 	history?: boolean;
+	trackRuns?: boolean;
+	runMetadata?: { callerId?: string; hostRunId?: string; hostTaskId?: string };
 	env?: NodeJS.ProcessEnv;
 	stateDir?: string;
 	signal?: AbortSignal;
@@ -69,6 +72,8 @@ export class Lobster {
 		this.#options = {
 			storeSession: options.storeSession,
 			history: options.history,
+			trackRuns: options.trackRuns,
+			runMetadata: options.runMetadata,
 			env: options.env ?? process.env,
 			stateDir: options.stateDir,
 			signal: options.signal,
@@ -107,14 +112,18 @@ export class Lobster {
 				const result = await instance.#runStages(instance.#stages, initialInput);
 				return instance.#trackPause(result);
 			},
-		).catch((err) => ({
-			ok: false,
-			status: "error",
-			output: [],
-			requiresApproval: null,
-			requiresInput: null,
-			error: runtimeErrorDetails(err),
-		}));
+		).catch((err) => {
+			const error = runtimeErrorDetails(err);
+			return {
+				ok: false,
+				status: "error",
+				runId: error.runId,
+				output: [],
+				requiresApproval: null,
+				requiresInput: null,
+				error,
+			};
+		});
 	}
 
 	async #runStages(
@@ -353,13 +362,54 @@ export class Lobster {
 			payload.resumeMode === "same_stage"
 				? await readStateJsonWithLock({ env, key: stateKey })
 				: {};
+		const { resumeToken: _token, ...question } = request;
 		await writeStateJson({
 			env,
 			key: stateKey,
-			value: { ...commandState, type: "lobster.sdk-tracked.v1", payload },
+			value: {
+				...commandState,
+				type: "lobster.sdk-tracked.v1",
+				payload,
+				wait: { ...question, kind: result.requiresInput ? "input" : "approval" },
+			},
 		});
 		request.resumeToken = encodeToken({ protocolVersion: 1, v: 2, kind: "sdk-tracked", stateKey });
 		return result;
+	}
+
+	async resumeWait(options: {
+		waitId: string;
+		expectedRevision: number;
+		approved?: boolean;
+		response?: unknown;
+		cancel?: boolean;
+	}) {
+		return withStoreContext(
+			{ ...this.#options, env: stateEnv(this.#options), trackRuns: true },
+			async (ctx) => {
+				const store = sessionFromEnv(ctx.env);
+				if (!store) throw new Error("Wait resume requires a persistence session");
+				const wait = await resolveWait(
+					store,
+					options.waitId,
+					options.expectedRevision,
+					callerId(this.#options.runMetadata),
+				);
+				if (!wait.key.startsWith("sdk_resume_"))
+					throw new Error("This wait is not an SDK checkpoint");
+				const instance = new Lobster({
+					...this.#options,
+					storeSession: store,
+					env: bindResumeGuard(ctx.env, {
+						key: wait.key,
+						expectedRevision: options.expectedRevision,
+						admitted: false,
+					}),
+				});
+				instance.#stages = this.#stages;
+				return instance.#resumeTracked(wait.key, options);
+			},
+		);
 	}
 
 	async #resumeTracked(

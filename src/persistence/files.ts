@@ -8,7 +8,12 @@ import {
 } from "../state/atomic_file.js";
 import type { AtomicExclusiveWriteOptions, AtomicWriteOptions } from "../state/atomic_file.js";
 import { withFileLock } from "../state/file_lock.js";
-import type { Backend, StateWriteOptions, StateWriteResult } from "./backend.js";
+import {
+	WaitConflictError,
+	type Backend,
+	type StateWriteOptions,
+	type StateWriteResult,
+} from "./backend.js";
 import {
 	applyTransition,
 	canRetain,
@@ -19,6 +24,8 @@ import {
 	type LogicalArchive,
 	type RunRecord,
 	type RunSummary,
+	type RunFilter,
+	type RunState,
 	type StateRecord,
 	type Transition,
 	type TransitionResult,
@@ -67,6 +74,13 @@ export class FileBackend implements Backend {
 		return run;
 	}
 
+	async getRunState(id: string): Promise<RunState | null> {
+		const run = await this.getRun(id);
+		if (!run) return null;
+		const { attempts: _attempts, events: _events, receipts: _receipts, ...state } = run;
+		return state;
+	}
+
 	async listRuns(): Promise<RunRecord[]> {
 		let names: string[];
 		try {
@@ -90,7 +104,11 @@ export class FileBackend implements Backend {
 		return runs;
 	}
 
-	async listRunSummaries(after: string, limit: number): Promise<RunSummary[]> {
+	async listRunSummaries(
+		after: string,
+		limit: number,
+		filter: RunFilter = {},
+	): Promise<RunSummary[]> {
 		let names: string[];
 		try {
 			names = await fs.readdir(path.join(this.directory, ".history"));
@@ -108,7 +126,11 @@ export class FileBackend implements Backend {
 			.sort();
 		for (const id of ids) {
 			const run = await this.getRun(id);
-			if (run) {
+			if (
+				run &&
+				(!filter.status || run.status === filter.status) &&
+				(filter.callerId === undefined || run.metadata?.callerId === filter.callerId)
+			) {
 				summaries.push(runSummary(run));
 			}
 			if (summaries.length === limit) {
@@ -165,13 +187,14 @@ export class FileBackend implements Backend {
 						kind: "state",
 						key,
 						text,
+						expectedWaitRevision: options.expectedWaitRevision,
 						...(options.decision ? { decision: options.decision } : {}),
 					},
 				},
 				options.signal,
 			);
 			if (result.status === "conflict") {
-				throw new Error("Unexpected conflict while publishing continuation state");
+				throw new WaitConflictError();
 			}
 
 			this.locators.set(key, id);

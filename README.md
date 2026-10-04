@@ -86,8 +86,90 @@ events together in indexed tables. The file backend rewrites its aggregate when
 history changes; SQLite avoids that cost. Legacy JSON values keep their layout
 until migration or association with a tracked continuation. New tracked tokens
 require this runtime; compatibility means reading existing tokens, not making
-older binaries understand new storage. Disabling history stops tracking new runs
-and preserves the ability to resume already tracked waits.
+older binaries understand new storage. History enables run tracking. To keep live
+run status and pending reviews without detailed history, use `LOBSTER_RUNS=1` or
+`trackRuns: true`. Each run retains its original history setting when resumed.
+
+### Run and pending review API
+
+Enable durable runs on either backend with `trackRuns: true`; add `history: true`
+when you also want step attempts and event history. A pending question is saved
+with its original prompt, schema, defaults, and full review subject. Discovery
+reads that snapshot, rather than rebuilding it from chat or a workflow file.
+
+```ts
+import {
+  openStoreSession, listRuns, getRun, getWait, resumeToolRequest,
+} from '@clawdbot/lobster/core';
+
+const store = await openStoreSession({
+  directory: '/path/to/state', backend: 'sqlite', trackRuns: true,
+});
+const ctx = {
+  storeSession: store,
+  runMetadata: { callerId: 'host:stable-logical-session' },
+};
+try {
+  const page = await listRuns({ status: 'waiting', limit: 20, ctx });
+  const run = page.runs[0] && await getRun({ runId: page.runs[0].id, ctx });
+  const pending = run?.pendingWaits[0];
+  const wait = pending && await getWait({ waitId: pending.id, ctx });
+  // Present wait.request to the user. After an explicit decision:
+  // await resumeToolRequest({
+  //   waitId: wait.id, expectedRevision: wait.revision, response: answer, ctx,
+  // });
+} finally {
+  await store.close();
+}
+```
+
+The three query functions are also exported from the SDK entry point. Run lists
+are paged (`after`, `limit`, `nextCursor`) and may be filtered by status. `getRun`
+returns status, metadata, the history setting, and pending wait IDs; it does not
+expose raw checkpoint payloads. `getWait` returns the complete saved question and
+its wait revision, without a resume token. Both getters return `null` for missing or caller-invisible records. `getWait`
+also returns `null` for consumed or retired waits; completed runs remain
+inspectable through `getRun`.
+
+`expectedRevision` refers to the **wait**, not the run's history revision. It is
+checked again in the same transaction as checkpoint consumption or cancellation.
+Invalid answers remain correctable; changed, consumed, or foreign waits return
+`wait_conflict`. The old token and approval-ID paths continue to use the same
+single-consumption mechanism. Host admission for those legacy bearer paths is
+unchanged.
+
+`callerId` is an opaque association supplied through trusted host context at run
+creation. Scoped discovery and wait-ID resume require an exact match. It is a
+filter, not a user-authentication system: hosts must authorize that context and
+keep it stable across the resets they intend to support. Unscoped local callers
+can inspect all runs in their store. Lobster owns saved execution facts; the host
+owns identity, conversation routing, and presentation.
+
+SDK function stages still require an instance supplying the original stages:
+`lobster.resumeWait({ waitId, expectedRevision, response })`. They are not
+serialized or resurrected from storage. Workflow-file and pipeline waits resume
+through `resumeToolRequest`. Existing untracked checkpoints retain token-based
+resume; they do not retroactively acquire run history or a known caller. Imported
+older tracked waits may have `request: null` when the original question was not
+saved; discovery does not invent it by rereading a changed workflow file.
+
+CLI equivalents use the same API:
+
+```sh
+LOBSTER_RUNS=1 lobster run --mode tool --file review.lobster
+lobster runs list --status waiting
+lobster runs show <runId>
+lobster waits show <waitId>
+lobster resume --wait <waitId> --expected-revision <revision> --response-json '{...}'
+# Or use --approve yes|no or --cancel for the appropriate decision.
+```
+
+Full wait inspection is an explicit read of private review material; callers must
+apply their own display limits. If a durable workflow question cannot fit the
+bounded tool envelope, the call reports a rendering error with its run ID and the
+saved question remains discoverable. Pending waits are protected from terminal
+history pruning. These APIs rediscover saved pauses; they do not automatically
+replay steps interrupted by a process crash.
 
 ### Migrating existing state
 

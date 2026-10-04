@@ -1,3 +1,4 @@
+import { listRuns, getRun, getWait } from "./core/runs.js";
 import { forceTerminateAbortableProcesses } from "./abortable_process.js";
 import { createDefaultRegistry } from "./commands/registry.js";
 import { resumeToolRequest } from "./core/tool_runtime.js";
@@ -61,6 +62,11 @@ async function runCliWithSignal(
 
 	if (argv[0] === "version" || argv[0] === "--version" || argv[0] === "-v") {
 		process.stdout.write(`${await readVersion()}\n`);
+		return;
+	}
+
+	if (argv[0] === "runs" || argv[0] === "waits") {
+		await handleRuns(argv, signal);
 		return;
 	}
 
@@ -650,6 +656,8 @@ async function handleResume({
 		envelope = await resumeToolRequest({
 			token: parsed.token ?? undefined,
 			approvalId: parsed.approvalId ?? undefined,
+			waitId: parsed.waitId,
+			expectedRevision: parsed.expectedRevision,
 			approved: parsed.approved,
 			response: parsed.response,
 			cancel: parsed.cancel,
@@ -772,6 +780,10 @@ function helpText() {
 		`  lobster resume --token <token> --approve yes|no\n` +
 		`  lobster resume --token <token> --response-json '{...}'\n` +
 		`  lobster resume --token <token> --cancel\n` +
+		`  lobster runs list [--status waiting] [--limit 20] [--after <cursor>]\n` +
+		`  lobster runs show <runId>\n` +
+		`  lobster waits show <waitId>\n` +
+		`  lobster resume --wait <waitId> --expected-revision <revision> --response-json '{...}'\n` +
 		`  lobster history list\n` +
 		`  lobster history show <runId> [afterSequence]\n` +
 		`  lobster history prune <before> [--apply]\n` +
@@ -844,4 +856,41 @@ async function handlePersistence(argv: string[]) {
 	} finally {
 		await session.close();
 	}
+}
+
+async function handleRuns(argv: string[], signal: AbortSignal) {
+	const [command, action, ...rest] = argv;
+	const ctx = { env: process.env, signal };
+	let result: unknown;
+	if (command === "runs" && (!action || action === "list")) {
+		const options: Parameters<typeof listRuns>[0] = { ctx };
+		for (let i = 0; i < rest.length; i += 2) {
+			const value = rest[i + 1];
+			if (!value) throw new Error(`Missing value for ${rest[i]}`);
+			switch (rest[i]) {
+				case "--status":
+					options.status = value as NonNullable<typeof options.status>;
+					break;
+				case "--limit":
+					options.limit = Number(value);
+					break;
+				case "--after":
+					options.after = value;
+					break;
+				default:
+					throw new Error(`Unknown runs option: ${rest[i]}`);
+			}
+		}
+		result = await listRuns(options);
+	} else if (action === "show" && rest.length === 1) {
+		result =
+			command === "runs"
+				? await getRun({ runId: rest[0], ctx })
+				: await getWait({ waitId: rest[0], ctx });
+	} else {
+		throw new Error(
+			"runs list [--status <status>] [--limit <limit>] [--after <cursor>]; runs show <runId>; waits show <waitId>",
+		);
+	}
+	process.stdout.write(JSON.stringify(result) + "\n");
 }

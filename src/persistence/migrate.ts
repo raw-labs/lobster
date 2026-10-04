@@ -34,7 +34,7 @@ async function assertOffline(directory: string) {
 }
 
 function canonical(data: LogicalArchive) {
-	return JSON.stringify({
+	return fingerprint({
 		version: data.version,
 		states: Object.fromEntries(Object.entries(data.states).sort(([a], [b]) => a.localeCompare(b))),
 		runs: [...data.runs].sort((a, b) => a.id.localeCompare(b.id)),
@@ -106,7 +106,7 @@ export async function migrateStore({ directory, backend, offline, onPhase }: Mig
 			}
 			validateArchive(archive);
 			validateContinuations(archive);
-			const digest = fingerprint(canonical(archive));
+			const digest = canonical(archive);
 			const backup = path.join(directory, `.backup-${digest}.archive`);
 			await writeFileAtomic(backup, JSON.stringify(archive) + "\n");
 			await onPhase?.("backed_up");

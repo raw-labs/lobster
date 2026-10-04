@@ -1,7 +1,7 @@
 import { randomBytes } from "node:crypto";
 import { promises as fsp } from "node:fs";
 import path from "node:path";
-import { recorderFromEnv, sessionFromEnv } from "../persistence/context.js";
+import { recorderFromEnv, sessionFromEnv, resumeGuardFromEnv } from "../persistence/context.js";
 import { withStoreContext } from "../persistence/execution.js";
 import type { FileWriteOptions } from "../persistence/files.js";
 import {
@@ -209,15 +209,19 @@ async function writeStateJsonUnlocked({
 	const session = sessionFromEnv(env);
 	if (session) {
 		const recorder = recorderFromEnv(env);
+		const guard = resumeGuardFromEnv(env);
+		const guarded = guard && !guard.admitted && guard.key === key && isConsumedResumeState(value);
 		const writeOptions: FileWriteOptions = {
 			signal,
 			atomicWriteOptions,
+			...(guarded ? { expectedWaitRevision: guard.expectedRevision } : {}),
 			...(recorder?.decisionKey === key.replace("workflow-resume_", "workflow_resume_")
 				? { decision: recorder.decision }
 				: {}),
 			...(isContinuationValue(key, value) && recorder ? { runId: recorder.runId } : {}),
 		};
 		const result = await session.write(key, JSON.stringify(value, null, 2) + "\n", writeOptions);
+		if (guarded) guard.admitted = true;
 		if (recorder && isConsumedResumeState(value)) {
 			recorder.ownsExecution = true;
 		}
@@ -455,13 +459,15 @@ async function deleteStateJsonUnlocked({ env, key }) {
 	if (session) {
 		const before = await session.read(key);
 		const currentRecorder = recorderFromEnv(env);
-		await session.write(
-			key,
-			null,
-			currentRecorder?.decisionKey === key.replace("workflow-resume_", "workflow_resume_")
+		const guard = resumeGuardFromEnv(env);
+		const guarded = guard && !guard.admitted && guard.key === key;
+		await session.write(key, null, {
+			...(guarded ? { expectedWaitRevision: guard.expectedRevision } : {}),
+			...(currentRecorder?.decisionKey === key.replace("workflow-resume_", "workflow_resume_")
 				? { decision: currentRecorder.decision }
-				: {},
-		);
+				: {}),
+		});
+		if (guarded) guard.admitted = true;
 		if (before.runId && before.text !== null) {
 			const recorder = recorderFromEnv(env);
 			if (recorder?.runId === before.runId) {

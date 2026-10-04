@@ -28,6 +28,7 @@ export type RunMetadata = {
 };
 
 export type WaitRecord = {
+	revision?: number;
 	status: "pending" | "consumed" | "retired";
 	kind: string;
 	prompt?: unknown;
@@ -65,6 +66,7 @@ export type RunRecord = {
 	createdAt: string;
 	updatedAt: string;
 	partialHistory: boolean;
+	historyEnabled?: boolean;
 	definitions: string[];
 	metadata?: RunMetadata;
 	attempts: Attempt[];
@@ -81,7 +83,13 @@ export type RunAction =
 	| { kind: "start"; attempt: Attempt }
 	| { kind: "finish"; id: string; status: AttemptStatus; summary?: unknown }
 	| { kind: "settle"; status: RunStatus; summary?: unknown }
-	| { kind: "state"; key: string; text: string | null; decision?: unknown };
+	| {
+			kind: "state";
+			key: string;
+			text: string | null;
+			decision?: unknown;
+			expectedWaitRevision?: number;
+	  };
 
 export type Transition = {
 	operationId: string;
@@ -99,6 +107,10 @@ type TransitionApplication =
 	| { status: "conflict"; revision: number; run: RunRecord | null };
 
 export type LogicalArchive = { version: 1; states: Record<string, string>; runs: RunRecord[] };
+
+export type RunFilter = { status?: RunStatus; callerId?: string };
+
+export type RunState = Omit<RunRecord, "attempts" | "events" | "receipts">;
 
 export type RunSummary = Pick<
 	RunRecord,
@@ -190,6 +202,15 @@ export function applyTransition(
 		return { status: "conflict", revision: current?.revision ?? 0, run: current };
 	}
 	const action = request.action;
+	if (action.kind === "state" && action.expectedWaitRevision !== undefined) {
+		if (!Number.isSafeInteger(action.expectedWaitRevision) || action.expectedWaitRevision < 0) {
+			throw new Error("Invalid expected wait revision");
+		}
+		const wait = current?.waits[action.key];
+		if (wait?.status !== "pending" || (wait.revision ?? 0) !== action.expectedWaitRevision) {
+			return { status: "conflict", revision: current?.revision ?? 0, run: current };
+		}
+	}
 	if (action.kind === "create" && current) {
 		throw new Error("Run already exists");
 	}
@@ -255,6 +276,7 @@ export function applyTransition(
 				run.status = "waiting";
 			}
 		}
+		if (run.waits[action.key]) run.waits[action.key].revision = run.revision + 1;
 		if (run.waits[action.key] && action.decision !== undefined) {
 			run.waits[action.key].decision = action.decision;
 		}
@@ -266,12 +288,13 @@ export function applyTransition(
 	}
 	run.updatedAt = at;
 	run.revision++;
-	run.events.push({
-		sequence: run.revision,
-		kind: action.kind,
-		at,
-		...(payload === undefined ? {} : { payload }),
-	});
+	if (run.historyEnabled !== false)
+		run.events.push({
+			sequence: run.revision,
+			kind: action.kind,
+			at,
+			...(payload === undefined ? {} : { payload }),
+		});
 	run.receipts[request.operationId] = {
 		fingerprint: hash,
 		revision: run.revision,
@@ -317,6 +340,9 @@ export function validateArchive(value: unknown): asserts value is LogicalArchive
 		) {
 			throw new Error("Invalid run archive entry");
 		}
+		if (run.historyEnabled !== undefined && typeof run.historyEnabled !== "boolean") {
+			throw new Error("Invalid run history setting");
+		}
 		ids.add(run.id);
 		if (
 			!Number.isFinite(Date.parse(run.createdAt)) ||
@@ -341,7 +367,11 @@ export function validateArchive(value: unknown): asserts value is LogicalArchive
 			if (
 				!Object.hasOwn(run.states, key) ||
 				!wait ||
-				!["pending", "consumed", "retired"].includes(wait.status)
+				!["pending", "consumed", "retired"].includes(wait.status) ||
+				(wait.revision !== undefined &&
+					(!Number.isSafeInteger(wait.revision) ||
+						wait.revision < 0 ||
+						wait.revision > run.revision))
 			) {
 				throw new Error("Invalid wait archive entry");
 			}

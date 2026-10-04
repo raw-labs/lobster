@@ -4,6 +4,8 @@ import type {
 	LogicalArchive,
 	RunRecord,
 	RunSummary,
+	RunFilter,
+	RunState,
 	StateRecord,
 	Transition,
 	TransitionResult,
@@ -14,6 +16,7 @@ type WriteRequest = {
 	text: string | null;
 	operationId: string;
 	exclusive?: boolean;
+	expectedWaitRevision?: number;
 	runId?: string;
 	decision?: unknown;
 };
@@ -25,8 +28,12 @@ type Operations = {
 	transition: { args: Transition; result: TransitionResult };
 	acknowledge: { args: { runId: string; operationId: string }; result: void };
 	getRun: { args: { id: string }; result: RunRecord | null };
+	getRunState: { args: { id: string }; result: RunState | null };
 	listRuns: { args: Record<string, never>; result: RunRecord[] };
-	listRunSummaries: { args: { after: string; limit: number }; result: RunSummary[] };
+	listRunSummaries: {
+		args: { after: string; limit: number; filter?: RunFilter };
+		result: RunSummary[];
+	};
 	inspectRun: {
 		args: { id: string; afterSequence: number; limit: number };
 		result: HistoryPage | null;

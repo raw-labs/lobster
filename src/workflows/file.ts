@@ -1,3 +1,4 @@
+import type { WaitRequest } from "../persistence/waits.js";
 import { randomUUID } from "node:crypto";
 import { promises as fsp } from "node:fs";
 import path from "node:path";
@@ -154,6 +155,7 @@ export type WorkflowResumePayload = {
 };
 
 type WorkflowResumeState = {
+	wait?: WaitRequest;
 	filePath: string;
 	resumeAtIndex: number;
 	steps: Record<string, WorkflowStepResult>;
@@ -536,14 +538,20 @@ async function runWorkflowFileInternal({
 					if (gateAttempt) {
 						await gateRecorder.finish(gateAttempt, "waiting");
 					}
-					const inputRequest = buildNeedsInputRequest({
+					const requestOptions = {
 						stepId: step.id,
 						prompt: step.input.prompt,
 						responseSchema: step.input.responseSchema,
 						defaults: step.input.defaults,
 						subject,
 						maxEnvelopeBytes: resolveToolEnvelopeMaxBytes(ctx.env),
-					});
+					};
+					// Durable runs publish the complete question before formatting a bounded
+					// tool response. Legacy calls retain their pre-publication size check.
+					const untrackedRequest = recorderFromEnv(ctx.env)
+						? undefined
+						: buildNeedsInputRequest(requestOptions);
+					let checkpointPublished = false;
 					let stateKey: string | undefined;
 					try {
 						stateKey = await saveWorkflowResumeState(
@@ -555,6 +563,13 @@ async function runWorkflowFileInternal({
 								args: resolvedArgs,
 								inputStepId: step.id,
 								inputSchema: step.input.responseSchema,
+								wait: {
+									kind: "input",
+									prompt: step.input.prompt,
+									responseSchema: step.input.responseSchema,
+									...(step.input.defaults !== undefined ? { defaults: step.input.defaults } : {}),
+									subject,
+								},
 								// Preserve the full resolved subject for resume semantics; the tool
 								// envelope may contain a truncated preview to stay within size limits.
 								inputSubject: subject,
@@ -586,6 +601,8 @@ async function runWorkflowFileInternal({
 							throw new Error("Workflow resume state not found");
 						}
 
+						checkpointPublished = true;
+						const inputRequest = untrackedRequest ?? buildNeedsInputRequest(requestOptions);
 						const resumeToken = encodeToken({
 							protocolVersion: 1,
 							v: 1,
@@ -602,7 +619,12 @@ async function runWorkflowFileInternal({
 							},
 						};
 					} catch (err) {
-						if (stateKey) await discardWorkflowResumeState(ctx.env, stateKey);
+						if (
+							stateKey &&
+							(!checkpointPublished || !recorderFromEnv(ctx.env) || ctx.signal?.aborted)
+						) {
+							await discardWorkflowResumeState(ctx.env, stateKey);
+						}
 						throw err;
 					}
 				}
@@ -1231,14 +1253,20 @@ async function runWorkflowFileInternal({
 					throw err;
 				}
 				if (err instanceof WorkflowPipelineInputSuspension) {
-					const inputRequest = buildNeedsInputRequest({
+					const requestOptions = {
 						stepId: err.stepId,
 						prompt: err.request.prompt,
 						responseSchema: err.request.responseSchema,
 						defaults: err.request.defaults,
 						subject: err.request.subject,
 						maxEnvelopeBytes: resolveToolEnvelopeMaxBytes(ctx.env),
-					});
+					};
+					// Durable runs publish the complete question before formatting a bounded
+					// tool response. Legacy calls retain their pre-publication size check.
+					const untrackedRequest = recorderFromEnv(ctx.env)
+						? undefined
+						: buildNeedsInputRequest(requestOptions);
+					let checkpointPublished = false;
 					let stateKey: string | undefined;
 					try {
 						stateKey = await saveWorkflowResumeState(
@@ -1251,6 +1279,13 @@ async function runWorkflowFileInternal({
 								inputStepId: err.stepId,
 								inputKind: "pipeline_command",
 								inputSchema: err.request.responseSchema,
+								wait: {
+									kind: "input",
+									prompt: err.request.prompt,
+									responseSchema: err.request.responseSchema,
+									...(err.request.defaults !== undefined ? { defaults: err.request.defaults } : {}),
+									...(err.request.subject !== undefined ? { subject: err.request.subject } : {}),
+								},
 								inputSubject: err.request.subject,
 								pipelineInput: err.pipelineInput,
 								...(costTracker.hasUsage() ? { cost: costTracker.getSummary() } : null),
@@ -1281,6 +1316,8 @@ async function runWorkflowFileInternal({
 							throw new Error("Workflow resume state not found");
 						}
 
+						checkpointPublished = true;
+						const inputRequest = untrackedRequest ?? buildNeedsInputRequest(requestOptions);
 						const resumeToken = encodeToken({
 							protocolVersion: 1,
 							v: 1,
@@ -1297,7 +1334,12 @@ async function runWorkflowFileInternal({
 							},
 						};
 					} catch (stateError) {
-						if (stateKey) await discardWorkflowResumeState(ctx.env, stateKey);
+						if (
+							stateKey &&
+							(!checkpointPublished || !recorderFromEnv(ctx.env) || ctx.signal?.aborted)
+						) {
+							await discardWorkflowResumeState(ctx.env, stateKey);
+						}
 						throw stateError;
 					}
 				}
@@ -1390,6 +1432,12 @@ async function runWorkflowFileInternal({
 								args: resolvedArgs,
 								approvalStepId: step.id,
 								approvalIdentity,
+								wait: {
+									kind: "approval",
+									prompt: approval.prompt,
+									items: approval.items,
+									...(approval.preview ? { preview: approval.preview } : {}),
+								},
 								...(costTracker.hasUsage() ? { cost: costTracker.getSummary() } : null),
 								...(llmSpendLedger.outstanding().length
 									? { llmSpend: llmSpendLedger.outstanding() }

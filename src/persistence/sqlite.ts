@@ -11,6 +11,8 @@ import type {
 	LogicalArchive,
 	RunRecord,
 	RunSummary,
+	RunFilter,
+	RunState,
 	StateRecord,
 	Transition,
 	TransitionResult,
@@ -211,6 +213,7 @@ export class SqliteBackend implements Backend {
 				text,
 				operationId,
 				exclusive: options.exclusive,
+				expectedWaitRevision: options.expectedWaitRevision,
 				runId: options.runId,
 				decision: options.decision,
 			},
@@ -236,8 +239,12 @@ export class SqliteBackend implements Backend {
 		return this.request("getRun", { id });
 	}
 
-	listRunSummaries(after: string, limit: number): Promise<RunSummary[]> {
-		return this.request("listRunSummaries", { after, limit });
+	getRunState(id: string): Promise<RunState | null> {
+		return this.request("getRunState", { id });
+	}
+
+	listRunSummaries(after: string, limit: number, filter?: RunFilter): Promise<RunSummary[]> {
+		return this.request("listRunSummaries", { after, limit, filter });
 	}
 
 	inspectRun(id: string, afterSequence: number, limit: number): Promise<HistoryPage | null> {

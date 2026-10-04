@@ -17,6 +17,7 @@ type ExecutionContext = {
 	env?: StoreEnvironment;
 	storeSession?: StoreSession;
 	history?: boolean;
+	trackRuns?: boolean;
 	readOnly?: boolean;
 	signal?: AbortSignal;
 	dryRun?: boolean;
@@ -50,13 +51,21 @@ export async function withStoreContext<C extends ExecutionContext, T>(
 			throw error;
 		}
 	}
-	if (!selected && !env.LOBSTER_BACKEND && env.LOBSTER_HISTORY !== "1" && !ctx.history) {
+	if (
+		!selected &&
+		!env.LOBSTER_BACKEND &&
+		env.LOBSTER_HISTORY !== "1" &&
+		!ctx.history &&
+		env.LOBSTER_RUNS !== "1" &&
+		!ctx.trackRuns
+	) {
 		return task(ctx);
 	}
 
 	const session = await openStoreSession({
 		env,
 		history: ctx.history,
+		trackRuns: ctx.trackRuns,
 		readOnly: ctx.readOnly,
 		signal: ctx.signal,
 	});
@@ -66,6 +75,13 @@ export async function withStoreContext<C extends ExecutionContext, T>(
 		await session.close();
 	}
 }
+
+export function withExecution<C extends ExecutionContext, T>(
+	ctx: C,
+	kind: string,
+	resumeKey: string | undefined,
+	task: (ctx: C) => Promise<T>,
+): Promise<T & { runId?: string }>;
 
 export async function withExecution<C extends ExecutionContext, T>(
 	ctx: C,
@@ -81,7 +97,7 @@ export async function withExecution<C extends ExecutionContext, T>(
 		const session = sessionFromEnv(runtime.env);
 		if (
 			!session ||
-			(!session.history && !resumeKey) ||
+			(!session.trackRuns && !resumeKey) ||
 			recorderFromEnv(runtime.env) ||
 			runtime.dryRun
 		) {
@@ -122,7 +138,7 @@ export async function withExecution<C extends ExecutionContext, T>(
 			const result = await task(bound);
 			const outcome =
 				result && typeof result === "object" ? (result as ExecutionOutcome) : undefined;
-			const run = await session.getRun(recorder.runId);
+			const run = await session.getRunState(recorder.runId);
 			const pending = Object.values(run?.waits ?? {}).some((wait) => wait.status === "pending");
 			const ownsExecution = !resumeKey || recorder.ownsExecution;
 
@@ -150,7 +166,7 @@ export async function withExecution<C extends ExecutionContext, T>(
 				throw error;
 			}
 
-			const run = await session.getRun(recorder.runId);
+			const run = await session.getRunState(recorder.runId);
 			const pending = Object.values(run?.waits ?? {}).some((wait) => wait.status === "pending");
 			if ((!resumeKey || recorder.ownsExecution) && !pending) {
 				await recorder.settle(runtime.signal?.aborted ? "cancelled" : "failed", error);

@@ -26,6 +26,8 @@ import {
 	type RunRecord,
 	type RunStatus,
 	type RunSummary,
+	type RunFilter,
+	type RunState,
 	type StateRecord,
 	type Transition,
 	type TransitionResult,
@@ -46,6 +48,7 @@ export type StoreOptions = {
 	env?: Record<string, string | undefined>;
 	readOnly?: boolean;
 	history?: boolean;
+	trackRuns?: boolean;
 	maxPending?: number;
 	signal?: AbortSignal;
 };
@@ -62,6 +65,7 @@ export class StoreSession {
 		history: boolean,
 		private lease?: string,
 		readonly readOnly = false,
+		readonly trackRuns = history,
 	) {
 		this.history = history;
 	}
@@ -154,6 +158,7 @@ export class StoreSession {
 			createdAt: at,
 			updatedAt: at,
 			partialHistory,
+			historyEnabled: this.history,
 			definitions: [],
 			metadata:
 				metadata && typeof metadata === "object"
@@ -189,9 +194,10 @@ export class StoreSession {
 			return undefined;
 		}
 		if (record.runId) {
-			return new ExecutionRecorder(this, record.runId);
+			const run = await this.getRunState(record.runId);
+			return new ExecutionRecorder(this, record.runId, "", run?.historyEnabled !== false);
 		}
-		if (!this.history || JSON.parse(record.text)?.type === "lobster.consumed-resume-state.v1") {
+		if (!this.trackRuns || JSON.parse(record.text)?.type === "lobster.consumed-resume-state.v1") {
 			return undefined;
 		}
 		const recorder = await this.createRun("legacy", undefined, true);
@@ -203,16 +209,25 @@ export class StoreSession {
 		return this.request(() => this.backend.getRun(id));
 	}
 
-	async listRuns({ limit = 20, after = "" } = {}): Promise<{
+	async getRunState(id: string): Promise<RunState | null> {
+		return this.request(() => this.backend.getRunState(id));
+	}
+
+	async listRuns({
+		limit = 20,
+		after = "",
+		...filter
+	}: RunFilter & { limit?: number; after?: string } = {}): Promise<{
 		runs: RunSummary[];
 		nextCursor: string | null;
 	}> {
 		this.assertOpen();
 		if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
-			throw new Error("History limit must be 1..100");
+			throw new Error("Run limit must be 1..100");
 		}
-		const runs = await this.request(() => this.backend.listRunSummaries(after, limit));
-		return { runs, nextCursor: runs.at(-1)?.id ?? null };
+		const found = await this.request(() => this.backend.listRunSummaries(after, limit + 1, filter));
+		const runs = found.slice(0, limit);
+		return { runs, nextCursor: found.length > limit ? (runs.at(-1)?.id ?? null) : null };
 	}
 
 	async inspect(id: string, { afterSequence = 0, limit = 50 } = {}): Promise<HistoryPage | null> {
@@ -309,10 +324,16 @@ export class ExecutionRecorder {
 		readonly session: StoreSession,
 		readonly runId: string,
 		readonly prefix = "",
+		readonly historyEnabled = session.history,
 	) {}
 
 	child(path: string): ExecutionRecorder {
-		return new ExecutionRecorder(this.session, this.runId, this.prefix + path + "/");
+		return new ExecutionRecorder(
+			this.session,
+			this.runId,
+			this.prefix + path + "/",
+			this.historyEnabled,
+		);
 	}
 
 	async action(action: RunAction): Promise<TransitionResult> {
@@ -330,12 +351,14 @@ export class ExecutionRecorder {
 	}
 
 	async definition(value: unknown): Promise<void> {
+		if (!this.historyEnabled) return;
 		await this.action({ kind: "definition", fingerprint: fingerprint(value) });
 	}
 
 	async start(path: string, name: string, ordinal?: number): Promise<string> {
 		const full = this.prefix + path;
 		const id = randomUUID();
+		if (!this.historyEnabled) return id;
 		await this.action({
 			kind: "start",
 			attempt: {
@@ -352,6 +375,7 @@ export class ExecutionRecorder {
 	}
 
 	async finish(id: string, status: AttemptStatus, value?: unknown): Promise<void> {
+		if (!this.historyEnabled) return;
 		await this.action({ kind: "finish", id, status, summary: summarize(value) });
 	}
 
@@ -386,6 +410,7 @@ export async function openStoreSession(options: StoreOptions = {}): Promise<Stor
 			throw new Error("Backend change requires verified migration");
 		}
 		const history = options.history ?? env.LOBSTER_HISTORY === "1";
+		const trackRuns = history || (options.trackRuns ?? env.LOBSTER_RUNS === "1");
 		let backend: Backend | undefined;
 		let lease: string | undefined;
 		try {
@@ -431,7 +456,7 @@ export async function openStoreSession(options: StoreOptions = {}): Promise<Stor
 			} else {
 				backend = new FileBackend(directory, options.readOnly);
 			}
-			if (!selected && kind === "files" && history && !options.readOnly) {
+			if (!selected && kind === "files" && trackRuns && !options.readOnly) {
 				await writeFileAtomic(
 					path.join(directory, ".backend"),
 					JSON.stringify({ version: 1, backend: "files" }) + "\n",
@@ -441,7 +466,7 @@ export async function openStoreSession(options: StoreOptions = {}): Promise<Stor
 				lease = path.join(directory, `.session-${process.pid}-${randomUUID()}`);
 				await fs.writeFile(lease, JSON.stringify({ pid: process.pid }), { mode: 0o600 });
 			}
-			return new StoreSession(directory, backend, history, lease, options.readOnly);
+			return new StoreSession(directory, backend, history, lease, options.readOnly, trackRuns);
 		} catch (error) {
 			await backend?.close();
 			if (lease) {

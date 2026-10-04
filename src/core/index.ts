@@ -12,6 +12,14 @@ export {
 	type StoreOptions,
 } from "../persistence/session.js";
 export { migrateStore } from "../persistence/migrate.js";
-export { PersistenceError, PersistenceOutcomeUnknown } from "../persistence/backend.js";
+export {
+	PersistenceError,
+	PersistenceOutcomeUnknown,
+	WaitConflictError,
+} from "../persistence/backend.js";
 
-export type { ToolRunContext } from "./tool_runtime.js";
+export type { ToolRunContext, ResumeToolOptions, ToolEnvelope } from "./tool_runtime.js";
+
+export { listRuns, getRun, getWait, type RunQuery, type RunPage } from "./runs.js";
+export type { RunView, WaitView, WaitSummary, WaitRequest } from "../persistence/waits.js";
+export type { RunStatus, RunSummary } from "../persistence/model.js";

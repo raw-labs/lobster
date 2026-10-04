@@ -3,6 +3,8 @@ import type {
 	LogicalArchive,
 	RunRecord,
 	RunSummary,
+	RunFilter,
+	RunState,
 	StateRecord,
 	Transition,
 	TransitionResult,
@@ -12,6 +14,7 @@ export type BackendKind = "files" | "sqlite";
 
 export type StateWriteOptions = {
 	exclusive?: boolean;
+	expectedWaitRevision?: number;
 	runId?: string;
 	decision?: unknown;
 	signal?: AbortSignal;
@@ -37,14 +40,24 @@ export interface Backend {
 	transition(request: Transition, signal?: AbortSignal): Promise<TransitionResult>;
 	acknowledge(runId: string, operationId: string): Promise<void>;
 	getRun(id: string): Promise<RunRecord | null>;
+	getRunState(id: string): Promise<RunState | null>;
 	listRuns(): Promise<RunRecord[]>;
-	listRunSummaries(after: string, limit: number): Promise<RunSummary[]>;
+	listRunSummaries(after: string, limit: number, filter?: RunFilter): Promise<RunSummary[]>;
 	inspectRun(id: string, afterSequence: number, limit: number): Promise<HistoryPage | null>;
 	removeRun(id: string, before: string): Promise<boolean>;
 
 	export(): Promise<LogicalArchive>;
 	import(data: LogicalArchive): Promise<void>;
 	close(): Promise<void>;
+}
+
+export class WaitConflictError extends Error {
+	readonly code = "LOBSTER_WAIT_CONFLICT";
+
+	constructor() {
+		super("Wait changed; inspect the pending wait before answering again");
+		this.name = "WaitConflictError";
+	}
 }
 
 export class PersistenceError extends Error {
@@ -91,7 +104,12 @@ function errorMessage(error: unknown): string {
 }
 
 export function runtimeErrorDetails(error: unknown, type = "runtime_error"): RuntimeErrorDetails {
-	if (error instanceof PersistenceOutcomeUnknown) {
+	if (
+		error instanceof WaitConflictError ||
+		(error as { code?: string })?.code === "LOBSTER_WAIT_CONFLICT"
+	) {
+		type = "wait_conflict";
+	} else if (error instanceof PersistenceOutcomeUnknown) {
 		type = "persistence_outcome_unknown";
 	} else if (error instanceof PersistenceError) {
 		type = "persistence_error";

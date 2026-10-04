@@ -1,5 +1,6 @@
 // This is the only module that loads node:sqlite. Files remain usable on Node 22.0.
 // This is the only module that loads node:sqlite. Files remain usable on Node 22.0.
+import { WaitConflictError } from "./backend.js";
 import { DatabaseSync } from "node:sqlite";
 import { parentPort, workerData } from "node:worker_threads";
 import {
@@ -276,11 +277,12 @@ function handle(request: WorkerRequest): WorkerResult<WorkerMethod> {
 							kind: "state",
 							key: args.key,
 							text: args.text,
+							expectedWaitRevision: args.expectedWaitRevision,
 							...(args.decision ? { decision: args.decision } : {}),
 						},
 					});
 					if (result.status === "conflict") {
-						throw new Error("Unexpected conflict while publishing continuation state");
+						throw new WaitConflictError();
 					}
 					return {
 						kind: "run",
@@ -322,9 +324,34 @@ function handle(request: WorkerRequest): WorkerResult<WorkerMethod> {
 			});
 		case "getRun":
 			return getRun(args.id);
+		case "getRunState":
+			return transaction(() => {
+				const run = metadata(args.id);
+				if (!run) return null;
+				for (const row of prepare("SELECT key,record FROM waits WHERE run_id=?").all(
+					args.id,
+				) as (RecordRow & { key: string })[]) {
+					run.waits[row.key] = JSON.parse(row.record) as WaitRecord;
+				}
+				for (const row of prepare("SELECT key,text FROM state WHERE run_id=?").all(
+					args.id,
+				) as StateRow[]) {
+					run.states[row.key] = row.text;
+				}
+				const { attempts: _attempts, events: _events, receipts: _receipts, ...state } = run;
+				return state;
+			}, false);
 		case "listRunSummaries": {
-			const rows = prepare("SELECT record FROM runs WHERE id > ? ORDER BY id LIMIT ?").all(
+			const filter = args.filter ?? {};
+			const rows = prepare(`SELECT record FROM runs WHERE id > ?
+				AND (? IS NULL OR json_extract(record, '$.status') = ?)
+				AND (? IS NULL OR json_extract(record, '$.metadata.callerId') = ?)
+				ORDER BY id LIMIT ?`).all(
 				args.after,
+				filter.status ?? null,
+				filter.status ?? null,
+				filter.callerId ?? null,
+				filter.callerId ?? null,
 				args.limit,
 			) as RecordRow[];
 			return rows.map((row) => runSummary(JSON.parse(row.record) as RunMetadataRecord));

@@ -1,3 +1,4 @@
+import type { WaitRequest } from "./persistence/waits.js";
 import { randomUUID } from "node:crypto";
 import { validateCommandInputState, type CommandInputState } from "./input_request.js";
 import { recorderFromEnv } from "./persistence/context.js";
@@ -16,6 +17,7 @@ import { encodeToken } from "./token.js";
 import { compileCached } from "./validation.js";
 
 export type PipelineResumeState = {
+	wait?: WaitRequest;
 	historyOffset?: number;
 	pipeline: Array<{ name: string; args: Record<string, unknown>; raw: string }>;
 	resumeAtIndex: number;
@@ -123,6 +125,12 @@ export async function finalizePipelineToolRun(params: {
 					items: approval.items,
 					haltType: "approval_request",
 					prompt: approval.prompt,
+					wait: {
+						kind: "approval",
+						prompt: approval.prompt,
+						items: approval.items,
+						...(approval.preview ? { preview: approval.preview } : {}),
+					},
 					supersededResumeStateKeys: collectSupersededPipelineResumeStateKeys(
 						params.previousStateKey,
 						params.previousState,
@@ -186,6 +194,13 @@ export async function finalizePipelineToolRun(params: {
 					resumeMode,
 					inputSchema: inputRequest.responseSchema,
 					prompt: inputRequest.prompt,
+					wait: {
+						kind: "input",
+						prompt: inputRequest.prompt,
+						responseSchema: inputRequest.responseSchema,
+						...(inputRequest.defaults !== undefined ? { defaults: inputRequest.defaults } : {}),
+						...(inputRequest.subject !== undefined ? { subject: inputRequest.subject } : {}),
+					},
 					...(inputRequest.commandInput ? { commandInput: inputRequest.commandInput } : null),
 					supersededResumeStateKeys: collectSupersededPipelineResumeStateKeys(
 						params.previousStateKey,

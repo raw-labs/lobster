@@ -3,7 +3,9 @@ import { Writable } from "node:stream";
 import { createDefaultRegistry } from "../commands/registry.js";
 import { parsePipeline } from "../parser.js";
 import { runtimeErrorDetails } from "../persistence/backend.js";
-import { recorderFromEnv } from "../persistence/context.js";
+import { recorderFromEnv, bindResumeGuard, sessionFromEnv } from "../persistence/context.js";
+import { resolveWait, callerId } from "../persistence/waits.js";
+import { encodeToken } from "../token.js";
 import { withExecution, withStoreContext } from "../persistence/execution.js";
 import type { StoreSession } from "../persistence/session.js";
 import {
@@ -11,7 +13,7 @@ import {
 	loadPipelineResumeState,
 	validatePipelineInputResponse,
 } from "../pipeline_resume_state.js";
-import { decodeResumeToken, resolveApprovalId } from "../resume.js";
+import { decodeResumeToken, resolveApprovalId, kindFromStateKey } from "../resume.js";
 import { runPipeline } from "../runtime.js";
 import {
 	deleteStateJsonWithBoundedResumeCleanup,
@@ -32,6 +34,7 @@ export type ToolRunContext = {
 	_resumeSignalAborted?: boolean;
 	storeSession?: StoreSession;
 	history?: boolean;
+	trackRuns?: boolean;
 	runMetadata?: { hostRunId?: string; hostTaskId?: string; callerId?: string };
 	cwd?: string;
 	env?: Record<string, string | undefined>;
@@ -45,7 +48,7 @@ export type ToolRunContext = {
 	llmAdapters?: Record<string, any>;
 };
 
-type ToolEnvelope = {
+export type ToolEnvelope = {
 	protocolVersion: 1;
 	runId?: string;
 	ok: boolean;
@@ -184,29 +187,89 @@ async function runToolRequestInternal({
 	}
 }
 
-export async function resumeToolRequest(
-	options: Parameters<typeof resumeToolRequestInternal>[0],
-): Promise<ToolEnvelope> {
+export type ResumeToolOptions = Parameters<typeof resumeToolRequestInternal>[0] & {
+	waitId?: string;
+	expectedRevision?: number;
+};
+
+export async function resumeToolRequest(options: ResumeToolOptions): Promise<ToolEnvelope> {
 	const entry = createToolContext(options.ctx);
 	entry._resumeSignalAborted = entry.signal?.aborted === true;
+	if (options.waitId !== undefined) entry.trackRuns = true;
 	try {
 		return await withStoreContext(entry, async (ctx) => {
+			let resolved = options;
+			if (options.waitId !== undefined) {
+				if (options.token || options.approvalId || options.expectedRevision === undefined) {
+					return errorEnvelope(
+						"parse_error",
+						"waitId requires expectedRevision and cannot be combined with token or approvalId",
+					);
+				}
+				const decisions =
+					Number(typeof options.approved === "boolean") +
+					Number(options.response !== undefined) +
+					Number(options.cancel === true);
+				if (
+					decisions !== 1 ||
+					!Number.isSafeInteger(options.expectedRevision) ||
+					options.expectedRevision < 0
+				) {
+					return errorEnvelope(
+						"parse_error",
+						"wait resume requires a non-negative revision and exactly one of approved, response, or cancel",
+					);
+				}
+				const store = sessionFromEnv(ctx.env);
+				if (!store) throw new Error("Wait resume requires a persistence session");
+				const wait = await resolveWait(
+					store,
+					options.waitId,
+					options.expectedRevision,
+					callerId(ctx.runMetadata),
+				);
+				if (wait.key.startsWith("sdk_resume_")) {
+					return errorEnvelope(
+						"parse_error",
+						"SDK waits require Lobster.resumeWait on an instance with the original stages",
+					);
+				}
+				ctx = {
+					...ctx,
+					env: bindResumeGuard(ctx.env, {
+						key: wait.key,
+						expectedRevision: options.expectedRevision,
+						admitted: false,
+					}),
+				};
+				resolved = {
+					...options,
+					token: encodeToken({
+						protocolVersion: 1,
+						v: 1,
+						kind: kindFromStateKey(wait.key),
+						stateKey: wait.key,
+					}),
+				};
+			} else if (options.expectedRevision !== undefined) {
+				return errorEnvelope("parse_error", "expectedRevision requires waitId");
+			}
 			let key: string | undefined;
 			try {
-				const payload = options.token
-					? decodeResumeToken(options.token)
-					: options.approvalId
-						? decodeResumeToken(await resolveApprovalId(options.approvalId, ctx.env))
+				const payload = resolved.token
+					? decodeResumeToken(resolved.token)
+					: resolved.approvalId
+						? decodeResumeToken(await resolveApprovalId(resolved.approvalId, ctx.env))
 						: undefined;
 				key = payload?.stateKey;
 			} catch {
 				/* normal parser reports the error */
 			}
 			if (!key) {
-				return resumeToolRequestInternal({ ...options, ctx });
+				return resumeToolRequestInternal({ ...resolved, ctx });
 			}
 			return withExecution({ ...ctx, _decision: options }, "resume", key, (runtime) =>
-				resumeToolRequestInternal({ ...options, ctx: runtime }),
+				resumeToolRequestInternal({ ...resolved, ctx: runtime }),
 			);
 		});
 	} catch (error) {
@@ -542,6 +605,7 @@ export function createToolContext(ctx: ToolRunContext = {}) {
 		llmAdapters: ctx.llmAdapters,
 		storeSession: ctx.storeSession,
 		history: ctx.history,
+		trackRuns: ctx.trackRuns,
 		runMetadata: ctx.runMetadata,
 		_resumeSignalAborted: ctx._resumeSignalAborted,
 	};
