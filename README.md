@@ -133,6 +133,18 @@ inspectable through `getRun`.
 
 `expectedRevision` refers to the **wait**, not the run's history revision. It is
 checked again in the same transaction as checkpoint consumption or cancellation.
+
+When a tracked run reaches another pause, Lobster retires the previous checkpoint
+and publishes the next one, its history event, and an operation receipt in one
+commit. Competing answers cannot create two pending successors. A crash before
+that commit preserves the previous checkpoint; a crash after it preserves the
+next one. Cancellation after publication does not undo the committed handoff.
+Lost handoff replies are reconciled against the receipt before reporting success;
+an unreadable receipt leaves the outcome explicitly unknown. Steps that already
+claimed a checkpoint before an unsafe operation remain subject to the execution
+recovery limits below. Untracked legacy JSON checkpoints keep their existing
+publication behavior.
+
 Invalid answers remain correctable; changed, consumed, or foreign waits return
 `wait_conflict`. The old token and approval-ID paths continue to use the same
 single-consumption mechanism. Host admission for those legacy bearer paths is

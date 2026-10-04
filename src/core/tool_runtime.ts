@@ -546,6 +546,7 @@ async function resumeToolRequestInternal({
 			previousStateKey: payload.stateKey,
 			previousState: resumeState,
 			previousStateConsumed: pipelineExecutionStarted,
+			previousStateClaimId: pipelineResumeStateClaimId,
 			restorePreviousStateOnAbort: !pipelineExecutionStarted,
 			onPreviousStateRestored: () => {
 				pipelineResumeStateRestored = true;

@@ -50,6 +50,7 @@ export type RunEvent = {
 		id?: string;
 		path?: string;
 		key?: string;
+		previousKey?: string;
 		status?: AttemptStatus | RunStatus | WaitRecord["status"];
 		summary?: unknown;
 		fingerprint?: string;
@@ -77,12 +78,22 @@ export type RunRecord = {
 	receipts: Record<string, OperationReceipt>;
 };
 
+export type CheckpointGuard =
+	| { key: string; status: "pending"; fingerprint: string; expectedWaitRevision?: number }
+	| { key: string; status: "consumed"; claimId: string };
+
 export type RunAction =
 	| { kind: "create"; run: RunRecord }
 	| { kind: "definition"; fingerprint: string }
 	| { kind: "start"; attempt: Attempt }
 	| { kind: "finish"; id: string; status: AttemptStatus; summary?: unknown }
 	| { kind: "settle"; status: RunStatus; summary?: unknown }
+	| {
+			kind: "handoff";
+			predecessor: CheckpointGuard;
+			successor: { key: string; text: string };
+			decision?: unknown;
+	  }
 	| {
 			kind: "state";
 			key: string;
@@ -167,7 +178,7 @@ export function capture(value: unknown): unknown {
 export function applyTransition(
 	current: RunRecord | null,
 	request: Transition,
-	projection: { previousAttempts?: number } = {},
+	projection: { previousAttempts?: number; successorExists?: boolean } = {},
 ): TransitionApplication {
 	if (
 		!/^[a-zA-Z0-9._-]{1,128}$/.test(request.operationId) ||
@@ -211,6 +222,28 @@ export function applyTransition(
 			return { status: "conflict", revision: current?.revision ?? 0, run: current };
 		}
 	}
+	if (action.kind === "handoff") {
+		const { predecessor, successor } = action;
+		if (predecessor.key === successor.key || !/^[a-z0-9._-]+$/.test(successor.key)) {
+			throw new Error("Invalid successor checkpoint key");
+		}
+		if (
+			projection.successorExists ||
+			Object.hasOwn(current?.states ?? {}, successor.key) ||
+			!matchesCheckpoint(current, predecessor)
+		) {
+			return { status: "conflict", revision: current?.revision ?? 0, run: current };
+		}
+		const value = JSON.parse(successor.text);
+		if (
+			!value ||
+			typeof value !== "object" ||
+			Array.isArray(value) ||
+			value.type === "lobster.consumed-resume-state.v1"
+		) {
+			throw new Error("Invalid successor checkpoint");
+		}
+	}
 	if (action.kind === "create" && current) {
 		throw new Error("Run already exists");
 	}
@@ -249,37 +282,14 @@ export function applyTransition(
 		// A stale/rejected resume must never settle another caller's run.
 		run.status = action.status;
 		payload = { status: action.status, summary: capture(action.summary) };
+	} else if (action.kind === "handoff") {
+		const previousKey = action.predecessor.key;
+		setCheckpoint(run, previousKey, null, action.decision);
+		setCheckpoint(run, action.successor.key, action.successor.text);
+		payload = { key: action.successor.key, previousKey, status: "pending" };
 	} else if (action.kind === "state") {
 		const previous = run.states[action.key];
-		run.states[action.key] = action.text;
-		if (action.text === null) {
-			if (run.waits[action.key]) {
-				run.waits[action.key].status = "retired";
-			}
-		} else {
-			const value = JSON.parse(action.text);
-			if (value?.type === "lobster.consumed-resume-state.v1") {
-				run.waits[action.key] ??= { kind: "legacy", status: "pending" };
-				Object.assign(run.waits[action.key], { status: "consumed", claimId: value.claimId });
-				run.status = "running";
-			} else {
-				run.waits[action.key] = {
-					status: "pending",
-					kind:
-						value.haltType ??
-						(value.inputStepId ||
-						value.inputSchema !== undefined ||
-						value.payload?.inputSchema !== undefined
-							? "input_request"
-							: "approval_request"),
-				};
-				run.status = "waiting";
-			}
-		}
-		if (run.waits[action.key]) run.waits[action.key].revision = run.revision + 1;
-		if (run.waits[action.key] && action.decision !== undefined) {
-			run.waits[action.key].decision = action.decision;
-		}
+		setCheckpoint(run, action.key, action.text, action.decision);
 		payload = {
 			key: action.key,
 			status: run.waits[action.key]?.status,
@@ -301,6 +311,54 @@ export function applyTransition(
 		acknowledged: false,
 	};
 	return { status: "committed", revision: run.revision, run };
+}
+
+function matchesCheckpoint(run: RunRecord | null, guard: CheckpointGuard): boolean {
+	const text = run?.states[guard.key];
+	const wait = run?.waits[guard.key];
+	if (!text || wait?.status !== guard.status) return false;
+
+	if (guard.status === "consumed") {
+		return wait.claimId === guard.claimId && JSON.parse(text).claimId === guard.claimId;
+	}
+	if (guard.expectedWaitRevision !== undefined) {
+		if (!Number.isSafeInteger(guard.expectedWaitRevision) || guard.expectedWaitRevision < 0) {
+			throw new Error("Invalid expected wait revision");
+		}
+		if ((wait.revision ?? 0) !== guard.expectedWaitRevision) return false;
+	}
+	return fingerprint(JSON.parse(text)) === guard.fingerprint;
+}
+
+function setCheckpoint(run: RunRecord, key: string, text: string | null, decision?: unknown): void {
+	run.states[key] = text;
+	if (text === null) {
+		if (run.waits[key]) run.waits[key].status = "retired";
+	} else {
+		const value = JSON.parse(text);
+		if (value?.type === "lobster.consumed-resume-state.v1") {
+			run.waits[key] ??= { kind: "legacy", status: "pending" };
+			Object.assign(run.waits[key], { status: "consumed", claimId: value.claimId });
+			run.status = "running";
+		} else {
+			run.waits[key] = {
+				status: "pending",
+				kind:
+					value.haltType ??
+					(value.inputStepId ||
+					value.inputSchema !== undefined ||
+					value.payload?.inputSchema !== undefined
+						? "input_request"
+						: "approval_request"),
+			};
+			run.status = "waiting";
+		}
+	}
+	const wait = run.waits[key];
+	if (wait) {
+		wait.revision = run.revision + 1;
+		if (decision !== undefined) wait.decision = decision;
+	}
 }
 
 export function validateArchive(value: unknown): asserts value is LogicalArchive {
@@ -441,7 +499,7 @@ export function historyPage(run: RunRecord, afterSequence: number, limit: number
 	} = run;
 	const page = events.filter((event) => event.sequence > afterSequence).slice(0, limit);
 	const ids = new Set(page.map((event) => event.payload?.id));
-	const keys = new Set(page.map((event) => event.payload?.key));
+	const keys = new Set(page.flatMap((event) => [event.payload?.key, event.payload?.previousKey]));
 	return {
 		...metadata,
 		definitions: definitions.slice(-32),

@@ -192,6 +192,7 @@ function saveRun(run: RunRecord): void {
 function transition(request: Transition): TransitionResult {
 	const current = metadata(request.runId);
 	let previousAttempts: number | undefined;
+	let successorExists = false;
 	if (current) {
 		const receipt = prepare("SELECT record FROM receipts WHERE run_id=? AND operation_id=?").get(
 			current.id,
@@ -218,8 +219,13 @@ function transition(request: Transition): TransitionResult {
 				current.attempts = [JSON.parse(row.record) as Attempt];
 			}
 		}
-		if (request.action.kind === "state") {
-			const key = request.action.key;
+		const keys =
+			request.action.kind === "state"
+				? [request.action.key]
+				: request.action.kind === "handoff"
+					? [request.action.predecessor.key, request.action.successor.key]
+					: [];
+		for (const key of keys) {
 			const state = prepare("SELECT text FROM state WHERE run_id=? AND key=?").get(
 				current.id,
 				key,
@@ -237,7 +243,12 @@ function transition(request: Transition): TransitionResult {
 		}
 	}
 
-	const applied = applyTransition(current, request, { previousAttempts });
+	if (request.action.kind === "handoff") {
+		successorExists = Boolean(
+			prepare("SELECT key FROM state WHERE key=?").get(request.action.successor.key),
+		);
+	}
+	const applied = applyTransition(current, request, { previousAttempts, successorExists });
 	if (applied.status === "committed" && applied.run !== current) {
 		saveRun(applied.run);
 	}
@@ -378,13 +389,14 @@ function handle(request: WorkerRequest): WorkerResult<WorkerMethod> {
 							run.attempts.push(JSON.parse(row.record) as Attempt);
 						}
 					}
-					if (payload?.key) {
+					for (const key of [payload?.key, payload?.previousKey]) {
+						if (!key) continue;
 						const row = prepare("SELECT record FROM waits WHERE run_id=? AND key=?").get(
 							args.id,
-							payload.key,
+							key,
 						) as RecordRow | undefined;
 						if (row) {
-							run.waits[payload.key] = JSON.parse(row.record) as WaitRecord;
+							run.waits[key] = JSON.parse(row.record) as WaitRecord;
 						}
 					}
 				}

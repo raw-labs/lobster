@@ -1,4 +1,8 @@
 import type { WaitRequest } from "../persistence/waits.js";
+import {
+	publishTrackedCheckpoint,
+	type ContinuationPredecessor,
+} from "../persistence/continuations.js";
 import { randomUUID } from "node:crypto";
 import { promises as fsp } from "node:fs";
 import path from "node:path";
@@ -272,6 +276,16 @@ async function runWorkflowFileInternal({
 		: (resume ?? null);
 	let resumedExecutionStarted = false;
 	let resumeStateConsumed = false;
+	let resumeStateClaimId: string | undefined;
+	const publishResumeState = (state: WorkflowResumeState) =>
+		publishWorkflowResumeState(
+			ctx.env,
+			state,
+			ctx.signal,
+			consumedResumeStateKey
+				? { key: consumedResumeStateKey, state: resumeState, claimId: resumeStateClaimId }
+				: undefined,
+		);
 	let executionBoundaryStarted = false;
 	const executionSignalListeners: Array<{ signal: AbortSignal; onAbort: () => void }> = [];
 	let executionStart: Promise<void> | undefined;
@@ -300,6 +314,7 @@ async function runWorkflowFileInternal({
 					signal?.throwIfAborted();
 				}
 				signal?.throwIfAborted();
+				resumeStateClaimId = consumption.claimId;
 				resumeStateConsumed = true;
 				resumedExecutionStarted = true;
 			}
@@ -551,45 +566,38 @@ async function runWorkflowFileInternal({
 					const untrackedRequest = recorderFromEnv(ctx.env)
 						? undefined
 						: buildNeedsInputRequest(requestOptions);
-					let checkpointPublished = false;
 					let stateKey: string | undefined;
 					try {
-						stateKey = await saveWorkflowResumeState(
-							ctx.env,
-							{
-								filePath: resolvedFilePath,
-								resumeAtIndex: idx + 1,
-								steps: results,
-								args: resolvedArgs,
-								inputStepId: step.id,
-								inputSchema: step.input.responseSchema,
-								wait: {
-									kind: "input",
-									prompt: step.input.prompt,
-									responseSchema: step.input.responseSchema,
-									...(step.input.defaults !== undefined ? { defaults: step.input.defaults } : {}),
-									subject,
-								},
-								// Preserve the full resolved subject for resume semantics; the tool
-								// envelope may contain a truncated preview to stay within size limits.
-								inputSubject: subject,
-								...(costTracker.hasUsage() ? { cost: costTracker.getSummary() } : null),
-								...(llmSpendLedger.outstanding().length
-									? { llmSpend: llmSpendLedger.outstanding() }
-									: null),
-								...(llmSpendLedger.settled().length
-									? { llmBilled: llmSpendLedger.settled() }
-									: null),
-								supersededResumeStateKeys: collectSupersededWorkflowResumeStateKeys(
-									consumedResumeStateKey,
-									resumeState,
-								),
-								createdAt: new Date().toISOString(),
+						stateKey = await publishResumeState({
+							filePath: resolvedFilePath,
+							resumeAtIndex: idx + 1,
+							steps: results,
+							args: resolvedArgs,
+							inputStepId: step.id,
+							inputSchema: step.input.responseSchema,
+							wait: {
+								kind: "input",
+								prompt: step.input.prompt,
+								responseSchema: step.input.responseSchema,
+								...(step.input.defaults !== undefined ? { defaults: step.input.defaults } : {}),
+								subject,
 							},
-							ctx.signal,
-						);
+							// Preserve the full resolved subject for resume semantics; the tool
+							// envelope may contain a truncated preview to stay within size limits.
+							inputSubject: subject,
+							...(costTracker.hasUsage() ? { cost: costTracker.getSummary() } : null),
+							...(llmSpendLedger.outstanding().length
+								? { llmSpend: llmSpendLedger.outstanding() }
+								: null),
+							...(llmSpendLedger.settled().length ? { llmBilled: llmSpendLedger.settled() } : null),
+							supersededResumeStateKeys: collectSupersededWorkflowResumeStateKeys(
+								consumedResumeStateKey,
+								resumeState,
+							),
+							createdAt: new Date().toISOString(),
+						});
 
-						const replaced = await replaceWorkflowResumeState({
+						const replaced = await retireLegacyWorkflowCheckpoint({
 							env: ctx.env,
 							previousStateKey: consumedResumeStateKey,
 							expectedPreviousState: resumeState,
@@ -601,7 +609,6 @@ async function runWorkflowFileInternal({
 							throw new Error("Workflow resume state not found");
 						}
 
-						checkpointPublished = true;
 						const inputRequest = untrackedRequest ?? buildNeedsInputRequest(requestOptions);
 						const resumeToken = encodeToken({
 							protocolVersion: 1,
@@ -619,10 +626,7 @@ async function runWorkflowFileInternal({
 							},
 						};
 					} catch (err) {
-						if (
-							stateKey &&
-							(!checkpointPublished || !recorderFromEnv(ctx.env) || ctx.signal?.aborted)
-						) {
+						if (stateKey && !recorderFromEnv(ctx.env)) {
 							await discardWorkflowResumeState(ctx.env, stateKey);
 						}
 						throw err;
@@ -1266,45 +1270,38 @@ async function runWorkflowFileInternal({
 					const untrackedRequest = recorderFromEnv(ctx.env)
 						? undefined
 						: buildNeedsInputRequest(requestOptions);
-					let checkpointPublished = false;
 					let stateKey: string | undefined;
 					try {
-						stateKey = await saveWorkflowResumeState(
-							ctx.env,
-							{
-								filePath: resolvedFilePath,
-								resumeAtIndex: idx,
-								steps: results,
-								args: resolvedArgs,
-								inputStepId: err.stepId,
-								inputKind: "pipeline_command",
-								inputSchema: err.request.responseSchema,
-								wait: {
-									kind: "input",
-									prompt: err.request.prompt,
-									responseSchema: err.request.responseSchema,
-									...(err.request.defaults !== undefined ? { defaults: err.request.defaults } : {}),
-									...(err.request.subject !== undefined ? { subject: err.request.subject } : {}),
-								},
-								inputSubject: err.request.subject,
-								pipelineInput: err.pipelineInput,
-								...(costTracker.hasUsage() ? { cost: costTracker.getSummary() } : null),
-								...(llmSpendLedger.outstanding().length
-									? { llmSpend: llmSpendLedger.outstanding() }
-									: null),
-								...(llmSpendLedger.settled().length
-									? { llmBilled: llmSpendLedger.settled() }
-									: null),
-								supersededResumeStateKeys: collectSupersededWorkflowResumeStateKeys(
-									consumedResumeStateKey,
-									resumeState,
-								),
-								createdAt: new Date().toISOString(),
+						stateKey = await publishResumeState({
+							filePath: resolvedFilePath,
+							resumeAtIndex: idx,
+							steps: results,
+							args: resolvedArgs,
+							inputStepId: err.stepId,
+							inputKind: "pipeline_command",
+							inputSchema: err.request.responseSchema,
+							wait: {
+								kind: "input",
+								prompt: err.request.prompt,
+								responseSchema: err.request.responseSchema,
+								...(err.request.defaults !== undefined ? { defaults: err.request.defaults } : {}),
+								...(err.request.subject !== undefined ? { subject: err.request.subject } : {}),
 							},
-							ctx.signal,
-						);
+							inputSubject: err.request.subject,
+							pipelineInput: err.pipelineInput,
+							...(costTracker.hasUsage() ? { cost: costTracker.getSummary() } : null),
+							...(llmSpendLedger.outstanding().length
+								? { llmSpend: llmSpendLedger.outstanding() }
+								: null),
+							...(llmSpendLedger.settled().length ? { llmBilled: llmSpendLedger.settled() } : null),
+							supersededResumeStateKeys: collectSupersededWorkflowResumeStateKeys(
+								consumedResumeStateKey,
+								resumeState,
+							),
+							createdAt: new Date().toISOString(),
+						});
 
-						const replaced = await replaceWorkflowResumeState({
+						const replaced = await retireLegacyWorkflowCheckpoint({
 							env: ctx.env,
 							previousStateKey: consumedResumeStateKey,
 							expectedPreviousState: resumeState,
@@ -1316,7 +1313,6 @@ async function runWorkflowFileInternal({
 							throw new Error("Workflow resume state not found");
 						}
 
-						checkpointPublished = true;
 						const inputRequest = untrackedRequest ?? buildNeedsInputRequest(requestOptions);
 						const resumeToken = encodeToken({
 							protocolVersion: 1,
@@ -1334,10 +1330,7 @@ async function runWorkflowFileInternal({
 							},
 						};
 					} catch (stateError) {
-						if (
-							stateKey &&
-							(!checkpointPublished || !recorderFromEnv(ctx.env) || ctx.signal?.aborted)
-						) {
+						if (stateKey && !recorderFromEnv(ctx.env)) {
 							await discardWorkflowResumeState(ctx.env, stateKey);
 						}
 						throw stateError;
@@ -1423,40 +1416,34 @@ async function runWorkflowFileInternal({
 				if (ctx.mode === "tool" || !isInteractive(ctx.stdin)) {
 					let stateKey: string | undefined;
 					try {
-						stateKey = await saveWorkflowResumeState(
-							ctx.env,
-							{
-								filePath: resolvedFilePath,
-								resumeAtIndex: idx + 1,
-								steps: results,
-								args: resolvedArgs,
-								approvalStepId: step.id,
-								approvalIdentity,
-								wait: {
-									kind: "approval",
-									prompt: approval.prompt,
-									items: approval.items,
-									...(approval.preview ? { preview: approval.preview } : {}),
-								},
-								...(costTracker.hasUsage() ? { cost: costTracker.getSummary() } : null),
-								...(llmSpendLedger.outstanding().length
-									? { llmSpend: llmSpendLedger.outstanding() }
-									: null),
-								...(llmSpendLedger.settled().length
-									? { llmBilled: llmSpendLedger.settled() }
-									: null),
-								supersededResumeStateKeys: collectSupersededWorkflowResumeStateKeys(
-									consumedResumeStateKey,
-									resumeState,
-								),
-								createdAt: new Date().toISOString(),
+						stateKey = await publishResumeState({
+							filePath: resolvedFilePath,
+							resumeAtIndex: idx + 1,
+							steps: results,
+							args: resolvedArgs,
+							approvalStepId: step.id,
+							approvalIdentity,
+							wait: {
+								kind: "approval",
+								prompt: approval.prompt,
+								items: approval.items,
+								...(approval.preview ? { preview: approval.preview } : {}),
 							},
-							ctx.signal,
-						);
+							...(costTracker.hasUsage() ? { cost: costTracker.getSummary() } : null),
+							...(llmSpendLedger.outstanding().length
+								? { llmSpend: llmSpendLedger.outstanding() }
+								: null),
+							...(llmSpendLedger.settled().length ? { llmBilled: llmSpendLedger.settled() } : null),
+							supersededResumeStateKeys: collectSupersededWorkflowResumeStateKeys(
+								consumedResumeStateKey,
+								resumeState,
+							),
+							createdAt: new Date().toISOString(),
+						});
 
 						const approvalId = await createApprovalIndex({ env: ctx.env, stateKey });
-						ctx.signal?.throwIfAborted();
-						const replaced = await replaceWorkflowResumeState({
+						if (!recorderFromEnv(ctx.env)) ctx.signal?.throwIfAborted();
+						const replaced = await retireLegacyWorkflowCheckpoint({
 							env: ctx.env,
 							previousStateKey: consumedResumeStateKey,
 							expectedPreviousState: resumeState,
@@ -1485,7 +1472,8 @@ async function runWorkflowFileInternal({
 							},
 						};
 					} catch (err) {
-						if (stateKey) await discardWorkflowResumeState(ctx.env, stateKey);
+						if (stateKey && !recorderFromEnv(ctx.env))
+							await discardWorkflowResumeState(ctx.env, stateKey);
 						throw err;
 					}
 				}
@@ -1602,12 +1590,17 @@ export function decodeWorkflowResumePayload(payload: unknown): WorkflowResumePay
 	return data as WorkflowResumePayload;
 }
 
-async function saveWorkflowResumeState(
+async function publishWorkflowResumeState(
 	env: Record<string, string | undefined>,
 	state: WorkflowResumeState,
 	signal?: AbortSignal,
+	predecessor?: ContinuationPredecessor,
 ) {
 	const stateKey = `workflow_resume_${randomUUID()}`;
+	if (recorderFromEnv(env)) {
+		await publishTrackedCheckpoint({ env, key: stateKey, state, predecessor, signal });
+		return stateKey;
+	}
 	try {
 		signal?.throwIfAborted();
 		await writeStateJson({ env, key: stateKey, value: state, signal });
@@ -1619,7 +1612,7 @@ async function saveWorkflowResumeState(
 	}
 }
 
-async function replaceWorkflowResumeState({
+async function retireLegacyWorkflowCheckpoint({
 	env,
 	previousStateKey,
 	expectedPreviousState,
@@ -1634,6 +1627,7 @@ async function replaceWorkflowResumeState({
 	replacementStateKey: string;
 	signal?: AbortSignal;
 }) {
+	if (recorderFromEnv(env)) return true;
 	if (!previousStateKey || previousStateKey === replacementStateKey) {
 		signal?.throwIfAborted();
 		return true;
@@ -1657,9 +1651,8 @@ async function replaceWorkflowResumeState({
 		});
 		if (!consumption.consumed) return false;
 		claimId = consumption.claimId;
-		// Keep the consumed marker until terminal cleanup. It is the atomic
-		// predecessor-to-successor handoff and prevents another resume from
-		// creating a competing successor after this call returns.
+		// Legacy checkpoints occupy separate files. Keep this consumed marker
+		// until terminal cleanup so later callers cannot reuse the old token.
 		signal?.throwIfAborted();
 		await cleanupApprovalIndexByStateKey({ env, stateKey: previousStateKey }).catch(() => {});
 		return true;

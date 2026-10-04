@@ -138,7 +138,10 @@ export async function withExecution<C extends ExecutionContext, T>(
 			const result = await task(bound);
 			const outcome =
 				result && typeof result === "object" ? (result as ExecutionOutcome) : undefined;
-			const run = await session.getRunState(recorder.runId);
+			const run =
+				outcome?.error?.type === "persistence_outcome_unknown"
+					? null
+					: await session.getRunState(recorder.runId);
 			const pending = Object.values(run?.waits ?? {}).some((wait) => wait.status === "pending");
 			const ownsExecution = !resumeKey || recorder.ownsExecution;
 

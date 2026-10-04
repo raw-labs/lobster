@@ -1,4 +1,5 @@
 import type { WaitRequest } from "./persistence/waits.js";
+import { publishTrackedCheckpoint } from "./persistence/continuations.js";
 import { randomUUID } from "node:crypto";
 import { validateCommandInputState, type CommandInputState } from "./input_request.js";
 import { recorderFromEnv } from "./persistence/context.js";
@@ -108,6 +109,7 @@ export async function finalizePipelineToolRun(params: {
 	previousStateKey?: string;
 	previousState?: PipelineResumeState;
 	previousStateConsumed?: boolean;
+	previousStateClaimId?: string;
 	restorePreviousStateOnAbort?: boolean;
 	onPreviousStateRestored?: () => void;
 	signal?: AbortSignal;
@@ -117,7 +119,7 @@ export async function finalizePipelineToolRun(params: {
 	if (approval) {
 		let nextStateKey: string | undefined;
 		try {
-			nextStateKey = await savePipelineResumeState(
+			nextStateKey = await publishPipelineResumeState(
 				params.env,
 				{
 					pipeline: params.pipeline,
@@ -137,11 +139,10 @@ export async function finalizePipelineToolRun(params: {
 					),
 					createdAt: new Date().toISOString(),
 				},
-				params.signal,
+				params,
 			);
-			let approvalId: string | null;
-			approvalId = await createApprovalIndex({ env: params.env, stateKey: nextStateKey });
-			const replaced = await replacePipelineResumeState({
+			const approvalId = await createApprovalIndex({ env: params.env, stateKey: nextStateKey });
+			const replaced = await retireLegacyPipelineCheckpoint({
 				env: params.env,
 				previousStateKey: params.previousStateKey,
 				expectedPreviousState: params.previousState,
@@ -169,9 +170,11 @@ export async function finalizePipelineToolRun(params: {
 			};
 		} catch (err) {
 			try {
-				if (!params.previousStateConsumed) await restorePreviousPipelineResumeState(params);
+				if (!recorderFromEnv(params.env) && !params.previousStateConsumed)
+					await restorePreviousPipelineResumeState(params);
 			} finally {
-				if (nextStateKey) await discardPipelineResumeState(params.env, nextStateKey);
+				if (nextStateKey && !recorderFromEnv(params.env))
+					await discardPipelineResumeState(params.env, nextStateKey);
 			}
 			throw err;
 		}
@@ -181,7 +184,7 @@ export async function finalizePipelineToolRun(params: {
 		const resumeMode = inputRequest.commandInput ? "same_stage" : "next_stage";
 		let nextStateKey: string | undefined;
 		try {
-			nextStateKey = await savePipelineResumeState(
+			nextStateKey = await publishPipelineResumeState(
 				params.env,
 				{
 					pipeline: params.pipeline,
@@ -208,9 +211,9 @@ export async function finalizePipelineToolRun(params: {
 					),
 					createdAt: new Date().toISOString(),
 				},
-				params.signal,
+				params,
 			);
-			const replaced = await replacePipelineResumeState({
+			const replaced = await retireLegacyPipelineCheckpoint({
 				env: params.env,
 				previousStateKey: params.previousStateKey,
 				expectedPreviousState: params.previousState,
@@ -241,9 +244,11 @@ export async function finalizePipelineToolRun(params: {
 			};
 		} catch (err) {
 			try {
-				if (!params.previousStateConsumed) await restorePreviousPipelineResumeState(params);
+				if (!recorderFromEnv(params.env) && !params.previousStateConsumed)
+					await restorePreviousPipelineResumeState(params);
 			} finally {
-				if (nextStateKey) await discardPipelineResumeState(params.env, nextStateKey);
+				if (nextStateKey && !recorderFromEnv(params.env))
+					await discardPipelineResumeState(params.env, nextStateKey);
 			}
 			throw err;
 		}
@@ -273,7 +278,8 @@ export async function finalizePipelineToolRun(params: {
 				params.previousState?.supersededResumeStateKeys,
 			);
 		} catch (err) {
-			if (!params.previousStateConsumed) await restorePreviousPipelineResumeState(params);
+			if (!recorderFromEnv(params.env) && !params.previousStateConsumed)
+				await restorePreviousPipelineResumeState(params);
 			throw err;
 		}
 	}
@@ -283,6 +289,36 @@ export async function finalizePipelineToolRun(params: {
 		requiresApproval: null,
 		requiresInput: null,
 	};
+}
+
+async function publishPipelineResumeState(
+	env: Record<string, string | undefined>,
+	state: PipelineResumeState,
+	params: {
+		previousStateKey?: string;
+		previousState?: PipelineResumeState;
+		previousStateClaimId?: string;
+		signal?: AbortSignal;
+	},
+): Promise<string> {
+	const recorder = recorderFromEnv(env);
+	if (!recorder) return savePipelineResumeState(env, state, params.signal);
+
+	const key = `pipeline_resume_${randomUUID()}`;
+	await publishTrackedCheckpoint({
+		env,
+		key,
+		state: { ...state, historyOffset: recorder.pipelineOffset },
+		predecessor: params.previousStateKey
+			? {
+					key: params.previousStateKey,
+					state: params.previousState,
+					claimId: params.previousStateClaimId,
+				}
+			: undefined,
+		signal: params.signal,
+	});
+	return key;
 }
 
 export async function savePipelineResumeState(
@@ -310,7 +346,7 @@ export async function savePipelineResumeState(
 	}
 }
 
-async function replacePipelineResumeState({
+async function retireLegacyPipelineCheckpoint({
 	env,
 	previousStateKey,
 	expectedPreviousState,
@@ -325,6 +361,7 @@ async function replacePipelineResumeState({
 	replacementStateKey: string;
 	signal?: AbortSignal;
 }) {
+	if (recorderFromEnv(env)) return true;
 	if (!previousStateKey || previousStateKey === replacementStateKey) {
 		signal?.throwIfAborted();
 		return true;
@@ -400,7 +437,7 @@ async function retirePreviousPipelineApprovalIndex(
 	previousStateKey: string | undefined,
 	replacementStateKey: string,
 ) {
-	if (!previousStateKey || previousStateKey === replacementStateKey) return;
+	if (recorderFromEnv(env) || !previousStateKey || previousStateKey === replacementStateKey) return;
 	// This runs only after replacement deletion has passed its cancellation
 	// checkpoint. Do not add a later cancellation check: the transition is
 	// committed once the old approval capability is retired.

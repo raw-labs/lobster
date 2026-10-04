@@ -283,7 +283,23 @@ export class StoreSession {
 
 	async transition(request: Transition, signal?: AbortSignal): Promise<TransitionResult> {
 		return this.request(async () => {
-			const result = await this.backend.transition(request, signal);
+			let result: TransitionResult;
+			try {
+				result = await this.backend.transition(request, signal);
+			} catch (error) {
+				if (!(error instanceof PersistenceOutcomeUnknown) || request.action.kind !== "handoff")
+					throw error;
+				// Read without the cancelled signal: a dispatched commit may have succeeded.
+				let receipt: OperationReceipt | undefined;
+				try {
+					const run = await this.backend.getRun(request.runId);
+					receipt = run?.receipts[request.operationId];
+				} catch {
+					throw error;
+				}
+				if (!receipt || receipt.fingerprint !== fingerprint(request)) throw error;
+				result = { status: "committed", revision: receipt.revision };
+			}
 			if (result.status === "committed") {
 				await this.acknowledgeObserved(request.runId, request.operationId);
 			}
@@ -336,11 +352,11 @@ export class ExecutionRecorder {
 		);
 	}
 
-	async action(action: RunAction): Promise<TransitionResult> {
+	async action(action: RunAction, signal?: AbortSignal): Promise<TransitionResult> {
 		const operationId = randomUUID();
 		let result: TransitionResult;
 		try {
-			result = await this.session.transition({ operationId, runId: this.runId, action });
+			result = await this.session.transition({ operationId, runId: this.runId, action }, signal);
 		} catch (error) {
 			if (error instanceof PersistenceError) {
 				throw error;

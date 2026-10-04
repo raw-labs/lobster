@@ -2,13 +2,16 @@ import { randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import {
+	atomicWriteWasPublished,
 	ensureDirectory,
 	writeFileAtomic,
 	writeFileAtomicExclusive,
 } from "../state/atomic_file.js";
 import type { AtomicExclusiveWriteOptions, AtomicWriteOptions } from "../state/atomic_file.js";
 import { withFileLock } from "../state/file_lock.js";
+import { keyToPath } from "../state/paths.js";
 import {
+	PersistenceOutcomeUnknown,
 	WaitConflictError,
 	type Backend,
 	type StateWriteOptions,
@@ -239,20 +242,44 @@ export class FileBackend implements Backend {
 		if (this.readOnly) {
 			throw new Error("Persistence session is read-only");
 		}
-		return withFileLock({
-			filePath: this.runPath(request.runId),
-			signal,
-			task: async () => {
-				signal?.throwIfAborted();
-				const current = await this.getRun(request.runId);
-				const applied = applyTransition(current, request);
-				if (applied.status === "committed" && applied.run !== current) {
-					await writeFileAtomic(this.runPath(request.runId), JSON.stringify(applied.run) + "\n", {
-						signal,
+		const commit = () =>
+			withFileLock({
+				filePath: this.runPath(request.runId),
+				signal,
+				task: async () => {
+					signal?.throwIfAborted();
+					const current = await this.getRun(request.runId);
+					const successor =
+						request.action.kind === "handoff"
+							? await this.read(request.action.successor.key)
+							: undefined;
+					const applied = applyTransition(current, request, {
+						successorExists: successor?.runId !== undefined || successor?.text != null,
 					});
-				}
-				return { status: applied.status, revision: applied.revision };
-			},
+					if (applied.status === "committed" && applied.run !== current) {
+						try {
+							await writeFileAtomic(
+								this.runPath(request.runId),
+								JSON.stringify(applied.run) + "\n",
+								{ signal },
+							);
+						} catch (error) {
+							if (atomicWriteWasPublished(error)) {
+								throw new PersistenceOutcomeUnknown(request.operationId, error, request.runId);
+							}
+							throw error;
+						}
+					}
+					return { status: applied.status, revision: applied.revision };
+				},
+			});
+		if (request.action.kind !== "handoff") return commit();
+		// Reserve the fresh successor key before taking the run lock. State writers
+		// use the same key lock, so another run cannot acquire this checkpoint.
+		return withFileLock({
+			filePath: keyToPath(this.directory, request.action.successor.key),
+			signal,
+			task: commit,
 		});
 	}
 
