@@ -17,9 +17,32 @@
  * const result = await workflow.run();
  */
 
-export { Lobster } from "./Lobster.js";
+export { Lobster, type LobsterOptions } from "./Lobster.js";
 export { approve } from "./primitives/approve.js";
 export { exec } from "./primitives/exec.js";
 export { stateGet, stateSet, state } from "./primitives/state.js";
 export { diffLast } from "./primitives/diff.js";
 export { runPipeline } from "./runtime.js";
+
+export {
+	openStoreSession,
+	bindStoreSession,
+	type StoreSession,
+	type StoreOptions,
+} from "../persistence/session.js";
+export { migrateStore } from "../persistence/migrate.js";
+export {
+	PersistenceError,
+	PersistenceOutcomeUnknown,
+	WaitConflictError,
+} from "../persistence/backend.js";
+
+export { listRuns, getRun, getWait, type RunQuery, type RunPage } from "../core/runs.js";
+export type { RunView, WaitView, WaitSummary, WaitRequest } from "../persistence/waits.js";
+export type { RunStatus, RunSummary } from "../persistence/model.js";
+
+export {
+	listLegacyCheckpoints,
+	adoptLegacyCheckpoint,
+	type LegacyCheckpointPage,
+} from "../core/runs.js";

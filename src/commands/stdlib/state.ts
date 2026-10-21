@@ -1,7 +1,11 @@
-import { promises as fsp } from "node:fs";
-
-import { defaultStateDir, keyToPath, withFileLock, writeStateJson } from "../../state/store.js";
 import { carryLlmProvenance } from "../../core/llm_accounting.js";
+import {
+	defaultStateDir,
+	keyToPath,
+	withFileLock,
+	writeStateJson,
+	readStateText,
+} from "../../state/store.js";
 
 // What this process last wrote to each state file. A value read straight back is the same value
 // rebuilt from its own JSON, and the marks a command attached in-process are not in that JSON:
@@ -23,7 +27,10 @@ async function readRememberedState({ env, key, signal }) {
 	const filePath = keyToPath(defaultStateDir(env), key);
 	const read = async () => {
 		try {
-			const text = await fsp.readFile(filePath, "utf8");
+			const text = await readStateText({ env, key });
+			if (text === null) {
+				return null;
+			}
 			const value = JSON.parse(text);
 			const written = lastWritten.get(filePath);
 			if (written?.text === text) carryLlmProvenance(written.value, value);

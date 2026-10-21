@@ -1,10 +1,26 @@
-import { stateEnv } from "./state_env.js";
 import { randomUUID } from "node:crypto";
-import { runPipelineInternal } from "./runtime.js";
+import { validateCommandInputState, type CommandInputState } from "../input_request.js";
+import {
+	publishTrackedCheckpoint,
+	type ContinuationPredecessor,
+} from "../persistence/continuations.js";
+import { runtimeErrorDetails } from "../persistence/backend.js";
+import { recorderFromEnv, sessionFromEnv, bindResumeGuard } from "../persistence/context.js";
+import { withExecution, withStoreContext } from "../persistence/execution.js";
+import type { StoreSession } from "../persistence/session.js";
+import {
+	consumeResumeState,
+	restoreConsumedResumeState,
+	deleteUnconsumedResumeState,
+	deleteStateJson,
+	readStateJsonWithLock,
+	writeStateJson,
+} from "../state/store.js";
+import { resolveWait, callerId } from "../persistence/waits.js";
 import { encodeToken, decodeToken } from "../token.js";
 import { compileCached } from "../validation.js";
-import { validateCommandInputState, type CommandInputState } from "../input_request.js";
-import { deleteStateJson, readStateJsonWithLock, writeStateJson } from "../state/store.js";
+import { runPipelineInternal } from "./runtime.js";
+import { stateEnv } from "./state_env.js";
 
 type SdkResumePayload = {
 	protocolVersion: 1;
@@ -19,6 +35,19 @@ type SdkResumePayload = {
 	stateKey?: string;
 };
 
+type SdkPauseResult = {
+	status?: string;
+	requiresApproval?: { resumeToken: string } | null;
+	requiresInput?: { resumeToken: string } | null;
+};
+
+type SdkTrackedResumePayload = {
+	protocolVersion: 1;
+	v: 2;
+	kind: "sdk-tracked";
+	stateKey: string;
+};
+
 type SdkCommandInputResumeState = {
 	resumeAtIndex: number;
 	items: unknown[];
@@ -28,6 +57,10 @@ type SdkCommandInputResumeState = {
 };
 
 export type LobsterOptions = {
+	storeSession?: StoreSession;
+	history?: boolean;
+	trackRuns?: boolean;
+	runMetadata?: { callerId?: string; hostRunId?: string; hostTaskId?: string };
 	env?: NodeJS.ProcessEnv;
 	stateDir?: string;
 	signal?: AbortSignal;
@@ -36,10 +69,16 @@ export type LobsterOptions = {
 export class Lobster {
 	#stages = [];
 	#options: LobsterOptions;
+	#onExecutionStart?: () => Promise<void>;
 	#meta = null;
+	#commandInputCheckpoint?: { key: string; state: SdkCommandInputResumeState };
 
 	constructor(options: LobsterOptions = {}) {
 		this.#options = {
+			storeSession: options.storeSession,
+			history: options.history,
+			trackRuns: options.trackRuns,
+			runMetadata: options.runMetadata,
 			env: options.env ?? process.env,
 			stateDir: options.stateDir,
 			signal: options.signal,
@@ -64,7 +103,32 @@ export class Lobster {
 	}
 
 	async run(initialInput = []) {
-		return this.#runStages(this.#stages, initialInput);
+		return withExecution(
+			{ ...this.#options, env: stateEnv(this.#options) },
+			"sdk",
+			undefined,
+			async (ctx) => {
+				const instance = new Lobster({
+					...this.#options,
+					env: ctx.env,
+					storeSession: sessionFromEnv(ctx.env),
+				});
+				instance.#stages = this.#stages;
+				const result = await instance.#runStages(instance.#stages, initialInput);
+				return instance.#trackPause(result);
+			},
+		).catch((err) => {
+			const error = runtimeErrorDetails(err);
+			return {
+				ok: false,
+				status: "error",
+				runId: error.runId,
+				output: [],
+				requiresApproval: null,
+				requiresInput: null,
+				error,
+			};
+		});
 	}
 
 	async #runStages(
@@ -75,12 +139,17 @@ export class Lobster {
 		fallbackIndex = -1,
 	) {
 		const ctx = {
-			env: this.#options.env,
+			env: stateEnv(this.#options),
+			_onExecutionStart: this.#onExecutionStart,
 			stateDir: this.#options.stateDir,
 			mode: "sdk",
 			signal: this.#options.signal,
 		};
 
+		const recorder = recorderFromEnv(ctx.env);
+		if (recorder) {
+			recorder.pipelineOffset = stageOffset;
+		}
 		try {
 			const result = await runPipelineInternal({
 				stages,
@@ -124,16 +193,22 @@ export class Lobster {
 					resumeMode === "same_stage"
 						? stageOffset + (result.haltedAt?.index ?? fallbackIndex)
 						: stageOffset + (result.haltedAt?.index ?? fallbackIndex) + 1;
-				const stateKey =
-					resumeMode === "same_stage"
-						? await saveSdkCommandInputResumeState(this.#options, {
-								resumeAtIndex,
-								items: input.items ?? [],
-								inputSchema: input.responseSchema,
-								...(input.subject !== undefined ? { inputSubject: input.subject } : null),
-								commandInput: input.commandInput,
-							})
-						: undefined;
+				let stateKey: string | undefined;
+				if (resumeMode === "same_stage") {
+					const state: SdkCommandInputResumeState = {
+						resumeAtIndex,
+						items: input.items ?? [],
+						inputSchema: input.responseSchema,
+						...(input.subject !== undefined ? { inputSubject: input.subject } : {}),
+						commandInput: input.commandInput,
+					};
+					if (recorder) {
+						stateKey = `sdk_resume_${randomUUID()}`;
+						this.#commandInputCheckpoint = { key: stateKey, state };
+					} else {
+						stateKey = await saveSdkCommandInputResumeState(this.#options, state);
+					}
+				}
 				const resumeToken = encodeToken({
 					protocolVersion: 1,
 					v: 1,
@@ -175,10 +250,7 @@ export class Lobster {
 				output: [],
 				requiresApproval: null,
 				requiresInput: null,
-				error: {
-					type: "runtime_error",
-					message: err?.message ?? String(err),
-				},
+				error: runtimeErrorDetails(err),
 			};
 		}
 	}
@@ -187,6 +259,10 @@ export class Lobster {
 		token: string,
 		options: { approved?: boolean; response?: unknown; cancel?: boolean } = {},
 	) {
+		const decoded = decodeToken(token) as SdkResumePayload | SdkTrackedResumePayload;
+		if (decoded?.v === 2 && decoded.kind === "sdk-tracked") {
+			return this.#resumeTracked(decoded.stateKey, options);
+		}
 		const { approved, response, cancel } = options;
 		const intentCount =
 			Number(typeof approved === "boolean") +
@@ -204,10 +280,17 @@ export class Lobster {
 		let sdkCommandInputState: SdkCommandInputResumeState | undefined;
 		if (payload.resumeMode === "same_stage") {
 			sdkCommandInputState = await loadSdkCommandInputResumeState(this.#options, payload.stateKey!);
+			if (
+				!this.#onExecutionStart &&
+				"type" in sdkCommandInputState &&
+				sdkCommandInputState.type === "lobster.sdk-tracked.v1"
+			) {
+				return this.#resumeTracked(payload.stateKey!, options);
+			}
 		}
 
 		if (cancel === true) {
-			if (payload.resumeMode === "same_stage") {
+			if (payload.resumeMode === "same_stage" && !this.#onExecutionStart) {
 				await deleteStateJson({ env: stateEnv(this.#options), key: payload.stateKey! });
 			}
 			return {
@@ -272,7 +355,9 @@ export class Lobster {
 					state: sdkCommandInputState!.commandInput,
 					response,
 					onConsumed: async () => {
-						await deleteStateJson({ env: stateEnv(this.#options), key: payload.stateKey! });
+						if (!this.#onExecutionStart) {
+							await deleteStateJson({ env: stateEnv(this.#options), key: payload.stateKey! });
+						}
 					},
 				};
 			} else {
@@ -282,6 +367,145 @@ export class Lobster {
 
 		const remainingStages = this.#stages.slice(resumeIndex);
 		return this.#runStages(remainingStages, resumeItems, requestInputResume, resumeIndex, 0);
+	}
+
+	async #trackPause<T extends SdkPauseResult>(
+		result: T,
+		predecessor?: ContinuationPredecessor,
+	): Promise<T> {
+		const env = stateEnv(this.#options);
+		if (!recorderFromEnv(env) || !["needs_approval", "needs_input"].includes(result.status)) {
+			return result;
+		}
+		const request = result.requiresApproval ?? result.requiresInput;
+		const payload = decodeSdkResumePayload(request.resumeToken);
+		const stateKey =
+			payload.resumeMode === "same_stage" ? payload.stateKey : `sdk_resume_${randomUUID()}`;
+		const commandState =
+			payload.resumeMode === "same_stage"
+				? (this.#commandInputCheckpoint?.state ??
+					(await readStateJsonWithLock({ env, key: stateKey })))
+				: {};
+		const { resumeToken: _token, ...question } = request;
+		await publishTrackedCheckpoint({
+			env,
+			key: stateKey,
+			predecessor,
+			signal: this.#options.signal,
+			state: {
+				...commandState,
+				type: "lobster.sdk-tracked.v1",
+				payload,
+				wait: { ...question, kind: result.requiresInput ? "input" : "approval" },
+			},
+		});
+		request.resumeToken = encodeToken({ protocolVersion: 1, v: 2, kind: "sdk-tracked", stateKey });
+		return result;
+	}
+
+	async resumeWait(options: {
+		waitId: string;
+		expectedRevision: number;
+		approved?: boolean;
+		response?: unknown;
+		cancel?: boolean;
+	}) {
+		return withStoreContext(
+			{ ...this.#options, env: stateEnv(this.#options), trackRuns: true },
+			async (ctx) => {
+				const store = sessionFromEnv(ctx.env);
+				if (!store) throw new Error("Wait resume requires a persistence session");
+				const wait = await resolveWait(
+					store,
+					options.waitId,
+					options.expectedRevision,
+					callerId(this.#options.runMetadata),
+				);
+				if (!wait.key.startsWith("sdk_resume_"))
+					throw new Error("This wait is not an SDK checkpoint");
+				const instance = new Lobster({
+					...this.#options,
+					storeSession: store,
+					env: bindResumeGuard(ctx.env, {
+						key: wait.key,
+						expectedRevision: options.expectedRevision,
+						admitted: false,
+					}),
+				});
+				instance.#stages = this.#stages;
+				return instance.#resumeTracked(wait.key, options);
+			},
+		);
+	}
+
+	async #resumeTracked(
+		key: string,
+		decision: { approved?: boolean; response?: unknown; cancel?: boolean },
+	) {
+		if (typeof key !== "string" || !/^sdk_resume_[a-f0-9-]+$/.test(key)) {
+			throw new Error("Invalid SDK tracked token");
+		}
+		return withExecution(
+			{ ...this.#options, env: stateEnv(this.#options), _decision: decision },
+			"sdk",
+			key,
+			async (ctx) => {
+				const state = await readStateJsonWithLock({ env: ctx.env, key, signal: ctx.signal });
+				if (state?.type !== "lobster.sdk-tracked.v1") {
+					throw new Error("SDK resume state not found");
+				}
+				const instance = new Lobster({
+					...this.#options,
+					env: ctx.env,
+					storeSession: sessionFromEnv(ctx.env),
+				});
+				instance.#stages = this.#stages;
+				let claimed = false;
+				let claimId: string | undefined;
+				instance.#onExecutionStart = async () => {
+					if (claimed) {
+						return;
+					}
+					const claim = await consumeResumeState({
+						env: ctx.env,
+						key,
+						expectedState: state,
+						signal: ctx.signal,
+					});
+					if (!claim.consumed) {
+						throw new Error("SDK resume state not found");
+					}
+					if (claim.signalAbortedAfterCommit) {
+						await restoreConsumedResumeState({
+							env: ctx.env,
+							key,
+							expectedState: state,
+							claimId: claim.claimId,
+						});
+						ctx.signal?.throwIfAborted();
+					}
+					claimId = claim.claimId;
+					claimed = true;
+				};
+				const result = await instance.resume(encodeToken(state.payload), decision);
+				const paused = ["needs_approval", "needs_input"].includes(result.status);
+				if (result.ok && !paused && !claimed) {
+					const deletion = await deleteUnconsumedResumeState({
+						env: ctx.env,
+						key,
+						signal: ctx.signal,
+					});
+					if (deletion !== "deleted") {
+						throw new Error("SDK resume state not found");
+					}
+				}
+				const tracked = await instance.#trackPause(result, { key, state, claimId });
+				if (claimed && !paused) {
+					await deleteStateJson({ env: ctx.env, key });
+				}
+				return tracked;
+			},
+		);
 	}
 
 	clone() {

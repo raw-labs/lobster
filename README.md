@@ -39,6 +39,305 @@ Requires Node.js 22 or newer and the pnpm version pinned in `package.json`. From
 - `bin/lobster.js` runs the compiled entrypoint in `dist/`; build after changing source files.
 Invalid workflow file paths are reported as input errors (exit code 2), whether passed with `--file` or as a single positional path (no whitespace; contains a path separator or ends in `.lobster`, `.yaml`, `.yml`, or `.json`). In `--mode tool`, these failures use the same JSON error envelope as other parsing errors.
 
+## Persistence and run history
+
+File storage remains the default. Existing state keys, approval IDs, and saved
+continuations keep their readers. Retained history is opt-in on either backend:
+
+```sh
+LOBSTER_HISTORY=1 lobster run --mode tool --file workflow.lobster
+lobster history list
+lobster history show <runId>                    # first 50 events
+lobster history show <runId> <afterSequence>    # next page
+```
+
+For a **fresh state directory**, select SQLite explicitly:
+
+```sh
+LOBSTER_STATE_DIR=/path/to/new/state LOBSTER_BACKEND=sqlite LOBSTER_HISTORY=1 \
+  lobster run --mode tool --file workflow.lobster
+```
+
+On Node, SQLite requires 22.13+ on the Node 22 line, 23.4+ on Node 23, or Node 24+.
+**The SQLite library must contain the WAL-reset fix**: 3.51.3 or later,
+or the 3.50.7/3.44.6 backports and subsequent patches on those branches. The worker
+checks `sqlite_version()` on its actual connection before enabling WAL or writing
+schema. Runtime version metadata can differ from a dynamically selected library.
+Upgrade the runtime or selected SQLite library if qualification rejects it.
+The same qualification applies to migration. See the [SQLite fix](https://sqlite.org/wal.html#walreset).
+The file backend retains Node >=22 support and does not load `node:sqlite`.
+A worker owns the SQLite connection, prepared statements, and short transactions;
+embedded hosts receive promises. The database uses WAL, a 5-second busy timeout,
+and FULL durability. A session admits at most 256 outstanding worker requests
+(configurable through `maxPending`); overflow fails before dispatch.
+
+A tracked execution keeps one run ID through approvals and structured-input
+pauses. History records step occurrences, attempts, retries, loop item ordinals,
+parallel branches, and child-workflow paths. Lazy stages finish when their
+iterators finish, fail, or close early; recording does not drain an unused stream.
+Workflow files retain their current reload-on-resume behavior. Definition hashes
+record what was supplied in each execution segment; they do not freeze execution.
+
+Default output summaries contain types and counts rather than raw outputs, error
+messages, prompts, arguments, or environment variables. Summary payloads are
+limited to 4 KiB. Inspection returns at most 100 events per page (50 by default),
+with related attempts and waits, and excludes executable continuation payloads
+and operation receipts. A logical export includes full authoritative state, so
+store exports and backups privately. Continuations retain their existing full
+payloads and existing output limits; history capture adds no execution truncation.
+
+New tracked file continuations live with their events in one atomically replaced
+per-run record under `.history`. SQLite commits continuation transitions and their
+events together in indexed tables. The file backend rewrites its aggregate when
+history changes; SQLite avoids that cost. Legacy JSON values keep their layout
+until migration or association with a tracked continuation. New tracked tokens
+require this runtime; compatibility means reading existing tokens, not making
+older binaries understand new storage. History enables run tracking. To keep live
+run status and pending reviews without detailed history, use `LOBSTER_RUNS=1` or
+`trackRuns: true`. Each run retains its original history setting when resumed.
+
+### Run and pending review API
+
+Enable durable runs on either backend with `trackRuns: true`; add `history: true`
+when you also want step attempts and event history. A pending question is saved
+with its original prompt, schema, defaults, and full review subject. Discovery
+reads that snapshot, rather than rebuilding it from chat or a workflow file.
+
+```ts
+import {
+  openStoreSession, listRuns, getRun, getWait, resumeToolRequest,
+} from '@clawdbot/lobster/core';
+
+const store = await openStoreSession({
+  directory: '/path/to/state', backend: 'sqlite', trackRuns: true,
+});
+const ctx = {
+  storeSession: store,
+  runMetadata: { callerId: 'host:stable-logical-session' },
+};
+try {
+  const page = await listRuns({ status: 'waiting', limit: 20, ctx });
+  const run = page.runs[0] && await getRun({ runId: page.runs[0].id, ctx });
+  const pending = run?.pendingWaits[0];
+  const wait = pending && await getWait({ waitId: pending.id, ctx });
+  // Present wait.request to the user. After an explicit decision:
+  // await resumeToolRequest({
+  //   waitId: wait.id, expectedRevision: wait.revision, response: answer, ctx,
+  // });
+} finally {
+  await store.close();
+}
+```
+
+The three query functions are also exported from the SDK entry point. Run lists
+are paged (`after`, `limit`, `nextCursor`) and may be filtered by status. `getRun`
+returns status, metadata, the history setting, and pending wait IDs; it does not
+expose raw checkpoint payloads. `getWait` returns the complete saved question and
+its wait revision, without a resume token. Both getters return `null` for missing or caller-invisible records. `getWait`
+also returns `null` for consumed or retired waits; completed runs remain
+inspectable through `getRun`.
+
+`expectedRevision` refers to the **wait**, not the run's history revision. It is
+checked again in the same transaction as checkpoint consumption or cancellation.
+
+When a tracked run reaches another pause, Lobster retires the previous checkpoint
+and publishes the next one, its history event, and an operation receipt in one
+commit. Competing answers cannot create two pending successors. A crash before
+that commit preserves the previous checkpoint; a crash after it preserves the
+next one. Cancellation after publication does not undo the committed handoff.
+Lost handoff replies are reconciled against the receipt before reporting success;
+an unreadable receipt leaves the outcome explicitly unknown. Steps that already
+claimed a checkpoint before an unsafe operation remain subject to the execution
+recovery limits below. Untracked legacy JSON checkpoints keep their existing
+publication behavior.
+
+Invalid answers remain correctable; changed, consumed, or foreign waits return
+`wait_conflict`. The old token and approval-ID paths continue to use the same
+single-consumption mechanism. Host admission for those legacy bearer paths is
+unchanged.
+
+`callerId` is an opaque association supplied through trusted host context at run
+creation. Scoped discovery and wait-ID resume require an exact match. It is a
+filter, not a user-authentication system: hosts must authorize that context and
+keep it stable across the resets they intend to support. Unscoped local callers
+can inspect all runs in their store. Lobster owns saved execution facts; the host
+owns identity, conversation routing, and presentation.
+
+SDK function stages still require an instance supplying the original stages:
+`lobster.resumeWait({ waitId, expectedRevision, response })`. They are not
+serialized or resurrected from storage. Workflow-file and pipeline waits resume
+through `resumeToolRequest`. Existing untracked checkpoints retain token-based
+resume; they do not retroactively acquire run history or a known caller. Imported
+older tracked waits may have `request: null` when the original question was not
+saved; discovery does not invent it by rereading a changed workflow file.
+
+CLI equivalents use the same API:
+
+```sh
+LOBSTER_RUNS=1 lobster run --mode tool --file review.lobster
+lobster runs list --status waiting
+lobster runs show <runId>
+lobster waits show <waitId>
+lobster resume --wait <waitId> --expected-revision <revision> --response-json '{...}'
+# Or use --approve yes|no or --cancel for the appropriate decision.
+```
+
+Full wait inspection is an explicit read of private review material; callers must
+apply their own display limits. If a durable workflow question cannot fit the
+bounded tool envelope, the call reports a rendering error with its run ID and the
+saved question remains discoverable. Pending waits are protected from terminal
+history pruning. These APIs rediscover saved pauses; they do not automatically
+replay steps interrupted by a process crash.
+
+### Migrating existing state
+
+A storage directory has one selected backend. SQLite selection refuses to create
+an empty authoritative database over existing file state. Coordinate all writers,
+including older binaries, then migrate explicitly:
+
+```sh
+LOBSTER_STATE_DIR=/path/to/state lobster storage migrate sqlite --offline
+```
+
+`--offline` declares that the caller has stopped all writers. Migration rejects
+live persistence sessions and outstanding state locks, writes a private logical
+backup, imports into a staging store, verifies it, closes it, and atomically
+activates backend selection. Retrying an interrupted conversion before activation
+keeps the source authoritative. After activation, stale files are never a fallback.
+The `.backup-*.archive` files contain full private state. Migration never scans or
+modifies OpenClaw's databases.
+
+The same command can migrate back to `files`, preserving the logical state and
+history. This is a backend round trip, not a binary downgrade. Source JSON must be
+valid; malformed authoritative input aborts conversion. Legacy runs have absent
+history until a stored continuation is associated with a new, explicitly partial
+record. Self-contained legacy SDK tokens remain usable with supplied SDK stages
+and cannot be discovered by scanning a directory. An owning host can build
+coordinated upgrade-time conversion on this API; automatic conversion is not enabled.
+
+### Adopting legacy pauses
+
+Backend migration preserves old checkpoints; it does not assign owners or invent
+run history. To make existing pauses discoverable before answering them, use
+`listLegacyCheckpoints` and `adoptLegacyCheckpoint` from either the core or SDK entry
+point. Both file and SQLite stores support the same maintenance operations.
+
+```ts
+import { listLegacyCheckpoints, adoptLegacyCheckpoint } from '@clawdbot/lobster/core';
+
+const inventory = await listLegacyCheckpoints({ ctx: { storeSession: store }, limit: 20 });
+const checkpoint = inventory.checkpoints[0];
+if (checkpoint) {
+  // The host establishes the owner mapping; checkpointId is opaque.
+  const run = await adoptLegacyCheckpoint({
+    checkpointId: checkpoint.checkpointId,
+    ctx: { storeSession: store, runMetadata: { callerId: 'host:verified-owner' } },
+  });
+  // Inspect run.pendingWaits and answer through the normal APIs.
+}
+```
+
+Inventory is bounded to 100 entries per page (20 by default), using `after` and
+`nextCursor`. It lists unassociated stored checkpoints, excludes consumed tokens,
+and requires unscoped host access because those records have no known caller.
+Adoption requires a nonempty trusted caller ID, executes no workflow steps, and
+creates one partial run with its pending wait in an atomic commit. Repeating it
+for the same owner preserves run identity; competing owners cannot both adopt a
+checkpoint. An already-associated, unowned partial run can also be bound using
+its saved checkpoint ID. Adoption cannot reassign an existing owner.
+
+These are host maintenance APIs, not permission checks or model-facing tools.
+The host must establish who owns a checkpoint before adopting it; possession of
+an old token alone does not establish that identity. CLI callers can make the
+same explicit association:
+
+```sh
+lobster storage legacy list
+lobster storage legacy list <after>
+lobster storage legacy adopt <checkpointId> --caller host:verified-owner
+```
+
+Existing tokens and short approval IDs remain usable after adoption. Stored SDK
+command-input tokens also keep working with an instance supplying the original
+stages. Self-contained legacy SDK tokens remain outside inventory and retain
+their previous behavior. No historical events or missing review material are
+reconstructed: `getWait().request` can be `null` for an old workflow checkpoint
+that did not save the question. Workflow source is never reread to invent it.
+
+Migration validates legacy and tracked checkpoint shapes and references before
+preparing the destination, and rejects ambiguous workflow-key aliases. Already
+expired optional approval IDs and references to deleted predecessor markers
+remain expired; migration never creates executable state to satisfy them.
+
+```sh
+lobster storage export                         # versioned logical archive
+lobster history prune 2026-01-01T00:00:00Z      # dry run
+lobster history prune 2026-01-01T00:00:00Z --apply
+```
+
+Retention removes only terminal runs older than the cutoff with no live
+continuation, pending wait, started attempt, or unacknowledged operation receipt.
+Valid consumed-capability markers may be removed with their terminal run; their
+tokens remain unusable because neither backend falls back to an old checkpoint.
+Committed transitions have stable operation IDs and receipts. A lost reply is an
+unknown outcome until reconciled; it does not authorize replaying an external
+side effect. Receipts are acknowledged only after the executor observes commit,
+and remain protected otherwise. Started attempts are history, not automatic
+restart checkpoints. A run's `running` status is its last recorded state, not a
+liveness guarantee after process death. Crash recovery and external-service
+idempotency remain separate executor work.
+
+History persistence errors bypass workflow retry and `on_error` continuation.
+Tool envelopes report `persistence_error` or `persistence_outcome_unknown`, with
+`error.runId` and `error.operationId`. Embedded callers can query
+`store.reconcile(runId, operationId)` and acknowledge an observed receipt. Neither
+reconciliation nor acknowledgement resumes an external action.
+
+Session writes return an explicit committed result for ordinary state or tracked
+run state. Tracked results include the run ID, operation ID, and revision;
+`confirmation` distinguishes a direct acknowledgement from a reconciled receipt.
+Revision-checked transitions return `committed` or `conflict`. Unknown outcomes
+remain errors until reconciliation establishes commit.
+
+### Embedded and SDK usage
+
+CLI/core/SDK roots open and close their selected session automatically. An embedded
+host can reuse a session and own its lifecycle:
+
+```ts
+import { openStoreSession, runToolRequest } from '@clawdbot/lobster/core';
+
+const store = await openStoreSession({
+  directory: '/path/to/state', backend: 'sqlite', history: true,
+});
+try {
+  const result = await runToolRequest({
+    filePath: '/path/to/workflow.lobster',
+    ctx: { storeSession: store, runMetadata: { hostRunId: 'trigger-123' } },
+  });
+  const page = await store.listRuns({ limit: 20 });
+  const history = await store.inspect(page.runs[0].id, { limit: 50 });
+} finally {
+  await store.close();
+}
+```
+
+`close()` rejects new requests and waits for admitted operations before closing
+the backend and releasing the session's migration fence.
+
+Session injection takes precedence over environment configuration. Correlation
+metadata accepts bounded `hostRunId`, `hostTaskId`, and `callerId` strings; these are
+records, not credentials or continuing authorization. Listing uses lexical run
+IDs as cursors, so new IDs before an existing cursor appear on a fresh scan.
+Event pagination uses committed run-local sequence numbers and reads current
+attempt/wait status for the returned references.
+
+`new Lobster({ storeSession: store })` or `new Lobster({ history: true, stateDir })`
+tracks SDK runs with additive stored tokens. Resume still requires an instance
+with the original JavaScript stages; closures are not serialized. Untracked
+legacy SDK tokens retain their decoder and behavior. Applications must obtain a
+user decision before resuming any approval, as before.
+
 ## Process output limits
 
 Captured process stdout and stderr remain unlimited by default. Set

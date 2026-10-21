@@ -1,32 +1,40 @@
-import { dryRunWorkflow } from "./dry_run.js";
+import type { WaitRequest } from "../persistence/waits.js";
 import {
-	createRecord,
-	mergeEnv,
-	resolveCwd,
-	resolveInputValue,
-	resolveShellStdin,
-	resolveWorkflowStepArgs,
-} from "./values.js";
-import { loadWorkflowFile, getStepExecution, isApprovalStep, isInputStep } from "./load.js";
-import { evaluateCondition, resolveTemplate } from "./expressions.js";
-import type {
-	WorkflowFile,
-	ParallelBranch,
-	WorkflowStep,
-	WorkflowApprovalIdentity,
-	WorkflowStepResult,
-	WorkflowRunResult,
-} from "./types.js";
+	publishTrackedCheckpoint,
+	type ContinuationPredecessor,
+} from "../persistence/continuations.js";
+import { randomUUID } from "node:crypto";
 import { promises as fsp } from "node:fs";
 import path from "node:path";
-
-import { randomUUID } from "node:crypto";
-import { isDeepStrictEqual } from "node:util";
 import { PassThrough } from "node:stream";
-
+import { isDeepStrictEqual } from "node:util";
+import { runAbortableProcess } from "../abortable_process.js";
+import { CostLimitExceededError, CostTracker } from "../core/cost_tracker.js";
+import type { CostSummary } from "../core/cost_tracker.js";
+import {
+	createLlmSpendLedger,
+	carryLlmProvenance,
+	markLlmProvenanceReplayed,
+	llmProvenanceOf,
+	restoreLlmProvenance,
+} from "../core/llm_accounting.js";
+import type {
+	LlmChargeCost,
+	LlmOutstandingCharge,
+	LlmSpendLedger,
+} from "../core/llm_accounting.js";
+import { withRetry, resolveRetryConfig } from "../core/retry.js";
+import {
+	RequestInputResumeError,
+	validateCommandInputState,
+	type CommandInputState,
+} from "../input_request.js";
 import { parsePipeline } from "../parser.js";
+import { PersistenceError } from "../persistence/backend.js";
+import { bindRecorder, recorderFromEnv } from "../persistence/context.js";
+import { withExecution } from "../persistence/execution.js";
+import { readLineFromStream } from "../read_line.js";
 import { runPipeline } from "../runtime.js";
-import { encodeToken, decodeToken } from "../token.js";
 import {
 	cleanupApprovalIndexByStateKey,
 	consumeResumeState,
@@ -42,29 +50,27 @@ import {
 	writeStateJson,
 	stableStringify,
 } from "../state/store.js";
-import { readLineFromStream } from "../read_line.js";
+import { encodeToken, decodeToken } from "../token.js";
 import { compileCached } from "../validation.js";
-import {
-	createLlmSpendLedger,
-	carryLlmProvenance,
-	markLlmProvenanceReplayed,
-	llmProvenanceOf,
-	restoreLlmProvenance,
-} from "../core/llm_accounting.js";
+import { dryRunWorkflow } from "./dry_run.js";
+import { evaluateCondition, resolveTemplate } from "./expressions.js";
+import { loadWorkflowFile, getStepExecution, isApprovalStep, isInputStep } from "./load.js";
 import type {
-	LlmChargeCost,
-	LlmOutstandingCharge,
-	LlmSpendLedger,
-} from "../core/llm_accounting.js";
-import { CostLimitExceededError, CostTracker } from "../core/cost_tracker.js";
-import type { CostSummary } from "../core/cost_tracker.js";
-import { withRetry, resolveRetryConfig } from "../core/retry.js";
+	WorkflowFile,
+	ParallelBranch,
+	WorkflowStep,
+	WorkflowApprovalIdentity,
+	WorkflowStepResult,
+	WorkflowRunResult,
+} from "./types.js";
 import {
-	RequestInputResumeError,
-	validateCommandInputState,
-	type CommandInputState,
-} from "../input_request.js";
-import { runAbortableProcess } from "../abortable_process.js";
+	createRecord,
+	mergeEnv,
+	resolveCwd,
+	resolveInputValue,
+	resolveShellStdin,
+	resolveWorkflowStepArgs,
+} from "./values.js";
 
 export { loadWorkflowFile } from "./load.js";
 export type {
@@ -156,6 +162,7 @@ export type WorkflowResumePayload = {
 };
 
 type WorkflowResumeState = {
+	wait?: WaitRequest;
 	filePath: string;
 	resumeAtIndex: number;
 	steps: Record<string, WorkflowStepResult>;
@@ -239,7 +246,13 @@ export function resolveWorkflowArgs(
 	return resolved;
 }
 
-export async function runWorkflowFile({
+export async function runWorkflowFile(options: Parameters<typeof runWorkflowFileInternal>[0]) {
+	return withExecution(options.ctx, "workflow", options.resume?.stateKey, (ctx) =>
+		runWorkflowFileInternal({ ...options, ctx }),
+	);
+}
+
+async function runWorkflowFileInternal({
 	filePath,
 	args,
 	ctx,
@@ -267,6 +280,16 @@ export async function runWorkflowFile({
 	let resumedUnsafeDispatchStarted = false;
 	let resumeStateConsumed = false;
 	let resumeStateClaimId: string | undefined;
+	const publishResumeState = (state: WorkflowResumeState) =>
+		publishWorkflowResumeState(
+			ctx.env,
+			state,
+			ctx.signal,
+			consumedResumeStateKey
+				? { key: consumedResumeStateKey, state: resumeState, claimId: resumeStateClaimId }
+				: undefined,
+			ctx.assertInvocationCurrent,
+		);
 	let executionBoundaryStarted = false;
 	const executionSignalListeners: Array<{ signal: AbortSignal; onAbort: () => void }> = [];
 	let executionStart: Promise<void> | undefined;
@@ -297,6 +320,7 @@ export async function runWorkflowFile({
 					signal?.throwIfAborted();
 				}
 				signal?.throwIfAborted();
+				resumeStateClaimId = consumption.claimId;
 				resumeStateConsumed = true;
 			}
 			await ctx._onExecutionStarted?.();
@@ -377,6 +401,7 @@ export async function runWorkflowFile({
 	ctx._activeWorkflows.add(canonicalFilePath);
 	try {
 		const workflow = await loadWorkflowFile(resolvedFilePath);
+		await recorderFromEnv(ctx.env)?.definition(workflow);
 		const resolvedArgs = resolveWorkflowArgs(workflow.args, args ?? resumeState?.args);
 		const steps = workflow.steps;
 		const stepIndexById = new Map(steps.map((step, idx) => [step.id, idx]));
@@ -515,10 +540,17 @@ export async function runWorkflowFile({
 
 			if (!evaluateCondition(step.when ?? step.condition, results)) {
 				results[step.id] = { id: step.id, skipped: true };
+				const recorder = recorderFromEnv(ctx.env);
+				if (recorder) {
+					const id = await recorder.start(`step/${idx}`, step.id, idx);
+					await recorder.finish(id, "skipped");
+				}
 				continue;
 			}
 
 			if (isInputStep(step.input)) {
+				const gateRecorder = recorderFromEnv(ctx.env);
+				const gateAttempt = await gateRecorder?.start(`step/${idx}`, step.id, idx);
 				const subject = resolveInputSubject({
 					step,
 					args: resolvedArgs,
@@ -527,45 +559,52 @@ export async function runWorkflowFile({
 				});
 
 				if (ctx.mode === "tool" || !isInteractive(ctx.stdin)) {
-					const inputRequest = buildNeedsInputRequest({
+					if (gateAttempt) {
+						await gateRecorder.finish(gateAttempt, "waiting");
+					}
+					const requestOptions = {
 						stepId: step.id,
 						prompt: step.input.prompt,
 						responseSchema: step.input.responseSchema,
 						defaults: step.input.defaults,
 						subject,
 						maxEnvelopeBytes: resolveToolEnvelopeMaxBytes(ctx.env),
-					});
+					};
+					// Durable runs publish the complete question before formatting a bounded
+					// tool response. Legacy calls retain their pre-publication size check.
+					const untrackedRequest = recorderFromEnv(ctx.env)
+						? undefined
+						: buildNeedsInputRequest(requestOptions);
 					let stateKey: string | undefined;
 					try {
-						stateKey = await saveWorkflowResumeState(
-							ctx.env,
-							{
-								filePath: resolvedFilePath,
-								resumeAtIndex: idx + 1,
-								steps: results,
-								args: resolvedArgs,
-								inputStepId: step.id,
-								inputSchema: step.input.responseSchema,
-								// Preserve the full resolved subject for resume semantics; the tool
-								// envelope may contain a truncated preview to stay within size limits.
-								inputSubject: subject,
-								...(costTracker.hasUsage() ? { cost: costTracker.getSummary() } : null),
-								...(llmSpendLedger.outstanding().length
-									? { llmSpend: llmSpendLedger.outstanding() }
-									: null),
-								...(llmSpendLedger.settled().length
-									? { llmBilled: llmSpendLedger.settled() }
-									: null),
-								supersededResumeStateKeys: collectSupersededWorkflowResumeStateKeys(
-									consumedResumeStateKey,
-									resumeState,
-								),
-								createdAt: new Date().toISOString(),
+						stateKey = await publishResumeState({
+							filePath: resolvedFilePath,
+							resumeAtIndex: idx + 1,
+							steps: results,
+							args: resolvedArgs,
+							inputStepId: step.id,
+							inputSchema: step.input.responseSchema,
+							wait: {
+								kind: "input",
+								prompt: step.input.prompt,
+								responseSchema: step.input.responseSchema,
+								...(step.input.defaults !== undefined ? { defaults: step.input.defaults } : {}),
+								subject,
 							},
-							ctx.signal,
-							ctx.assertInvocationCurrent,
-						);
-						ctx.assertInvocationCurrent?.();
+							// Preserve the full resolved subject for resume semantics; the tool
+							// envelope may contain a truncated preview to stay within size limits.
+							inputSubject: subject,
+							...(costTracker.hasUsage() ? { cost: costTracker.getSummary() } : null),
+							...(llmSpendLedger.outstanding().length
+								? { llmSpend: llmSpendLedger.outstanding() }
+								: null),
+							...(llmSpendLedger.settled().length ? { llmBilled: llmSpendLedger.settled() } : null),
+							supersededResumeStateKeys: collectSupersededWorkflowResumeStateKeys(
+								consumedResumeStateKey,
+								resumeState,
+							),
+							createdAt: new Date().toISOString(),
+						});
 
 						await publishWorkflowResumeStateReplacement({
 							env: ctx.env,
@@ -577,6 +616,7 @@ export async function runWorkflowFile({
 							assertInvocationCurrent: ctx.assertInvocationCurrent,
 						});
 
+						const inputRequest = untrackedRequest ?? buildNeedsInputRequest(requestOptions);
 						const resumeToken = encodeToken({
 							protocolVersion: 1,
 							v: 1,
@@ -593,7 +633,9 @@ export async function runWorkflowFile({
 							},
 						};
 					} catch (err) {
-						if (stateKey) await discardWorkflowResumeState(ctx.env, stateKey);
+						if (stateKey && !recorderFromEnv(ctx.env)) {
+							await discardWorkflowResumeState(ctx.env, stateKey);
+						}
 						throw err;
 					}
 				}
@@ -616,6 +658,9 @@ export async function runWorkflowFile({
 					response: parsed,
 				};
 				lastStepId = step.id;
+				if (gateAttempt) {
+					await gateRecorder.finish(gateAttempt, "completed");
+				}
 				continue;
 			}
 
@@ -628,12 +673,15 @@ export async function runWorkflowFile({
 				result: WorkflowStepResult;
 				parallelBranchResults: Record<string, WorkflowStepResult> | null;
 			}> => {
+				ctx.signal?.throwIfAborted();
+				const recorder = recorderFromEnv(ctx.env);
+				const historyAttempt = await recorder?.start(`step/${idx}`, step.id, idx);
 				let attemptHadNonRetryableSideEffect = false;
 				const markNonRetryableSideEffect = () => {
 					attemptHadNonRetryableSideEffect = true;
 					ctx._onNonRetryableSideEffect?.();
 				};
-				ctx.signal?.throwIfAborted();
+
 				// Combine external cancellation and optional per-step timeout into one signal.
 				let stepSignal: AbortSignal | undefined = ctx.signal;
 				let timeoutId: ReturnType<typeof setTimeout> | undefined;
@@ -655,6 +703,7 @@ export async function runWorkflowFile({
 				let result: WorkflowStepResult;
 				let parallelBranchResults: Record<string, WorkflowStepResult> | null = null;
 				try {
+					ctx.signal?.throwIfAborted();
 					if (typeof step.for_each === "string" && Array.isArray(step.steps)) {
 						const itemsRef = resolveInputValue(step.for_each, resolvedArgs, results);
 						if (!Array.isArray(itemsRef)) {
@@ -708,59 +757,94 @@ export async function runWorkflowFile({
 									resolveCwd(subStep.cwd ?? step.cwd ?? workflow.cwd, resolvedArgs) ?? ctx.cwd;
 								const subExecution = getStepExecution(subStep);
 
+								const itemRecorder = recorder?.child(`step/${idx}/item/${itemIdx}`);
+								const subAttempt = await itemRecorder?.start(
+									`step/${subStep.id}`,
+									subStep.id,
+									itemIdx,
+								);
 								let subResult: WorkflowStepResult;
-								if (subExecution.kind === "shell") {
-									const command = resolveTemplate(subExecution.value, resolvedArgs, scopedResults);
-									const stdinValue = resolveShellStdin(subStep.stdin, resolvedArgs, scopedResults);
-									await markExecutionStarted(stepSignal);
-									const { stdout } = await runShellCommand({
-										command,
-										stdin: stdinValue,
-										env: subEnv,
-										cwd: subCwd,
-										signal: stepSignal,
-										forceTerminationSignal: ctx.forceTerminationSignal,
-										assertInvocationCurrent: ctx.assertInvocationCurrent,
-										onEffectDispatch: markUnsafeDispatchStarted,
-										killSignal: () =>
-											stepTimeoutController?.signal.aborted
-												? ("SIGKILL" as NodeJS.Signals)
-												: undefined,
-									});
-									subResult = { id: subStep.id, stdout, json: parseJson(stdout) };
-								} else if (subExecution.kind === "pipeline") {
-									if (!ctx.registry) {
-										throw new Error(
-											`Workflow step ${step.id} for_each sub-step ${subStep.id} requires a command registry for pipeline execution`,
+								try {
+									if (subExecution.kind === "shell") {
+										const command = resolveTemplate(
+											subExecution.value,
+											resolvedArgs,
+											scopedResults,
 										);
-									}
-									const pipelineText = resolveTemplate(
-										subExecution.value,
-										resolvedArgs,
-										scopedResults,
-									);
-									const inputValue = resolveInputValue(subStep.stdin, resolvedArgs, scopedResults);
-									subResult = await runPipelineStep({
-										stepId: subStep.id,
-										pipelineText,
-										inputValue,
-										ctx: {
-											...ctx,
+										const stdinValue = resolveShellStdin(
+											subStep.stdin,
+											resolvedArgs,
+											scopedResults,
+										);
+										await markExecutionStarted(stepSignal);
+										const { stdout } = await runShellCommand({
+											command,
+											stdin: stdinValue,
+											env: itemRecorder ? bindRecorder(subEnv, itemRecorder) : subEnv,
+											cwd: subCwd,
 											signal: stepSignal,
-											_onNonRetryableSideEffect: markNonRetryableSideEffect,
-											_onUnsafeDispatch: markUnsafeDispatchStarted,
-										},
-										llmSpendLedger,
-										env: subEnv,
-										cwd: subCwd,
-										requestInputEnabled: false,
-										onExecutionStart: () => markExecutionStarted(stepSignal),
-									});
-								} else {
-									const inputValue = resolveInputValue(subStep.stdin, resolvedArgs, scopedResults);
-									subResult = createSyntheticStepResult(subStep.id, inputValue);
-								}
+											forceTerminationSignal: ctx.forceTerminationSignal,
+											assertInvocationCurrent: ctx.assertInvocationCurrent,
+											onEffectDispatch: markUnsafeDispatchStarted,
+											killSignal: () =>
+												stepTimeoutController?.signal.aborted
+													? ("SIGKILL" as NodeJS.Signals)
+													: undefined,
+										});
+										subResult = { id: subStep.id, stdout, json: parseJson(stdout) };
+									} else if (subExecution.kind === "pipeline") {
+										if (!ctx.registry) {
+											throw new Error(
+												`Workflow step ${step.id} for_each sub-step ${subStep.id} requires a command registry for pipeline execution`,
+											);
+										}
+										const pipelineText = resolveTemplate(
+											subExecution.value,
+											resolvedArgs,
+											scopedResults,
+										);
+										const inputValue = resolveInputValue(
+											subStep.stdin,
+											resolvedArgs,
+											scopedResults,
+										);
+										subResult = await runPipelineStep({
+											stepId: subStep.id,
+											pipelineText,
+											inputValue,
+											ctx: {
+												...ctx,
+												signal: stepSignal,
+												_onNonRetryableSideEffect: markNonRetryableSideEffect,
+												_onUnsafeDispatch: markUnsafeDispatchStarted,
+											},
+											llmSpendLedger,
+											env: itemRecorder ? bindRecorder(subEnv, itemRecorder) : subEnv,
+											cwd: subCwd,
+											requestInputEnabled: false,
+											onExecutionStart: () => markExecutionStarted(stepSignal),
+										});
+									} else {
+										const inputValue = resolveInputValue(
+											subStep.stdin,
+											resolvedArgs,
+											scopedResults,
+										);
+										subResult = createSyntheticStepResult(subStep.id, inputValue);
+									}
 
+									if (subAttempt) {
+										await itemRecorder.finish(subAttempt, "completed", subResult);
+									}
+								} catch (error) {
+									if (error instanceof PersistenceError) {
+										throw error;
+									}
+									if (subAttempt) {
+										await itemRecorder.finish(subAttempt, "failed", error);
+									}
+									throw error;
+								}
 								scopedResults[subStep.id] = subResult;
 								trackStepCost(costTracker, `${step.id}.${subStep.id}`, subResult, llmSpendLedger);
 								// Before the next step runs: a charge no item carried is spend the step really made,
@@ -817,7 +901,7 @@ export async function runWorkflowFile({
 							}
 							return buffered;
 						};
-						const runBranch = async (
+						const runBranchInternal = async (
 							branch: ParallelBranch,
 						): Promise<{ branchId: string; result: WorkflowStepResult }> => {
 							const mergedBranchEnv = { ...step.env, ...branch.env };
@@ -845,7 +929,9 @@ export async function runWorkflowFile({
 								const { stdout } = await runShellCommand({
 									command,
 									stdin: stdinValue,
-									env: branchEnv,
+									env: recorder
+										? bindRecorder(branchEnv, recorder.child(`step/${idx}/branch/${branch.id}`))
+										: branchEnv,
 									cwd: branchCwd,
 									signal: branchSignal,
 									forceTerminationSignal: ctx.forceTerminationSignal,
@@ -878,7 +964,9 @@ export async function runWorkflowFile({
 										_onUnsafeDispatch: markUnsafeDispatchStarted,
 									},
 									llmSpendLedger: ledgerFor(branch.id),
-									env: branchEnv,
+									env: recorder
+										? bindRecorder(branchEnv, recorder.child(`step/${idx}/branch/${branch.id}`))
+										: branchEnv,
 									cwd: branchCwd,
 									requestInputEnabled: false,
 									onExecutionStart: () => markExecutionStarted(branchSignal),
@@ -889,6 +977,25 @@ export async function runWorkflowFile({
 							return { branchId: branch.id, result: { id: branch.id } };
 						};
 
+						const runBranch = async (branch: ParallelBranch) => {
+							const branchRecorder = recorder?.child(`step/${idx}/branch/${branch.id}`);
+							const branchAttempt = await branchRecorder?.start("branch", branch.id);
+							try {
+								const result = await runBranchInternal(branch);
+								if (branchAttempt) {
+									await branchRecorder.finish(branchAttempt, "completed", result.result);
+								}
+								return result;
+							} catch (error) {
+								if (error instanceof PersistenceError) {
+									throw error;
+								}
+								if (branchAttempt) {
+									await branchRecorder.finish(branchAttempt, "failed", error);
+								}
+								throw error;
+							}
+						};
 						let parallelTimeoutId: ReturnType<typeof setTimeout> | undefined;
 						const timeoutPromise = parallel.timeout_ms
 							? new Promise<never>((_resolve, reject) => {
@@ -909,6 +1016,7 @@ export async function runWorkflowFile({
 
 						const branchPromises = parallel.branches.map((branch) => runBranch(branch));
 						const branchesSettled = Promise.allSettled(branchPromises);
+						let parallelFailure: { error: unknown } | undefined;
 						try {
 							if (wait === "any") {
 								const winner = (await (timeoutPromise
@@ -931,6 +1039,9 @@ export async function runWorkflowFile({
 								parallelBranchResults = createRecord();
 								for (const entry of settled) {
 									if (entry.status === "rejected") {
+										if (entry.reason instanceof PersistenceError) {
+											throw entry.reason;
+										}
 										throw new Error(
 											`Parallel branch failed: ${entry.reason?.message ?? String(entry.reason)}`,
 										);
@@ -938,12 +1049,22 @@ export async function runWorkflowFile({
 									parallelBranchResults[entry.value.branchId] = entry.value.result;
 								}
 							}
+						} catch (error) {
+							parallelFailure = { error };
 						} finally {
 							if (parallelTimeoutId !== undefined) clearTimeout(parallelTimeoutId);
 							const branchesCancelled = wait === "any" || parallelSignal.aborted;
 							if (branchesCancelled) branchAbortController.abort();
 							if (branchesCancelled) await waitForCancelledParallelBranches(branchesSettled);
 							else await branchesSettled;
+						}
+						for (const entry of await branchesSettled) {
+							if (entry.status === "rejected" && entry.reason instanceof PersistenceError) {
+								throw entry.reason;
+							}
+						}
+						if (parallelFailure) {
+							throw parallelFailure.error;
 						}
 
 						const merged = Object.fromEntries(
@@ -988,10 +1109,10 @@ export async function runWorkflowFile({
 							args: subArgs,
 							ctx: {
 								...ctx,
-								env,
 								cwd,
 								signal: stepSignal,
 								_activeWorkflows: childActive,
+								env: recorder ? bindRecorder(env, recorder.child(`step/${idx}/child`)) : env,
 								_llmSpendLedger: stepScopedLedger(llmSpendLedger, step.id),
 								_onExecutionStarted: async () => {
 									await markExecutionStarted(stepSignal);
@@ -1085,8 +1206,21 @@ export async function runWorkflowFile({
 						result = createSyntheticStepResult(step.id, inputValue);
 					}
 
+					if (historyAttempt) {
+						await recorder.finish(historyAttempt, "completed", result);
+					}
 					return { result, parallelBranchResults };
 				} catch (error) {
+					if (error instanceof PersistenceError) {
+						throw error;
+					}
+					if (historyAttempt) {
+						await recorder.finish(
+							historyAttempt,
+							error instanceof WorkflowPipelineInputSuspension ? "waiting" : "failed",
+							error,
+						);
+					}
 					if (attemptHadNonRetryableSideEffect) {
 						throw markStepErrorNonRetryable(error);
 					}
@@ -1106,6 +1240,7 @@ export async function runWorkflowFile({
 								shouldRetry: (error) => {
 									ctx.assertInvocationCurrent?.();
 									if (
+										error instanceof PersistenceError ||
 										error instanceof WorkflowPipelineInputSuspension ||
 										error instanceof RequestInputResumeError ||
 										error instanceof CostLimitExceededError
@@ -1136,47 +1271,54 @@ export async function runWorkflowFile({
 				result = attemptResult.result;
 				parallelBranchResults = attemptResult.parallelBranchResults;
 			} catch (err: any) {
+				if (err instanceof PersistenceError) {
+					throw err;
+				}
 				ctx.assertInvocationCurrent?.();
 				if (err instanceof WorkflowPipelineInputSuspension) {
-					const inputRequest = buildNeedsInputRequest({
+					const requestOptions = {
 						stepId: err.stepId,
 						prompt: err.request.prompt,
 						responseSchema: err.request.responseSchema,
 						defaults: err.request.defaults,
 						subject: err.request.subject,
 						maxEnvelopeBytes: resolveToolEnvelopeMaxBytes(ctx.env),
-					});
+					};
+					// Durable runs publish the complete question before formatting a bounded
+					// tool response. Legacy calls retain their pre-publication size check.
+					const untrackedRequest = recorderFromEnv(ctx.env)
+						? undefined
+						: buildNeedsInputRequest(requestOptions);
 					let stateKey: string | undefined;
 					try {
-						stateKey = await saveWorkflowResumeState(
-							ctx.env,
-							{
-								filePath: resolvedFilePath,
-								resumeAtIndex: idx,
-								steps: results,
-								args: resolvedArgs,
-								inputStepId: err.stepId,
-								inputKind: "pipeline_command",
-								inputSchema: err.request.responseSchema,
-								inputSubject: err.request.subject,
-								pipelineInput: err.pipelineInput,
-								...(costTracker.hasUsage() ? { cost: costTracker.getSummary() } : null),
-								...(llmSpendLedger.outstanding().length
-									? { llmSpend: llmSpendLedger.outstanding() }
-									: null),
-								...(llmSpendLedger.settled().length
-									? { llmBilled: llmSpendLedger.settled() }
-									: null),
-								supersededResumeStateKeys: collectSupersededWorkflowResumeStateKeys(
-									consumedResumeStateKey,
-									resumeState,
-								),
-								createdAt: new Date().toISOString(),
+						stateKey = await publishResumeState({
+							filePath: resolvedFilePath,
+							resumeAtIndex: idx,
+							steps: results,
+							args: resolvedArgs,
+							inputStepId: err.stepId,
+							inputKind: "pipeline_command",
+							inputSchema: err.request.responseSchema,
+							wait: {
+								kind: "input",
+								prompt: err.request.prompt,
+								responseSchema: err.request.responseSchema,
+								...(err.request.defaults !== undefined ? { defaults: err.request.defaults } : {}),
+								...(err.request.subject !== undefined ? { subject: err.request.subject } : {}),
 							},
-							ctx.signal,
-							ctx.assertInvocationCurrent,
-						);
-						ctx.assertInvocationCurrent?.();
+							inputSubject: err.request.subject,
+							pipelineInput: err.pipelineInput,
+							...(costTracker.hasUsage() ? { cost: costTracker.getSummary() } : null),
+							...(llmSpendLedger.outstanding().length
+								? { llmSpend: llmSpendLedger.outstanding() }
+								: null),
+							...(llmSpendLedger.settled().length ? { llmBilled: llmSpendLedger.settled() } : null),
+							supersededResumeStateKeys: collectSupersededWorkflowResumeStateKeys(
+								consumedResumeStateKey,
+								resumeState,
+							),
+							createdAt: new Date().toISOString(),
+						});
 
 						await publishWorkflowResumeStateReplacement({
 							env: ctx.env,
@@ -1188,6 +1330,7 @@ export async function runWorkflowFile({
 							assertInvocationCurrent: ctx.assertInvocationCurrent,
 						});
 
+						const inputRequest = untrackedRequest ?? buildNeedsInputRequest(requestOptions);
 						const resumeToken = encodeToken({
 							protocolVersion: 1,
 							v: 1,
@@ -1204,7 +1347,9 @@ export async function runWorkflowFile({
 							},
 						};
 					} catch (stateError) {
-						if (stateKey) await discardWorkflowResumeState(ctx.env, stateKey);
+						if (stateKey && !recorderFromEnv(ctx.env)) {
+							await discardWorkflowResumeState(ctx.env, stateKey);
+						}
 						throw stateError;
 					}
 				}
@@ -1288,40 +1433,37 @@ export async function runWorkflowFile({
 				if (ctx.mode === "tool" || !isInteractive(ctx.stdin)) {
 					let stateKey: string | undefined;
 					try {
-						stateKey = await saveWorkflowResumeState(
-							ctx.env,
-							{
-								filePath: resolvedFilePath,
-								resumeAtIndex: idx + 1,
-								steps: results,
-								args: resolvedArgs,
-								approvalStepId: step.id,
-								approvalIdentity,
-								...(costTracker.hasUsage() ? { cost: costTracker.getSummary() } : null),
-								...(llmSpendLedger.outstanding().length
-									? { llmSpend: llmSpendLedger.outstanding() }
-									: null),
-								...(llmSpendLedger.settled().length
-									? { llmBilled: llmSpendLedger.settled() }
-									: null),
-								supersededResumeStateKeys: collectSupersededWorkflowResumeStateKeys(
-									consumedResumeStateKey,
-									resumeState,
-								),
-								createdAt: new Date().toISOString(),
+						stateKey = await publishResumeState({
+							filePath: resolvedFilePath,
+							resumeAtIndex: idx + 1,
+							steps: results,
+							args: resolvedArgs,
+							approvalStepId: step.id,
+							approvalIdentity,
+							wait: {
+								kind: "approval",
+								prompt: approval.prompt,
+								items: approval.items,
+								...(approval.preview ? { preview: approval.preview } : {}),
 							},
-							ctx.signal,
-							ctx.assertInvocationCurrent,
-						);
-						ctx.assertInvocationCurrent?.();
+							...(costTracker.hasUsage() ? { cost: costTracker.getSummary() } : null),
+							...(llmSpendLedger.outstanding().length
+								? { llmSpend: llmSpendLedger.outstanding() }
+								: null),
+							...(llmSpendLedger.settled().length ? { llmBilled: llmSpendLedger.settled() } : null),
+							supersededResumeStateKeys: collectSupersededWorkflowResumeStateKeys(
+								consumedResumeStateKey,
+								resumeState,
+							),
+							createdAt: new Date().toISOString(),
+						});
 
 						const approvalId = await createApprovalIndex({
 							env: ctx.env,
 							stateKey,
 							options: { assertInvocationCurrent: ctx.assertInvocationCurrent },
 						});
-						ctx.signal?.throwIfAborted();
-						ctx.assertInvocationCurrent?.();
+						if (!recorderFromEnv(ctx.env)) ctx.signal?.throwIfAborted();
 						await publishWorkflowResumeStateReplacement({
 							env: ctx.env,
 							previousStateKey: consumedResumeStateKey,
@@ -1349,7 +1491,8 @@ export async function runWorkflowFile({
 							},
 						};
 					} catch (err) {
-						if (stateKey) await discardWorkflowResumeState(ctx.env, stateKey);
+						if (stateKey && !recorderFromEnv(ctx.env))
+							await discardWorkflowResumeState(ctx.env, stateKey);
 						throw err;
 					}
 				}
@@ -1492,13 +1635,25 @@ export function decodeWorkflowResumePayload(payload: unknown): WorkflowResumePay
 	return data as WorkflowResumePayload;
 }
 
-async function saveWorkflowResumeState(
+async function publishWorkflowResumeState(
 	env: Record<string, string | undefined>,
 	state: WorkflowResumeState,
 	signal?: AbortSignal,
+	predecessor?: ContinuationPredecessor,
 	assertInvocationCurrent?: () => void,
 ) {
 	const stateKey = `workflow_resume_${randomUUID()}`;
+	if (recorderFromEnv(env)) {
+		await publishTrackedCheckpoint({
+			env,
+			key: stateKey,
+			state,
+			predecessor,
+			signal,
+			assertInvocationCurrent,
+		});
+		return stateKey;
+	}
 	try {
 		signal?.throwIfAborted();
 		assertInvocationCurrent?.();
@@ -1531,6 +1686,7 @@ type WorkflowResumeReplacement = {
 };
 
 async function publishWorkflowResumeStateReplacement(params: WorkflowResumeReplacement) {
+	if (recorderFromEnv(params.env)) return;
 	let previousApprovalId: string | null = null;
 	if (params.previousStateKey && !params.previousStateConsumed) {
 		previousApprovalId = await findApprovalIdByStateKey({
@@ -1541,7 +1697,7 @@ async function publishWorkflowResumeStateReplacement(params: WorkflowResumeRepla
 	}
 	let claimId: string | undefined;
 	try {
-		const replacement = await replaceWorkflowResumeState(params);
+		const replacement = await retireLegacyWorkflowCheckpoint(params);
 		if (!replacement.replaced) throw new Error("Workflow resume state not found");
 		claimId = replacement.claimId;
 		params.assertInvocationCurrent?.();
@@ -1566,7 +1722,7 @@ async function publishWorkflowResumeStateReplacement(params: WorkflowResumeRepla
 	}
 }
 
-async function replaceWorkflowResumeState({
+async function retireLegacyWorkflowCheckpoint({
 	env,
 	previousStateKey,
 	expectedPreviousState,
@@ -1597,9 +1753,8 @@ async function replaceWorkflowResumeState({
 		});
 		if (!consumption.consumed) return { replaced: false as const };
 		claimId = consumption.claimId;
-		// Keep the consumed marker until terminal cleanup. It is the atomic
-		// predecessor-to-successor handoff and prevents another resume from
-		// creating a competing successor after this call returns.
+		// Legacy checkpoints occupy separate files. Keep this consumed marker
+		// until terminal cleanup so later callers cannot reuse the old token.
 		signal?.throwIfAborted();
 		assertInvocationCurrent?.();
 		return { replaced: true as const, claimId };
@@ -2460,13 +2615,17 @@ async function runPipelineStep({
 
 	const pipelineStartIndex = resume ? resume.pipelineInput.resumeAtIndex : 0;
 	const remainingPipeline = pipeline.slice(pipelineStartIndex);
+	const pipelineRecorder = recorderFromEnv(env)?.child(`step/${stepId}`);
+	if (pipelineRecorder) {
+		pipelineRecorder.pipelineOffset = pipelineStartIndex;
+	}
 	const result = await runPipeline({
 		pipeline: remainingPipeline,
 		registry: ctx.registry,
 		stdin: ctx.stdin,
 		stdout,
 		stderr: ctx.stderr,
-		env,
+		env: pipelineRecorder ? bindRecorder(env, pipelineRecorder) : env,
 		mode: ctx.mode,
 		cwd,
 		signal: ctx.signal,
