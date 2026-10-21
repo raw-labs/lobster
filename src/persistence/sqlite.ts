@@ -1,4 +1,4 @@
-import { assertSqliteRuntime } from "./sqlite-support.js";
+import { assertSqliteNodeSupport } from "./sqlite-support.js";
 import { randomUUID } from "node:crypto";
 import { Worker } from "node:worker_threads";
 import {
@@ -47,7 +47,7 @@ export class SqliteBackend implements Backend {
 			throw new Error("Persistence admission limit must be 1..4096");
 		}
 
-		assertSqliteRuntime();
+		assertSqliteNodeSupport();
 		this.connect();
 
 		if (startupSignal) {

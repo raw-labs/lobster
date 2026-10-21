@@ -489,12 +489,7 @@ export class Lobster {
 				};
 				const result = await instance.resume(encodeToken(state.payload), decision);
 				const paused = ["needs_approval", "needs_input"].includes(result.status);
-				if (
-					result.ok &&
-					!paused &&
-					!claimed &&
-					(await readStateJsonWithLock({ env: ctx.env, key })) !== null
-				) {
+				if (result.ok && !paused && !claimed) {
 					const deletion = await deleteUnconsumedResumeState({
 						env: ctx.env,
 						key,

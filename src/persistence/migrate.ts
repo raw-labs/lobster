@@ -1,6 +1,6 @@
 import { readBackendSelection } from "./selection.js";
 import { validateContinuations } from "./legacy.js";
-import { assertSqliteRuntime } from "./sqlite-support.js";
+import { assertSqliteNodeSupport } from "./sqlite-support.js";
 import { randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
 import path from "node:path";
@@ -71,7 +71,7 @@ export async function migrateStore({ directory, backend, offline, onPhase }: Mig
 	if (!["files", "sqlite"].includes(backend)) {
 		throw new Error("Invalid migration backend");
 	}
-	if (backend === "sqlite") assertSqliteRuntime();
+	if (backend === "sqlite") assertSqliteNodeSupport();
 
 	directory = path.resolve(directory);
 	await ensureDirectory(directory);

@@ -6,10 +6,7 @@ function parseVersion(value: string | undefined): Version | null {
 }
 
 /** Keep file storage usable on older Node releases without loading node:sqlite. */
-export function assertSqliteRuntime(
-	nodeVersion = process.versions.node,
-	sqliteVersion = process.versions.sqlite,
-): void {
+export function assertSqliteNodeSupport(nodeVersion = process.versions.node): void {
 	const node = parseVersion(nodeVersion);
 	if (
 		!node ||
@@ -19,7 +16,11 @@ export function assertSqliteRuntime(
 	) {
 		throw new Error("SQLite backend requires Node 22.13+, 23.4+, or 24+");
 	}
+}
 
+/** Qualify the library used by the worker connection, before enabling WAL. */
+export function assertSqliteRuntime(nodeVersion: string, sqliteVersion: string | undefined): void {
+	assertSqliteNodeSupport(nodeVersion);
 	const sqlite = parseVersion(sqliteVersion);
 	const patched =
 		sqlite &&

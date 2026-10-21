@@ -58,11 +58,12 @@ LOBSTER_STATE_DIR=/path/to/new/state LOBSTER_BACKEND=sqlite LOBSTER_HISTORY=1 \
   lobster run --mode tool --file workflow.lobster
 ```
 
-SQLite requires Node 22.13+ on the Node 22 line, 23.4+ on Node 23, or Node 24+,
-**and a bundled SQLite version containing the WAL-reset fix**: 3.51.3 or later,
-or the 3.50.7/3.44.6 backports and subsequent patches on those branches. Node's
-version alone does not establish that its SQLite is patched. Check with
-`node -p process.versions.sqlite`; upgrade Node if SQLite selection rejects it.
+On Node, SQLite requires 22.13+ on the Node 22 line, 23.4+ on Node 23, or Node 24+.
+**The SQLite library must contain the WAL-reset fix**: 3.51.3 or later,
+or the 3.50.7/3.44.6 backports and subsequent patches on those branches. The worker
+checks `sqlite_version()` on its actual connection before enabling WAL or writing
+schema. Runtime version metadata can differ from a dynamically selected library.
+Upgrade the runtime or selected SQLite library if qualification rejects it.
 The same qualification applies to migration. See the [SQLite fix](https://sqlite.org/wal.html#walreset).
 The file backend retains Node >=22 support and does not load `node:sqlite`.
 A worker owns the SQLite connection, prepared statements, and short transactions;

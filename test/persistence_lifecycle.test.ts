@@ -254,3 +254,74 @@ for (const backend of ["legacy", "files", "sqlite"] as const) {
 		}
 	});
 }
+
+for (const backend of ["files", "sqlite"] as const) {
+	test(`${backend}: an SDK cancellation that loses to an answer cannot report success`, async (t) => {
+		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "lobster-sdk-late-cancel-"));
+		t.after(() => fs.rm(directory, { recursive: true, force: true }));
+		const store = await openStoreSession({ directory, backend, trackRuns: true });
+		t.after(() => store.close());
+		let effects = 0;
+		const sdk = new Lobster({ storeSession: store }).pipe({
+			async run({ ctx }) {
+				const answer = await ctx.requestInput({
+					prompt: "Choose",
+					responseSchema: { type: "integer" },
+				});
+				effects++;
+				return { output: [answer] };
+			},
+		});
+		const first = await sdk.run();
+		const ctx = { storeSession: store };
+		const run = await getRun({ runId: first.runId, ctx });
+		const wait = run.pendingWaits[0];
+		let prepared!: () => void;
+		let release!: () => void;
+		const cancellationPrepared = new Promise<void>((resolve) => {
+			prepared = resolve;
+		});
+		const cleanupAllowed = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		const resume = Lobster.prototype.resume;
+		// Hold the cancellation after loading its SDK frame but before retiring the
+		// checkpoint, so the answer can consume it and finish first.
+		Lobster.prototype.resume = async function (...args) {
+			const result = await resume.apply(this, args);
+			if (args[1]?.cancel) {
+				prepared();
+				await cleanupAllowed;
+			}
+			return result;
+		};
+		const cancellation = sdk
+			.resumeWait({ waitId: wait.id, expectedRevision: wait.revision, cancel: true })
+			.then(
+				(result) => result,
+				(error) => ({ ok: false, error }),
+			);
+		try {
+			await Promise.race([
+				cancellationPrepared,
+				cancellation.then(() => {
+					throw new Error("Cancellation settled before the prepared decision");
+				}),
+			]);
+			const answered = await sdk.resumeWait({
+				waitId: wait.id,
+				expectedRevision: wait.revision,
+				response: 7,
+			});
+			assert.equal(answered.ok, true, JSON.stringify(answered));
+			release();
+			assert.equal((await cancellation).ok, false);
+			assert.equal(effects, 1);
+			assert.equal((await getRun({ runId: first.runId, ctx })).status, "completed");
+		} finally {
+			release();
+			Lobster.prototype.resume = resume;
+			await cancellation;
+		}
+	});
+}

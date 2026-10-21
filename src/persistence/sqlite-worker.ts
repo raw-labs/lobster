@@ -1,5 +1,6 @@
 // This is the only module that loads node:sqlite. Files remain usable on Node 22.0.
 import { WaitConflictError } from "./backend.js";
+import { assertSqliteRuntime } from "./sqlite-support.js";
 import { DatabaseSync } from "node:sqlite";
 import { parentPort, workerData } from "node:worker_threads";
 import {
@@ -27,6 +28,13 @@ type StateRow = { key: string; text: string | null; run_id: string | null };
 type RunMetadataRecord = Omit<RunRecord, "attempts" | "waits" | "events" | "receipts" | "states">;
 
 const db = new DatabaseSync(workerData.path, { readOnly: workerData.readOnly });
+try {
+	const version = db.prepare("SELECT sqlite_version() AS version").get().version;
+	assertSqliteRuntime(process.versions.node, String(version));
+} catch (error) {
+	db.close();
+	throw error;
+}
 
 const statements = new Map<string, ReturnType<DatabaseSync["prepare"]>>();
 

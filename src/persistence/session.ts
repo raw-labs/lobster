@@ -1,6 +1,6 @@
 import { readBackendSelection } from "./selection.js";
 import { legacyCheckpointText, validateCheckpoint, type LegacyCheckpointPage } from "./legacy.js";
-import { assertSqliteRuntime } from "./sqlite-support.js";
+import { assertSqliteNodeSupport } from "./sqlite-support.js";
 import { randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
 import path from "node:path";
@@ -610,7 +610,7 @@ export async function openStoreSession(options: StoreOptions = {}): Promise<Stor
 		let lease: string | undefined;
 		try {
 			if (kind === "sqlite") {
-				assertSqliteRuntime();
+				assertSqliteNodeSupport();
 				if (!selected) {
 					const legacy = await new FileBackend(directory).export();
 					if (Object.keys(legacy.states).length || legacy.runs.length) {

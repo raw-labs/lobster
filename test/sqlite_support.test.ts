@@ -3,6 +3,8 @@ import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { once } from "node:events";
+import { Worker } from "node:worker_threads";
 import { migrateStore, openStoreSession } from "../src/core/index.js";
 import { assertSqliteRuntime } from "../src/persistence/sqlite-support.js";
 
@@ -23,25 +25,49 @@ test("SQLite qualification preserves the native-driver Node minimum", () => {
 	}
 });
 
-test("unpatched runtimes refuse SQLite opening and migration while files remain usable", async (t) => {
+test("SQLite admission qualifies the connection instead of stale process version metadata", async (t) => {
 	const directory = await fs.mkdtemp(path.join(os.tmpdir(), "lobster-sqlite-version-"));
 	t.after(() => fs.rm(directory, { recursive: true, force: true }));
 	const descriptor = Object.getOwnPropertyDescriptor(process.versions, "sqlite");
 	Object.defineProperty(process.versions, "sqlite", { value: "3.50.1", configurable: true });
 	t.after(() => Object.defineProperty(process.versions, "sqlite", descriptor));
-	await assert.rejects(openStoreSession({ directory, backend: "sqlite" }), /WAL-reset fix/);
-	await fs.writeFile(path.join(directory, "saved.json"), "42\n");
-	await assert.rejects(
-		migrateStore({ directory, backend: "sqlite", offline: true }),
-		/WAL-reset fix/,
-	);
-	assert.equal(await fs.readFile(path.join(directory, "saved.json"), "utf8"), "42\n");
-	await assert.rejects(fs.access(path.join(directory, ".backend")), { code: "ENOENT" });
-	await assert.rejects(fs.access(path.join(directory, "lobster.sqlite")), { code: "ENOENT" });
 	const store = await openStoreSession({ directory, backend: "files" });
+	await store.write("saved", "42\n");
+	await store.close();
+	await migrateStore({ directory, backend: "sqlite", offline: true });
+	const sqlite = await openStoreSession({ directory });
 	try {
-		assert.equal((await store.read("saved")).text, "42\n");
+		assert.equal(sqlite.backend.kind, "sqlite");
+		assert.equal((await sqlite.read("saved")).text, "42\n");
 	} finally {
-		await store.close();
+		await sqlite.close();
+	}
+});
+
+test("SQLite worker rejects an unpatched connection before publishing readiness or enabling WAL", async (t) => {
+	const directory = await fs.mkdtemp(path.join(os.tmpdir(), "lobster-worker-version-"));
+	t.after(() => fs.rm(directory, { recursive: true, force: true }));
+	const filePath = path.join(directory, "lobster.sqlite");
+	const worker = new Worker(new URL("./fixtures/sqlite-version.js", import.meta.url), {
+		workerData: { path: filePath, readOnly: false },
+		execArgv: [],
+	});
+	t.after(() => worker.terminate());
+	let ready = false;
+	worker.on("message", () => {
+		ready = true;
+	});
+	const exited = new Promise<void>((resolve) => worker.once("exit", () => resolve()));
+	const [error] = await once(worker, "error");
+	await exited;
+	assert.match(error.message, /WAL-reset fix.*found 3.50.1/);
+	assert.equal(ready, false);
+	await assert.rejects(fs.access(filePath + "-wal"), { code: "ENOENT" });
+	const { DatabaseSync } = await import("node:sqlite");
+	const db = new DatabaseSync(filePath, { readOnly: true });
+	try {
+		assert.deepEqual(db.prepare("SELECT name FROM sqlite_schema").all(), []);
+	} finally {
+		db.close();
 	}
 });
