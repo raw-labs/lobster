@@ -281,11 +281,15 @@ export class StoreSession {
 		return run?.receipts[operationId] ?? null;
 	}
 
-	async transition(request: Transition, signal?: AbortSignal): Promise<TransitionResult> {
+	async transition(
+		request: Transition,
+		signal?: AbortSignal,
+		assertInvocationCurrent?: () => void,
+	): Promise<TransitionResult> {
 		return this.request(async () => {
 			let result: TransitionResult;
 			try {
-				result = await this.backend.transition(request, signal);
+				result = await this.backend.transition(request, signal, assertInvocationCurrent);
 			} catch (error) {
 				if (!(error instanceof PersistenceOutcomeUnknown) || request.action.kind !== "handoff")
 					throw error;
@@ -352,11 +356,19 @@ export class ExecutionRecorder {
 		);
 	}
 
-	async action(action: RunAction, signal?: AbortSignal): Promise<TransitionResult> {
+	async action(
+		action: RunAction,
+		signal?: AbortSignal,
+		assertInvocationCurrent?: () => void,
+	): Promise<TransitionResult> {
 		const operationId = randomUUID();
 		let result: TransitionResult;
 		try {
-			result = await this.session.transition({ operationId, runId: this.runId, action }, signal);
+			result = await this.session.transition(
+				{ operationId, runId: this.runId, action },
+				signal,
+				assertInvocationCurrent,
+			);
 		} catch (error) {
 			if (error instanceof PersistenceError) {
 				throw error;

@@ -195,6 +195,7 @@ export class FileBackend implements Backend {
 					},
 				},
 				options.signal,
+				options.assertInvocationCurrent,
 			);
 			if (result.status === "conflict") {
 				throw new WaitConflictError();
@@ -221,10 +222,16 @@ export class FileBackend implements Backend {
 		} else {
 			await ensureDirectory(this.directory);
 			if (options.exclusive) {
-				await writeFileAtomicExclusive(file, text, options.atomicWriteOptions);
+				await writeFileAtomicExclusive(file, text, {
+					...options.atomicWriteOptions,
+					assertInvocationCurrent:
+						options.assertInvocationCurrent ?? options.atomicWriteOptions?.assertInvocationCurrent,
+				});
 			} else {
 				await writeFileAtomic(file, text, {
 					...options.atomicWriteOptions,
+					assertInvocationCurrent:
+						options.assertInvocationCurrent ?? options.atomicWriteOptions?.assertInvocationCurrent,
 					signal: options.signal,
 				});
 			}
@@ -238,7 +245,11 @@ export class FileBackend implements Backend {
 		};
 	}
 
-	async transition(request: Transition, signal?: AbortSignal): Promise<TransitionResult> {
+	async transition(
+		request: Transition,
+		signal?: AbortSignal,
+		assertInvocationCurrent?: () => void,
+	): Promise<TransitionResult> {
 		if (this.readOnly) {
 			throw new Error("Persistence session is read-only");
 		}
@@ -261,7 +272,7 @@ export class FileBackend implements Backend {
 							await writeFileAtomic(
 								this.runPath(request.runId),
 								JSON.stringify(applied.run) + "\n",
-								{ signal },
+								{ signal, assertInvocationCurrent },
 							);
 						} catch (error) {
 							if (atomicWriteWasPublished(error)) {

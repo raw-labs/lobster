@@ -591,7 +591,8 @@ async function resolveRunTarget(parsed: {
 		try {
 			const workflowFile = await resolveWorkflowFile(restWithoutDryRun[0]);
 			return { ...parsed, filePath: workflowFile, rest: [], dryRun: true };
-		} catch {
+		} catch (err) {
+			if (isWorkflowPathLike(restWithoutDryRun[0])) throw err;
 			return parsed;
 		}
 	}
@@ -608,9 +609,19 @@ async function detectWorkflowFile(rest) {
 	if (!candidate || candidate.includes("|")) return null;
 	try {
 		return await resolveWorkflowFile(candidate);
-	} catch {
+	} catch (err) {
+		if (isWorkflowPathLike(candidate)) throw err;
 		return null;
 	}
+}
+
+const WORKFLOW_FILE_EXTENSIONS = [".lobster", ".yaml", ".yml", ".json"];
+
+// Command names never contain a path separator or end in a workflow extension.
+function isWorkflowPathLike(token: string) {
+	if (/[\s|]/.test(token) || token.startsWith("-")) return false;
+	const lower = token.toLowerCase();
+	return /[\\/]/.test(token) || WORKFLOW_FILE_EXTENSIONS.some((ext) => lower.endsWith(ext));
 }
 
 async function resolveWorkflowFile(candidate) {
@@ -621,7 +632,7 @@ async function resolveWorkflowFile(candidate) {
 	if (!stat.isFile()) throw new Error("Workflow path is not a file");
 
 	const ext = extname(resolved).toLowerCase();
-	if (![".lobster", ".yaml", ".yml", ".json"].includes(ext)) {
+	if (!WORKFLOW_FILE_EXTENSIONS.includes(ext)) {
 		throw new Error("Workflow file must end in .lobster, .yaml, .yml, or .json");
 	}
 

@@ -41,7 +41,7 @@ export const sortCommand = {
 			`  ... | sort --key prNumber --desc\n\n` +
 			`Notes:\n` +
 			`  - Sorting is stable (preserves order for equal keys).\n` +
-			`  - undefined/null keys sort last.\n`
+			`  - With --key, undefined/null keys sort last in either direction.\n`
 		);
 	},
 	async run({ input, args }: any) {
@@ -58,6 +58,7 @@ export const sortCommand = {
 			const av = key ? getByPath(a.item, key) : a.item;
 			const bv = key ? getByPath(b.item, key) : b.item;
 			const c = defaultCompare(av, bv);
+			if (key && (av == null || bv == null)) return c;
 			return desc ? -c : c;
 		});
 

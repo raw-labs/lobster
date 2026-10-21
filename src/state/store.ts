@@ -213,6 +213,7 @@ async function writeStateJsonUnlocked({
 		const guarded = guard && !guard.admitted && guard.key === key && isConsumedResumeState(value);
 		const writeOptions: FileWriteOptions = {
 			signal,
+			assertInvocationCurrent: atomicWriteOptions?.assertInvocationCurrent,
 			atomicWriteOptions,
 			...(guarded ? { expectedWaitRevision: guard.expectedRevision } : {}),
 			...(recorder?.decisionKey === key.replace("workflow-resume_", "workflow_resume_")
@@ -330,11 +331,13 @@ async function restoreConsumedResumeStateInternal({
 	key,
 	expectedState,
 	claimId,
+	approvalId,
 }: {
 	env: Record<string, string | undefined>;
 	key: string;
 	expectedState: unknown;
 	claimId: string;
+	approvalId?: string;
 }) {
 	return withStateKeyLock({
 		env,
@@ -348,6 +351,9 @@ async function restoreConsumedResumeStateInternal({
 			const recorder = recorderFromEnv(env);
 			if (recorder) {
 				recorder.ownsExecution = false;
+			}
+			if (approvalId) {
+				await restoreApprovalIndex({ env, stateKey: key, approvalId }).catch(() => {});
 			}
 			return true;
 		},
@@ -366,11 +372,13 @@ async function deleteResumeStateWithRollbackInternal({
 	key,
 	expectedState,
 	signal = undefined,
+	assertInvocationCurrent = undefined,
 }: {
 	env: Record<string, string | undefined>;
 	key: string;
 	expectedState: unknown;
 	signal?: AbortSignal;
+	assertInvocationCurrent?: () => void;
 }): Promise<boolean> {
 	return withStateKeyLock({
 		env,
@@ -378,13 +386,13 @@ async function deleteResumeStateWithRollbackInternal({
 		signal,
 		task: async () => {
 			signal?.throwIfAborted();
+			assertInvocationCurrent?.();
 			const currentState = await readStateJson({ env, key });
 			if (stableStringify(currentState) !== stableStringify(expectedState)) return false;
 
 			const claimId = randomBytes(16).toString("hex");
 			let claimPublished = false;
 			let claimMayBePublished = false;
-			let deleted = false;
 			try {
 				let result;
 				try {
@@ -397,6 +405,7 @@ async function deleteResumeStateWithRollbackInternal({
 							claimId,
 						},
 						signal,
+						atomicWriteOptions: { assertInvocationCurrent },
 					});
 				} catch (err) {
 					claimMayBePublished = atomicWriteWasPublished(err);
@@ -405,15 +414,19 @@ async function deleteResumeStateWithRollbackInternal({
 				claimPublished = true;
 				if (result?.signalAbortedAfterCommit) signal?.throwIfAborted();
 				signal?.throwIfAborted();
+				assertInvocationCurrent?.();
 				await deleteStateJsonUnlocked({ env, key });
-				deleted = true;
 				signal?.throwIfAborted();
+				assertInvocationCurrent?.();
 				return true;
 			} catch (err) {
-				if ((signal?.aborted && claimPublished) || claimMayBePublished) {
+				if (
+					((signal?.aborted || assertInvocationCurrent) && claimPublished) ||
+					claimMayBePublished
+				) {
 					const latest = await readStateJson({ env, key });
 					if (
-						(deleted && latest === null) ||
+						(claimPublished && latest === null) ||
 						(isConsumedResumeState(latest) && latest.claimId === claimId)
 					) {
 						await writeStateJsonUnlocked({ env, key, value: expectedState });
@@ -597,7 +610,11 @@ async function writeApprovalIndexInternal({
 	const indexPath = path.join(stateDir, `approval_${safe}.json`);
 	const session = sessionFromEnv(env);
 	if (session) {
-		const writeOptions: FileWriteOptions = { exclusive: true, atomicWriteOptions: options };
+		const writeOptions: FileWriteOptions = {
+			exclusive: true,
+			atomicWriteOptions: options,
+			assertInvocationCurrent: options?.assertInvocationCurrent,
+		};
 		await session.write(
 			`approval_${safe}`,
 			JSON.stringify({ stateKey, createdAt: new Date().toISOString() }) + "\n",
@@ -662,6 +679,72 @@ async function findStateKeyByApprovalIdInternal({
 		if (err?.code === "ENOENT") return null;
 		if (isJsonSyntaxError(err)) return null;
 		throw err;
+	}
+}
+
+/** Locate the short ID through the selected store before retiring its index. */
+export async function findApprovalIdByStateKey({
+	env,
+	stateKey,
+}: {
+	env: Record<string, string | undefined>;
+	stateKey: string;
+}): Promise<string | null> {
+	return withStoreContext({ env, readOnly: true }, async (ctx) => {
+		const session = sessionFromEnv(ctx.env);
+		if (session) {
+			for (const [key, text] of Object.entries(await session.backend.listState("approval_"))) {
+				const match = /^approval_([a-f0-9]+)$/.exec(key);
+				if (!match) continue;
+				try {
+					if (JSON.parse(text)?.stateKey === stateKey) return match[1];
+				} catch {
+					/* Ignore unrelated corrupt optional indexes. */
+				}
+			}
+			return null;
+		}
+		const directory = defaultStateDir(ctx.env);
+		let files: string[];
+		try {
+			files = await fsp.readdir(directory);
+		} catch (error) {
+			if (error.code === "ENOENT") return null;
+			throw error;
+		}
+		for (const file of files) {
+			const match = /^approval_([a-f0-9]+)\.json$/.exec(file);
+			if (!match) continue;
+			try {
+				const value = JSON.parse(await fsp.readFile(path.join(directory, file), "utf8"));
+				if (value?.stateKey === stateKey) return match[1];
+			} catch {
+				/* Ignore unrelated corrupt optional indexes. */
+			}
+		}
+		return null;
+	});
+}
+
+/** Restore only a missing mapping; another allocation must never be overwritten. */
+async function restoreApprovalIndex({
+	env,
+	stateKey,
+	approvalId,
+}: {
+	env: Record<string, string | undefined>;
+	stateKey: string;
+	approvalId: string;
+}): Promise<boolean> {
+	const mappedStateKey = await findStateKeyByApprovalId({ env, approvalId });
+	if (mappedStateKey === stateKey) return true;
+	if (mappedStateKey !== null) return false;
+	try {
+		await writeApprovalIndex({ env, stateKey, approvalId });
+		return true;
+	} catch (err: any) {
+		if (err?.code !== "EEXIST") throw err;
+		return (await findStateKeyByApprovalId({ env, approvalId })) === stateKey;
 	}
 }
 

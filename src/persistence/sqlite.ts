@@ -66,7 +66,8 @@ export class SqliteBackend implements Backend {
 	private connect(): void {
 		this.worker = new Worker(new URL("./sqlite-worker.js", import.meta.url), {
 			workerData: { path: this.databasePath, readOnly: this.readOnly },
-			execArgv: process.execArgv.filter((arg) => !arg.startsWith("--input-type")),
+			// This compiled worker needs no host loaders or process-only Node flags.
+			execArgv: [],
 		});
 		this.ready = new Promise((resolve, reject) => {
 			this.worker.once("error", reject);
@@ -129,6 +130,7 @@ export class SqliteBackend implements Backend {
 		method: M,
 		args: WorkerArgs<M>,
 		signal?: AbortSignal,
+		assertInvocationCurrent?: () => void,
 	): Promise<WorkerResult<M>> {
 		signal?.throwIfAborted();
 		if (this.closing) {
@@ -152,12 +154,13 @@ export class SqliteBackend implements Backend {
 		await this.ready;
 		signal?.throwIfAborted();
 		if (this.failed) {
-			return this.request(method, args, signal);
+			return this.request(method, args, signal, assertInvocationCurrent);
 		}
 		if (method !== "close" && this.pending.size >= this.maxPending) {
 			throw new Error("Persistence admission limit reached");
 		}
 
+		assertInvocationCurrent?.();
 		const id = randomUUID();
 		const operationId =
 			"operationId" in args && typeof args.operationId === "string" ? args.operationId : id;
@@ -218,6 +221,7 @@ export class SqliteBackend implements Backend {
 				decision: options.decision,
 			},
 			options.signal,
+			options.assertInvocationCurrent,
 		);
 		return {
 			...result,
@@ -227,8 +231,12 @@ export class SqliteBackend implements Backend {
 		};
 	}
 
-	transition(request: Transition, signal?: AbortSignal): Promise<TransitionResult> {
-		return this.request("transition", request, signal);
+	transition(
+		request: Transition,
+		signal?: AbortSignal,
+		assertInvocationCurrent?: () => void,
+	): Promise<TransitionResult> {
+		return this.request("transition", request, signal, assertInvocationCurrent);
 	}
 
 	acknowledge(runId: string, operationId: string): Promise<void> {

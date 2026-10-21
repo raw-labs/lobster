@@ -9,6 +9,7 @@ import {
 	createApprovalIndex,
 	deleteResumeStateWithRollback,
 	deleteStateJson,
+	findApprovalIdByStateKey,
 	isConsumedResumeState,
 	readStateJsonWithLock,
 	restoreConsumedResumeState,
@@ -113,12 +114,16 @@ export async function finalizePipelineToolRun(params: {
 	restorePreviousStateOnAbort?: boolean;
 	onPreviousStateRestored?: () => void;
 	signal?: AbortSignal;
+	assertInvocationCurrent?: () => void;
 }): Promise<PipelineToolRunResolution> {
 	params.signal?.throwIfAborted();
 	const { approval, inputRequest } = extractPipelineHalt(params.output);
 	if (approval) {
 		let nextStateKey: string | undefined;
+		let previousClaimId: string | undefined;
+		let previousApprovalId: string | null = null;
 		try {
+			params.assertInvocationCurrent?.();
 			nextStateKey = await publishPipelineResumeState(
 				params.env,
 				{
@@ -141,16 +146,34 @@ export async function finalizePipelineToolRun(params: {
 				},
 				params,
 			);
-			const approvalId = await createApprovalIndex({ env: params.env, stateKey: nextStateKey });
-			const replaced = await retireLegacyPipelineCheckpoint({
+			const approvalId = await createApprovalIndex({
+				env: params.env,
+				stateKey: nextStateKey,
+				options: { assertInvocationCurrent: params.assertInvocationCurrent },
+			});
+			params.assertInvocationCurrent?.();
+			if (
+				!recorderFromEnv(params.env) &&
+				params.previousStateKey &&
+				!params.previousStateConsumed
+			) {
+				previousApprovalId = await findApprovalIdByStateKey({
+					env: params.env,
+					stateKey: params.previousStateKey,
+				});
+			}
+			const replacement = await retireLegacyPipelineCheckpoint({
 				env: params.env,
 				previousStateKey: params.previousStateKey,
 				expectedPreviousState: params.previousState,
 				previousStateConsumed: params.previousStateConsumed,
 				replacementStateKey: nextStateKey,
 				signal: params.signal,
+				assertInvocationCurrent: params.assertInvocationCurrent,
 			});
-			if (!replaced) throw new Error("Pipeline resume state not found");
+			if (!replacement.replaced) throw new Error("Pipeline resume state not found");
+			previousClaimId = replacement.claimId;
+			params.assertInvocationCurrent?.();
 			const resumeToken = encodeToken({
 				protocolVersion: 1,
 				v: 1,
@@ -158,6 +181,7 @@ export async function finalizePipelineToolRun(params: {
 				stateKey: nextStateKey,
 			});
 			await retirePreviousPipelineApprovalIndex(params.env, params.previousStateKey, nextStateKey);
+			params.assertInvocationCurrent?.();
 			return {
 				status: "needs_approval",
 				output: [],
@@ -170,8 +194,10 @@ export async function finalizePipelineToolRun(params: {
 			};
 		} catch (err) {
 			try {
-				if (!recorderFromEnv(params.env) && !params.previousStateConsumed)
-					await restorePreviousPipelineResumeState(params);
+				if (!recorderFromEnv(params.env)) {
+					await restorePreviousPipelineClaim(params, previousClaimId, previousApprovalId);
+					if (!params.previousStateConsumed) await restorePreviousPipelineResumeState(params);
+				}
 			} finally {
 				if (nextStateKey && !recorderFromEnv(params.env))
 					await discardPipelineResumeState(params.env, nextStateKey);
@@ -183,7 +209,10 @@ export async function finalizePipelineToolRun(params: {
 	if (inputRequest) {
 		const resumeMode = inputRequest.commandInput ? "same_stage" : "next_stage";
 		let nextStateKey: string | undefined;
+		let previousClaimId: string | undefined;
+		let previousApprovalId: string | null = null;
 		try {
+			params.assertInvocationCurrent?.();
 			nextStateKey = await publishPipelineResumeState(
 				params.env,
 				{
@@ -213,15 +242,29 @@ export async function finalizePipelineToolRun(params: {
 				},
 				params,
 			);
-			const replaced = await retireLegacyPipelineCheckpoint({
+			params.assertInvocationCurrent?.();
+			if (
+				!recorderFromEnv(params.env) &&
+				params.previousStateKey &&
+				!params.previousStateConsumed
+			) {
+				previousApprovalId = await findApprovalIdByStateKey({
+					env: params.env,
+					stateKey: params.previousStateKey,
+				});
+			}
+			const replacement = await retireLegacyPipelineCheckpoint({
 				env: params.env,
 				previousStateKey: params.previousStateKey,
 				expectedPreviousState: params.previousState,
 				previousStateConsumed: params.previousStateConsumed,
 				replacementStateKey: nextStateKey,
 				signal: params.signal,
+				assertInvocationCurrent: params.assertInvocationCurrent,
 			});
-			if (!replaced) throw new Error("Pipeline resume state not found");
+			if (!replacement.replaced) throw new Error("Pipeline resume state not found");
+			previousClaimId = replacement.claimId;
+			params.assertInvocationCurrent?.();
 			const resumeToken = encodeToken({
 				protocolVersion: 1,
 				v: 1,
@@ -229,6 +272,7 @@ export async function finalizePipelineToolRun(params: {
 				stateKey: nextStateKey,
 			});
 			await retirePreviousPipelineApprovalIndex(params.env, params.previousStateKey, nextStateKey);
+			params.assertInvocationCurrent?.();
 			return {
 				status: "needs_input",
 				output: [],
@@ -244,8 +288,10 @@ export async function finalizePipelineToolRun(params: {
 			};
 		} catch (err) {
 			try {
-				if (!recorderFromEnv(params.env) && !params.previousStateConsumed)
-					await restorePreviousPipelineResumeState(params);
+				if (!recorderFromEnv(params.env)) {
+					await restorePreviousPipelineClaim(params, previousClaimId, previousApprovalId);
+					if (!params.previousStateConsumed) await restorePreviousPipelineResumeState(params);
+				}
 			} finally {
 				if (nextStateKey && !recorderFromEnv(params.env))
 					await discardPipelineResumeState(params.env, nextStateKey);
@@ -257,6 +303,13 @@ export async function finalizePipelineToolRun(params: {
 	params.signal?.throwIfAborted();
 	if (params.previousStateKey) {
 		try {
+			if (!params.previousStateConsumed) {
+				await cleanupSupersededPipelineResumeStates(
+					params.env,
+					params.previousState?.supersededResumeStateKeys,
+				);
+				params.assertInvocationCurrent?.();
+			}
 			if (params.previousStateConsumed) {
 				await deleteStateJson({
 					env: params.env,
@@ -270,13 +323,16 @@ export async function finalizePipelineToolRun(params: {
 					key: params.previousStateKey,
 					expectedState: params.previousState,
 					signal: params.signal,
+					assertInvocationCurrent: params.assertInvocationCurrent,
 				});
 				if (!deleted) throw new Error("Pipeline resume state not found");
 			}
-			await cleanupSupersededPipelineResumeStates(
-				params.env,
-				params.previousState?.supersededResumeStateKeys,
-			);
+			if (params.previousStateConsumed) {
+				await cleanupSupersededPipelineResumeStates(
+					params.env,
+					params.previousState?.supersededResumeStateKeys,
+				);
+			}
 		} catch (err) {
 			if (!recorderFromEnv(params.env) && !params.previousStateConsumed)
 				await restorePreviousPipelineResumeState(params);
@@ -299,10 +355,12 @@ async function publishPipelineResumeState(
 		previousState?: PipelineResumeState;
 		previousStateClaimId?: string;
 		signal?: AbortSignal;
+		assertInvocationCurrent?: () => void;
 	},
 ): Promise<string> {
 	const recorder = recorderFromEnv(env);
-	if (!recorder) return savePipelineResumeState(env, state, params.signal);
+	if (!recorder)
+		return savePipelineResumeState(env, state, params.signal, params.assertInvocationCurrent);
 
 	const key = `pipeline_resume_${randomUUID()}`;
 	await publishTrackedCheckpoint({
@@ -317,6 +375,7 @@ async function publishPipelineResumeState(
 				}
 			: undefined,
 		signal: params.signal,
+		assertInvocationCurrent: params.assertInvocationCurrent,
 	});
 	return key;
 }
@@ -325,6 +384,7 @@ export async function savePipelineResumeState(
 	env: Record<string, string | undefined>,
 	state: PipelineResumeState,
 	signal?: AbortSignal,
+	assertInvocationCurrent?: () => void,
 ) {
 	const stateKey = `pipeline_resume_${randomUUID()}`;
 	try {
@@ -332,6 +392,7 @@ export async function savePipelineResumeState(
 		await writeStateJson({
 			env,
 			key: stateKey,
+			atomicWriteOptions: { assertInvocationCurrent },
 			value: {
 				...state,
 				...(recorderFromEnv(env) ? { historyOffset: recorderFromEnv(env).pipelineOffset } : {}),
@@ -339,9 +400,12 @@ export async function savePipelineResumeState(
 			signal,
 		});
 		signal?.throwIfAborted();
+		assertInvocationCurrent?.();
 		return stateKey;
 	} catch (err) {
-		if (signal?.aborted) await discardPipelineResumeState(env, stateKey);
+		if (signal?.aborted || assertInvocationCurrent) {
+			await discardPipelineResumeState(env, stateKey);
+		}
 		throw err;
 	}
 }
@@ -353,6 +417,7 @@ async function retireLegacyPipelineCheckpoint({
 	previousStateConsumed,
 	replacementStateKey,
 	signal,
+	assertInvocationCurrent,
 }: {
 	env: Record<string, string | undefined>;
 	previousStateKey?: string;
@@ -360,20 +425,23 @@ async function retireLegacyPipelineCheckpoint({
 	previousStateConsumed?: boolean;
 	replacementStateKey: string;
 	signal?: AbortSignal;
+	assertInvocationCurrent?: () => void;
 }) {
-	if (recorderFromEnv(env)) return true;
+	if (recorderFromEnv(env)) return { replaced: true as const };
 	if (!previousStateKey || previousStateKey === replacementStateKey) {
 		signal?.throwIfAborted();
-		return true;
+		assertInvocationCurrent?.();
+		return { replaced: true as const };
 	}
 	// The current resume has already crossed an unsafe boundary and owns the
 	// predecessor's consumed marker. It may safely publish the next gate, but
 	// must retain that marker rather than attempting a stale snapshot CAS.
 	if (previousStateConsumed) {
 		signal?.throwIfAborted();
-		return true;
+		assertInvocationCurrent?.();
+		return { replaced: true as const };
 	}
-	if (!expectedPreviousState) return false;
+	if (!expectedPreviousState) return { replaced: false as const };
 
 	let claimId: string | undefined;
 	try {
@@ -383,18 +451,19 @@ async function retireLegacyPipelineCheckpoint({
 			expectedState: expectedPreviousState,
 			signal,
 		});
-		if (!consumption.consumed) return false;
+		if (!consumption.consumed) return { replaced: false as const };
 		claimId = consumption.claimId;
 		// The predecessor remains as a durable tombstone until terminal cleanup.
 		// A concurrent caller can therefore never turn the same approval into a
 		// second successor capability.
 		signal?.throwIfAborted();
-		return true;
+		assertInvocationCurrent?.();
+		return { replaced: true as const, claimId };
 	} catch (err) {
 		// A cancellation after the atomic marker publication has not exposed the
 		// successor token yet. Restore only the marker created by this caller so a
 		// competing transition can never be overwritten.
-		if (claimId && signal?.aborted) {
+		if (claimId) {
 			await restoreConsumedResumeState({
 				env,
 				key: previousStateKey,
@@ -404,6 +473,23 @@ async function retireLegacyPipelineCheckpoint({
 		}
 		throw err;
 	}
+}
+
+async function restorePreviousPipelineClaim(
+	params: Parameters<typeof finalizePipelineToolRun>[0],
+	claimId: string | undefined,
+	approvalId: string | null,
+) {
+	if (!claimId || !params.previousStateKey || !params.previousState) return;
+	const restored = await restoreConsumedResumeState({
+		env: params.env,
+		key: params.previousStateKey,
+		expectedState: params.previousState,
+		claimId,
+		approvalId: approvalId ?? undefined,
+	}).catch(() => false);
+	if (!restored) return;
+	params.onPreviousStateRestored?.();
 }
 
 async function restorePreviousPipelineResumeState({

@@ -37,7 +37,7 @@ Requires Node.js 22 or newer and the pnpm version pinned in `package.json`. From
 
 - `pnpm test` runs `tsc` and then executes tests against `dist/`.
 - `bin/lobster.js` runs the compiled entrypoint in `dist/`; build after changing source files.
-Invalid explicit workflow file paths are reported as input errors (exit code 2). In `--mode tool`, these failures use the same JSON error envelope as other parsing errors.
+Invalid workflow file paths are reported as input errors (exit code 2), whether passed with `--file` or as a single positional path (no whitespace; contains a path separator or ends in `.lobster`, `.yaml`, `.yml`, or `.json`). In `--mode tool`, these failures use the same JSON error envelope as other parsing errors.
 
 ## Persistence and run history
 
@@ -344,6 +344,22 @@ const result = await pending;
 Custom stages receive the signal as `ctx.signal` and must cooperate with it to
 cancel their own work.
 
+## Host invocation authority
+
+Hosts using the core `runToolRequest()` and `resumeToolRequest()` APIs can pass
+`ctx.assertInvocationCurrent`, a synchronous callback that throws when the host
+has retired an invocation. Lobster rechecks it before built-in process, network,
+and state effects, including after asynchronous resume preparation. Keep passing
+an `AbortSignal` to cancel work that has already started.
+
+A retired resume restores its caller-owned checkpoint when no unsafe dispatch
+has started. Once an unsafe pipeline command has been entered, the approval stays
+consumed even if a later authority check prevents the effect. This conservative
+boundary prevents replaying work that may already have happened. Custom commands
+and injected adapters must check the callback themselves after awaited preparation
+and before their own effects. The SDK does not expose this host-authority contract;
+CLI behavior is unchanged when no callback is supplied.
+
 ## GitHub recipe cancellation
 
 The SDK GitHub recipes accept an `AbortSignal` in both
@@ -558,11 +574,13 @@ args:
     default: ""
 steps:
   - id: safe
-    env:
-      TEXT: "$LOBSTER_ARG_TEXT"
     command: |
-      jq -n --arg text "$TEXT" '{"result": $text}'
+      jq -n --arg text "$LOBSTER_ARG_TEXT" '{"result": $text}'
 ```
+
+Values in an `env:` block are not shell-expanded, so `TEXT: "$LOBSTER_ARG_TEXT"`
+sets `TEXT` to that literal string. To pass an arg under another name, use
+`TEXT: "${text}"`; env values never go through the shell, so this stays safe.
 
 ## HTTP response limits
 
@@ -591,3 +609,5 @@ post-dispatch errors; `llm.invoke` retains its existing retry policy.
 The source is one TypeScript package. `src/core` contains the embeddable tool API, cost tracking, and LLM accounting; `src/sdk` provides pipeline composition; `src/commands` holds the command registry and standard library. Workflow loading, expressions, dry-run rendering, and execution live under `src/workflows`. `src/state` owns atomic file persistence, locks, and resume capabilities. GitHub SDK recipes and built-in workflows share transport and snapshot helpers.
 
 Run `pnpm test`, `pnpm typecheck`, and `pnpm lint` before submitting changes. Tests compile into `dist/test` and use Node's test runner; platform-specific process tests run only where their OS primitives exist. Dependencies observe the two-day release-age policy in `pnpm-workspace.yaml`.
+
+To validate release packaging from the current `main` without publishing, run `gh workflow run lobster-npm-release.yml --ref main -f tag=v$(node -p "require('./package.json').version") -F dry_run=true`. This builds the selected commit and skips publishing, promotion, and uploading a promotable artifact. The existing `preflight_only` mode still builds the requested release tag for later promotion.

@@ -19,12 +19,14 @@ export async function publishTrackedCheckpoint({
 	state,
 	predecessor,
 	signal,
+	assertInvocationCurrent,
 }: {
 	env: StoreEnvironment;
 	key: string;
 	state: unknown;
 	predecessor?: ContinuationPredecessor;
 	signal?: AbortSignal;
+	assertInvocationCurrent?: () => void;
 }): Promise<void> {
 	const recorder = recorderFromEnv(env);
 	if (!recorder) throw new Error("Checkpoint publication requires a tracked run");
@@ -53,6 +55,7 @@ export async function publishTrackedCheckpoint({
 				? { kind: "handoff", predecessor: checkpointGuard, successor, decision: recorder.decision }
 				: { kind: "state", ...successor },
 			signal,
+			assertInvocationCurrent,
 		);
 	// Legacy token consumers check their snapshot while holding this key lock.
 	// Share that barrier so a stale claimant cannot overwrite a retired wait.

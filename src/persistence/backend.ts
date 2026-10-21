@@ -18,6 +18,7 @@ export type StateWriteOptions = {
 	runId?: string;
 	decision?: unknown;
 	signal?: AbortSignal;
+	assertInvocationCurrent?: () => void;
 };
 
 export type StateWriteCommit =
@@ -37,7 +38,11 @@ export interface Backend {
 	listState(prefix: string): Promise<Record<string, string>>;
 	write(key: string, text: string | null, options?: StateWriteOptions): Promise<StateWriteResult>;
 
-	transition(request: Transition, signal?: AbortSignal): Promise<TransitionResult>;
+	transition(
+		request: Transition,
+		signal?: AbortSignal,
+		assertInvocationCurrent?: () => void,
+	): Promise<TransitionResult>;
 	acknowledge(runId: string, operationId: string): Promise<void>;
 	getRun(id: string): Promise<RunRecord | null>;
 	getRunState(id: string): Promise<RunState | null>;

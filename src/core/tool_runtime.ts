@@ -44,6 +44,7 @@ export type ToolRunContext = {
 	stderr?: NodeJS.WritableStream;
 	signal?: AbortSignal;
 	forceTerminationSignal?: AbortSignal;
+	assertInvocationCurrent?: () => void;
 	registry?: any;
 	llmAdapters?: Record<string, any>;
 };
@@ -168,6 +169,7 @@ async function runToolRequestInternal({
 			signal: runtime.signal,
 			forceTerminationSignal: runtime.forceTerminationSignal,
 			haltAfterStageOnAbort: true,
+			assertInvocationCurrent: runtime.assertInvocationCurrent,
 		});
 
 		const finalized = await finalizePipelineToolRun({
@@ -175,6 +177,7 @@ async function runToolRequestInternal({
 			pipeline: parsed,
 			output,
 			signal: runtime.signal,
+			assertInvocationCurrent: runtime.assertInvocationCurrent,
 		});
 		return okEnvelope(
 			finalized.status,
@@ -484,7 +487,7 @@ async function resumeToolRequestInternal({
 			: resumeState.items;
 	const abortedBeforeResume = runtime.signal?.aborted === true;
 	let pipelineResumeStateRestored = false;
-	let pipelineExecutionStarted = false;
+	let pipelineUnsafeDispatchStarted = false;
 	let pipelineResumeStateClaimId: string | undefined;
 	const requestInputResume = isSameStageInput
 		? {
@@ -508,6 +511,7 @@ async function resumeToolRequestInternal({
 			signal: runtime.signal,
 			forceTerminationSignal: runtime.forceTerminationSignal,
 			haltAfterStageOnAbort: true,
+			assertInvocationCurrent: runtime.assertInvocationCurrent,
 			input,
 			requestInputResume,
 			onExecutionStart: async () => {
@@ -535,7 +539,9 @@ async function resumeToolRequestInternal({
 					runtime.signal?.throwIfAborted();
 				}
 				runtime.signal?.throwIfAborted();
-				pipelineExecutionStarted = true;
+			},
+			onUnsafeCommandDispatch: () => {
+				pipelineUnsafeDispatchStarted = true;
 			},
 		});
 
@@ -543,17 +549,18 @@ async function resumeToolRequestInternal({
 			env: runtime.env,
 			pipeline: remaining,
 			output,
+			assertInvocationCurrent: runtime.assertInvocationCurrent,
 			previousStateKey: payload.stateKey,
 			previousState: resumeState,
-			previousStateConsumed: pipelineExecutionStarted,
+			previousStateConsumed: pipelineUnsafeDispatchStarted,
 			previousStateClaimId: pipelineResumeStateClaimId,
-			restorePreviousStateOnAbort: !pipelineExecutionStarted,
+			restorePreviousStateOnAbort: !pipelineUnsafeDispatchStarted,
 			onPreviousStateRestored: () => {
 				pipelineResumeStateRestored = true;
 			},
 			signal: runtime.signal,
 		});
-		if (finalized.status === "ok" && pipelineExecutionStarted) await cleanupIndex();
+		if (finalized.status === "ok" && pipelineUnsafeDispatchStarted) await cleanupIndex();
 		return okEnvelope(
 			finalized.status,
 			finalized.output,
@@ -563,8 +570,7 @@ async function resumeToolRequestInternal({
 	} catch (err: any) {
 		const abortedResume = runtime.signal?.aborted === true;
 		if (
-			abortedResume &&
-			!pipelineExecutionStarted &&
+			!pipelineUnsafeDispatchStarted &&
 			!pipelineResumeStateRestored &&
 			pipelineResumeStateClaimId
 		) {
@@ -575,19 +581,18 @@ async function resumeToolRequestInternal({
 				claimId: pipelineResumeStateClaimId,
 			}).catch(() => false);
 		}
-		if (pipelineExecutionStarted && !pipelineResumeStateRestored) {
+		if (pipelineUnsafeDispatchStarted && !pipelineResumeStateRestored) {
 			if (abortedResume && !abortedBeforeResume) {
 				await deleteStateJsonWithBoundedResumeCleanup({
 					env: runtime.env,
 					key: payload.stateKey,
 				}).catch(() => {});
 			}
-			// Keep the short approval ID through the pre-dispatch claim window. Once
-			// the unsafe stage has actually been entered, the tombstone makes retry
-			// unsafe and the old index may be retired just as it was before this fix.
+			// Once an unsafe stage has actually entered, replay is not safe even if
+			// a later effect-site check prevented its external side effect.
 			await cleanupIndex().catch(() => {});
 		}
-		// Non-abort failures and pre-aborted resumes remain retryable by token or approval ID.
+		// Only a restored pre-dispatch claim remains retryable.
 		return errorEnvelope("runtime_error", err);
 	}
 }
@@ -602,6 +607,7 @@ export function createToolContext(ctx: ToolRunContext = {}) {
 		stderr: ctx.stderr ?? createCaptureStream(),
 		signal: ctx.signal,
 		forceTerminationSignal: ctx.forceTerminationSignal,
+		assertInvocationCurrent: ctx.assertInvocationCurrent,
 		registry: ctx.registry ?? createDefaultRegistry(),
 		llmAdapters: ctx.llmAdapters,
 		storeSession: ctx.storeSession,
