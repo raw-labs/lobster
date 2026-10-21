@@ -58,7 +58,12 @@ LOBSTER_STATE_DIR=/path/to/new/state LOBSTER_BACKEND=sqlite LOBSTER_HISTORY=1 \
   lobster run --mode tool --file workflow.lobster
 ```
 
-SQLite requires Node 22.13+ on the Node 22 line, 23.4+ on Node 23, or Node 24+.
+SQLite requires Node 22.13+ on the Node 22 line, 23.4+ on Node 23, or Node 24+,
+**and a bundled SQLite version containing the WAL-reset fix**: 3.51.3 or later,
+or the 3.50.7/3.44.6 backports and subsequent patches on those branches. Node's
+version alone does not establish that its SQLite is patched. Check with
+`node -p process.versions.sqlite`; upgrade Node if SQLite selection rejects it.
+The same qualification applies to migration. See the [SQLite fix](https://sqlite.org/wal.html#walreset).
 The file backend retains Node >=22 support and does not load `node:sqlite`.
 A worker owns the SQLite connection, prepared statements, and short transactions;
 embedded hosts receive promises. The database uses WAL, a 5-second busy timeout,
@@ -209,6 +214,60 @@ record. Self-contained legacy SDK tokens remain usable with supplied SDK stages
 and cannot be discovered by scanning a directory. An owning host can build
 coordinated upgrade-time conversion on this API; automatic conversion is not enabled.
 
+### Adopting legacy pauses
+
+Backend migration preserves old checkpoints; it does not assign owners or invent
+run history. To make existing pauses discoverable before answering them, use
+`listLegacyCheckpoints` and `adoptLegacyCheckpoint` from either the core or SDK entry
+point. Both file and SQLite stores support the same maintenance operations.
+
+```ts
+import { listLegacyCheckpoints, adoptLegacyCheckpoint } from '@clawdbot/lobster/core';
+
+const inventory = await listLegacyCheckpoints({ ctx: { storeSession: store }, limit: 20 });
+const checkpoint = inventory.checkpoints[0];
+if (checkpoint) {
+  // The host establishes the owner mapping; checkpointId is opaque.
+  const run = await adoptLegacyCheckpoint({
+    checkpointId: checkpoint.checkpointId,
+    ctx: { storeSession: store, runMetadata: { callerId: 'host:verified-owner' } },
+  });
+  // Inspect run.pendingWaits and answer through the normal APIs.
+}
+```
+
+Inventory is bounded to 100 entries per page (20 by default), using `after` and
+`nextCursor`. It lists unassociated stored checkpoints, excludes consumed tokens,
+and requires unscoped host access because those records have no known caller.
+Adoption requires a nonempty trusted caller ID, executes no workflow steps, and
+creates one partial run with its pending wait in an atomic commit. Repeating it
+for the same owner preserves run identity; competing owners cannot both adopt a
+checkpoint. An already-associated, unowned partial run can also be bound using
+its saved checkpoint ID. Adoption cannot reassign an existing owner.
+
+These are host maintenance APIs, not permission checks or model-facing tools.
+The host must establish who owns a checkpoint before adopting it; possession of
+an old token alone does not establish that identity. CLI callers can make the
+same explicit association:
+
+```sh
+lobster storage legacy list
+lobster storage legacy list <after>
+lobster storage legacy adopt <checkpointId> --caller host:verified-owner
+```
+
+Existing tokens and short approval IDs remain usable after adoption. Stored SDK
+command-input tokens also keep working with an instance supplying the original
+stages. Self-contained legacy SDK tokens remain outside inventory and retain
+their previous behavior. No historical events or missing review material are
+reconstructed: `getWait().request` can be `null` for an old workflow checkpoint
+that did not save the question. Workflow source is never reread to invent it.
+
+Migration validates legacy and tracked checkpoint shapes and references before
+preparing the destination, and rejects ambiguous workflow-key aliases. Already
+expired optional approval IDs and references to deleted predecessor markers
+remain expired; migration never creates executable state to satisfy them.
+
 ```sh
 lobster storage export                         # versioned logical archive
 lobster history prune 2026-01-01T00:00:00Z      # dry run
@@ -217,12 +276,15 @@ lobster history prune 2026-01-01T00:00:00Z --apply
 
 Retention removes only terminal runs older than the cutoff with no live
 continuation, pending wait, started attempt, or unacknowledged operation receipt.
+Valid consumed-capability markers may be removed with their terminal run; their
+tokens remain unusable because neither backend falls back to an old checkpoint.
 Committed transitions have stable operation IDs and receipts. A lost reply is an
 unknown outcome until reconciled; it does not authorize replaying an external
 side effect. Receipts are acknowledged only after the executor observes commit,
 and remain protected otherwise. Started attempts are history, not automatic
-restart checkpoints. Crash recovery and external-service idempotency remain
-separate executor work.
+restart checkpoints. A run's `running` status is its last recorded state, not a
+liveness guarantee after process death. Crash recovery and external-service
+idempotency remain separate executor work.
 
 History persistence errors bypass workflow retry and `on_error` continuation.
 Tool envelopes report `persistence_error` or `persistence_outcome_unknown`, with

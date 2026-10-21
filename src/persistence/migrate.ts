@@ -1,3 +1,6 @@
+import { readBackendSelection } from "./selection.js";
+import { validateContinuations } from "./legacy.js";
+import { assertSqliteRuntime } from "./sqlite-support.js";
 import { randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
 import path from "node:path";
@@ -5,12 +8,7 @@ import { ensureDirectory, writeFileAtomic } from "../state/atomic_file.js";
 import { withFileLock } from "../state/file_lock.js";
 import type { Backend, BackendKind } from "./backend.js";
 import { FileBackend } from "./files.js";
-import {
-	fingerprint,
-	validateArchive,
-	validateContinuations,
-	type LogicalArchive,
-} from "./model.js";
+import { fingerprint, validateArchive, type LogicalArchive } from "./model.js";
 
 async function assertOffline(directory: string) {
 	for (const name of await fs.readdir(directory)) {
@@ -69,24 +67,16 @@ export async function migrateStore({ directory, backend, offline, onPhase }: Mig
 	if (!["files", "sqlite"].includes(backend)) {
 		throw new Error("Invalid migration backend");
 	}
+	if (backend === "sqlite") assertSqliteRuntime();
+
 	directory = path.resolve(directory);
 	await ensureDirectory(directory);
 	return withFileLock({
 		filePath: path.join(directory, ".backend-selection"),
 		task: async () => {
 			await assertOffline(directory);
-			let selected: { version: number; backend: "files" | "sqlite" } | undefined;
-			try {
-				selected = JSON.parse(await fs.readFile(path.join(directory, ".backend"), "utf8"));
-			} catch (error) {
-				if (error.code !== "ENOENT") {
-					throw error;
-				}
-			}
+			const selected = await readBackendSelection(directory);
 			const from = selected?.backend ?? "files";
-			if (!["files", "sqlite"].includes(from) || (selected && selected.version !== 1)) {
-				throw new Error("Unsupported backend selection");
-			}
 			if (from === "sqlite") {
 				try {
 					await fs.access(path.join(directory, "lobster.sqlite"));

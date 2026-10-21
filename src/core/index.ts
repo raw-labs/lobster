@@ -23,3 +23,5 @@ export type { ToolRunContext, ResumeToolOptions, ToolEnvelope } from "./tool_run
 export { listRuns, getRun, getWait, type RunQuery, type RunPage } from "./runs.js";
 export type { RunView, WaitView, WaitSummary, WaitRequest } from "../persistence/waits.js";
 export type { RunStatus, RunSummary } from "../persistence/model.js";
+
+export { listLegacyCheckpoints, adoptLegacyCheckpoint, type LegacyCheckpointPage } from "./runs.js";

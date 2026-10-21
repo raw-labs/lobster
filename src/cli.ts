@@ -1,4 +1,10 @@
-import { listRuns, getRun, getWait } from "./core/runs.js";
+import {
+	listRuns,
+	getRun,
+	getWait,
+	listLegacyCheckpoints,
+	adoptLegacyCheckpoint,
+} from "./core/runs.js";
 import { forceTerminateAbortableProcesses } from "./abortable_process.js";
 import { createDefaultRegistry } from "./commands/registry.js";
 import { resumeToolRequest } from "./core/tool_runtime.js";
@@ -798,6 +804,8 @@ function helpText() {
 		`  lobster history list\n` +
 		`  lobster history show <runId> [afterSequence]\n` +
 		`  lobster history prune <before> [--apply]\n` +
+		`  lobster storage legacy list [after]\n` +
+		`  lobster storage legacy adopt <checkpointId> --caller <id>\n` +
 		`  lobster storage export\n` +
 		`  lobster storage migrate files|sqlite --offline\n` +
 		`  lobster doctor\n` +
@@ -830,6 +838,23 @@ function graphHelpText() {
 }
 
 async function handlePersistence(argv: string[]) {
+	if (argv[0] === "storage" && argv[1] === "legacy") {
+		let result: unknown;
+		if (argv[2] === "list" && argv.length <= 4) {
+			result = await listLegacyCheckpoints({ after: argv[3] });
+		} else if (argv[2] === "adopt" && argv.length === 6 && argv[4] === "--caller") {
+			result = await adoptLegacyCheckpoint({
+				checkpointId: argv[3],
+				ctx: { runMetadata: { callerId: argv[5] } },
+			});
+		} else {
+			throw new Error(
+				"storage legacy list [after]; storage legacy adopt <checkpointId> --caller <id>",
+			);
+		}
+		process.stdout.write(JSON.stringify(result) + "\n");
+		return;
+	}
 	if (argv[0] === "storage" && argv[1] === "migrate") {
 		const backend = argv[2];
 		if (backend !== "files" && backend !== "sqlite") {

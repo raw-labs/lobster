@@ -40,3 +40,9 @@ export {
 export { listRuns, getRun, getWait, type RunQuery, type RunPage } from "../core/runs.js";
 export type { RunView, WaitView, WaitSummary, WaitRequest } from "../persistence/waits.js";
 export type { RunStatus, RunSummary } from "../persistence/model.js";
+
+export {
+	listLegacyCheckpoints,
+	adoptLegacyCheckpoint,
+	type LegacyCheckpointPage,
+} from "../core/runs.js";

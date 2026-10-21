@@ -1,6 +1,5 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
-import { withFileLock } from "../state/file_lock.js";
 import { resolveStateDirectory } from "../state/paths.js";
 import { PersistenceOutcomeUnknown } from "./backend.js";
 import {
@@ -106,14 +105,7 @@ export async function withExecution<C extends ExecutionContext, T>(
 
 		let recorder: ExecutionRecorder;
 		if (resumeKey) {
-			recorder = await withFileLock({
-				filePath: path.join(
-					session.directory,
-					`.association-${resumeKey.replace(/[^a-zA-Z0-9._-]/g, "_")}`,
-				),
-				signal: runtime.signal,
-				task: () => session.recorderForState(resumeKey),
-			});
+			recorder = await session.recorderForState(resumeKey, runtime.signal);
 			if (!recorder) {
 				return task(runtime);
 			}

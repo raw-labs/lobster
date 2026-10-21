@@ -1,3 +1,4 @@
+import { stableStringify } from "./serialization.js";
 import { randomBytes } from "node:crypto";
 import { promises as fsp } from "node:fs";
 import path from "node:path";
@@ -47,18 +48,7 @@ export function defaultStateDir(env: Record<string, string | undefined>): string
 	return sessionFromEnv(env)?.directory ?? resolveStateDirectory(env);
 }
 
-export function stableStringify(value) {
-	return JSON.stringify(value, (_k, v) => {
-		if (v && typeof v === "object" && !Array.isArray(v)) {
-			return Object.fromEntries(
-				Object.keys(v)
-					.sort()
-					.map((k) => [k, v[k]]),
-			);
-		}
-		return v;
-	});
-}
+export { stableStringify } from "./serialization.js";
 
 const TERMINAL_RESUME_CLEANUP_TIMEOUT_MS = FILE_LOCK_RETRY_MS * 10;
 

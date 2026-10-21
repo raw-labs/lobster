@@ -27,6 +27,20 @@ export type RunMetadata = {
 	callerId?: string;
 };
 
+/** Persist only bounded host references, never arbitrary invocation context. */
+export function captureRunMetadata(metadata?: RunMetadata): RunMetadata | undefined {
+	if (!metadata || typeof metadata !== "object") return undefined;
+	return Object.fromEntries(
+		Object.entries(metadata).filter(
+			([key, value]) =>
+				["hostRunId", "hostTaskId", "callerId"].includes(key) &&
+				typeof value === "string" &&
+				value.length > 0 &&
+				value.length <= 256,
+		),
+	);
+}
+
 export type WaitRecord = {
 	revision?: number;
 	status: "pending" | "consumed" | "retired";
@@ -83,7 +97,8 @@ export type CheckpointGuard =
 	| { key: string; status: "consumed"; claimId: string };
 
 export type RunAction =
-	| { kind: "create"; run: RunRecord }
+	| { kind: "create"; run: RunRecord; checkpoint?: { key: string; text: string } }
+	| { kind: "adopt"; checkpoint: CheckpointGuard; metadata: RunMetadata }
 	| { kind: "definition"; fingerprint: string }
 	| { kind: "start"; attempt: Attempt }
 	| { kind: "finish"; id: string; status: AttemptStatus; summary?: unknown }
@@ -222,6 +237,15 @@ export function applyTransition(
 			return { status: "conflict", revision: current?.revision ?? 0, run: current };
 		}
 	}
+	if (
+		action.kind === "adopt" &&
+		(!current?.partialHistory ||
+			!matchesCheckpoint(current, action.checkpoint) ||
+			(current.metadata?.callerId !== undefined &&
+				current.metadata.callerId !== action.metadata.callerId))
+	) {
+		return { status: "conflict", revision: current?.revision ?? 0, run: current };
+	}
 	if (action.kind === "handoff") {
 		const { predecessor, successor } = action;
 		if (predecessor.key === successor.key || !/^[a-z0-9._-]+$/.test(successor.key)) {
@@ -255,7 +279,12 @@ export function applyTransition(
 	const run = structuredClone(source);
 	const at = new Date().toISOString();
 	let payload: RunEvent["payload"];
-	if (action.kind === "definition") {
+	if (action.kind === "create" && action.checkpoint) {
+		setCheckpoint(run, action.checkpoint.key, action.checkpoint.text);
+	} else if (action.kind === "adopt") {
+		run.metadata = { ...run.metadata, ...captureRunMetadata(action.metadata) };
+		payload = { key: action.checkpoint.key };
+	} else if (action.kind === "definition") {
 		run.definitions.push(action.fingerprint);
 		payload = { fingerprint: action.fingerprint };
 	} else if (action.kind === "start") {
@@ -471,11 +500,26 @@ export function validateArchive(value: unknown): asserts value is LogicalArchive
 	}
 }
 
+export function isRetiredCheckpoint(text: string | null): boolean {
+	if (text === null) return true;
+	try {
+		const value = JSON.parse(text);
+		return (
+			value?.type === "lobster.consumed-resume-state.v1" &&
+			typeof value.claimId === "string" &&
+			value.claimId.length > 0 &&
+			Number.isFinite(Date.parse(value.consumedAt))
+		);
+	} catch {
+		return false;
+	}
+}
+
 export function canRetain(run: RunRecord, before: string): boolean {
 	return (
 		["completed", "failed", "cancelled"].includes(run.status) &&
 		Date.parse(run.updatedAt) < Date.parse(before) &&
-		!Object.values(run.states).some((text) => text !== null) &&
+		Object.values(run.states).every(isRetiredCheckpoint) &&
 		!Object.values(run.waits).some((wait) => wait.status === "pending") &&
 		!run.attempts.some((attempt) => attempt.status === "started") &&
 		!Object.values(run.receipts).some((receipt) => receipt.acknowledged !== true)
@@ -509,56 +553,4 @@ export function historyPage(run: RunRecord, afterSequence: number, limit: number
 		attempts: attempts.filter((attempt) => ids.has(attempt.id)),
 		nextCursor: page.at(-1)?.sequence ?? afterSequence,
 	};
-}
-
-export function validateContinuations(data: LogicalArchive) {
-	const entries = data.runs.flatMap((run) => Object.entries(run.states));
-	for (const [key, text] of entries) {
-		if (text === null || !/^(pipeline_resume_|workflow[-_]resume_|sdk_resume_)/.test(key)) {
-			continue;
-		}
-		const value = JSON.parse(text);
-		if (value?.type === "lobster.consumed-resume-state.v1") {
-			if (typeof value.claimId !== "string" || !Number.isFinite(Date.parse(value.consumedAt))) {
-				throw new Error("Invalid consumed continuation");
-			}
-		} else if (key.startsWith("pipeline_resume_")) {
-			if (
-				!value ||
-				!Array.isArray(value.pipeline) ||
-				!Array.isArray(value.items) ||
-				!Number.isInteger(value.resumeAtIndex) ||
-				value.resumeAtIndex < 0 ||
-				value.resumeAtIndex > value.pipeline.length ||
-				value.pipeline.some(
-					(stage) =>
-						typeof stage?.name !== "string" ||
-						!stage.name ||
-						!stage.args ||
-						typeof stage.args !== "object" ||
-						Array.isArray(stage.args),
-				)
-			) {
-				throw new Error("Invalid pipeline continuation");
-			}
-		} else if (key.startsWith("sdk_resume_")) {
-			const frame = value?.type === "lobster.sdk-tracked.v1" ? value.payload : value;
-			if (!frame || !Number.isInteger(frame.resumeAtIndex) || frame.resumeAtIndex < 0) {
-				throw new Error("Invalid SDK continuation");
-			}
-		} else if (
-			!value ||
-			typeof value.filePath !== "string" ||
-			!value.steps ||
-			typeof value.steps !== "object" ||
-			Array.isArray(value.steps) ||
-			!value.args ||
-			typeof value.args !== "object" ||
-			Array.isArray(value.args) ||
-			!Number.isInteger(value.resumeAtIndex) ||
-			value.resumeAtIndex < 0
-		) {
-			throw new Error("Invalid workflow continuation");
-		}
-	}
 }

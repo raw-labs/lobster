@@ -280,10 +280,17 @@ export class Lobster {
 		let sdkCommandInputState: SdkCommandInputResumeState | undefined;
 		if (payload.resumeMode === "same_stage") {
 			sdkCommandInputState = await loadSdkCommandInputResumeState(this.#options, payload.stateKey!);
+			if (
+				!this.#onExecutionStart &&
+				"type" in sdkCommandInputState &&
+				sdkCommandInputState.type === "lobster.sdk-tracked.v1"
+			) {
+				return this.#resumeTracked(payload.stateKey!, options);
+			}
 		}
 
 		if (cancel === true) {
-			if (payload.resumeMode === "same_stage") {
+			if (payload.resumeMode === "same_stage" && !this.#onExecutionStart) {
 				await deleteStateJson({ env: stateEnv(this.#options), key: payload.stateKey! });
 			}
 			return {
@@ -482,7 +489,12 @@ export class Lobster {
 				};
 				const result = await instance.resume(encodeToken(state.payload), decision);
 				const paused = ["needs_approval", "needs_input"].includes(result.status);
-				if (!paused && !claimed && (await readStateJsonWithLock({ env: ctx.env, key })) !== null) {
+				if (
+					result.ok &&
+					!paused &&
+					!claimed &&
+					(await readStateJsonWithLock({ env: ctx.env, key })) !== null
+				) {
 					const deletion = await deleteUnconsumedResumeState({
 						env: ctx.env,
 						key,

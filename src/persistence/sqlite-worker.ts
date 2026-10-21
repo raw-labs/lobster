@@ -1,5 +1,4 @@
 // This is the only module that loads node:sqlite. Files remain usable on Node 22.0.
-// This is the only module that loads node:sqlite. Files remain usable on Node 22.0.
 import { WaitConflictError } from "./backend.js";
 import { DatabaseSync } from "node:sqlite";
 import { parentPort, workerData } from "node:worker_threads";
@@ -220,11 +219,13 @@ function transition(request: Transition): TransitionResult {
 			}
 		}
 		const keys =
-			request.action.kind === "state"
-				? [request.action.key]
-				: request.action.kind === "handoff"
-					? [request.action.predecessor.key, request.action.successor.key]
-					: [];
+			request.action.kind === "adopt"
+				? [request.action.checkpoint.key]
+				: request.action.kind === "state"
+					? [request.action.key]
+					: request.action.kind === "handoff"
+						? [request.action.predecessor.key, request.action.successor.key]
+						: [];
 		for (const key of keys) {
 			const state = prepare("SELECT text FROM state WHERE run_id=? AND key=?").get(
 				current.id,

@@ -1,3 +1,5 @@
+import type { LegacyCheckpointPage } from "../persistence/legacy.js";
+import { withStoreContext } from "../persistence/execution.js";
 import { sessionFromEnv } from "../persistence/context.js";
 import { openStoreSession, type StoreSession } from "../persistence/session.js";
 import type { RunStatus, RunSummary } from "../persistence/model.js";
@@ -84,5 +86,58 @@ export async function getWait({
 	return readRuns(
 		ctx,
 		async (store) => (await findWait(store, waitId, callerId(ctx.runMetadata)))?.view ?? null,
+	);
+}
+
+export type { LegacyCheckpointPage } from "../persistence/legacy.js";
+
+/** Host maintenance inventory. Unowned legacy checkpoints have no caller scope. */
+export async function listLegacyCheckpoints({
+	ctx = {},
+	after = "",
+	limit = 20,
+}: {
+	ctx?: ToolRunContext;
+	after?: string;
+	limit?: number;
+} = {}): Promise<LegacyCheckpointPage> {
+	if (callerId(ctx.runMetadata) !== undefined)
+		throw new Error("Legacy inventory requires unscoped host access");
+	if (typeof after !== "string" || (after !== "" && !/^[a-z0-9._-]{1,256}$/.test(after))) {
+		throw new Error("Invalid legacy checkpoint cursor");
+	}
+	return readRuns(ctx, (store) => store.listLegacyCheckpoints({ after, limit }));
+}
+
+/** Register a saved legacy pause without executing or answering it. */
+export async function adoptLegacyCheckpoint({
+	checkpointId,
+	ctx = {},
+}: {
+	checkpointId: string;
+	ctx?: ToolRunContext;
+}): Promise<RunView> {
+	if (
+		typeof checkpointId !== "string" ||
+		!/^(pipeline_resume_|workflow[-_]resume_|sdk_resume_)[a-z0-9._-]{1,128}$/.test(checkpointId)
+	) {
+		throw new Error("Invalid legacy checkpoint ID");
+	}
+	if (callerId(ctx.runMetadata) === undefined)
+		throw new Error("Legacy adoption requires a trusted caller ID");
+	return withStoreContext(
+		{ ...ctx, env: { ...process.env, ...ctx.env }, trackRuns: true },
+		async (runtime) => {
+			const store = runtime.storeSession ?? sessionFromEnv(runtime.env);
+			if (!store) throw new Error("Legacy adoption requires a persistence session");
+			return runView(
+				await store.adoptCheckpoint(
+					checkpointId,
+					ctx.runMetadata,
+					ctx.signal,
+					ctx.assertInvocationCurrent,
+				),
+			);
+		},
 	);
 }
