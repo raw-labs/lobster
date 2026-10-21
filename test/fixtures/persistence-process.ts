@@ -2,7 +2,16 @@ import { runToolRequest, resumeToolRequest } from "../../src/core/tool_runtime.j
 
 const [mode, value] = process.argv.slice(2);
 
-if (mode === "cli-fault") {
+if (mode === "state-lock") {
+	const { withFileLock } = await import("../../src/state/file_lock.js");
+	await withFileLock({
+		filePath: value,
+		task: async () => {
+			process.send("locked");
+			await new Promise<void>((resolve) => process.once("message", () => resolve()));
+		},
+	});
+} else if (mode === "cli-fault") {
 	const { runCli } = await import("../../src/cli.js");
 	const { PersistenceOutcomeUnknown } = await import("../../src/persistence/backend.js");
 	const Backend =

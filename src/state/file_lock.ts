@@ -121,7 +121,7 @@ async function hasExpiredFileLockLease(lockPath: string): Promise<boolean> {
 	}
 }
 
-async function reclaimOrphanedFileLock(lockPath: string): Promise<boolean> {
+export async function reclaimOrphanedFileLock(lockPath: string): Promise<boolean> {
 	let observedLock: { dev: number; ino: number };
 	try {
 		const stat = await fsp.lstat(lockPath);

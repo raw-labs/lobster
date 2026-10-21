@@ -190,3 +190,67 @@ for (const backend of ["files", "sqlite"] as const) {
 		}
 	});
 }
+
+for (const backend of ["legacy", "files", "sqlite"] as const) {
+	test(`${backend}: a failed for_each pipeline cannot restore an approval after an effect`, async (t) => {
+		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "lobster-loop-replay-"));
+		t.after(() => fs.rm(directory, { recursive: true, force: true }));
+		const stateDir = path.join(directory, "state");
+		const store =
+			backend === "legacy"
+				? undefined
+				: await openStoreSession({ directory: stateDir, backend, history: true });
+		t.after(() => store?.close());
+		let effects = 0;
+		const defaults = createDefaultRegistry();
+		const registry = {
+			get(name: string) {
+				if (name === "data")
+					return {
+						async run() {
+							return { output: [[1]] };
+						},
+					};
+				if (name === "effect")
+					return {
+						async run() {
+							effects++;
+							throw new Error("Effect failed after dispatch");
+						},
+					};
+				return defaults.get(name);
+			},
+		};
+		const filePath = path.join(directory, "flow.lobster");
+		await fs.writeFile(
+			filePath,
+			JSON.stringify({
+				steps: [
+					{ id: "data", pipeline: "data" },
+					{ id: "review", approval: "Proceed?" },
+					{ id: "loop", for_each: "$data.json", steps: [{ id: "write", pipeline: "effect" }] },
+				],
+			}),
+		);
+		const ctx = {
+			storeSession: store,
+			registry,
+			env: { LOBSTER_STATE_DIR: stateDir },
+		};
+		const first = await runToolRequest({ filePath, ctx });
+		assert.equal(first.status, "needs_approval", JSON.stringify(first));
+		const token = first.requiresApproval.resumeToken;
+		const failed = await resumeToolRequest({ token, approved: true, ctx });
+		assert.equal(failed.ok, false);
+		assert.match(failed.error.message, /Effect failed after dispatch/);
+		const repeated = await resumeToolRequest({ token, approved: true, ctx });
+		assert.equal(repeated.ok, false);
+		assert.match(repeated.error.message, /resume state not found/);
+		assert.equal(effects, 1);
+		if (store) {
+			const run = await getRun({ runId: first.runId, ctx });
+			assert.equal(run.status, "failed");
+			assert.equal(run.pendingWaits.length, 0);
+		}
+	});
+}

@@ -5,14 +5,18 @@ import { randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import { ensureDirectory, writeFileAtomic } from "../state/atomic_file.js";
-import { withFileLock } from "../state/file_lock.js";
+import { reclaimOrphanedFileLock, withFileLock } from "../state/file_lock.js";
 import type { Backend, BackendKind } from "./backend.js";
 import { FileBackend } from "./files.js";
 import { fingerprint, validateArchive, type LogicalArchive } from "./model.js";
 
 async function assertOffline(directory: string) {
 	for (const name of await fs.readdir(directory)) {
-		if (name.endsWith(".lock") && name !== ".backend-selection.lock") {
+		if (
+			name.endsWith(".lock") &&
+			name !== ".backend-selection.lock" &&
+			!(await reclaimOrphanedFileLock(path.join(directory, name)))
+		) {
 			throw new Error("State writers must be stopped before migration");
 		}
 		if (!name.startsWith(".session-")) {

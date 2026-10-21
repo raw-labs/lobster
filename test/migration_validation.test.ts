@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import { fork } from "node:child_process";
+import { once } from "node:events";
+import { fileURLToPath } from "node:url";
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -219,5 +222,45 @@ test("opening and migration reject malformed backend selection without reinterpr
 		assert.equal(await fs.readFile(path.join(directory, ".backend"), "utf8"), selection);
 		assert.equal(await fs.readFile(path.join(directory, "saved.json"), "utf8"), "42\n");
 		await assert.rejects(fs.access(path.join(directory, "lobster.sqlite")), { code: "ENOENT" });
+	}
+});
+
+test("migration rejects a live key lock and reclaims it after its writer dies", async (t) => {
+	const directory = await fs.mkdtemp(path.join(os.tmpdir(), "lobster-orphaned-migration-"));
+	t.after(() => fs.rm(directory, { recursive: true, force: true }));
+	await fs.writeFile(path.join(directory, "saved.json"), "42\n");
+	const filePath = path.join(directory, "saved.json");
+	const child = fork(
+		fileURLToPath(new URL("./fixtures/persistence-process.js", import.meta.url)),
+		["state-lock", filePath],
+		{ stdio: ["ignore", "ignore", "inherit", "ipc"], execArgv: [] },
+	);
+	t.after(() => {
+		if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+	});
+	const exited = once(child, "exit");
+	await Promise.race([
+		once(child, "message"),
+		exited.then(() => {
+			throw new Error("State-lock fixture exited before acquiring its lock");
+		}),
+	]);
+	const owner = await fs.readFile(path.join(filePath + ".lock", "owner"), "utf8");
+	await assert.rejects(
+		migrateStore({ directory, backend: "sqlite", offline: true }),
+		/State writers must be stopped/,
+	);
+	assert.equal(await fs.readFile(path.join(filePath + ".lock", "owner"), "utf8"), owner);
+	await assert.rejects(fs.access(path.join(directory, ".backend")), { code: "ENOENT" });
+	child.kill("SIGKILL");
+	await exited;
+	await migrateStore({ directory, backend: "sqlite", offline: true });
+	await assert.rejects(fs.access(filePath + ".lock"), { code: "ENOENT" });
+	const store = await openStoreSession({ directory });
+	try {
+		assert.equal(store.backend.kind, "sqlite");
+		assert.equal((await store.read("saved")).text, "42\n");
+	} finally {
+		await store.close();
 	}
 });

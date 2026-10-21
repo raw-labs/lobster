@@ -816,6 +816,7 @@ async function runWorkflowFileInternal({
 												...ctx,
 												signal: stepSignal,
 												_onNonRetryableSideEffect: markNonRetryableSideEffect,
+												_onUnsafeDispatch: markUnsafeDispatchStarted,
 											},
 											llmSpendLedger,
 											env: itemRecorder ? bindRecorder(subEnv, itemRecorder) : subEnv,
