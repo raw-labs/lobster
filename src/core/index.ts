@@ -25,3 +25,15 @@ export type { RunView, WaitView, WaitSummary, WaitRequest } from "../persistence
 export type { RunStatus, RunSummary } from "../persistence/model.js";
 
 export { listLegacyCheckpoints, adoptLegacyCheckpoint, type LegacyCheckpointPage } from "./runs.js";
+
+export type { ResumeDecision, WaitResumeOptions, ResumeTarget } from "../resume_options.js";
+export type { PersistenceOptions, RunScope } from "../persistence/context.js";
+export type { MigrationOptions, MigrationPhase } from "../persistence/migrate.js";
+export type {
+	RunMetadata,
+	HistoryPage,
+	RunEvent,
+	Attempt,
+	AttemptStatus,
+	OperationReceipt,
+} from "../persistence/model.js";

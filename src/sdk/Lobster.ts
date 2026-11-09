@@ -1,3 +1,5 @@
+import type { ResumeDecision, WaitResumeOptions } from "../resume_options.js";
+import type { SdkResult } from "./types.js";
 import { randomUUID } from "node:crypto";
 import { validateCommandInputState, type CommandInputState } from "../input_request.js";
 import {
@@ -98,7 +100,7 @@ export class Lobster {
 		return this.#meta;
 	}
 
-	async run(initialInput = []) {
+	async run(initialInput = []): Promise<SdkResult> {
 		return withExecution(
 			{ ...this.#options, env: stateEnv(this.#options) },
 			"sdk",
@@ -133,7 +135,7 @@ export class Lobster {
 		requestInputResume = undefined,
 		stageOffset = 0,
 		fallbackIndex = -1,
-	) {
+	): Promise<SdkResult> {
 		const ctx = {
 			env: stateEnv(this.#options),
 			_onExecutionStart: this.#onExecutionStart,
@@ -251,13 +253,14 @@ export class Lobster {
 		}
 	}
 
+	resume(token: string, options: ResumeDecision): Promise<SdkResult>;
 	async resume(
 		token: string,
 		options: { approved?: boolean; response?: unknown; cancel?: boolean } = {},
-	) {
+	): Promise<SdkResult> {
 		const decoded = decodeToken(token) as SdkResumePayload | SdkTrackedResumePayload;
 		if (decoded?.v === 2 && decoded.kind === "sdk-tracked") {
-			return this.#resumeTracked(decoded.stateKey, options);
+			return this.#resumeTracked(decoded.stateKey, options as ResumeDecision);
 		}
 		const { approved, response, cancel } = options;
 		const intentCount =
@@ -281,7 +284,7 @@ export class Lobster {
 				"type" in sdkCommandInputState &&
 				sdkCommandInputState.type === "lobster.sdk-tracked.v1"
 			) {
-				return this.#resumeTracked(payload.stateKey!, options);
+				return this.#resumeTracked(payload.stateKey!, options as ResumeDecision);
 			}
 		}
 
@@ -399,13 +402,7 @@ export class Lobster {
 		return result;
 	}
 
-	async resumeWait(options: {
-		waitId: string;
-		expectedRevision: number;
-		approved?: boolean;
-		response?: unknown;
-		cancel?: boolean;
-	}) {
+	async resumeWait(options: WaitResumeOptions): Promise<SdkResult> {
 		return withStoreContext(
 			{ ...this.#options, env: stateEnv(this.#options), trackRuns: true },
 			async (ctx) => {
@@ -434,10 +431,7 @@ export class Lobster {
 		);
 	}
 
-	async #resumeTracked(
-		key: string,
-		decision: { approved?: boolean; response?: unknown; cancel?: boolean },
-	) {
+	async #resumeTracked(key: string, decision: ResumeDecision): Promise<SdkResult> {
 		if (typeof key !== "string" || !/^sdk_resume_[a-f0-9-]+$/.test(key)) {
 			throw new Error("Invalid SDK tracked token");
 		}

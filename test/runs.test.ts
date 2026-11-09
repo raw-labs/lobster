@@ -89,7 +89,7 @@ for (const backend of ["files", "sqlite"] as const) {
 		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "lobster-public-store-"));
 		t.after(() => fs.rm(directory, { recursive: true, force: true }));
 		const build = (storeSession) =>
-			new Lobster({ storeSession })
+			new Lobster({ storeSession, runMetadata: { callerId: "owner" } })
 				.pipe(() => [1])
 				.pipe(approve({ prompt: "Continue?" }))
 				.pipe((items) => items.map((item) => item + 1));
@@ -102,7 +102,18 @@ for (const backend of ["files", "sqlite"] as const) {
 			await store.close();
 			store = await openSdkStore({ directory });
 			const run = await getRun({ runId: first.runId, ctx: { storeSession: store } });
+			assert.deepEqual(await store.getRun(first.runId), run);
+			assert.equal(await store.getRun(first.runId, { callerId: "other" }), null);
 			const wait = run.pendingWaits[0];
+			assert.deepEqual(
+				await store.getWait(wait.id),
+				await getWait({ waitId: wait.id, ctx: { storeSession: store } }),
+			);
+			assert.equal(await store.getWait(wait.id, { callerId: "other" }), null);
+			assert.equal(
+				(await store.getWait(wait.id, { callerId: "owner" })).request.prompt,
+				"Continue?",
+			);
 			const result = await build(store).resumeWait({
 				waitId: wait.id,
 				expectedRevision: wait.revision,
@@ -111,6 +122,7 @@ for (const backend of ["files", "sqlite"] as const) {
 			assert.equal(result.ok, true);
 			assert.deepEqual(result.output, [2]);
 			assert.equal((await store.listRuns()).runs[0].status, "completed");
+			assert.equal(await store.getWait(wait.id), null);
 		} finally {
 			await store.close();
 		}
@@ -301,6 +313,7 @@ for (const backend of ["files", "sqlite"] as const) {
 			assert.ok(await getWait({ waitId: wait.id, ctx: scoped(store) }));
 			await assert.rejects(listRuns({ limit: 0, ctx: scoped(store) }), /limit/);
 			await assert.rejects(listRuns({ after: "../invalid", ctx: scoped(store) }), /cursor/);
+			// @ts-expect-error Deliberately exercise malformed JavaScript/tool input.
 			const ambiguous = await resumeToolRequest({
 				waitId: wait.id,
 				expectedRevision: wait.revision,

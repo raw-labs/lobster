@@ -329,10 +329,29 @@ try {
 the backend and releasing the session's migration fence.
 
 The public `StoreSession` handle exposes lifecycle and inspection only:
-`directory`, `history`, `trackRuns`, `readOnly`, `listRuns`, `inspect`, `retain`,
-`reconcile`, `acknowledge`, and `close`. Use the run/wait APIs for discovery and
+`directory`, `history`, `trackRuns`, `readOnly`, `listRuns`, `getRun`, `getWait`, `inspect`, `retain`,
+`reconcile`, `acknowledge`, and `close`. Use the execution APIs for
 resume, and SDK state primitives for ordinary state. Backend access, raw
 checkpoints, and executor transitions are internal, not package API.
+
+Store discovery is also available as `store.getRun(runId, { callerId })` and
+`store.getWait(waitId, { callerId })`; these use the same validation and caller
+scope as the top-level functions. Omit the scope only for unscoped host access.
+Existing top-level discovery functions remain supported. `inspect`, retention,
+and receipt methods are unscoped host-maintenance APIs.
+
+Both entry points export named persistence, migration, metadata, history and
+resume types. Package builds include TypeScript declarations. `ResumeDecision`
+allows exactly one of `{ approved: boolean }`, `{ response: unknown }`, or
+`{ cancel: true }`. Core `ResumeToolOptions` also requires exactly one target:
+`{ token }`, `{ approvalId }`, or `{ waitId, expectedRevision }`. SDK
+`resumeWait` uses `WaitResumeOptions`; SDK token resume uses `ResumeDecision`.
+Malformed JavaScript/tool requests still receive runtime validation.
+
+SDK `run`, `resume` and `resumeWait` return `Promise<SdkResult>`, preserving the
+existing SDK statuses (including `"error"`), output and saved request fields.
+Core execution continues to return `ToolEnvelope`; these are not interchangeable
+wire formats. SDK closures still require the original stages on resume.
 
 Session injection takes precedence over environment configuration. Correlation
 metadata accepts bounded `hostRunId`, `hostTaskId`, and `callerId` strings; these are

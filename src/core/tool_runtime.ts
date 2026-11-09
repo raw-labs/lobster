@@ -1,3 +1,4 @@
+import type { ResumeDecision, ResumeTarget } from "../resume_options.js";
 import path from "node:path";
 import { Writable } from "node:stream";
 import { createDefaultRegistry } from "../commands/registry.js";
@@ -186,12 +187,15 @@ async function runToolRequestInternal({
 	}
 }
 
-export type ResumeToolOptions = Parameters<typeof resumeToolRequestInternal>[0] & {
-	waitId?: string;
-	expectedRevision?: number;
-};
+export type ResumeToolOptions = ResumeTarget & ResumeDecision & { ctx?: ToolRunContext };
 
-export async function resumeToolRequest(options: ResumeToolOptions): Promise<ToolEnvelope> {
+export function resumeToolRequest(options: ResumeToolOptions): Promise<ToolEnvelope>;
+export async function resumeToolRequest(
+	options: Parameters<typeof resumeToolRequestInternal>[0] & {
+		waitId?: string;
+		expectedRevision?: number;
+	},
+): Promise<ToolEnvelope> {
 	const entry = createToolContext(options.ctx);
 	entry._resumeSignalAborted = entry.signal?.aborted === true;
 	if (options.waitId !== undefined) entry.trackRuns = true;

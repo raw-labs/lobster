@@ -21,9 +21,13 @@ test("prepared npm package excludes compiled tests and keeps runtime entrypoints
 		pack.files.some((file) => file.path.startsWith("dist/test/")),
 		false,
 	);
-	for (const entry of [...Object.values(pkg.bin), ...Object.values(pkg.exports)]) {
+	for (const entry of [
+		...Object.values(pkg.bin),
+		...Object.values(pkg.exports).flatMap((entry) => Object.values(entry)),
+	]) {
 		assert.ok(files.has(String(entry).replace(/^\.\//, "")), `Missing entrypoint: ${entry}`);
 	}
+	assert.ok(files.has(pkg.types.replace(/^\.\//, "")));
 	assert.ok(files.has("bin/invoke.js"));
 	assert.ok(files.has("dist/src/cli.js"));
 	assert.ok(files.has("dist/src/cli.js.map"));

@@ -46,3 +46,16 @@ export {
 	adoptLegacyCheckpoint,
 	type LegacyCheckpointPage,
 } from "../core/runs.js";
+
+export type { ResumeDecision, WaitResumeOptions, ResumeTarget } from "../resume_options.js";
+export type { PersistenceOptions, RunScope } from "../persistence/context.js";
+export type { MigrationOptions, MigrationPhase } from "../persistence/migrate.js";
+export type {
+	RunMetadata,
+	HistoryPage,
+	RunEvent,
+	Attempt,
+	AttemptStatus,
+	OperationReceipt,
+} from "../persistence/model.js";
+export type { SdkResult, SdkApprovalRequest, SdkInputRequest } from "./types.js";
