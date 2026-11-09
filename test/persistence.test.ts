@@ -112,6 +112,90 @@ for (const backend of ["files", "sqlite"] as const) {
 			await store.close();
 		}
 	});
+	for (const failure of ["read", "receipt"] as const) {
+		test(`${backend}: failed ${failure} reconciliation preserves the lost-write outcome`, async (t) => {
+			const directory = await fs.mkdtemp(path.join(os.tmpdir(), "lobster-unknown-write-"));
+			t.after(() => fs.rm(directory, { recursive: true, force: true }));
+			const store = await openStoreSession({ directory, backend, history: true });
+			t.after(() => store.close());
+			const recorder = await store.createRun("fixture");
+			const write = store.backend.write.bind(store.backend);
+			let unknown: PersistenceOutcomeUnknown;
+			t.mock.method(store.backend, "write", async (...args) => {
+				const commit = await write(...args);
+				assert.ok(commit.kind === "run");
+				unknown = new PersistenceOutcomeUnknown(commit.operationId, undefined, commit.runId);
+				t.mock.method(store.backend, failure === "read" ? "read" : "getRun", async () => {
+					throw new Error("Storage unavailable during reconciliation");
+				});
+				throw unknown;
+			});
+			await assert.rejects(
+				store.write(
+					`pipeline_resume_${randomUUID()}`,
+					JSON.stringify({ pipeline: [], items: [], resumeAtIndex: 0 }),
+					{ runId: recorder.runId },
+				),
+				(error) => error === unknown,
+			);
+		});
+	}
+
+	test(`${backend}: an unreadable write outcome bypasses retry and on_error`, async (t) => {
+		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "lobster-unknown-retry-"));
+		t.after(() => fs.rm(directory, { recursive: true, force: true }));
+		const store = await openStoreSession({ directory, backend, history: true });
+		t.after(() => store.close());
+		const write = store.backend.write.bind(store.backend);
+		const read = store.backend.read.bind(store.backend);
+		let unreadable = false;
+		t.mock.method(store.backend, "write", async (key, ...args) => {
+			const commit = await write(key, ...args);
+			if (key === "fixture") {
+				unreadable = true;
+				throw new PersistenceOutcomeUnknown("lost-write");
+			}
+			return commit;
+		});
+		t.mock.method(store.backend, "read", async (key) => {
+			if (key === "fixture" && unreadable) {
+				unreadable = false;
+				throw new Error("Storage unavailable during reconciliation");
+			}
+			return read(key);
+		});
+		let effects = 0;
+		let laterSteps = 0;
+		const filePath = path.join(directory, "unknown.lobster");
+		await fs.writeFile(
+			filePath,
+			JSON.stringify({
+				steps: [
+					{ id: "write", pipeline: "write", retry: { max: 2, delay_ms: 0 }, on_error: "continue" },
+					{ id: "later", pipeline: "later" },
+				],
+			}),
+		);
+		const registry = {
+			get(name: string) {
+				return {
+					async run({ ctx }) {
+						if (name === "write") {
+							effects++;
+							await writeStateJson({ env: ctx.env, key: "fixture", value: effects });
+						} else laterSteps++;
+						return { output: [] };
+					},
+				};
+			},
+		};
+		const result = await runToolRequest({ filePath, ctx: { storeSession: store, registry } });
+		assert.equal(result.ok, false);
+		assert.equal(result.error.type, "persistence_outcome_unknown");
+		assert.equal(result.error.operationId, "lost-write");
+		assert.equal(effects, 1);
+		assert.equal(laterSteps, 0);
+	});
 }
 
 test("selected file sessions preserve legacy publication hooks and cancellation results", async (t) => {

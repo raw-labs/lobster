@@ -45,7 +45,7 @@ async function reviewFixture(directory: string, chained = false) {
 				{
 					id: "prepare",
 					run: script(
-						`require('fs').appendFileSync(process.env.LOBSTER_ARG_EFFECTS,'prepare'+String.fromCharCode(10)); console.log(JSON.stringify({draft:${JSON.stringify(draft)}}))`,
+						`require('fs').appendFileSync(process.env.LOBSTER_ARG_EFFECTS,'prepare'+String.fromCharCode(10)); console.log(JSON.stringify({draft:${JSON.stringify("Review this saved draft. ")}.repeat(6000)}))`,
 					),
 				},
 				{

@@ -115,36 +115,34 @@ export class StoreSession {
 						options.signal?.aborted === true || result.signalAbortedAfterCommit,
 				};
 			} catch (error) {
-				if (!(error instanceof PersistenceOutcomeUnknown)) {
-					throw error;
-				}
-				// Replacement waits for the old worker to stop. While the caller still owns
-				// the publication barrier, reconcile the mutation before releasing readers.
-				const current = await this.backend.read(normalizeStateKey(key));
-				if (current.runId) {
-					const run = await this.backend.getRun(current.runId);
-					const receipt = run?.receipts[error.operationId];
-					if (receipt) {
-						await this.acknowledgeObserved(current.runId, error.operationId);
+				return this.reconcileUnknown<StateWriteResult>(error, async (error) => {
+					// Replacement waits for the old worker to stop. While the caller still owns
+					// the publication barrier, reconcile the mutation before releasing readers.
+					const current = await this.backend.read(normalizeStateKey(key));
+					if (current.runId) {
+						const run = await this.backend.getRun(current.runId);
+						const receipt = run?.receipts[error.operationId];
+						if (receipt) {
+							await this.acknowledgeObserved(current.runId, error.operationId);
+							return {
+								status: "committed",
+								kind: "run",
+								runId: current.runId,
+								operationId: error.operationId,
+								revision: receipt.revision,
+								confirmation: "reconciled",
+								signalAbortedAfterCommit: options.signal?.aborted === true,
+							};
+						}
+					} else if (!options.exclusive && current.text === text) {
 						return {
 							status: "committed",
-							kind: "run",
-							runId: current.runId,
-							operationId: error.operationId,
-							revision: receipt.revision,
+							kind: "state",
 							confirmation: "reconciled",
 							signalAbortedAfterCommit: options.signal?.aborted === true,
 						};
 					}
-				} else if (!options.exclusive && current.text === text) {
-					return {
-						status: "committed",
-						kind: "state",
-						confirmation: "reconciled",
-						signalAbortedAfterCommit: options.signal?.aborted === true,
-					};
-				}
-				throw error;
+				});
 			}
 		}, true);
 	}
@@ -468,24 +466,36 @@ export class StoreSession {
 			try {
 				result = await this.backend.transition(request, signal, assertInvocationCurrent);
 			} catch (error) {
-				if (!(error instanceof PersistenceOutcomeUnknown) || request.action.kind !== "handoff")
-					throw error;
-				// Read without the cancelled signal: a dispatched commit may have succeeded.
-				let receipt: OperationReceipt | undefined;
-				try {
+				result = await this.reconcileUnknown(error, async () => {
+					if (request.action.kind !== "handoff") return;
 					const run = await this.backend.getRun(request.runId);
-					receipt = run?.receipts[request.operationId];
-				} catch {
-					throw error;
-				}
-				if (!receipt || receipt.fingerprint !== fingerprint(request)) throw error;
-				result = { status: "committed", revision: receipt.revision };
+					const receipt = run?.receipts[request.operationId];
+					if (receipt?.fingerprint === fingerprint(request)) {
+						return { status: "committed" as const, revision: receipt.revision };
+					}
+				});
 			}
 			if (result.status === "committed") {
 				await this.acknowledgeObserved(request.runId, request.operationId);
 			}
 			return result;
 		}, true);
+	}
+
+	// A failed reconciliation is not evidence of rollback. Preserve the original
+	// uncertainty so workflow retry/on_error cannot replay a committed operation.
+	private async reconcileUnknown<T>(
+		error: unknown,
+		readCommit: (error: PersistenceOutcomeUnknown) => Promise<T | undefined>,
+	): Promise<T> {
+		if (!(error instanceof PersistenceOutcomeUnknown)) throw error;
+		try {
+			const result = await readCommit(error);
+			if (result !== undefined) return result;
+		} catch {
+			// The outcome remains unknown, including when recovery cannot reopen storage.
+		}
+		throw error;
 	}
 
 	async close(): Promise<void> {
