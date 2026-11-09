@@ -1,5 +1,5 @@
 import { bindStoreSession } from "../persistence/context.js";
-import type { StoreSession } from "../persistence/session.js";
+import type { StoreHandle as StoreSession } from "../persistence/context.js";
 
 export function stateEnv(
 	ctx: { stateDir?: string; env?: NodeJS.ProcessEnv; storeSession?: StoreSession } | undefined,

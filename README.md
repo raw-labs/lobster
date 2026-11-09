@@ -89,7 +89,10 @@ payloads and existing output limits; history capture adds no execution truncatio
 New tracked file continuations live with their events in one atomically replaced
 per-run record under `.history`. SQLite commits continuation transitions and their
 events together in indexed tables. The file backend rewrites its aggregate when
-history changes; SQLite avoids that cost. Legacy JSON values keep their layout
+history changes; SQLite avoids that cost. File-backed continuation lookup can scan
+retained runs, so use SQLite for large histories or busy embedded hosts. File
+queries stream run records instead of loading all histories into memory at once.
+Legacy JSON values keep their layout
 until migration or association with a tracked continuation. New tracked tokens
 require this runtime; compatibility means reading existing tokens, not making
 older binaries understand new storage. History enables run tracking. To keep live
@@ -324,6 +327,12 @@ try {
 
 `close()` rejects new requests and waits for admitted operations before closing
 the backend and releasing the session's migration fence.
+
+The public `StoreSession` handle exposes lifecycle and inspection only:
+`directory`, `history`, `trackRuns`, `readOnly`, `listRuns`, `inspect`, `retain`,
+`reconcile`, `acknowledge`, and `close`. Use the run/wait APIs for discovery and
+resume, and SDK state primitives for ordinary state. Backend access, raw
+checkpoints, and executor transitions are internal, not package API.
 
 Session injection takes precedence over environment configuration. Correlation
 metadata accepts bounded `hostRunId`, `hostTaskId`, and `callerId` strings; these are

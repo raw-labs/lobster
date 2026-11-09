@@ -7,7 +7,7 @@ import { recorderFromEnv, bindResumeGuard, sessionFromEnv } from "../persistence
 import { resolveWait, callerId } from "../persistence/waits.js";
 import { encodeToken } from "../token.js";
 import { withExecution, withStoreContext } from "../persistence/execution.js";
-import type { StoreSession } from "../persistence/session.js";
+import type { PersistenceOptions } from "../persistence/context.js";
 import {
 	finalizePipelineToolRun,
 	loadPipelineResumeState,
@@ -30,12 +30,8 @@ import {
 	runWorkflowFile,
 } from "../workflows/file.js";
 
-export type ToolRunContext = {
+export type ToolRunContext = PersistenceOptions & {
 	_resumeSignalAborted?: boolean;
-	storeSession?: StoreSession;
-	history?: boolean;
-	trackRuns?: boolean;
-	runMetadata?: { hostRunId?: string; hostTaskId?: string; callerId?: string };
 	cwd?: string;
 	env?: Record<string, string | undefined>;
 	mode?: "tool" | "human" | "sdk";

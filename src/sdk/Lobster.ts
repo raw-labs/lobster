@@ -7,7 +7,7 @@ import {
 import { runtimeErrorDetails } from "../persistence/backend.js";
 import { recorderFromEnv, sessionFromEnv, bindResumeGuard } from "../persistence/context.js";
 import { withExecution, withStoreContext } from "../persistence/execution.js";
-import type { StoreSession } from "../persistence/session.js";
+import type { PersistenceOptions } from "../persistence/context.js";
 import {
 	consumeResumeState,
 	restoreConsumedResumeState,
@@ -56,11 +56,7 @@ type SdkCommandInputResumeState = {
 	commandInput: CommandInputState;
 };
 
-export type LobsterOptions = {
-	storeSession?: StoreSession;
-	history?: boolean;
-	trackRuns?: boolean;
-	runMetadata?: { callerId?: string; hostRunId?: string; hostTaskId?: string };
+export type LobsterOptions = PersistenceOptions & {
 	env?: NodeJS.ProcessEnv;
 	stateDir?: string;
 	signal?: AbortSignal;

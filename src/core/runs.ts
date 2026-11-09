@@ -1,6 +1,6 @@
 import type { LegacyCheckpointPage } from "../persistence/legacy.js";
 import { withStoreContext } from "../persistence/execution.js";
-import { sessionFromEnv } from "../persistence/context.js";
+import { sessionFromEnv, resolveStoreSession } from "../persistence/context.js";
 import { openStoreSession, type StoreSession } from "../persistence/session.js";
 import type { RunStatus, RunSummary } from "../persistence/model.js";
 import {
@@ -22,7 +22,7 @@ async function readRuns<T>(
 	task: (store: StoreSession) => Promise<T>,
 ): Promise<T> {
 	ctx.signal?.throwIfAborted();
-	const store = ctx.storeSession ?? sessionFromEnv(ctx.env);
+	const store = ctx.storeSession ? resolveStoreSession(ctx.storeSession) : sessionFromEnv(ctx.env);
 	if (store) return task(store);
 	const owned = await openStoreSession({
 		env: { ...process.env, ...ctx.env },
@@ -128,7 +128,7 @@ export async function adoptLegacyCheckpoint({
 	return withStoreContext(
 		{ ...ctx, env: { ...process.env, ...ctx.env }, trackRuns: true },
 		async (runtime) => {
-			const store = runtime.storeSession ?? sessionFromEnv(runtime.env);
+			const store = sessionFromEnv(runtime.env);
 			if (!store) throw new Error("Legacy adoption requires a persistence session");
 			return runView(
 				await store.adoptCheckpoint(

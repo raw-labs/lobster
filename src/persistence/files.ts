@@ -84,26 +84,27 @@ export class FileBackend implements Backend {
 		return state;
 	}
 
-	async listRuns(): Promise<RunRecord[]> {
+	private async *runs(after = ""): AsyncGenerator<RunRecord> {
 		let names: string[];
 		try {
 			names = await fs.readdir(path.join(this.directory, ".history"));
 		} catch (error) {
-			if (error.code === "ENOENT") {
-				return [];
-			}
+			if (error.code === "ENOENT") return;
 			throw error;
 		}
-		const runs: RunRecord[] = [];
 		for (const name of names.sort()) {
-			if (!name.endsWith(".json")) {
-				continue;
-			}
-			const run = await this.getRun(name.slice(0, -5));
-			if (run) {
-				runs.push(run);
+			if (!name.endsWith(".json")) continue;
+			const id = name.slice(0, -5);
+			if (id > after) {
+				const run = await this.getRun(id);
+				if (run) yield run;
 			}
 		}
+	}
+
+	async listRuns(): Promise<RunRecord[]> {
+		const runs: RunRecord[] = [];
+		for await (const run of this.runs()) runs.push(run);
 		return runs;
 	}
 
@@ -112,32 +113,14 @@ export class FileBackend implements Backend {
 		limit: number,
 		filter: RunFilter = {},
 	): Promise<RunSummary[]> {
-		let names: string[];
-		try {
-			names = await fs.readdir(path.join(this.directory, ".history"));
-		} catch (error) {
-			if (error.code === "ENOENT") {
-				return [];
-			}
-			throw error;
-		}
 		const summaries: RunSummary[] = [];
-		const ids = names
-			.filter((name) => name.endsWith(".json"))
-			.map((name) => name.slice(0, -5))
-			.filter((id) => id > after)
-			.sort();
-		for (const id of ids) {
-			const run = await this.getRun(id);
+		for await (const run of this.runs(after)) {
 			if (
-				run &&
 				(!filter.status || run.status === filter.status) &&
 				(filter.callerId === undefined || run.metadata?.callerId === filter.callerId)
 			) {
 				summaries.push(runSummary(run));
-			}
-			if (summaries.length === limit) {
-				break;
+				if (summaries.length === limit) break;
 			}
 		}
 		return summaries;
@@ -151,7 +134,7 @@ export class FileBackend implements Backend {
 	async read(key: string): Promise<StateRecord> {
 		let id = this.locators.get(key);
 		if (!id && /^(pipeline_resume_|workflow[-_]resume_|sdk_resume_)/.test(key)) {
-			for (const run of await this.listRuns()) {
+			for await (const run of this.runs()) {
 				for (const stateKey of Object.keys(run.states)) {
 					const existing = this.locators.get(stateKey);
 					if (existing && existing !== run.id) {

@@ -1,3 +1,4 @@
+import { openStoreSession } from "../src/persistence/session.js";
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { promises as fs } from "node:fs";
@@ -15,7 +16,6 @@ import {
 	listLegacyCheckpoints,
 	listRuns,
 	migrateStore,
-	openStoreSession,
 	resumeToolRequest,
 	runToolRequest,
 } from "../src/core/index.js";

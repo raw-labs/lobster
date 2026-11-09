@@ -1,3 +1,4 @@
+import { openStoreSession } from "../src/persistence/session.js";
 import assert from "node:assert/strict";
 import { promises as fs } from "node:fs";
 import os from "node:os";
@@ -7,7 +8,6 @@ import {
 	createDefaultRegistry,
 	getRun,
 	getWait,
-	openStoreSession,
 	resumeToolRequest,
 	runToolRequest,
 } from "../src/core/index.js";

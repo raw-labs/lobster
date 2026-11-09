@@ -8,19 +8,17 @@ import {
 	recorderFromEnv,
 	sessionFromEnv,
 	type StoreEnvironment,
+	type PersistenceOptions,
+	resolveStoreSession,
 } from "./context.js";
-import { fingerprint, type RunMetadata } from "./model.js";
-import { openStoreSession, type ExecutionRecorder, type StoreSession } from "./session.js";
+import { fingerprint } from "./model.js";
+import { openStoreSession, type ExecutionRecorder } from "./session.js";
 
-type ExecutionContext = {
+type ExecutionContext = PersistenceOptions & {
 	env?: StoreEnvironment;
-	storeSession?: StoreSession;
-	history?: boolean;
-	trackRuns?: boolean;
 	readOnly?: boolean;
 	signal?: AbortSignal;
 	dryRun?: boolean;
-	runMetadata?: RunMetadata;
 	_decision?: { approved?: boolean; cancel?: boolean; response?: unknown };
 };
 
@@ -36,7 +34,7 @@ export async function withStoreContext<C extends ExecutionContext, T>(
 	task: (ctx: C) => Promise<T>,
 ): Promise<T> {
 	const env = ctx.env ?? process.env;
-	const injected = ctx.storeSession ?? sessionFromEnv(env);
+	const injected = ctx.storeSession ? resolveStoreSession(ctx.storeSession) : sessionFromEnv(env);
 	if (injected) {
 		return task({ ...ctx, env: bindStoreSession(env, injected) });
 	}

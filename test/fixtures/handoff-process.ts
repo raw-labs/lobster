@@ -1,4 +1,5 @@
-import { openStoreSession, resumeToolRequest } from "../../src/core/index.js";
+import { resumeToolRequest } from "../../src/core/index.js";
+import { openStoreSession } from "../../src/persistence/session.js";
 
 const [directory, waitId, revision, phase] = process.argv.slice(2);
 const store = await openStoreSession({ directory, trackRuns: true });

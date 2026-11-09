@@ -5,7 +5,8 @@ import path from "node:path";
 import test from "node:test";
 import { once } from "node:events";
 import { Worker } from "node:worker_threads";
-import { migrateStore, openStoreSession } from "../src/core/index.js";
+import { migrateStore } from "../src/core/index.js";
+import { openStoreSession } from "../src/persistence/session.js";
 import { assertSqliteRuntime } from "../src/persistence/sqlite-support.js";
 
 for (const node of ["22.13.0", "22.23.4", "23.4.0", "24.3.0", "24.22.1", "26.0.0"]) {

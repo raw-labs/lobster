@@ -6,7 +6,8 @@ import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { migrateStore, openStoreSession } from "../src/core/index.js";
+import { migrateStore } from "../src/core/index.js";
+import { openStoreSession } from "../src/persistence/session.js";
 
 const pipeline = {
 	pipeline: [{ name: "approve", args: {}, raw: "approve" }],

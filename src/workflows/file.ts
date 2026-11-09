@@ -1,3 +1,4 @@
+import type { PersistenceOptions } from "../persistence/context.js";
 import type { WaitRequest } from "../persistence/waits.js";
 import {
 	publishTrackedCheckpoint,
@@ -84,7 +85,7 @@ export type {
 	WorkflowRunResult,
 } from "./types.js";
 
-type RunContext = {
+type RunContext = PersistenceOptions & {
 	stdin: NodeJS.ReadableStream;
 	stdout: NodeJS.WritableStream;
 	stderr: NodeJS.WritableStream;

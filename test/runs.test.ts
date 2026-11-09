@@ -1,3 +1,4 @@
+import { openStoreSession } from "../src/persistence/session.js";
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { promises as fs } from "node:fs";
@@ -9,13 +10,13 @@ import {
 	getRun,
 	getWait,
 	listRuns,
-	openStoreSession,
 	resumeToolRequest,
 	runToolRequest,
 	type ToolRunContext,
 } from "../src/core/index.js";
 import { migrateStore } from "../src/persistence/migrate.js";
-import { Lobster } from "../src/sdk/index.js";
+import { Lobster, approve, openStoreSession as openSdkStore } from "../src/sdk/index.js";
+import { openStoreSession as openCoreStore } from "../src/core/index.js";
 import { parseResumeArgs } from "../src/resume.js";
 
 const exec = promisify(execFile);
@@ -81,6 +82,39 @@ function scoped(
 		env: { LOBSTER_MAX_TOOL_ENVELOPE_BYTES: "16384" },
 		runMetadata: { callerId: id },
 	};
+}
+
+for (const backend of ["files", "sqlite"] as const) {
+	test(`${backend}: public store handles support SDK pause, reopen and wait resume`, async (t) => {
+		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "lobster-public-store-"));
+		t.after(() => fs.rm(directory, { recursive: true, force: true }));
+		const build = (storeSession) =>
+			new Lobster({ storeSession })
+				.pipe(() => [1])
+				.pipe(approve({ prompt: "Continue?" }))
+				.pipe((items) => items.map((item) => item + 1));
+		let store = await openCoreStore({ directory, backend, trackRuns: true });
+		try {
+			assert.equal("backend" in store, false);
+			assert.equal("transition" in store, false);
+			const first = await build(store).run();
+			assert.equal(first.status, "needs_approval");
+			await store.close();
+			store = await openSdkStore({ directory });
+			const run = await getRun({ runId: first.runId, ctx: { storeSession: store } });
+			const wait = run.pendingWaits[0];
+			const result = await build(store).resumeWait({
+				waitId: wait.id,
+				expectedRevision: wait.revision,
+				approved: true,
+			});
+			assert.equal(result.ok, true);
+			assert.deepEqual(result.output, [2]);
+			assert.equal((await store.listRuns()).runs[0].status, "completed");
+		} finally {
+			await store.close();
+		}
+	});
 }
 
 for (const backend of ["files", "sqlite"] as const) {

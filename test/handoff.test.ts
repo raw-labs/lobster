@@ -1,3 +1,4 @@
+import { openStoreSession } from "../src/persistence/session.js";
 import assert from "node:assert/strict";
 import { fork } from "node:child_process";
 import { randomUUID } from "node:crypto";
@@ -12,7 +13,6 @@ import {
 	decodeResumeToken,
 	getRun,
 	getWait,
-	openStoreSession,
 	resumeToolRequest,
 	runToolRequest,
 	type ToolRunContext,

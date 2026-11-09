@@ -29,7 +29,7 @@ export {
 	bindStoreSession,
 	type StoreSession,
 	type StoreOptions,
-} from "../persistence/session.js";
+} from "../persistence/public.js";
 export { migrateStore } from "../persistence/migrate.js";
 export {
 	PersistenceError,

@@ -1,15 +1,10 @@
+import { openStoreSession } from "../src/persistence/session.js";
 import assert from "node:assert/strict";
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import {
-	getRun,
-	getWait,
-	openStoreSession,
-	resumeToolRequest,
-	runToolRequest,
-} from "../src/core/index.js";
+import { getRun, getWait, resumeToolRequest, runToolRequest } from "../src/core/index.js";
 
 for (const backend of ["files", "sqlite"] as const) {
 	test(`${backend}: retirement during state preparation prevents the write`, async (t) => {
