@@ -1,3 +1,4 @@
+import type { ExecutionState, ExecutionLease } from "../engine/state.js";
 import { createHash } from "node:crypto";
 
 export const SCHEMA_VERSION = 1;
@@ -73,6 +74,8 @@ export type RunEvent = {
 };
 
 export type RunRecord = {
+	execution?: ExecutionState;
+	executionLease?: ExecutionLease;
 	version: 1;
 	id: string;
 	kind: string;
@@ -97,6 +100,18 @@ export type CheckpointGuard =
 	| { key: string; status: "consumed"; claimId: string };
 
 export type RunAction =
+	| { kind: "execution-claim"; owner: string; expiresAt: number; epoch: number }
+	| { kind: "execution-renew"; owner: string; epoch: number; expiresAt: number }
+	| { kind: "execution-release"; owner: string; epoch: number }
+	| {
+			kind: "execution-save";
+			owner: string;
+			epoch: number;
+			expectedVersion: number;
+			execution: ExecutionState;
+			publish?: { key: string; text: string };
+			consume?: { key: string; expectedWaitRevision?: number };
+	  }
 	| { kind: "create"; run: RunRecord; checkpoint?: { key: string; text: string } }
 	| { kind: "adopt"; checkpoint: CheckpointGuard; metadata: RunMetadata }
 	| { kind: "definition"; fingerprint: string }
@@ -143,7 +158,10 @@ export type RunSummary = Pick<
 	"id" | "kind" | "status" | "revision" | "createdAt" | "updatedAt" | "partialHistory"
 >;
 
-export type HistoryPage = Omit<RunRecord, "states" | "receipts"> & {
+export type HistoryPage = Omit<
+	RunRecord,
+	"states" | "receipts" | "execution" | "executionLease"
+> & {
 	definitionCount: number;
 	nextCursor: number;
 };
@@ -268,6 +286,45 @@ export function applyTransition(
 			throw new Error("Invalid successor checkpoint");
 		}
 	}
+	if (action.kind.startsWith("execution-") && action.kind !== "execution-claim") {
+		const owned = action as Extract<RunAction, { owner: string }>;
+		const lease = current?.executionLease;
+		if (
+			!lease ||
+			lease.owner !== owned.owner ||
+			lease.epoch !== owned.epoch ||
+			lease.expiresAt <= Date.now()
+		)
+			return { status: "conflict", revision: current?.revision ?? 0, run: current };
+	}
+	if (action.kind === "execution-claim") {
+		const lease = current?.executionLease;
+		if (
+			(lease && lease.expiresAt > Date.now()) ||
+			action.epoch !== (lease?.epoch ?? 0) + 1 ||
+			!Number.isFinite(action.expiresAt) ||
+			action.expiresAt <= Date.now()
+		)
+			return { status: "conflict", revision: current?.revision ?? 0, run: current };
+	}
+	if (action.kind === "execution-save") {
+		if (
+			action.expectedVersion !== (current?.execution?.revision ?? 0) ||
+			action.execution.version !== 1 ||
+			action.execution.revision !== action.expectedVersion + 1
+		)
+			return { status: "conflict", revision: current?.revision ?? 0, run: current };
+		if (action.consume) {
+			const wait = current?.waits[action.consume.key];
+			if (
+				!wait ||
+				wait.status !== "pending" ||
+				(action.consume.expectedWaitRevision !== undefined &&
+					wait.revision !== action.consume.expectedWaitRevision)
+			)
+				return { status: "conflict", revision: current?.revision ?? 0, run: current };
+		}
+	}
 	if (action.kind === "create" && current) {
 		throw new Error("Run already exists");
 	}
@@ -279,7 +336,26 @@ export function applyTransition(
 	const run = structuredClone(source);
 	const at = new Date().toISOString();
 	let payload: RunEvent["payload"];
-	if (action.kind === "create" && action.checkpoint) {
+	if (action.kind === "execution-claim") {
+		run.executionLease = { owner: action.owner, epoch: action.epoch, expiresAt: action.expiresAt };
+		// The previous owner is gone. Diagnostic attempts are no longer live;
+		// unresolved effects remain authoritative in the execution checkpoint.
+		for (const attempt of run.attempts) {
+			if (attempt.status === "started") {
+				attempt.status = "closed";
+				attempt.finishedAt = at;
+			}
+		}
+	} else if (action.kind === "execution-renew") {
+		run.executionLease!.expiresAt = action.expiresAt;
+	} else if (action.kind === "execution-release") {
+		run.executionLease!.expiresAt = 0;
+	} else if (action.kind === "execution-save") {
+		run.execution = action.execution;
+		if (action.consume) setCheckpoint(run, action.consume.key, null);
+		if (action.publish) setCheckpoint(run, action.publish.key, action.publish.text);
+		run.status = action.execution.status === "blocked" ? "running" : action.execution.status;
+	} else if (action.kind === "create" && action.checkpoint) {
 		setCheckpoint(run, action.checkpoint.key, action.checkpoint.text);
 	} else if (action.kind === "adopt") {
 		run.metadata = { ...run.metadata, ...captureRunMetadata(action.metadata) };
@@ -430,6 +506,23 @@ export function validateArchive(value: unknown): asserts value is LogicalArchive
 		if (run.historyEnabled !== undefined && typeof run.historyEnabled !== "boolean") {
 			throw new Error("Invalid run history setting");
 		}
+		if (run.execution !== undefined) {
+			const execution = run.execution;
+			if (
+				execution.version !== 1 ||
+				!Number.isSafeInteger(execution.revision) ||
+				execution.revision < 1 ||
+				!execution.definition?.workflow ||
+				!Array.isArray(execution.definition.workflow.steps) ||
+				typeof execution.definition.filePath !== "string" ||
+				!execution.activations ||
+				!execution.args ||
+				!["running", "waiting", "completed", "failed", "cancelled", "blocked"].includes(
+					execution.status,
+				)
+			)
+				throw new Error("Invalid workflow execution snapshot");
+		}
 		ids.add(run.id);
 		if (
 			!Number.isFinite(Date.parse(run.createdAt)) ||
@@ -516,6 +609,13 @@ export function isRetiredCheckpoint(text: string | null): boolean {
 }
 
 export function canRetain(run: RunRecord, before: string): boolean {
+	if (
+		run.execution &&
+		Object.entries(run.execution.activations).some(
+			([key, frame]) => key.endsWith("/activity") && frame.phase === "started",
+		)
+	)
+		return false;
 	return (
 		["completed", "failed", "cancelled"].includes(run.status) &&
 		Date.parse(run.updatedAt) < Date.parse(before) &&
@@ -535,6 +635,8 @@ export function historyPage(run: RunRecord, afterSequence: number, limit: number
 	const {
 		states: _states,
 		receipts: _receipts,
+		execution: _execution,
+		executionLease: _executionLease,
 		events,
 		attempts,
 		waits,

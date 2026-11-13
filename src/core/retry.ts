@@ -25,7 +25,7 @@ export function resolveRetryConfig(raw: RetryConfig | undefined): Required<Retry
 	};
 }
 
-function computeDelay(config: Required<RetryConfig>, attempt: number): number {
+export function computeDelay(config: Required<RetryConfig>, attempt: number): number {
 	let delay: number;
 	if (config.backoff === "exponential") {
 		delay = Math.min(config.delay_ms * Math.pow(2, attempt), config.max_delay_ms);

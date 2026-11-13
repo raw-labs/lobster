@@ -7,7 +7,7 @@ import {
 } from "./core/runs.js";
 import { forceTerminateAbortableProcesses } from "./abortable_process.js";
 import { createDefaultRegistry } from "./commands/registry.js";
-import { resumeToolRequest } from "./core/tool_runtime.js";
+import { resumeToolRequest, createToolContext } from "./core/tool_runtime.js";
 import { parsePipeline } from "./parser.js";
 import { runtimeErrorDetails } from "./persistence/backend.js";
 import { recorderFromEnv } from "./persistence/context.js";
@@ -17,7 +17,12 @@ import { openStoreSession } from "./persistence/session.js";
 import { finalizePipelineToolRun } from "./pipeline_resume_state.js";
 import { parseResumeArgs } from "./resume.js";
 import { runPipeline } from "./runtime.js";
-import { loadWorkflowFile, resolveWorkflowArgs, runWorkflowFile } from "./workflows/file.js";
+import {
+	loadWorkflowFile,
+	resolveWorkflowArgs,
+	runWorkflowFile,
+	advanceWorkflowRun,
+} from "./workflows/file.js";
 import { renderWorkflowGraph } from "./workflows/graph.js";
 import type { WorkflowGraphFormat } from "./workflows/graph.js";
 
@@ -68,6 +73,35 @@ async function runCliWithSignal(
 
 	if (argv[0] === "version" || argv[0] === "--version" || argv[0] === "-v") {
 		process.stdout.write(`${await readVersion()}\n`);
+		return;
+	}
+
+	if (argv[0] === "runs" && argv[1] === "advance") {
+		try {
+			if (!argv[2] || argv.length !== 3) throw new Error("runs advance requires a run ID");
+			const result = await advanceWorkflowRun({
+				runId: argv[2],
+				ctx: createToolContext({ signal, forceTerminationSignal }),
+			});
+			writeToolEnvelope({
+				ok: true,
+				status: result.status,
+				output: result.output,
+				requiresApproval: result.requiresApproval ?? null,
+				requiresInput: result.requiresInput ?? null,
+				runId: result.runId,
+			});
+		} catch (error) {
+			writeToolEnvelope({
+				ok: false,
+				status: "error",
+				output: [],
+				requiresApproval: null,
+				requiresInput: null,
+				error: runtimeErrorDetails(error),
+			});
+			process.exitCode = 1;
+		}
 		return;
 	}
 
@@ -219,7 +253,12 @@ async function handleRun(options: RunOptions) {
 	let envelope: ToolPayload | undefined;
 	try {
 		const result = await withExecution(
-			{ env: process.env, signal: options.signal, dryRun: prepared.dryRun },
+			{
+				env: process.env,
+				signal: options.signal,
+				dryRun: prepared.dryRun,
+				...(prepared.workflowFile ? { trackRuns: true } : {}),
+			},
 			"cli",
 			undefined,
 			(ctx) =>
@@ -798,7 +837,7 @@ function helpText() {
 		`  lobster resume --token <token> --response-json '{...}'\n` +
 		`  lobster resume --token <token> --cancel\n` +
 		`  lobster runs list [--status waiting] [--limit 20] [--after <cursor>]\n` +
-		`  lobster runs show <runId>\n` +
+		`  lobster runs show <runId>\n  lobster runs advance <runId>\n` +
 		`  lobster waits show <waitId>\n` +
 		`  lobster resume --wait <waitId> --expected-revision <revision> --response-json '{...}'\n` +
 		`  lobster history list\n` +

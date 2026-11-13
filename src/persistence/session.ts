@@ -467,7 +467,8 @@ export class StoreSession {
 				result = await this.backend.transition(request, signal, assertInvocationCurrent);
 			} catch (error) {
 				result = await this.reconcileUnknown(error, async () => {
-					if (request.action.kind !== "handoff") return;
+					if (request.action.kind !== "handoff" && !request.action.kind.startsWith("execution-"))
+						return;
 					const run = await this.backend.getRun(request.runId);
 					const receipt = run?.receipts[request.operationId];
 					if (receipt?.fingerprint === fingerprint(request)) {

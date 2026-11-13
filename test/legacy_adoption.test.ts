@@ -21,7 +21,7 @@ import {
 } from "../src/core/index.js";
 import { PersistenceOutcomeUnknown } from "../src/persistence/backend.js";
 import { Lobster } from "../src/sdk/Lobster.js";
-import { decodeToken } from "../src/token.js";
+import { encodeToken, decodeToken } from "../src/token.js";
 
 const exec = promisify(execFile);
 const schema = { type: "integer" };
@@ -74,17 +74,42 @@ async function seed(directory: string, kind: "pipeline" | "workflow" = "pipeline
 			}),
 		);
 	}
-	const first = await runToolRequest({
-		...(filePath
-			? { filePath }
-			: {
+	const checkpointId = kind === "workflow" ? "workflow_resume_fixture" : undefined;
+	const first =
+		kind === "workflow"
+			? {
+					status: "needs_input",
+					requiresInput: {
+						resumeToken: encodeToken({
+							protocolVersion: 1,
+							v: 1,
+							kind: "workflow-file",
+							stateKey: checkpointId,
+						}),
+					},
+				}
+			: await runToolRequest({
 					pipeline: 'prepare | ask --emit --prompt Review --schema \'{"type":"integer"}\' | finish',
-				}),
-		ctx: { env, registry },
-	});
+					ctx: { env, registry },
+				});
 	assert.equal(first.status, "needs_input", JSON.stringify(first));
-	const checkpointId = decodeResumeToken(first.requiresInput.resumeToken).stateKey;
-	const checkpointPath = path.join(directory, checkpointId + ".json");
+	const key = checkpointId ?? decodeResumeToken(first.requiresInput.resumeToken).stateKey;
+	if (kind === "workflow") {
+		prepared++;
+		await fs.mkdir(directory, { recursive: true });
+		await fs.writeFile(
+			path.join(directory, key + ".json"),
+			JSON.stringify({
+				filePath,
+				args: {},
+				steps: { prepare: { id: "prepare", json: "saved draft" } },
+				resumeAtIndex: 1,
+				inputStepId: "review",
+				inputSchema: schema,
+			}),
+		);
+	}
+	const checkpointPath = path.join(directory, key + ".json");
 	const legacy = JSON.parse(await fs.readFile(checkpointPath, "utf8"));
 	delete legacy.wait;
 	delete legacy.historyOffset;
@@ -93,7 +118,7 @@ async function seed(directory: string, kind: "pipeline" | "workflow" = "pipeline
 		env,
 		registry,
 		first,
-		checkpointId,
+		checkpointId: key,
 		get prepared() {
 			return prepared;
 		},
@@ -162,6 +187,12 @@ for (const backend of ["files", "sqlite"] as const) {
 				response: 4,
 				ctx: scoped(),
 			});
+			if (kind === "workflow") {
+				assert.equal(resumed.ok, false);
+				assert.match(resumed.error.message, /migration/);
+				assert.equal(fixture.finished, 0);
+				return;
+			}
 			assert.equal(resumed.status, "ok", JSON.stringify(resumed));
 			assert.equal(resumed.runId, adopted.id);
 			assert.equal(fixture.prepared, 1);
@@ -487,7 +518,7 @@ for (const backend of ["files", "sqlite"] as const) {
 		);
 	});
 
-	test(`${backend}: adoption resolves a historical workflow-key alias and preserves its original token`, async (t) => {
+	test(`${backend}: legacy workflow aliases require execution-state migration`, async (t) => {
 		const root = await fs.mkdtemp(path.join(os.tmpdir(), "lobster-alias-adoption-"));
 		t.after(() => fs.rm(root, { recursive: true, force: true }));
 		const directory = path.join(root, "state");
@@ -515,11 +546,12 @@ for (const backend of ["files", "sqlite"] as const) {
 			response: 2,
 			ctx,
 		});
-		assert.equal(resumed.status, "ok", JSON.stringify(resumed));
+		assert.equal(resumed.ok, false);
+		assert.match(resumed.error.message, /migration|not found/);
 		assert.equal(resumed.runId, adopted.id);
 		assert.equal(fixture.prepared, 1);
-		assert.equal(fixture.finished, 1);
-		assert.equal((await getRun({ runId: adopted.id, ctx })).status, "completed");
+		assert.equal(fixture.finished, 0);
+		assert.equal((await getRun({ runId: adopted.id, ctx })).status, "waiting");
 	});
 }
 

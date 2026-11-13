@@ -94,7 +94,7 @@ export async function withExecution<C extends ExecutionContext, T>(
 		const session = sessionFromEnv(runtime.env);
 		if (
 			!session ||
-			(!session.trackRuns && !resumeKey) ||
+			(!session.trackRuns && !runtime.trackRuns && !resumeKey) ||
 			recorderFromEnv(runtime.env) ||
 			runtime.dryRun
 		) {
@@ -135,7 +135,9 @@ export async function withExecution<C extends ExecutionContext, T>(
 			const pending = Object.values(run?.waits ?? {}).some((wait) => wait.status === "pending");
 			const ownsExecution = !resumeKey || recorder.ownsExecution;
 
-			if (outcome?.error?.type === "persistence_outcome_unknown") {
+			if (run?.execution) {
+				// The saved-state workflow engine owns status, including recoverable interruption.
+			} else if (outcome?.error?.type === "persistence_outcome_unknown") {
 				// Reconcile the admitted mutation before assigning an execution outcome.
 			} else if (outcome?.ok === false) {
 				if (ownsExecution && !pending && run?.status === "running") {
@@ -161,7 +163,7 @@ export async function withExecution<C extends ExecutionContext, T>(
 
 			const run = await session.getRunState(recorder.runId);
 			const pending = Object.values(run?.waits ?? {}).some((wait) => wait.status === "pending");
-			if ((!resumeKey || recorder.ownsExecution) && !pending) {
+			if (!run?.execution && (!resumeKey || recorder.ownsExecution) && !pending) {
 				await recorder.settle(runtime.signal?.aborted ? "cancelled" : "failed", error);
 			}
 			throw error;

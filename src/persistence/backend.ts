@@ -114,6 +114,10 @@ export function runtimeErrorDetails(error: unknown, type = "runtime_error"): Run
 		(error as { code?: string })?.code === "LOBSTER_WAIT_CONFLICT"
 	) {
 		type = "wait_conflict";
+	} else if ((error as { code?: string })?.code === "LOBSTER_ACTIVITY_OUTCOME_UNKNOWN") {
+		type = "activity_outcome_unknown";
+	} else if ((error as { code?: string })?.code === "LOBSTER_EXECUTION_CONFLICT") {
+		type = "execution_conflict";
 	} else if (error instanceof PersistenceOutcomeUnknown) {
 		type = "persistence_outcome_unknown";
 	} else if (error instanceof PersistenceError) {

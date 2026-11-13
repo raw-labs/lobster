@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { execFile, spawn, type ExecFileException } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
 import os from "node:os";
@@ -294,9 +294,7 @@ for (const backend of ["files", "sqlite"] as const) {
 				run.attempts.map((a) => a.name),
 				["fetch", "review", "finish"],
 			);
-			assert.ok(
-				run.events.some((event) => event.kind === "state" && event.payload?.status === "consumed"),
-			);
+			assert.ok(run.events.some((event) => event.kind === "execution-save"));
 			assert.equal((await reopened.listRuns()).runs.length, 1);
 		} finally {
 			await reopened.close();
@@ -354,7 +352,7 @@ for (const backend of ["files", "sqlite"] as const) {
 	});
 }
 
-test("legacy pending and consumed state survives interrupted import and activation", async (t) => {
+test("workflow checkpoint and consumed state survive interrupted backend conversion", async (t) => {
 	const directory = await fs.mkdtemp(path.join(os.tmpdir(), "lobster-persistence-migrate-"));
 	t.after(() => fs.rm(directory, { recursive: true, force: true }));
 	const filePath = path.join(directory, "flow.lobster");
@@ -406,7 +404,7 @@ test("legacy pending and consumed state survives interrupted import and activati
 	try {
 		assert.equal(JSON.parse((await session.read("pipeline_resume_consumed")).text).claimId, "old");
 		const { runs } = await session.listRuns();
-		assert.equal(runs[0].partialHistory, true);
+		assert.equal(runs[0].partialHistory, false);
 		await assert.rejects(
 			migrateStore({ directory: env.LOBSTER_STATE_DIR, backend: "files", offline: true }),
 			/Close all/,
@@ -754,10 +752,15 @@ for (const backend of ["files", "sqlite"] as const) {
 			["failed", "completed"],
 		);
 		assert.deepEqual(
-			run.attempts.filter((a) => a.name === "member").map((a) => a.ordinal),
+			run.attempts
+				.filter((a) => a.name === "member")
+				.map((a) => Number(a.path.match(/item-(\d+)/)?.[1])),
 			[0, 1],
 		);
-		assert.equal(run.attempts.filter((a) => a.path.includes("/branch/")).length, 2);
+		assert.equal(
+			run.attempts.filter((a) => /\/branches\/attempt-1\/[ab]\//.test(a.path)).length,
+			2,
+		);
 		const page = await session.inspect(run.id, { limit: 2 });
 		assert.equal(page.events.length, 2);
 		assert.ok(!("states" in page));
@@ -1084,7 +1087,7 @@ for (const backend of ["files", "sqlite"] as const) {
 		const shown = await exec(process.execPath, [bin, "history", "show", envelope.runId], { env });
 		assert.equal(JSON.parse(shown.stdout).status, "completed");
 	});
-	test(`${backend}: CLI emits one error envelope when the terminal history reply is lost`, async (t) => {
+	test(`${backend}: CLI reconciles a lost terminal checkpoint reply`, async (t) => {
 		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "lobster-cli-history-fault-"));
 		t.after(() => fs.rm(directory, { recursive: true, force: true }));
 		const file = path.join(directory, "flow.lobster");
@@ -1099,25 +1102,17 @@ for (const backend of ["files", "sqlite"] as const) {
 			LOBSTER_HISTORY: "1",
 		};
 		const fixture = fileURLToPath(new URL("./fixtures/persistence-process.js", import.meta.url));
-		const error: ExecFileException & { stdout: string } = await exec(
-			process.execPath,
-			[fixture, "cli-fault", file],
-			{ env },
-		).then(
-			() => assert.fail("fixture should fail"),
-			(error) => error,
-		);
-		assert.equal(error.code, 1);
-		// Parsing the whole output rejects concatenated success and error envelopes.
-		const envelope = JSON.parse(error.stdout);
-		assert.equal(envelope.ok, false);
-		assert.equal(envelope.error.type, "persistence_outcome_unknown");
+		const { stdout } = await exec(process.execPath, [fixture, "cli-fault", file], { env });
+		const envelope = JSON.parse(stdout);
+		assert.equal(envelope.ok, true);
+		assert.equal(envelope.status, "ok");
+		assert.deepEqual(envelope.output, [42]);
+
 		const store = await openStoreSession({ env });
 		try {
-			const receipt = await store.reconcile(envelope.error.runId, envelope.error.operationId);
-			assert.equal(receipt.acknowledged, false);
-			assert.equal((await store.getRun(envelope.error.runId)).status, "completed");
-			assert.deepEqual(await store.retain({ before: "2099-01-01T00:00:00Z", dryRun: false }), []);
+			const run = await store.getRun(envelope.runId);
+			assert.equal(run.status, "completed");
+			assert.ok(Object.values(run.receipts).every((receipt) => receipt.acknowledged));
 		} finally {
 			await store.close();
 		}
@@ -1415,7 +1410,7 @@ for (const backend of ["files", "sqlite"] as const) {
 				assert.equal(result.error.runId, failedOperation.runId);
 				assert.equal(await fs.readFile(effects, "utf8"), "x");
 				const run = await store.getRun(failedOperation.runId);
-				assert.equal(run.status, unknown ? "running" : "failed");
+				assert.equal(run.status, "running");
 				assert.equal(run.attempts.length, 1);
 				assert.equal(run.attempts[0].status, unknown ? "completed" : "started");
 				const receipt = await store.reconcile(run.id, failedOperation.operationId);
@@ -1471,10 +1466,10 @@ for (const backend of ["files", "sqlite"] as const) {
 			const children = run.attempts.filter((a) => a.name === "child");
 			assert.equal(children.length, 4);
 			assert.equal(new Set(children.map((a) => a.path)).size, 4);
-			assert.ok(children.some((a) => a.path.includes("step/1/item/0/")));
-			assert.ok(children.some((a) => a.path.includes("step/1/item/1/")));
-			assert.ok(children.some((a) => a.path.includes("step/2/branch/a/")));
-			assert.ok(children.some((a) => a.path.includes("step/2/branch/b/")));
+			assert.ok(children.some((a) => a.path.includes("/loop/attempt-1/item-0/")));
+			assert.ok(children.some((a) => a.path.includes("/loop/attempt-1/item-1/")));
+			assert.ok(children.some((a) => a.path.includes("/branches/attempt-1/a/")));
+			assert.ok(children.some((a) => a.path.includes("/branches/attempt-1/b/")));
 		} finally {
 			await store.close();
 		}

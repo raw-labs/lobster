@@ -98,6 +98,18 @@ export function validateCheckpoint(key: string, text: string): void {
 			throw new Error(`Invalid SDK continuation: ${key}`);
 		}
 	} else if (/^workflow[-_]resume_/.test(key)) {
+		if (value.machineVersion !== undefined) {
+			if (
+				value.machineVersion !== 1 ||
+				typeof value.runId !== "string" ||
+				typeof value.activation !== "string" ||
+				!object(value.wait) ||
+				!["approval", "input"].includes(String(value.wait.kind))
+			)
+				throw new Error("Invalid workflow machine continuation: " + key);
+			return;
+		}
+
 		if (
 			typeof value.filePath !== "string" ||
 			!value.filePath ||
@@ -158,6 +170,18 @@ export function validateContinuations(data: LogicalArchive): void {
 		if (/^(pipeline_resume_|workflow[-_]resume_|sdk_resume_)/.test(key)) {
 			validateCheckpoint(key, text);
 			const value = JSON.parse(text);
+			if (value.machineVersion === 1) {
+				const run = data.runs.find((run) => run.id === value.runId);
+				const frame = run?.execution?.activations[value.activation];
+				if (
+					!frame ||
+					frame.waitKey !== key ||
+					frame.phase !== "waiting" ||
+					fingerprint(frame.wait) !== fingerprint(value.wait)
+				)
+					throw new Error("Orphaned workflow machine continuation: " + key);
+			}
+
 			if (
 				key.startsWith("workflow_resume_") &&
 				!isRetiredCheckpoint(text) &&
@@ -183,6 +207,18 @@ export function validateContinuations(data: LogicalArchive): void {
 			}
 		} else if (/^approval_[a-f0-9]+$/.test(key)) {
 			const value = JSON.parse(text);
+			if (value.machineVersion === 1) {
+				const run = data.runs.find((run) => run.id === value.runId);
+				const frame = run?.execution?.activations[value.activation];
+				if (
+					!frame ||
+					frame.waitKey !== key ||
+					frame.phase !== "waiting" ||
+					fingerprint(frame.wait) !== fingerprint(value.wait)
+				)
+					throw new Error("Orphaned workflow machine continuation: " + key);
+			}
+
 			if (
 				!value ||
 				typeof value.stateKey !== "string" ||

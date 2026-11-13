@@ -1,7 +1,7 @@
 export { createDefaultRegistry } from "../commands/registry.js";
 export { parsePipeline } from "../parser.js";
 export { runPipeline } from "../runtime.js";
-export { runWorkflowFile } from "../workflows/file.js";
+export { runWorkflowFile, advanceWorkflowRun } from "../workflows/file.js";
 export { decodeResumeToken } from "../resume.js";
 export { runToolRequest, resumeToolRequest, createToolContext } from "./tool_runtime.js";
 
@@ -37,3 +37,6 @@ export type {
 	AttemptStatus,
 	OperationReceipt,
 } from "../persistence/model.js";
+
+export { InterruptedActivityError, ExecutionConflictError } from "../engine/state.js";
+export type { WorkflowRunOptions } from "../workflows/file.js";

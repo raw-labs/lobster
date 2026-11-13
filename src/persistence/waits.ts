@@ -24,6 +24,14 @@ export type WaitView = WaitSummary & { request: WaitRequest | null };
 
 export type RunView = RunSummary & {
 	historyEnabled: boolean;
+	execution?: {
+		version: number;
+		status: string;
+		error?: string;
+		nextRetryAt?: number;
+		active: boolean;
+		unresolvedActivities: string[];
+	};
 	metadata?: RunMetadata;
 	pendingWaits: WaitSummary[];
 };
@@ -42,9 +50,26 @@ function waitSummary(run: RunState, key: string): WaitSummary {
 }
 
 export function runView(run: RunState): RunView {
+	const retryTimes = Object.values(run.execution?.activations ?? {}).flatMap((frame) =>
+		frame.retryAt === undefined ? [] : [frame.retryAt],
+	);
 	return {
 		...runSummary(run),
 		historyEnabled: run.historyEnabled !== false,
+		...(run.execution
+			? {
+					execution: {
+						version: run.execution.version,
+						status: run.execution.status,
+						...(run.execution.error ? { error: run.execution.error } : {}),
+						...(retryTimes.length ? { nextRetryAt: Math.min(...retryTimes) } : {}),
+						active: (run.executionLease?.expiresAt ?? 0) > Date.now(),
+						unresolvedActivities: Object.entries(run.execution.activations)
+							.filter(([key, frame]) => key.endsWith("/activity") && frame.phase === "started")
+							.map(([key]) => key),
+					},
+				}
+			: {}),
 		...(run.metadata ? { metadata: run.metadata } : {}),
 		pendingWaits: Object.keys(run.waits)
 			.filter((key) => run.waits[key].status === "pending" && typeof run.states[key] === "string")

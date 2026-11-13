@@ -41,8 +41,9 @@ Invalid workflow file paths are reported as input errors (exit code 2), whether 
 
 ## Persistence and run history
 
-File storage remains the default. Existing state keys, approval IDs, and saved
-continuations keep their readers. Retained history is opt-in on either backend:
+File storage remains the default. Workflow-file runs always save execution progress
+on either backend. Standalone pipelines and SDK stages retain their existing
+persistence contracts. Detailed diagnostic history remains opt-in:
 
 ```sh
 LOBSTER_HISTORY=1 lobster run --mode tool --file workflow.lobster
@@ -75,8 +76,10 @@ A tracked execution keeps one run ID through approvals and structured-input
 pauses. History records step occurrences, attempts, retries, loop item ordinals,
 parallel branches, and child-workflow paths. Lazy stages finish when their
 iterators finish, fail, or close early; recording does not drain an unused stream.
-Workflow files retain their current reload-on-resume behavior. Definition hashes
-record what was supplied in each execution segment; they do not freeze execution.
+Workflow files and static child definitions are snapshotted before execution.
+Continuation uses the snapshot, not a reread of the source file. Dynamic child
+references are snapshotted when first entered. Scripts, command implementations
+and the host environment are not frozen.
 
 Default output summaries contain types and counts rather than raw outputs, error
 messages, prompts, arguments, or environment variables. Summary payloads are
@@ -89,20 +92,23 @@ payloads and existing output limits; history capture adds no execution truncatio
 New tracked file continuations live with their events in one atomically replaced
 per-run record under `.history`. SQLite commits continuation transitions and their
 events together in indexed tables. The file backend rewrites its aggregate when
-history changes; SQLite avoids that cost. File-backed continuation lookup can scan
+history changes. Execution checkpoints currently replace the full execution
+snapshot on both backends; SQLite stores that snapshot with its run metadata. File-backed continuation lookup can scan
 retained runs, so use SQLite for large histories or busy embedded hosts. File
 queries stream run records instead of loading all histories into memory at once.
 Legacy JSON values keep their layout
 until migration or association with a tracked continuation. New tracked tokens
-require this runtime; compatibility means reading existing tokens, not making
-older binaries understand new storage. History enables run tracking. To keep live
-run status and pending reviews without detailed history, use `LOBSTER_RUNS=1` or
+require this runtime; older binaries cannot understand the new execution state.
+Old workflow-file checkpoints require a separate one-off state migration, which
+is not implemented yet; there is no legacy executor fallback. Old pipeline and
+SDK tokens retain their existing readers. History enables run tracking. To track
+standalone pipeline/SDK status without detailed history, use `LOBSTER_RUNS=1` or
 `trackRuns: true`. Each run retains its original history setting when resumed.
 
 ### Run and pending review API
 
-Enable durable runs on either backend with `trackRuns: true`; add `history: true`
-when you also want step attempts and event history. A pending question is saved
+Workflow-file runs are recorded automatically. For standalone pipelines/SDK stages,
+enable recording with `trackRuns: true`; add `history: true` for diagnostic events. A pending question is saved
 with its original prompt, schema, defaults, and full review subject. Discovery
 reads that snapshot, rather than rebuilding it from chat or a workflow file.
 
@@ -143,16 +149,15 @@ inspectable through `getRun`.
 `expectedRevision` refers to the **wait**, not the run's history revision. It is
 checked again in the same transaction as checkpoint consumption or cancellation.
 
-When a tracked run reaches another pause, Lobster retires the previous checkpoint
-and publishes the next one, its history event, and an operation receipt in one
-commit. Competing answers cannot create two pending successors. A crash before
-that commit preserves the previous checkpoint; a crash after it preserves the
-next one. Cancellation after publication does not undo the committed handoff.
-Lost handoff replies are reconciled against the receipt before reporting success;
-an unreadable receipt leaves the outcome explicitly unknown. Steps that already
-claimed a checkpoint before an unsafe operation remain subject to the execution
-recovery limits below. Untracked legacy JSON checkpoints keep their existing
-publication behavior.
+Workflow-file answers consume the question and save the accepted decision in one
+transaction. The decision remains accepted if later execution is interrupted.
+A successor question is published with its execution checkpoint in a separate
+transaction; a crash between those commits leaves recoverable progress, not a
+reusable old approval. Publication and consumption use ownership fencing and
+revision checks. Lost checkpoint replies are reconciled against their receipts;
+an unreadable receipt leaves the outcome explicitly unknown.
+
+Standalone tracked pipeline and SDK pauses retain their atomic handoff protocol.
 
 Invalid answers remain correctable; changed, consumed, or foreign waits return
 `wait_conflict`. The old token and approval-ID paths continue to use the same
@@ -170,14 +175,15 @@ SDK function stages still require an instance supplying the original stages:
 `lobster.resumeWait({ waitId, expectedRevision, response })`. They are not
 serialized or resurrected from storage. Workflow-file and pipeline waits resume
 through `resumeToolRequest`. Existing untracked checkpoints retain token-based
-resume; they do not retroactively acquire run history or a known caller. Imported
+resume for pipelines/SDK stages; old workflow-file checkpoints require migration.
+Legacy records do not retroactively acquire history or a known caller. Imported
 older tracked waits may have `request: null` when the original question was not
 saved; discovery does not invent it by rereading a changed workflow file.
 
 CLI equivalents use the same API:
 
 ```sh
-LOBSTER_RUNS=1 lobster run --mode tool --file review.lobster
+lobster run --mode tool --file review.lobster
 lobster runs list --status waiting
 lobster runs show <runId>
 lobster waits show <waitId>
@@ -189,8 +195,9 @@ Full wait inspection is an explicit read of private review material; callers mus
 apply their own display limits. If a durable workflow question cannot fit the
 bounded tool envelope, the call reports a rendering error with its run ID and the
 saved question remains discoverable. Pending waits are protected from terminal
-history pruning. These APIs rediscover saved pauses; they do not automatically
-replay steps interrupted by a process crash.
+history pruning. Workflow-file runs can also continue through `advanceWorkflowRun`
+or `lobster runs advance`, subject to interrupted-activity recovery policy.
+No background dispatcher is included.
 
 ### Migrating existing state
 
@@ -236,7 +243,7 @@ if (checkpoint) {
     checkpointId: checkpoint.checkpointId,
     ctx: { storeSession: store, runMetadata: { callerId: 'host:verified-owner' } },
   });
-  // Inspect run.pendingWaits and answer through the normal APIs.
+  // Inspect run.pendingWaits. Legacy workflow-file state still needs conversion.
 }
 ```
 
@@ -260,7 +267,9 @@ lobster storage legacy list <after>
 lobster storage legacy adopt <checkpointId> --caller host:verified-owner
 ```
 
-Existing tokens and short approval IDs remain usable after adoption. Stored SDK
+Existing pipeline tokens and short approval IDs remain usable after adoption.
+Adopting old workflow-file state only inventories/associates it: execution still
+requires the deferred one-off conversion. Stored SDK
 command-input tokens also keep working with an instance supplying the original
 stages. Self-contained legacy SDK tokens remain outside inventory and retain
 their previous behavior. No historical events or missing review material are
@@ -285,10 +294,12 @@ tokens remain unusable because neither backend falls back to an old checkpoint.
 Committed transitions have stable operation IDs and receipts. A lost reply is an
 unknown outcome until reconciled; it does not authorize replaying an external
 side effect. Receipts are acknowledged only after the executor observes commit,
-and remain protected otherwise. Started attempts are history, not automatic
-restart checkpoints. A run's `running` status is its last recorded state, not a
-liveness guarantee after process death. Crash recovery and external-service
-idempotency remain separate executor work.
+and remain protected otherwise. Diagnostic attempts are not restart checkpoints;
+workflow-file execution uses its separate saved execution records. A run's
+`running` status is its last recorded state, not a liveness guarantee.
+`getRun().execution` reports execution status, lease activity, saved retry dates
+and unresolved activity paths. Storage receipts do not supply external-service
+idempotency.
 
 History persistence errors bypass workflow retry and `on_error` continuation.
 Tool envelopes report `persistence_error` or `persistence_outcome_unknown`, with
@@ -443,13 +454,14 @@ has retired an invocation. Lobster rechecks it before built-in process, network,
 and state effects, including after asynchronous resume preparation. Keep passing
 an `AbortSignal` to cancel work that has already started.
 
-A retired resume restores its caller-owned checkpoint when no unsafe dispatch
-has started. Once an unsafe pipeline command has been entered, the approval stays
-consumed even if a later authority check prevents the effect. This conservative
-boundary prevents replaying work that may already have happened. Custom commands
-and injected adapters must check the callback themselves after awaited preparation
-and before their own effects. The SDK does not expose this host-authority contract;
-CLI behavior is unchanged when no callback is supplied.
+For standalone pipelines, a retired resume restores its caller-owned checkpoint
+when no unsafe dispatch has started. Workflow-file decisions follow a different
+rule: a committed answer remains accepted; later host retirement cannot undo it.
+Authority is checked again before activity dispatch and question publication.
+Recovery uses saved execution rather than asking for the same decision again.
+Custom commands and injected adapters must check the callback after asynchronous
+preparation and before their own effects. The SDK does not expose this
+host-authority contract.
 
 ## GitHub recipe cancellation
 
@@ -462,6 +474,55 @@ PR snapshot or emit a notification.
 For a manually composed pipeline, pass the signal to
 `new Lobster({ signal }).pipe(ghPrView({ repo, pr }))`. Custom stages receive
 `ctx.signal` and must cooperate with it to cancel their own work.
+
+## Restarting workflow-file runs
+
+A workflow run saves its definition, resolved activity inputs, complete results,
+control position and accounting. After a process restart, completed activities
+are not executed again. Continue an unfinished run explicitly:
+
+```sh
+lobster runs list
+lobster runs show <runId>
+lobster runs advance <runId>
+```
+
+Embedded hosts use `advanceWorkflowRun({ runId, ctx })` from
+`@clawdbot/lobster/core`. There is no sleeping harness or automatic Gateway
+wake-up service in this change. An active execution lease prevents a competing
+advance; after process death, wait for lease expiry before recovery.
+
+An interrupted command with no saved result has an unknown outcome by default.
+Only commands safe to repeat should opt in:
+
+```yaml
+steps:
+  - id: fetch
+    run: fetch-metrics --json
+    recovery: repeat
+```
+
+`recovery: manual` is the default. It stops automatic continuation at an
+uncertain activity. There is no general external-action reconciliation API yet.
+A known OpenClaw pipeline dispatch remains non-replayable even with
+`recovery: repeat`. Arbitrary shell commands must be classified by the author;
+Lobster cannot infer their effects. `LOBSTER_RUN_ID` and `LOBSTER_ACTIVITY_ID`
+provide stable logical identities to adapters; `LOBSTER_ACTIVITY_ATTEMPT`
+identifies the saved attempt.
+
+Explicit retries still respond to reported failures. They preserve their attempt
+count and selected backoff deadline across restarts. Whole-control-node retries
+deliberately repeat their subtree; recovery within an attempt skips completed
+children. Retry delays and existing batch pauses still wait inside the current
+invocation: general durable sleep/event operations are not added here.
+
+Shell commands and pipelines are whole activity boundaries, not arbitrary
+instruction-level checkpoints. A partially executed pipeline may have effects;
+its existing structured-input protocol is the only supported internal
+continuation. SDK JavaScript closures are not made restartable by this engine.
+
+See [execution-machine.md](docs/execution-machine.md) for the implementation
+boundary and source layout.
 
 ## Workflow files
 
@@ -697,7 +758,7 @@ post-dispatch errors; `llm.invoke` retains its existing retry policy.
 
 ## Development
 
-The source is one TypeScript package. `src/core` contains the embeddable tool API, cost tracking, and LLM accounting; `src/sdk` provides pipeline composition; `src/commands` holds the command registry and standard library. Workflow loading, expressions, dry-run rendering, and execution live under `src/workflows`. `src/state` owns atomic file persistence, locks, and resume capabilities. GitHub SDK recipes and built-in workflows share transport and snapshot helpers.
+The source is one TypeScript package. `src/core` contains the embeddable tool API, cost tracking, and LLM accounting; `src/sdk` provides pipeline composition; `src/commands` holds the command registry and standard library. Workflow loading, expressions and dry-run rendering live under `src/workflows`; `src/definition` snapshots definitions, `src/engine` owns saved execution and node handlers, and `src/activities` runs commands/pipelines. `src/state` owns atomic file persistence, locks, and resume capabilities. GitHub SDK recipes and built-in workflows share transport and snapshot helpers.
 
 Run `pnpm test`, `pnpm typecheck`, and `pnpm lint` before submitting changes. Tests compile into `dist/test` and use Node's test runner; platform-specific process tests run only where their OS primitives exist. Dependencies observe the two-day release-age policy in `pnpm-workspace.yaml`.
 

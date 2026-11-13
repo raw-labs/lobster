@@ -217,6 +217,12 @@ function transition(request: Transition): TransitionResult {
 			// Supply the count separately so the request fingerprint stays stable on replay.
 			previousAttempts = Number(row.count);
 		}
+		if (request.action.kind === "execution-claim") {
+			const rows = prepare(
+				"SELECT record FROM attempts WHERE run_id=? AND json_extract(record, '$.status')='started'",
+			).all(current.id) as RecordRow[];
+			current.attempts = rows.map((row) => JSON.parse(row.record) as Attempt);
+		}
 		if (request.action.kind === "finish") {
 			const row = prepare("SELECT record FROM attempts WHERE run_id=? AND id=?").get(
 				current.id,
@@ -227,13 +233,17 @@ function transition(request: Transition): TransitionResult {
 			}
 		}
 		const keys =
-			request.action.kind === "adopt"
-				? [request.action.checkpoint.key]
-				: request.action.kind === "state"
-					? [request.action.key]
-					: request.action.kind === "handoff"
-						? [request.action.predecessor.key, request.action.successor.key]
-						: [];
+			request.action.kind === "execution-save"
+				? [request.action.consume?.key, request.action.publish?.key].filter((key): key is string =>
+						Boolean(key),
+					)
+				: request.action.kind === "adopt"
+					? [request.action.checkpoint.key]
+					: request.action.kind === "state"
+						? [request.action.key]
+						: request.action.kind === "handoff"
+							? [request.action.predecessor.key, request.action.successor.key]
+							: [];
 		for (const key of keys) {
 			const state = prepare("SELECT text FROM state WHERE run_id=? AND key=?").get(
 				current.id,

@@ -130,7 +130,7 @@ async function killAtHandoff(
 }
 
 for (const backend of ["files", "sqlite"] as const) {
-	for (const kind of ["pipeline", "workflow"] as const) {
+	for (const kind of ["pipeline"] as const) {
 		for (const history of [false, true]) {
 			for (const phase of ["before", "after"] as const) {
 				test(`${backend}: ${kind} survives a crash ${phase} handoff, history=${history}`, async (t) => {

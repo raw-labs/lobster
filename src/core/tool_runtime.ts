@@ -23,13 +23,8 @@ import {
 	cleanupApprovalIndexByStateKey,
 	consumeResumeState,
 	restoreConsumedResumeState,
-	stateJsonExists,
 } from "../state/store.js";
-import {
-	WorkflowResumeArgumentError,
-	alternateWorkflowResumeStateKey,
-	runWorkflowFile,
-} from "../workflows/file.js";
+import { WorkflowResumeArgumentError, runWorkflowFile } from "../workflows/file.js";
 
 export type ToolRunContext = PersistenceOptions & {
 	_resumeSignalAborted?: boolean;
@@ -81,7 +76,7 @@ export async function runToolRequest(
 ): Promise<ToolEnvelope> {
 	try {
 		return await withExecution(
-			createToolContext(options.ctx),
+			createToolContext({ ...options.ctx, ...(options.filePath ? { trackRuns: true } : {}) }),
 			options.filePath ? "workflow" : "pipeline",
 			undefined,
 			(ctx) => runToolRequestInternal({ ...options, ctx }),
@@ -329,24 +324,8 @@ async function resumeToolRequestInternal({
 		}
 	};
 
-	if (cancel === true) {
-		let stateKeys = payload.stateKey ? [payload.stateKey] : [];
-		if (payload.kind === "workflow-file" && payload.stateKey) {
-			const alternateStateKey = alternateWorkflowResumeStateKey(payload.stateKey);
-			if (alternateStateKey) {
-				// Delete a non-authoritative spelling first. If cancellation interrupts
-				// its lock wait, the state that makes this capability resumable remains.
-				const [primaryExists, alternateExists] = await Promise.all([
-					stateJsonExists({ env: runtime.env, key: payload.stateKey }),
-					stateJsonExists({ env: runtime.env, key: alternateStateKey }),
-				]);
-				if (primaryExists || !alternateExists) {
-					stateKeys = [alternateStateKey, payload.stateKey];
-				} else {
-					stateKeys = [payload.stateKey, alternateStateKey];
-				}
-			}
-		}
+	if (cancel === true && payload.kind !== "workflow-file") {
+		const stateKeys = payload.stateKey ? [payload.stateKey] : [];
 		// Keep the capability indexed until every state deletion succeeds. A
 		// cancelled request must not orphan a resume state by dropping its
 		// approval ID while waiting on another writer's state lock.

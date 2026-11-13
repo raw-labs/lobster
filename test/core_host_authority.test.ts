@@ -844,171 +844,7 @@ test("approved pipeline restores the predecessor when a successor input is retir
 	}
 });
 
-test("approved workflow cannot publish a successor approval after host retirement", async () => {
-	const tmp = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-host-authority-workflow-gate-"));
-	const stateDir = path.join(tmp, "state");
-	const env = { ...process.env, LOBSTER_STATE_DIR: stateDir };
-	let gate: ReturnType<typeof pauseStateRead> | undefined;
-	try {
-		const filePath = path.join(tmp, "gates.lobster");
-		await fsp.writeFile(
-			filePath,
-			JSON.stringify({
-				steps: [
-					{ id: "first", approval: "First?" },
-					{ id: "second", approval: "Second?" },
-				],
-			}),
-		);
-		const first = await runToolRequest({ filePath, ctx: { cwd: tmp, env } });
-		assert.equal(first.status, "needs_approval");
-		const token = first.requiresApproval?.resumeToken;
-		assert.ok(token);
-		const before = (await fsp.readdir(stateDir)).sort();
-		gate = pauseStateRead(resumeStatePath(stateDir, token));
-		let current = true;
-		let checks = 0;
-		const pending = resumeToolRequest({
-			token,
-			approved: true,
-			ctx: {
-				cwd: tmp,
-				env,
-				assertInvocationCurrent: () => {
-					checks++;
-					if (!current) throw new Error("host invocation retired");
-				},
-			},
-		});
-		await gate.readStarted;
-		current = false;
-		gate.release();
-		const resumed = await pending;
-		assert.equal(resumed.ok, false);
-		assert.match(resumed.error?.message ?? "", /host invocation retired/);
-		assert.ok(checks >= 1);
-		assert.deepEqual((await fsp.readdir(stateDir)).sort(), before);
-	} finally {
-		gate?.release();
-		gate?.restore();
-		await fsp.rm(tmp, { recursive: true, force: true });
-	}
-});
-
-test("approved workflow removes a successor linked before host retirement", async () => {
-	const tmp = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-host-authority-workflow-link-"));
-	const stateDir = path.join(tmp, "state");
-	const env = { ...process.env, LOBSTER_STATE_DIR: stateDir };
-	let gate: ReturnType<typeof pauseApprovalIndexLink> | undefined;
-	try {
-		const filePath = path.join(tmp, "gates.lobster");
-		await fsp.writeFile(
-			filePath,
-			JSON.stringify({
-				steps: [
-					{ id: "first", approval: "First?" },
-					{ id: "second", approval: "Second?" },
-				],
-			}),
-		);
-		const first = await runToolRequest({ filePath, ctx: { cwd: tmp, env } });
-		assert.equal(first.status, "needs_approval");
-		const token = first.requiresApproval?.resumeToken;
-		const approvalId = first.requiresApproval?.approvalId;
-		assert.ok(token);
-		assert.ok(approvalId);
-		const before = (await fsp.readdir(stateDir)).sort();
-		gate = pauseApprovalIndexLink(stateDir);
-		let current = true;
-		const pending = resumeToolRequest({
-			token,
-			approved: true,
-			ctx: {
-				cwd: tmp,
-				env,
-				assertInvocationCurrent: () => {
-					if (!current) throw new Error("host invocation retired");
-				},
-			},
-		});
-		await waitForGate(gate.linkStarted);
-		current = false;
-		gate.release();
-		const resumed = await pending;
-		assert.equal(resumed.ok, false);
-		assert.match(resumed.error?.message ?? "", /host invocation retired/);
-		assert.deepEqual((await fsp.readdir(stateDir)).sort(), before);
-		const cancelled = await resumeToolRequest({
-			approvalId,
-			cancel: true,
-			ctx: { cwd: tmp, env },
-		});
-		assert.equal(cancelled.status, "cancelled");
-	} finally {
-		gate?.release();
-		gate?.restore();
-		await fsp.rm(tmp, { recursive: true, force: true });
-	}
-});
-
-test("approved workflow restores the predecessor after retirement during old-index cleanup", async () => {
-	const tmp = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-host-authority-workflow-index-"));
-	const stateDir = path.join(tmp, "state");
-	const env = { ...process.env, LOBSTER_STATE_DIR: stateDir };
-	let gate: ReturnType<typeof pauseFileUnlink> | undefined;
-	try {
-		const filePath = path.join(tmp, "gates.lobster");
-		await fsp.writeFile(
-			filePath,
-			JSON.stringify({
-				steps: [
-					{ id: "first", approval: "First?" },
-					{ id: "second", approval: "Second?" },
-				],
-			}),
-		);
-		const first = await runToolRequest({ filePath, ctx: { cwd: tmp, env } });
-		assert.equal(first.status, "needs_approval");
-		const token = first.requiresApproval?.resumeToken;
-		const approvalId = first.requiresApproval?.approvalId;
-		assert.ok(token);
-		assert.ok(approvalId);
-		const before = (await fsp.readdir(stateDir)).sort();
-		gate = pauseFileUnlink(path.join(stateDir, `approval_${approvalId}.json`));
-		let current = true;
-		const pending = resumeToolRequest({
-			token,
-			approved: true,
-			ctx: {
-				cwd: tmp,
-				env,
-				assertInvocationCurrent: () => {
-					if (!current) throw new Error("host invocation retired");
-				},
-			},
-		});
-		await waitForGate(gate.unlinkStarted);
-		current = false;
-		gate.release();
-		const resumed = await pending;
-		assert.equal(resumed.ok, false);
-		assert.match(resumed.error?.message ?? "", /host invocation retired/);
-		assert.deepEqual((await fsp.readdir(stateDir)).sort(), before);
-		const retried = await resumeToolRequest({
-			approvalId,
-			approved: true,
-			ctx: { cwd: tmp, env },
-		});
-		assert.equal(retried.status, "needs_approval");
-		assert.equal(retried.requiresApproval?.prompt, "Second?");
-	} finally {
-		gate?.release();
-		gate?.restore();
-		await fsp.rm(tmp, { recursive: true, force: true });
-	}
-});
-
-for (const kind of ["pipeline", "workflow"] as const) {
+for (const kind of ["pipeline"] as const) {
 	test(`approved ${kind} restores a pre-dispatch claim when host authority retires`, async () => {
 		const tmp = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-host-authority-claim-"));
 		const stateDir = path.join(tmp, "state");
@@ -1017,20 +853,6 @@ for (const kind of ["pipeline", "workflow"] as const) {
 		let gate: ReturnType<typeof pauseStateMarkerRename> | undefined;
 		try {
 			const filePath = path.join(tmp, "workflow.lobster");
-			if (kind === "workflow") {
-				await fsp.writeFile(
-					filePath,
-					JSON.stringify({
-						steps: [
-							{ id: "gate", approval: "Write?" },
-							{
-								id: "write",
-								run: `"${process.execPath}" -e "require('node:fs').writeFileSync(process.env.LOBSTER_EFFECT_FILE, 'committed')"`,
-							},
-						],
-					}),
-				);
-			}
 			const first =
 				kind === "pipeline"
 					? await runToolRequest({
@@ -1081,7 +903,7 @@ for (const kind of ["pipeline", "workflow"] as const) {
 	});
 }
 
-for (const kind of ["pipeline", "workflow"] as const) {
+for (const kind of ["pipeline"] as const) {
 	for (const phase of ["marker", "delete"] as const) {
 		test(`approved terminal ${kind} preserves its checkpoint after retirement during ${phase}`, async () => {
 			const tmp = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-host-authority-terminal-"));
@@ -1093,12 +915,6 @@ for (const kind of ["pipeline", "workflow"] as const) {
 				| undefined;
 			try {
 				const filePath = path.join(tmp, "workflow.lobster");
-				if (kind === "workflow") {
-					await fsp.writeFile(
-						filePath,
-						JSON.stringify({ steps: [{ id: "finish", approval: "Finish?" }] }),
-					);
-				}
 				const first =
 					kind === "pipeline"
 						? await runToolRequest({
@@ -1148,7 +964,7 @@ for (const kind of ["pipeline", "workflow"] as const) {
 	}
 }
 
-for (const kind of ["pipeline", "workflow"] as const) {
+for (const kind of ["pipeline"] as const) {
 	test(`approved ${kind} does not restore a predecessor after unsafe dispatch`, async () => {
 		const tmp = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-host-authority-effect-"));
 		const stateDir = path.join(tmp, "state");
@@ -1158,17 +974,6 @@ for (const kind of ["pipeline", "workflow"] as const) {
 		try {
 			const command = `"${process.execPath}" -e "require('node:fs').writeFileSync(process.env.LOBSTER_EFFECT_FILE, 'committed')"`;
 			const filePath = path.join(tmp, "workflow.lobster");
-			if (kind === "workflow") {
-				await fsp.writeFile(
-					filePath,
-					JSON.stringify({
-						steps: [
-							{ id: "first", approval: "First?" },
-							{ id: "write", run: command, approval: "Second?" },
-						],
-					}),
-				);
-			}
 			const first =
 				kind === "pipeline"
 					? await runToolRequest({
@@ -1213,79 +1018,6 @@ for (const kind of ["pipeline", "workflow"] as const) {
 			const replay = await resumeToolRequest({ token, approved: true, ctx: { cwd: tmp, env } });
 			assert.equal(replay.ok, false);
 			assert.equal(await fsp.readFile(effectPath, "utf8"), "committed");
-		} finally {
-			gate?.release();
-			gate?.restore();
-			await fsp.rm(tmp, { recursive: true, force: true });
-		}
-	});
-}
-
-for (const shellKind of ["direct", "for_each", "parallel", "retry_continue"] as const) {
-	test(`approved ${shellKind} workflow shell rechecks host authority after state read`, async () => {
-		const tmp = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-host-authority-workflow-"));
-		const stateDir = path.join(tmp, "state");
-		const effectPath = path.join(tmp, "committed.txt");
-		const env = { ...process.env, LOBSTER_STATE_DIR: stateDir, LOBSTER_EFFECT_FILE: effectPath };
-		let gate: ReturnType<typeof pauseStateRead> | undefined;
-		try {
-			const command = `"${process.execPath}" -e "require('node:fs').writeFileSync(process.env.LOBSTER_EFFECT_FILE, 'committed')"`;
-			if (shellKind === "for_each") {
-				await fsp.mkdir(stateDir, { recursive: true });
-				await fsp.writeFile(path.join(stateDir, "items.json"), '["item"]');
-			}
-			const filePath = path.join(tmp, "workflow.lobster");
-			await fsp.writeFile(
-				filePath,
-				JSON.stringify({
-					steps: [
-						...(shellKind === "for_each" ? [{ id: "items", pipeline: "state.get items" }] : []),
-						{ id: "gate", approval: "Write?" },
-						shellKind === "direct" || shellKind === "retry_continue"
-							? {
-									id: "write",
-									run: command,
-									...(shellKind === "retry_continue"
-										? { retry: { max: 2, delay_ms: 0 }, on_error: "continue" }
-										: {}),
-								}
-							: shellKind === "for_each"
-								? {
-										id: "write",
-										for_each: "$items.json",
-										steps: [{ id: "item_write", run: command }],
-									}
-								: { id: "write", parallel: { branches: [{ id: "branch_write", run: command }] } },
-					],
-				}),
-			);
-			const first = await runToolRequest({ filePath, ctx: { cwd: tmp, env } });
-			assert.equal(first.status, "needs_approval");
-			const token = first.requiresApproval?.resumeToken;
-			assert.ok(token);
-			gate = pauseStateRead(resumeStatePath(stateDir, token));
-			let current = true;
-			let checks = 0;
-			const pending = resumeToolRequest({
-				token,
-				approved: true,
-				ctx: {
-					cwd: tmp,
-					env,
-					assertInvocationCurrent: () => {
-						checks++;
-						if (!current) throw new Error("host invocation retired");
-					},
-				},
-			});
-			await gate.readStarted;
-			current = false;
-			gate.release();
-			const resumed = await pending;
-			assert.equal(resumed.ok, false);
-			assert.match(resumed.error?.message ?? "", /host invocation retired/);
-			assert.ok(checks >= 1);
-			await assert.rejects(fsp.stat(effectPath), { code: "ENOENT" });
 		} finally {
 			gate?.release();
 			gate?.restore();

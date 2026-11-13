@@ -21,7 +21,10 @@ if (mode === "state-lock") {
 	const transition = Backend.prototype.transition;
 	Backend.prototype.transition = async function (request, signal) {
 		const result = await transition.call(this, request, signal);
-		if (request.action.kind === "settle") {
+		if (
+			request.action.kind === "execution-save" &&
+			request.action.execution.status === "completed"
+		) {
 			throw new PersistenceOutcomeUnknown(
 				request.operationId,
 				new Error("fixture lost terminal reply"),
