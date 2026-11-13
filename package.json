@@ -34,11 +34,24 @@
 	],
 	"type": "module",
 	"main": "./dist/src/sdk/index.js",
+	"types": "./dist/src/sdk/index.d.ts",
 	"exports": {
-		".": "./dist/src/sdk/index.js",
-		"./sdk": "./dist/src/sdk/index.js",
-		"./core": "./dist/src/core/index.js",
-		"./recipes/github": "./dist/src/recipes/github/index.js"
+		".": {
+			"types": "./dist/src/sdk/index.d.ts",
+			"default": "./dist/src/sdk/index.js"
+		},
+		"./sdk": {
+			"types": "./dist/src/sdk/index.d.ts",
+			"default": "./dist/src/sdk/index.js"
+		},
+		"./core": {
+			"types": "./dist/src/core/index.d.ts",
+			"default": "./dist/src/core/index.js"
+		},
+		"./recipes/github": {
+			"types": "./dist/src/recipes/github/index.d.ts",
+			"default": "./dist/src/recipes/github/index.js"
+		}
 	},
 	"scripts": {
 		"clean": "node -e \"require('fs').rmSync('dist', { recursive: true, force: true })\"",

@@ -40,6 +40,7 @@ export async function loadWorkflowFile(filePath: string): Promise<WorkflowFile> 
 		if (!step || typeof step !== "object") {
 			throw new Error("Workflow step must be an object");
 		}
+		validateRecovery(step);
 		if (!step.id || typeof step.id !== "string") {
 			throw new Error("Workflow step requires an id");
 		}
@@ -93,6 +94,7 @@ export async function loadWorkflowFile(filePath: string): Promise<WorkflowFile> 
 				if (!branch || typeof branch !== "object") {
 					throw new Error(`Workflow step ${step.id} parallel branches must be objects`);
 				}
+				validateRecovery(branch);
 				if (!branch.id || typeof branch.id !== "string") {
 					throw new Error(`Workflow step ${step.id} parallel branch requires an id`);
 				}
@@ -198,6 +200,7 @@ export async function loadWorkflowFile(filePath: string): Promise<WorkflowFile> 
 				if (!sub || typeof sub !== "object" || !sub.id || typeof sub.id !== "string") {
 					throw new Error(`Workflow step ${step.id} for_each sub-step requires an id`);
 				}
+				validateRecovery(sub);
 				if (sub.id === loopItemVar || sub.id === loopIndexVar) {
 					throw new Error(
 						`Workflow step ${step.id} for_each sub-step id '${sub.id}' conflicts with loop variable`,
@@ -450,4 +453,9 @@ export function getStepExecution(step: WorkflowStep) {
 	}
 
 	return { kind: "none" as const };
+}
+
+function validateRecovery(step: WorkflowStep) {
+	if (step.recovery !== undefined && step.recovery !== "repeat" && step.recovery !== "manual")
+		throw new Error("Workflow recovery must be repeat or manual");
 }

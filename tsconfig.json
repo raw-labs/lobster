@@ -7,7 +7,7 @@
 		"types": ["node"],
 		"rootDir": ".",
 		"outDir": "dist",
-		"declaration": false,
+		"declaration": true,
 		"sourceMap": true,
 		"strict": false,
 		"useUnknownInCatchVariables": false,

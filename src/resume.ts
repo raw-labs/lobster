@@ -21,10 +21,34 @@ export type PipelineResumePayload = {
 };
 
 export function parseResumeArgs(argv) {
-	const args = { decision: null, token: null, approvalId: null, responseJson: null, cancel: false };
+	const args = {
+		decision: null,
+		token: null,
+		approvalId: null,
+		responseJson: null,
+		cancel: false,
+		waitId: null,
+		expectedRevision: null,
+	};
 
 	for (let i = 0; i < argv.length; i++) {
 		const tok = argv[i];
+		if (tok === "--wait" || tok.startsWith("--wait=")) {
+			args.waitId = tok === "--wait" ? argv[++i] : tok.slice("--wait=".length);
+			if (!args.waitId || args.waitId.startsWith("--"))
+				throw new Error("resume --wait requires a wait ID");
+			continue;
+		}
+		if (tok === "--expected-revision" || tok.startsWith("--expected-revision=")) {
+			const value =
+				tok === "--expected-revision" ? argv[++i] : tok.slice("--expected-revision=".length);
+			if (!value || !/^\d+$/.test(value))
+				throw new Error("resume --expected-revision requires a non-negative integer");
+			args.expectedRevision = Number(value);
+			if (!Number.isSafeInteger(args.expectedRevision))
+				throw new Error("Invalid expected wait revision");
+			continue;
+		}
 		if (tok === "--token") {
 			args.token = argv[i + 1];
 			i++;
@@ -87,7 +111,20 @@ export function parseResumeArgs(argv) {
 		}
 	}
 
-	if (!args.token && !args.approvalId) throw new Error("resume requires --token or --id");
+	if (args.waitId) {
+		if (args.token || args.approvalId || args.expectedRevision === null) {
+			throw new Error(
+				"resume --wait requires --expected-revision and cannot be combined with --token or --id",
+			);
+		}
+	} else {
+		if (args.expectedRevision !== null)
+			throw new Error("resume --expected-revision requires --wait");
+		if (!args.token && !args.approvalId) throw new Error("resume requires --token or --id");
+	}
+	const wait = args.waitId
+		? { waitId: String(args.waitId), expectedRevision: args.expectedRevision as number }
+		: {};
 	const intentCount =
 		Number(Boolean(args.decision)) + Number(args.responseJson !== null) + Number(args.cancel);
 	if (intentCount > 1) {
@@ -101,6 +138,7 @@ export function parseResumeArgs(argv) {
 		return {
 			token: args.token ? String(args.token) : null,
 			approvalId: args.approvalId ? String(args.approvalId) : null,
+			...wait,
 			cancel: true,
 		};
 	}
@@ -110,6 +148,7 @@ export function parseResumeArgs(argv) {
 			return {
 				token: args.token ? String(args.token) : null,
 				approvalId: args.approvalId ? String(args.approvalId) : null,
+				...wait,
 				response: JSON.parse(String(args.responseJson)),
 			};
 		} catch {
@@ -123,6 +162,7 @@ export function parseResumeArgs(argv) {
 	return {
 		token: args.token ? String(args.token) : null,
 		approvalId: args.approvalId ? String(args.approvalId) : null,
+		...wait,
 		approved: decision === "yes" || decision === "y",
 	};
 }

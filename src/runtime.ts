@@ -1,4 +1,4 @@
-import { createJsonRenderer } from "./renderers/json.js";
+import { PersistenceError } from "./persistence/backend.js";
 import type { LlmSpendLedger } from "./core/llm_accounting.js";
 import {
 	InputRequestSuspension,
@@ -8,6 +8,8 @@ import {
 	createStageRequestInput,
 	type CommandInputResume,
 } from "./input_request.js";
+import { recorderFromEnv } from "./persistence/context.js";
+import { createJsonRenderer } from "./renderers/json.js";
 
 export async function runPipeline({
 	pipeline,
@@ -60,6 +62,7 @@ export async function runPipeline({
 		return dryRunPipeline({ pipeline, registry, stderr });
 	}
 
+	await recorderFromEnv(env)?.definition(pipeline);
 	let stream = input ?? [];
 	let rendered = false;
 	const renderedItems: unknown[] = [];
@@ -96,147 +99,226 @@ export async function runPipeline({
 		assertInvocationCurrent,
 	};
 
-	for (let idx = 0; idx < pipeline.length; idx++) {
-		if (haltAfterStageOnAbort) signal?.throwIfAborted();
-		const stage = pipeline[idx];
-		const command = registry.get(stage.name);
-		if (!command) {
-			throw new Error(`Unknown command: ${stage.name}`);
-		}
-		if (command.meta?.resumeSafeBeforeInput !== true) {
-			await markExecutionStarted();
-		}
-
-		const inputTracker = createInputTracker(stream);
-		const stageResume = idx === 0 ? requestInputResume : undefined;
-		let commandActive = true;
-		let inactiveReason: string | undefined;
-		let commandOutputStarted = false;
-		let stageFinished = false;
-		async function finishStage({ assertResume = true, suppressCloseErrors = false } = {}) {
-			if (stageFinished) return;
-			stageFinished = true;
-			commandActive = false;
-			inputTracker.disableReplay();
-			await inputTracker.close({ suppressErrors: suppressCloseErrors });
-			if (assertResume) assertRequestInputResumeConsumed(stageResume);
-		}
-		const stageStdout = trackWritableOutput(stdout, () => {
-			pipelineOutputStarted = true;
-		});
-		const ctx = {
-			...baseCtx,
-			stdout: stageStdout,
-			render: createRecordingJsonRenderer(stageStdout, renderedItems),
-		};
-		const stageCtx = {
-			...ctx,
-			requestInput: requestInputEnabled
-				? createStageRequestInput({
-						ctx,
-						stageIndex: idx,
-						mode,
-						inputTracker,
-						isCommandActive: () => commandActive,
-						getInactiveReason: () => inactiveReason,
-						isOutputStarted: () => pipelineOutputStarted || commandOutputStarted,
-						resume: stageResume,
-						onResumedInput:
-							command.meta?.resumeSafeAfterInput === true
-								? undefined
-								: async () => {
-										await markExecutionStarted();
-										assertInvocationCurrent?.();
-										onUnsafeCommandDispatch?.();
-									},
-					})
-				: createUnsupportedRequestInput(),
-		};
-
-		let result;
+	const unfinishedStages = new Set<() => Promise<void>>();
+	try {
+		const result = await executeStages();
+		await closeStages();
+		return result;
+	} catch (error) {
 		try {
-			assertInvocationCurrent?.();
-			if (command.meta?.resumeSafeBeforeInput !== true) onUnsafeCommandDispatch?.();
-			result = await command.run({ input: inputTracker.iterable, args: stage.args, ctx: stageCtx });
-		} catch (err) {
-			await finishStage({ assertResume: false, suppressCloseErrors: true });
-			if (haltForInputRequest(err)) break;
-			assertNoUnconsumedResumeAfterError(stageResume, err);
-			throw err;
+			await closeStages();
+		} catch (cleanupError) {
+			// Keep unknown persistence outcomes intact. Otherwise a history failure
+			// must prevent an ordinary runtime error from triggering an unsafe retry.
+			if (!(error instanceof PersistenceError)) throw cleanupError;
 		}
+		throw error;
+	}
 
-		if (result?.rendered) {
-			rendered = true;
-		}
-
-		const terminalOutput = Boolean(result?.halt);
-		let stageHalted = Boolean(terminalOutput || (haltAfterStageOnAbort && signal?.aborted));
-		const output = result?.output;
-		if (Array.isArray(output)) {
-			stream = output;
-			await finishStage();
-		} else if (output && idx < pipeline.length - 1 && !terminalOutput) {
-			commandActive = false;
-			inactiveReason = "requestInput cannot suspend from lazy output before downstream stages";
-			assertRequestInputResumeConsumed(stageResume);
-			const trackedOutput = trackCommandOutput(
-				output,
-				() => {
-					commandOutputStarted = true;
-				},
-				() => assertRequestInputResumeConsumed(stageResume),
-				(err) => assertNoUnconsumedResumeAfterError(stageResume, err),
-				finishStage,
+	async function executeStages() {
+		for (let idx = 0; idx < pipeline.length; idx++) {
+			if (haltAfterStageOnAbort) signal?.throwIfAborted();
+			const stage = pipeline[idx];
+			const command = registry.get(stage.name);
+			if (!command) {
+				throw new Error(`Unknown command: ${stage.name}`);
+			}
+			const history = recorderFromEnv(env);
+			const attemptId = await history?.start(
+				`pipeline/${history.pipelineOffset + idx}`,
+				stage.name,
+				history.pipelineOffset + idx,
 			);
-			stream = haltAfterStageOnAbort
-				? throwIfAbortedAfterDrain(trackedOutput, signal)
-				: trackedOutput;
-		} else {
-			if (output) {
+			let historyError: unknown;
+			let historyWaiting = false;
+			const inputTracker = createInputTracker(stream);
+			const stageResume = idx === 0 ? requestInputResume : undefined;
+			let commandActive = true;
+			let inactiveReason: string | undefined;
+			let commandOutputStarted = false;
+			let stageFinished = false;
+			const closeStage = () => finishStage({ assertResume: false, suppressCloseErrors: true });
+			if (history?.historyEnabled) unfinishedStages.add(closeStage);
+			async function finishStage({ assertResume = true, suppressCloseErrors = false } = {}) {
+				if (stageFinished) return;
+				stageFinished = true;
+				unfinishedStages.delete(closeStage);
+				commandActive = false;
+				inputTracker.disableReplay();
+				try {
+					await inputTracker.close({ suppressErrors: suppressCloseErrors });
+					if (assertResume) {
+						assertRequestInputResumeConsumed(stageResume);
+					}
+				} catch (error) {
+					historyError = error;
+					throw error;
+				} finally {
+					if (attemptId) {
+						await history.finish(
+							attemptId,
+							historyWaiting
+								? "waiting"
+								: historyError
+									? "failed"
+									: assertResume
+										? "completed"
+										: "closed",
+							historyError,
+						);
+					}
+				}
+			}
+			const stageStdout = trackWritableOutput(stdout, () => {
+				pipelineOutputStarted = true;
+			});
+			const ctx = {
+				...baseCtx,
+				stdout: stageStdout,
+				render: createRecordingJsonRenderer(stageStdout, renderedItems),
+			};
+			const stageCtx = {
+				...ctx,
+				requestInput: requestInputEnabled
+					? createStageRequestInput({
+							ctx,
+							stageIndex: idx,
+							mode,
+							inputTracker,
+							isCommandActive: () => commandActive,
+							getInactiveReason: () => inactiveReason,
+							isOutputStarted: () => pipelineOutputStarted || commandOutputStarted,
+							resume: stageResume,
+							onResumedInput:
+								command.meta?.resumeSafeAfterInput === true
+									? undefined
+									: async () => {
+											await markExecutionStarted();
+											assertInvocationCurrent?.();
+											onUnsafeCommandDispatch?.();
+										},
+						})
+					: createUnsupportedRequestInput(),
+			};
+
+			let result;
+			try {
+				if (haltAfterStageOnAbort) {
+					signal?.throwIfAborted();
+				}
+				if (command.meta?.resumeSafeBeforeInput !== true) {
+					await markExecutionStarted();
+				}
+				assertInvocationCurrent?.();
+				if (command.meta?.resumeSafeBeforeInput !== true) onUnsafeCommandDispatch?.();
+				result = await command.run({
+					input: inputTracker.iterable,
+					args: stage.args,
+					ctx: stageCtx,
+				});
+			} catch (err) {
+				historyError = err;
+				historyWaiting = err instanceof InputRequestSuspension;
+				await finishStage({ assertResume: false, suppressCloseErrors: true });
+				if (haltForInputRequest(err)) break;
+				assertNoUnconsumedResumeAfterError(stageResume, err);
+				throw err;
+			}
+
+			if (result?.rendered) {
+				rendered = true;
+			}
+
+			const terminalOutput = Boolean(result?.halt);
+			historyWaiting = terminalOutput;
+			let stageHalted = Boolean(terminalOutput || (haltAfterStageOnAbort && signal?.aborted));
+			const output = result?.output;
+			if (Array.isArray(output)) {
+				stream = output;
+				await finishStage();
+			} else if (output && idx < pipeline.length - 1 && !terminalOutput) {
+				commandActive = false;
+				inactiveReason = "requestInput cannot suspend from lazy output before downstream stages";
+				assertRequestInputResumeConsumed(stageResume);
 				const trackedOutput = trackCommandOutput(
 					output,
 					() => {
 						commandOutputStarted = true;
 					},
 					() => assertRequestInputResumeConsumed(stageResume),
-					(err) => assertNoUnconsumedResumeAfterError(stageResume, err),
+					(err) => {
+						historyError = err;
+						assertNoUnconsumedResumeAfterError(stageResume, err);
+					},
 					finishStage,
 				);
-				// Terminal output is drained after the stage loop as well. It needs the
-				// same abort-aware read as a handoff, otherwise a stalled final iterator
-				// can prevent the tool cancellation from settling forever.
 				stream = haltAfterStageOnAbort
 					? throwIfAbortedAfterDrain(trackedOutput, signal)
 					: trackedOutput;
 			} else {
-				stream = [];
-				await finishStage();
+				if (output) {
+					const trackedOutput = trackCommandOutput(
+						output,
+						() => {
+							commandOutputStarted = true;
+						},
+						() => assertRequestInputResumeConsumed(stageResume),
+						(err) => {
+							historyError = err;
+							assertNoUnconsumedResumeAfterError(stageResume, err);
+						},
+						finishStage,
+					);
+					// Terminal output is drained after the stage loop as well. It needs the
+					// same abort-aware read as a handoff, otherwise a stalled final iterator
+					// can prevent the tool cancellation from settling forever.
+					stream = haltAfterStageOnAbort
+						? throwIfAbortedAfterDrain(trackedOutput, signal)
+						: trackedOutput;
+				} else {
+					stream = [];
+					await finishStage();
+				}
+			}
+
+			stageHalted ||= Boolean(haltAfterStageOnAbort && signal?.aborted);
+			if (stageHalted) {
+				halted = true;
+				haltedAt = { index: idx, stage };
+				break;
 			}
 		}
 
-		stageHalted ||= Boolean(haltAfterStageOnAbort && signal?.aborted);
-		if (stageHalted) {
-			halted = true;
-			haltedAt = { index: idx, stage };
-			break;
-		}
-	}
-
-	const items = [];
-	try {
-		for await (const item of stream) items.push(item);
-	} catch (err) {
-		if (haltForInputRequest(err)) {
-			items.length = 0;
+		const items = [];
+		try {
 			for await (const item of stream) items.push(item);
-		} else {
-			throw err;
+		} catch (err) {
+			if (haltForInputRequest(err)) {
+				items.length = 0;
+				for await (const item of stream) items.push(item);
+			} else {
+				throw err;
+			}
 		}
-	}
-	if (haltAfterStageOnAbort) signal?.throwIfAborted();
-	assertRequestInputResumeConsumed(requestInputResume);
+		if (haltAfterStageOnAbort) signal?.throwIfAborted();
+		assertRequestInputResumeConsumed(requestInputResume);
 
-	return { items, rendered, renderedItems, halted, haltedAt, executionStarted };
+		return { items, rendered, renderedItems, halted, haltedAt, executionStarted };
+	}
+
+	async function closeStages() {
+		// Close history for stages whose output was never requested. Calling next()
+		// here would execute unused work, so only release existing inputs/finalizers.
+		let cleanupError: unknown;
+		for (const close of [...unfinishedStages].reverse()) {
+			try {
+				await close();
+			} catch (error) {
+				cleanupError ??= error;
+			}
+		}
+		if (cleanupError) throw cleanupError;
+	}
 
 	function haltForInputRequest(err: unknown) {
 		if (!(err instanceof InputRequestSuspension)) return false;
@@ -438,8 +520,8 @@ function trackCommandOutput(
 			}
 			completed = true;
 		} catch (err) {
-			await finishStage({ assertResume: false, suppressCloseErrors: true });
 			assertNoUnconsumedResumeAfterError(err);
+			await finishStage({ assertResume: false, suppressCloseErrors: true });
 			throw err;
 		} finally {
 			await finishStage({ assertResume: completed });

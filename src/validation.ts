@@ -1,6 +1,6 @@
 import { Ajv, type AnySchema, type ValidateFunction } from "ajv";
 
-import { stableStringify } from "./state/store.js";
+import { stableStringify } from "./state/serialization.js";
 
 export const sharedAjv = new Ajv({
 	allErrors: false,

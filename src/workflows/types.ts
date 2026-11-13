@@ -27,6 +27,7 @@ export type ParallelConfig = {
 };
 
 export type WorkflowStep = {
+	recovery?: "repeat" | "manual";
 	id: string;
 	command?: string;
 	run?: string;

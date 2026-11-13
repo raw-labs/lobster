@@ -1,10 +1,10 @@
-import type { WorkflowFile, WorkflowStep, WorkflowStepResult } from "./types.js";
 import {
 	resolveArgsTemplate,
 	resolveTemplate,
 	parseStepRef,
 	getStepRefValue,
 } from "./expressions.js";
+import type { WorkflowFile, WorkflowStep, WorkflowStepResult } from "./types.js";
 
 export function createRecord<T>(source?: Record<string, T>): Record<string, T> {
 	const record = Object.create(null) as Record<string, T>;
@@ -21,6 +21,9 @@ export function mergeEnv(
 	results: Record<string, WorkflowStepResult>,
 ) {
 	const env = createRecord(base);
+	for (const symbol of Object.getOwnPropertySymbols(base)) {
+		(env as any)[symbol] = (base as any)[symbol];
+	}
 
 	// Expose resolved args as env vars so shell commands can safely reference them
 	// without embedding raw values into the command string.
