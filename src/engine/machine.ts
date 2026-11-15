@@ -43,7 +43,6 @@ import {
 	resolveToolEnvelopeMaxBytes,
 	validateInputResponse,
 	WorkflowResumeArgumentError,
-	WorkflowApprovalRejectedError,
 	enforceApprovalIdentity,
 	approvalIdentityFromRequest,
 } from "./gates.js";
@@ -139,7 +138,6 @@ export class Machine {
 			error instanceof RequestInputResumeError ||
 			error instanceof CostLimitExceededError ||
 			error instanceof WorkflowResumeArgumentError ||
-			error instanceof WorkflowApprovalRejectedError ||
 			error instanceof WaitConflictError
 		);
 	}
@@ -202,6 +200,7 @@ export class Machine {
 					signal: AbortSignal.any([scope.ctx.signal, timeout.signal].filter(Boolean)),
 				},
 			};
+			let decidingApproval = false;
 			try {
 				let result: WorkflowStepResult;
 				switch (nodeKind(step)) {
@@ -251,15 +250,18 @@ export class Machine {
 				// An approval is a separate activation: the preceding command is never rerun to ask again.
 				if (isApprovalStep(step.approval) && scope.nested)
 					throw new Error("Sub-workflow approval/input gates are not supported in composition.");
-				if (isApprovalStep(step.approval))
+				if (isApprovalStep(step.approval)) {
+					// A completed activity must not be retried for a failed human decision/read.
+					decidingApproval = true;
 					result = await approval(this, step, attemptKey, scope, result);
+				}
 				frame.result = result;
 				frame.phase = "completed";
 				await this.save();
 				return result;
 			} catch (error) {
 				this.checkAuthority(scope.ctx);
-				if (this.fatal(error) || scope.ctx.signal?.aborted) throw error;
+				if (decidingApproval || this.fatal(error) || scope.ctx.signal?.aborted) throw error;
 				const nonRetryable = Object.entries(this.state.activations).some(
 					([path, item]) => path.startsWith(attemptKey + "/") && item.nonRetryable,
 				);

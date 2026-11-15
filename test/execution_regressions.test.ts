@@ -310,66 +310,72 @@ test("child budget excludes prior parent spending", async (t) => {
 	assert.equal(result._meta!.cost!.estimatedCostUsd, 0.0125);
 });
 
-test(
-	"interactive rejection cannot retry an approved step's command",
-	{ timeout: 5000 },
-	async (t) => {
-		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "lobster-rejection-"));
-		t.after(() => fs.rm(directory, { recursive: true, force: true }));
-		const filePath = path.join(directory, "root.lobster");
-		await fs.writeFile(
-			filePath,
-			JSON.stringify({
-				steps: [
-					{
-						id: "work",
-						pipeline: "probe",
-						approval: { prompt: "Proceed?" },
-						retry: { max: 3, delay_ms: 0 },
-						on_error: "continue",
-					},
-					{ id: "later", run: "exit 99" },
-				],
-			}),
-		);
-		const stdin = Object.assign(new PassThrough(), { isTTY: true });
-		const stdout = new PassThrough();
-		t.after(() => {
-			stdin.destroy();
-			stdout.destroy();
-		});
-		stdout.on("data", () => {
-			stdin.write("no\n");
-		});
-		const ctx = createToolContext({
-			env: { ...process.env, LOBSTER_STATE_DIR: path.join(directory, "state") },
-			stdin,
-			stdout,
-			mode: "human",
-		});
-		let calls = 0;
-		const original = ctx.registry;
-		ctx.registry = {
-			get: (name) =>
-				name === "probe"
-					? {
-							name: "probe",
-							meta: { argsSchema: { type: "object" } },
-							async run() {
-								calls++;
-								return {
-									output: (async function* () {
-										yield "subject";
-									})(),
-								};
-							},
-						}
-					: original.get(name),
-		};
-		await assert.rejects(
-			runWorkflowFile({ filePath, ctx: { ...ctx, mode: "human" } }),
-			/Not approved/,
-		);
-		assert.equal(calls, 1);
-	},
-);
+for (const decision of ["rejection", "timeout"]) {
+	test(
+		`interactive ${decision} cannot retry an approval step's command`,
+		{ timeout: 5000 },
+		async (t) => {
+			const directory = await fs.mkdtemp(path.join(os.tmpdir(), "lobster-rejection-"));
+			t.after(() => fs.rm(directory, { recursive: true, force: true }));
+			const filePath = path.join(directory, "root.lobster");
+			await fs.writeFile(
+				filePath,
+				JSON.stringify({
+					steps: [
+						{
+							id: "work",
+							pipeline: "probe",
+							approval: { prompt: "Proceed?" },
+							retry: { max: 3, delay_ms: 0 },
+							on_error: "continue",
+						},
+						{ id: "later", run: "exit 99" },
+					],
+				}),
+			);
+			const stdin = Object.assign(new PassThrough(), { isTTY: true });
+			const stdout = new PassThrough();
+			t.after(() => {
+				stdin.destroy();
+				stdout.destroy();
+			});
+			stdout.on("data", () => {
+				if (decision === "rejection") stdin.write("no\n");
+			});
+			const ctx = createToolContext({
+				env: {
+					...process.env,
+					LOBSTER_STATE_DIR: path.join(directory, "state"),
+					LOBSTER_APPROVAL_INPUT_TIMEOUT_MS: "10",
+				},
+				stdin,
+				stdout,
+				mode: "human",
+			});
+			let calls = 0;
+			const original = ctx.registry;
+			ctx.registry = {
+				get: (name) =>
+					name === "probe"
+						? {
+								name: "probe",
+								meta: { argsSchema: { type: "object" } },
+								async run() {
+									calls++;
+									return {
+										output: (async function* () {
+											yield "subject";
+										})(),
+									};
+								},
+							}
+						: original.get(name),
+			};
+			await assert.rejects(
+				runWorkflowFile({ filePath, ctx: { ...ctx, mode: "human" } }),
+				decision === "rejection" ? /Not approved/ : /Timed out waiting for input/,
+			);
+			assert.equal(calls, 1);
+		},
+	);
+}
