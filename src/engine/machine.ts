@@ -3,7 +3,7 @@ import type { RunContext } from "./context.js";
 import type { WorkflowStep, WorkflowStepResult, WorkflowRunResult } from "../workflows/types.js";
 import type { LlmSpendLedger } from "../core/llm_accounting.js";
 import { createLlmSpendLedger, restoreLlmProvenance } from "../core/llm_accounting.js";
-import { CostTracker, CostLimitExceededError } from "../core/cost_tracker.js";
+import { CostTracker, CostLimitExceededError, type CostLimit } from "../core/cost_tracker.js";
 import { resolveRetryConfig, computeDelay } from "../core/retry.js";
 import { PersistenceError, WaitConflictError } from "../persistence/backend.js";
 import { RequestInputResumeError } from "../input_request.js";
@@ -52,6 +52,9 @@ export type Scope = {
 	definitionPath?: string;
 	args: Record<string, unknown>;
 	results: Record<string, WorkflowStepResult>;
+	lastStepId?: string;
+	baseEnv?: Record<string, string | undefined>;
+	parentLimits?: CostLimit[];
 	env?: Record<string, string>;
 	cwd?: string;
 	ancestors: string[];
@@ -111,6 +114,12 @@ export class Machine {
 			ctx.assertInvocationCurrent?.();
 		} catch (error) {
 			throw new InvocationRetiredError(error);
+		}
+	}
+
+	checkCost(scope: Scope) {
+		for (const limit of [...(scope.parentLimits ?? []), scope.definition.workflow.cost_limit]) {
+			if (limit) this.cost.checkLimit(limit, scope.ctx.stderr);
 		}
 	}
 
@@ -230,9 +239,8 @@ export class Machine {
 					);
 					settleDeferredCosts(this.cost, deferred, scope.ledger);
 					settleUnbilledCharges(this.cost, scope.ledger);
-					if (scope.definition.workflow.cost_limit)
-						this.cost.checkLimit(scope.definition.workflow.cost_limit, scope.ctx.stderr);
 				}
+				if (account) this.checkCost(scope);
 				frame.accounted = account || frame.accounted;
 				// An approval is a separate activation: the preceding command is never rerun to ask again.
 				if (isApprovalStep(step.approval) && scope.nested)
@@ -250,8 +258,7 @@ export class Machine {
 					([path, item]) => path.startsWith(attemptKey + "/") && item.nonRetryable,
 				);
 				settleUnbilledCharges(this.cost, scope.ledger);
-				if (scope.definition.workflow.cost_limit)
-					this.cost.checkLimit(scope.definition.workflow.cost_limit, scope.ctx.stderr);
+				this.checkCost(scope);
 				if (
 					!nonRetryable &&
 					frame.attempt < config.max &&

@@ -12,13 +12,17 @@ export async function sequence(machine: Machine, steps: WorkflowStep[], key: str
 		const step = steps[frame.cursor];
 		const result = await machine.visit(step, occurrence(key, step.id), {
 			...local,
+			lastStepId: frame.lastStepId,
 			definitionPath: (scope.definitionPath ?? "") + "/" + step.id,
 		});
 		frame.results[step.id] = result;
 		const node = activation(machine.state, occurrence(key, step.id));
 		if (node.results) Object.assign(frame.results, node.results);
 		frame.cursor++;
-		if (!result.skipped && !result.error) frame.result = result;
+		if (!result.skipped && !result.error) {
+			frame.result = result;
+			frame.lastStepId = step.id;
+		}
 		if (result.error && step.on_error === "skip_rest") frame.cursor = steps.length;
 		await machine.save();
 	}

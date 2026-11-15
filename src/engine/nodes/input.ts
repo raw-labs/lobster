@@ -26,7 +26,7 @@ export async function input(
 			step,
 			args: scope.args,
 			results: scope.results,
-			lastStepId: Object.keys(scope.results).at(-1) ?? null,
+			lastStepId: scope.lastStepId ?? null,
 		});
 		frame.wait = request ?? {
 			kind: "input",

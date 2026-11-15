@@ -3,7 +3,12 @@ import { activation } from "../state.js";
 import type { Machine, Scope } from "../machine.js";
 import type { WorkflowStep } from "../../workflows/types.js";
 import { resolveTemplate } from "../../workflows/expressions.js";
-import { resolveWorkflowStepArgs, createRecord } from "../../workflows/values.js";
+import {
+	resolveWorkflowStepArgs,
+	createRecord,
+	mergeEnv,
+	resolveCwd,
+} from "../../workflows/values.js";
 import { resolveWorkflowArgs } from "../../definition/args.js";
 import { snapshotDefinition } from "../../definition/normalize.js";
 import { sequence } from "./sequence.js";
@@ -29,6 +34,7 @@ export async function childWorkflow(
 			scope.definition.children[scope.definitionPath!] ??
 			(await snapshotDefinition(file, args, scope.ancestors));
 		frame.childArgs = resolveWorkflowArgs(frame.child.workflow.args, args);
+		frame.childEnv = mergeEnv(scope.baseEnv ?? {}, scope.env, step.env, scope.args, scope.results);
 		await machine.save();
 	}
 	const result = await sequence(machine, frame.child.workflow.steps, key + "/child", {
@@ -39,8 +45,16 @@ export async function childWorkflow(
 		definitionPath: "",
 		args: frame.childArgs!,
 		results: createRecord(),
-		env: { ...scope.env, ...step.env, ...frame.child.workflow.env },
-		cwd: step.cwd ?? frame.child.workflow.cwd ?? scope.cwd,
+		baseEnv: frame.childEnv,
+		env: frame.child.workflow.env,
+		parentLimits: [
+			...(scope.parentLimits ?? []),
+			...(scope.definition.workflow.cost_limit ? [scope.definition.workflow.cost_limit] : []),
+		],
+		cwd:
+			step.cwd !== undefined
+				? resolveCwd(step.cwd, scope.args)
+				: (frame.child.workflow.cwd ?? resolveCwd(scope.cwd, scope.args)),
 		ancestors: [...scope.ancestors, frame.child.filePath],
 		costPrefix: scope.costPrefix + step.id + ".",
 	});

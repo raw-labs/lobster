@@ -35,12 +35,15 @@ export type Activation = {
 	input?: ActivityInput;
 	retryAt?: number;
 	cursor?: number;
+	lastStepId?: string;
+	dispatchAttempts?: number;
 	items?: unknown[];
 	iterations?: unknown[];
 	results?: Record<string, WorkflowStepResult>;
 	winner?: string;
 	child?: Definition;
 	childArgs?: Record<string, unknown>;
+	childEnv?: Record<string, string | undefined>;
 	pipelineInput?: WorkflowPipelineInputResumeState;
 	response?: unknown;
 	waitKey?: string;

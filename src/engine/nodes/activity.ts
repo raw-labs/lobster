@@ -32,7 +32,6 @@ export async function activity(machine: Machine, step: WorkflowStep, key: string
 		if (record.input?.kind !== "none" && (step.recovery !== "repeat" || record.nonRetryable))
 			throw new InterruptedActivityError(key);
 		record.phase = "ready";
-		record.attempt++;
 	}
 	if (record.phase === "failed") throw new Error(record.error);
 	if (!record.input) {
@@ -46,7 +45,7 @@ export async function activity(machine: Machine, step: WorkflowStep, key: string
 				: {}),
 			input: resolveInputValue(step.stdin, scope.args, scope.results),
 			// Do not persist the host environment or credentials. Resolve only explicit workflow values.
-			env: mergeEnv({}, scope.env, step.env, scope.args, scope.results),
+			env: mergeEnv(scope.baseEnv ?? {}, scope.env, step.env, scope.args, scope.results),
 			cwd: resolveCwd(step.cwd ?? scope.cwd, scope.args) ?? scope.ctx.cwd,
 		};
 	}
@@ -56,6 +55,11 @@ export async function activity(machine: Machine, step: WorkflowStep, key: string
 			scope.ctx.registry?.get(stage.name)?.meta?.sideEffects?.includes("calls_openclaw_agent"),
 		);
 
+	const activityKey = key.slice(0, key.lastIndexOf("/attempt-"));
+	if (record.phase !== "waiting") {
+		const logical = activation(machine.state, activityKey);
+		record.attempt = logical.dispatchAttempts = (logical.dispatchAttempts ?? 0) + 1;
+	}
 	const history = recorderFromEnv(scope.ctx.env)?.child(key + "/");
 	const historyId = await history?.start("activity", step.id);
 	record.phase = "started";
@@ -73,7 +77,6 @@ export async function activity(machine: Machine, step: WorkflowStep, key: string
 			},
 			_onUnsafeDispatch: () => scope.ctx._onUnsafeDispatch?.(),
 		};
-		const activityKey = key.slice(0, key.lastIndexOf("/attempt-"));
 		const baseEnv = {
 			...ctx.env,
 			...saved.env,
