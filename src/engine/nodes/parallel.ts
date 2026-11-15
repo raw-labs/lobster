@@ -20,6 +20,13 @@ export async function parallel(machine: Machine, step: WorkflowStep, key: string
 		);
 	}
 	const signal = AbortSignal.any([scope.ctx.signal!, abort.signal, timeout.signal].filter(Boolean));
+	let onAbort: () => void;
+	const interrupted = new Promise<never>((_, reject) => {
+		onAbort = () => reject(signal.reason);
+		if (signal.aborted) onAbort();
+		else signal.addEventListener("abort", onAbort, { once: true });
+	});
+	void interrupted.catch(() => {});
 	const branchScope = {
 		...scope,
 		nested: true,
@@ -49,16 +56,15 @@ export async function parallel(machine: Machine, step: WorkflowStep, key: string
 		const settled = Promise.allSettled(pending);
 		let failure: unknown;
 		try {
-			if (any && !frame.winner) await Promise.race(pending);
+			if (any && !frame.winner) await Promise.race([...pending, interrupted]);
 			else if (!any) {
-				const outcomes = await settled;
-				const rejected = outcomes.find((entry) => entry.status === "rejected");
-				if (rejected?.status === "rejected")
-					throw machine.fatal(rejected.reason)
-						? rejected.reason
-						: new Error(
-								"Parallel branch failed: " + (rejected.reason?.message ?? String(rejected.reason)),
-							);
+				try {
+					await Promise.race([Promise.all(pending), interrupted]);
+				} catch (error) {
+					throw machine.fatal(error) || signal.aborted
+						? error
+						: new Error("Parallel branch failed: " + (error?.message ?? String(error)));
+				}
 			}
 		} catch (error) {
 			failure = error;
@@ -99,5 +105,6 @@ export async function parallel(machine: Machine, step: WorkflowStep, key: string
 		};
 	} finally {
 		if (timer) clearTimeout(timer);
+		signal.removeEventListener("abort", onAbort!);
 	}
 }

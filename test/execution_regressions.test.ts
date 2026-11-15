@@ -187,3 +187,91 @@ for (const backend of ["files", "sqlite"]) {
 		assert.equal(seen[0].id, seen[1].id);
 	});
 }
+
+test(
+	"parallel timeout bounds a command that ignores cancellation",
+	{ timeout: 5000 },
+	async (t) => {
+		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "lobster-parallel-timeout-"));
+		t.after(() => fs.rm(directory, { recursive: true, force: true }));
+		const filePath = path.join(directory, "flow.lobster");
+		await fs.writeFile(
+			filePath,
+			JSON.stringify({
+				steps: [
+					{
+						id: "group",
+						parallel: { timeout_ms: 1000, branches: [{ id: "stalled", pipeline: "stall" }] },
+					},
+				],
+			}),
+		);
+		let release!: () => void;
+		let entered = false;
+		const stalled = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		t.after(() => release());
+		const ctx = createToolContext({
+			env: { ...process.env, LOBSTER_STATE_DIR: path.join(directory, "state") },
+		});
+		const original = ctx.registry;
+		ctx.registry = {
+			get: (name) =>
+				name === "stall"
+					? {
+							name: "stall",
+							meta: { argsSchema: { type: "object" } },
+							async run() {
+								entered = true;
+								await stalled;
+								return {
+									output: (async function* () {
+										yield "late";
+									})(),
+								};
+							},
+						}
+					: original.get(name),
+		};
+		await assert.rejects(
+			runWorkflowFile({ filePath, ctx }),
+			/did not settle after cancellation|timed out/,
+		);
+		assert.equal(entered, true, "the uncooperative command must actually start");
+		release();
+	},
+);
+
+test("static child defers a descendant selected by parent output", async (t) => {
+	const directory = await fs.mkdtemp(path.join(os.tmpdir(), "lobster-descendant-"));
+	t.after(() => fs.rm(directory, { recursive: true, force: true }));
+	const filePath = path.join(directory, "root.lobster");
+	await fs.writeFile(
+		filePath,
+		JSON.stringify({
+			steps: [
+				{ id: "data", run: `echo '{"route":"selected"}'` },
+				{ id: "child", workflow: "child.lobster", workflow_args: { route: "$data.json.route" } },
+			],
+		}),
+	);
+	await fs.writeFile(
+		path.join(directory, "child.lobster"),
+		JSON.stringify({
+			args: { route: { default: "wrong" } },
+			steps: [{ id: "grandchild", workflow: "${route}.lobster" }],
+		}),
+	);
+	await fs.writeFile(
+		path.join(directory, "selected.lobster"),
+		JSON.stringify({ steps: [{ id: "output", run: "echo correct" }] }),
+	);
+	const result = await runWorkflowFile({
+		filePath,
+		ctx: createToolContext({
+			env: { ...process.env, LOBSTER_STATE_DIR: path.join(directory, "state") },
+		}),
+	});
+	assert.deepEqual(result.output, ["correct\n"]);
+});
