@@ -140,17 +140,17 @@ export class CostTracker {
 		return this.steps.length > 0;
 	}
 
-	checkLimit(limit: CostLimit, stderr?: NodeJS.WritableStream) {
-		const summary = this.getSummary();
-		if (summary.estimatedCostUsd <= limit.max_usd) return;
+	checkLimit(limit: CostLimit, stderr?: NodeJS.WritableStream, startCostUsd = 0) {
+		const costUsd = Math.max(0, this.getSummary().estimatedCostUsd - startCostUsd);
+		if (costUsd <= limit.max_usd) return;
 
 		if (limit.action === "stop") {
-			throw new CostLimitExceededError(summary.estimatedCostUsd, limit.max_usd);
+			throw new CostLimitExceededError(costUsd, limit.max_usd);
 		}
 
 		if (stderr) {
 			stderr.write(
-				`[WARN] Cost $${summary.estimatedCostUsd.toFixed(4)} exceeds limit $${limit.max_usd.toFixed(2)}\n`,
+				`[WARN] Cost $${costUsd.toFixed(4)} exceeds limit $${limit.max_usd.toFixed(2)}\n`,
 			);
 		}
 	}

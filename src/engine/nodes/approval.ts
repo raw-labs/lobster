@@ -3,6 +3,7 @@ import type { Machine, Scope } from "../machine.js";
 import type { WorkflowStep, WorkflowStepResult } from "../../workflows/types.js";
 import {
 	extractApprovalRequest,
+	WorkflowApprovalRejectedError,
 	approvalIdentityFromRequest,
 	enforceApprovalIdentity,
 	isInteractive,
@@ -35,7 +36,7 @@ export async function approval(
 		timeoutMs: parseApprovalTimeoutMs(scope.ctx.env),
 		signal: scope.ctx.signal,
 	});
-	if (!/^y(es)?$/i.test(String(answer).trim())) throw new Error("Not approved");
+	if (!/^y(es)?$/i.test(String(answer).trim())) throw new WorkflowApprovalRejectedError();
 	const approvedBy = String(scope.ctx.env.LOBSTER_APPROVAL_APPROVED_BY ?? "").trim() || undefined;
 	enforceApprovalIdentity({
 		stepId: step.id,

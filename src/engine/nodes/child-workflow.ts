@@ -34,6 +34,7 @@ export async function childWorkflow(
 			scope.definition.children[scope.definitionPath!] ??
 			(await snapshotDefinition(file, args, scope.ancestors));
 		frame.childArgs = resolveWorkflowArgs(frame.child.workflow.args, args);
+		frame.costStart = machine.cost.getSummary().estimatedCostUsd;
 		frame.childEnv = mergeEnv(scope.baseEnv ?? {}, scope.env, step.env, scope.args, scope.results);
 		await machine.save();
 	}
@@ -46,10 +47,13 @@ export async function childWorkflow(
 		args: frame.childArgs!,
 		results: createRecord(),
 		baseEnv: frame.childEnv,
+		costStart: frame.costStart,
 		env: frame.child.workflow.env,
 		parentLimits: [
 			...(scope.parentLimits ?? []),
-			...(scope.definition.workflow.cost_limit ? [scope.definition.workflow.cost_limit] : []),
+			...(scope.definition.workflow.cost_limit
+				? [{ limit: scope.definition.workflow.cost_limit, start: scope.costStart ?? 0 }]
+				: []),
 		],
 		cwd:
 			step.cwd !== undefined

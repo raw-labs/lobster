@@ -43,6 +43,7 @@ import {
 	resolveToolEnvelopeMaxBytes,
 	validateInputResponse,
 	WorkflowResumeArgumentError,
+	WorkflowApprovalRejectedError,
 	enforceApprovalIdentity,
 	approvalIdentityFromRequest,
 } from "./gates.js";
@@ -54,7 +55,8 @@ export type Scope = {
 	results: Record<string, WorkflowStepResult>;
 	lastStepId?: string;
 	baseEnv?: Record<string, string | undefined>;
-	parentLimits?: CostLimit[];
+	parentLimits?: Array<{ limit: CostLimit; start: number }>;
+	costStart?: number;
 	env?: Record<string, string>;
 	cwd?: string;
 	ancestors: string[];
@@ -118,8 +120,11 @@ export class Machine {
 	}
 
 	checkCost(scope: Scope) {
-		for (const limit of [...(scope.parentLimits ?? []), scope.definition.workflow.cost_limit]) {
-			if (limit) this.cost.checkLimit(limit, scope.ctx.stderr);
+		for (const { limit, start } of scope.parentLimits ?? []) {
+			this.cost.checkLimit(limit, scope.ctx.stderr, start);
+		}
+		if (scope.definition.workflow.cost_limit) {
+			this.cost.checkLimit(scope.definition.workflow.cost_limit, scope.ctx.stderr, scope.costStart);
 		}
 	}
 
@@ -134,6 +139,7 @@ export class Machine {
 			error instanceof RequestInputResumeError ||
 			error instanceof CostLimitExceededError ||
 			error instanceof WorkflowResumeArgumentError ||
+			error instanceof WorkflowApprovalRejectedError ||
 			error instanceof WaitConflictError
 		);
 	}

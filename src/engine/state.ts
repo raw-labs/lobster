@@ -43,6 +43,7 @@ export type Activation = {
 	winner?: string;
 	child?: Definition;
 	childArgs?: Record<string, unknown>;
+	costStart?: number;
 	childEnv?: Record<string, string | undefined>;
 	pipelineInput?: WorkflowPipelineInputResumeState;
 	response?: unknown;

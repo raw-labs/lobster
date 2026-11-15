@@ -8,6 +8,13 @@ import { compileCached } from "../validation.js";
 import { serializeValueForStdout } from "./values.js";
 import { resolveInputValue } from "../workflows/values.js";
 
+export class WorkflowApprovalRejectedError extends Error {
+	constructor() {
+		super("Not approved");
+		this.name = "WorkflowApprovalRejectedError";
+	}
+}
+
 export class WorkflowResumeArgumentError extends Error {
 	constructor(message: string) {
 		super(message);
