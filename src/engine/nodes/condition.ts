@@ -10,6 +10,7 @@ export async function enter(machine: Machine, step: WorkflowStep, frame: Activat
 		frame.result = { id: step.id, skipped: true };
 		frame.phase = "completed";
 	} else frame.phase = "started";
-	await machine.save();
+	// Deterministic from saved results; written with the step's first real save.
+	machine.defer();
 	return frame.phase === "completed";
 }

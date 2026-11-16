@@ -13,7 +13,7 @@ export async function forEach(machine: Machine, step: WorkflowStep, key: string,
 		frame.items = structuredClone(items);
 		frame.cursor = 0;
 		frame.iterations = [];
-		await machine.save();
+		machine.defer();
 	}
 	const itemVar = step.item_var ?? "item",
 		indexVar = step.index_var ?? "index";
@@ -53,7 +53,9 @@ export async function forEach(machine: Machine, step: WorkflowStep, key: string,
 		}
 		frame.iterations!.push(output);
 		frame.cursor!++;
-		await machine.save();
+		// The iteration's output is kept above; its body is not needed to recover.
+		machine.forgetBelow(bodyKey, true, frame);
+		machine.defer();
 	}
 	return { id: step.id, json: frame.iterations, stdout: JSON.stringify(frame.iterations) };
 }

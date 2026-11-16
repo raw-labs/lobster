@@ -924,9 +924,7 @@ for (const backend of ["files", "sqlite"] as const) {
 			});
 			assert.equal(first.status, "needs_approval", JSON.stringify(first));
 			const controller = new AbortController();
-			const acknowledge = session.backend.acknowledge.bind(session.backend);
-			session.backend.acknowledge = async (runId, operationId) => {
-				await acknowledge(runId, operationId);
+			const cancelOnceConsumed = async (runId: string) => {
 				const run = await session.getRun(runId);
 				if (
 					!controller.signal.aborted &&
@@ -935,6 +933,21 @@ for (const backend of ["files", "sqlite"] as const) {
 					controller.abort(new Error("fixture cancel after receipt"));
 				}
 			};
+			if (backend === "files") {
+				// The file backend acknowledges in memory; cancel right after the commit instead.
+				const transition = session.backend.transition.bind(session.backend);
+				session.backend.transition = async (...args: any[]) => {
+					const result = await (transition as any)(...args);
+					await cancelOnceConsumed(args[0].runId);
+					return result;
+				};
+			} else {
+				const acknowledge = session.backend.acknowledge.bind(session.backend);
+				session.backend.acknowledge = async (runId, operationId) => {
+					await acknowledge(runId, operationId);
+					await cancelOnceConsumed(runId);
+				};
+			}
 			const stopped = await resumeToolRequest({
 				token: first.requiresApproval.resumeToken,
 				approved: true,

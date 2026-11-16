@@ -365,10 +365,21 @@ export class StoreSession {
 	}
 
 	async acknowledge(runId: string, operationId: string): Promise<boolean> {
-		return this.request(() => this.acknowledgeObserved(runId, operationId), true);
+		return this.request(async () => {
+			try {
+				await this.backend.acknowledge(runId, operationId);
+				return true;
+			} catch {
+				return false;
+			}
+		}, true);
 	}
 
 	private async acknowledgeObserved(runId: string, operationId: string): Promise<boolean> {
+		if (this.backend instanceof FileBackend) {
+			this.backend.acknowledgeLater(runId, operationId);
+			return true;
+		}
 		try {
 			await this.backend.acknowledge(runId, operationId);
 			return true;

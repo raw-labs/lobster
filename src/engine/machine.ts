@@ -101,6 +101,27 @@ export class Machine {
 		restoreLlmProvenance(state.activations, state.llmBilled);
 	}
 
+	/**
+	 * Record bookkeeping that is recomputed from saved results after a restart
+	 * (cursors, completion markers, evaluated conditions). It is written with the
+	 * next save. Saves guarding an effect (before dispatch, results, waits) stay
+	 * immediate; each save writes the whole snapshot, so nothing is lost.
+	 */
+	defer() {}
+
+	/**
+	 * Forget the activations below a completed node. Its own frame keeps the result,
+	 * and both changes reach storage in the same snapshot, so recovery never needs them.
+	 */
+	forgetBelow(key: string, inclusive: boolean, survivor: Activation) {
+		for (const [path, item] of Object.entries(this.state.activations))
+			if ((inclusive && path === key) || path.startsWith(key + "/")) {
+				// An effect that must not repeat keeps blocking retries of every enclosing step.
+				if (item.nonRetryable) survivor.nonRetryable = true;
+				delete this.state.activations[path];
+			}
+	}
+
 	save(extras: Parameters<ExecutionStore["save"]>[1] = {}) {
 		this.state.cost = this.cost.hasUsage() ? this.cost.getSummary() : undefined;
 		this.state.llmSpend = this.ledger.outstanding();
@@ -221,7 +242,8 @@ export class Machine {
 					result = await approval(this, step, attemptKey, scope, gate.result!);
 					frame.result = result;
 					frame.phase = "completed";
-					await this.save();
+					this.forgetBelow(key, false, frame);
+					this.defer();
 					return result;
 				}
 				switch (nodeKind(step)) {
@@ -278,7 +300,8 @@ export class Machine {
 				}
 				frame.result = result;
 				frame.phase = "completed";
-				await this.save();
+				this.forgetBelow(key, false, frame);
+				this.defer();
 				return result;
 			} catch (error) {
 				this.checkAuthority(scope.ctx);
@@ -311,7 +334,8 @@ export class Machine {
 				}
 				frame.result = { id: step.id, error: true, errorMessage: frame.error };
 				frame.phase = "completed";
-				await this.save();
+				this.forgetBelow(key, false, frame);
+				this.defer();
 				return frame.result;
 			} finally {
 				if (timer) clearTimeout(timer);

@@ -362,7 +362,7 @@ export async function convertWorkflowPause(key: string, old: OldWorkflowPause) {
 		attempt: 1,
 		cursor: index,
 		results,
-		...(lastStepId ? { lastStepId, result: results[lastStepId] } : {}),
+		...(lastStepId ? { lastStepId } : {}),
 	};
 
 	// No cwd: the old executor ran steps without one in the directory of whoever resumed.

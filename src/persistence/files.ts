@@ -54,6 +54,7 @@ async function readText(file: string): Promise<string | null> {
 export class FileBackend implements Backend {
 	readonly kind = "files" as const;
 	private locators = new Map<string, string>();
+	private pendingAcknowledgements = new Map<string, Set<string>>();
 
 	constructor(
 		readonly directory: string,
@@ -74,6 +75,7 @@ export class FileBackend implements Backend {
 		}
 		const run = JSON.parse(text);
 		validateArchive({ version: 1, states: {}, runs: [run] });
+		this.overlayAcknowledgements(run);
 		return run;
 	}
 
@@ -251,12 +253,17 @@ export class FileBackend implements Backend {
 						successorExists: successor?.runId !== undefined || successor?.text != null,
 					});
 					if (applied.status === "committed" && applied.run !== current) {
+						// `current` came through getRun, so pending acknowledgements ride along.
 						try {
 							await writeFileAtomic(
 								this.runPath(request.runId),
 								JSON.stringify(applied.run) + "\n",
 								{ signal, assertInvocationCurrent },
 							);
+							const pending = this.pendingAcknowledgements.get(request.runId);
+							for (const operationId of pending ?? [])
+								if (applied.run.receipts[operationId]?.acknowledged) pending!.delete(operationId);
+							if (pending && !pending.size) this.pendingAcknowledgements.delete(request.runId);
 						} catch (error) {
 							if (atomicWriteWasPublished(error)) {
 								throw new PersistenceOutcomeUnknown(request.operationId, error, request.runId);
@@ -349,6 +356,32 @@ export class FileBackend implements Backend {
 		}
 	}
 
+	/**
+	 * Mark a receipt as observed without a durable write of its own; it is written
+	 * with the run's next transition or when the backend closes. If it is lost in a
+	 * crash the receipt merely stays protected, which is the conservative outcome.
+	 * A separate locked, fsynced rewrite per checkpoint doubled the cost of every save.
+	 */
+	acknowledgeLater(runId: string, operationId: string): void {
+		if (this.readOnly) return;
+		let pending = this.pendingAcknowledgements.get(runId);
+		if (!pending) this.pendingAcknowledgements.set(runId, (pending = new Set()));
+		pending.add(operationId);
+	}
+
+	/** This process sees its own acknowledgements at once, before they are written. */
+	private overlayAcknowledgements(run: RunRecord): boolean {
+		let changed = false;
+		for (const operationId of this.pendingAcknowledgements.get(run.id) ?? []) {
+			const receipt = run.receipts[operationId];
+			if (receipt && !receipt.acknowledged) {
+				receipt.acknowledged = true;
+				changed = true;
+			}
+		}
+		return changed;
+	}
+
 	async acknowledge(runId: string, operationId: string): Promise<void> {
 		if (this.readOnly) {
 			throw new Error("Persistence session is read-only");
@@ -391,5 +424,20 @@ export class FileBackend implements Backend {
 		});
 	}
 
-	async close(): Promise<void> {}
+	async close(): Promise<void> {
+		for (const runId of [...this.pendingAcknowledgements.keys()]) {
+			await withFileLock({
+				filePath: this.runPath(runId),
+				task: async () => {
+					const text = await readText(this.runPath(runId));
+					const run = text === null ? null : (JSON.parse(text) as RunRecord);
+					if (run && this.overlayAcknowledgements(run))
+						await writeFileAtomic(this.runPath(runId), JSON.stringify(run) + "\n");
+					this.pendingAcknowledgements.delete(runId);
+				},
+			}).catch(() => {
+				// Unacknowledged receipts stay protected; nothing is lost.
+			});
+		}
+	}
 }
