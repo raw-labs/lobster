@@ -475,6 +475,20 @@ steps:
 
 `recovery: manual` is the default. It stops automatic continuation at an
 uncertain activity. There is no general external-action reconciliation API yet.
+
+A run stopped while a command was running (Ctrl-C, SIGTERM, a host abort, or an
+advance that meets such a command) has status `blocked` (`lobster runs list
+--status blocked`). Check what the command did, then either continue it with
+`lobster runs advance <runId>` (steps with `recovery: repeat` run again) or stop
+it for good:
+
+```sh
+lobster runs abandon <runId>
+```
+
+Abandoning records the started commands as abandoned (nothing runs again),
+withdraws pending questions and approval IDs, and cancels the run, so `history
+prune` can remove it. Embedded hosts use `abandonWorkflowRun({ runId, ctx })`.
 A known OpenClaw pipeline dispatch remains non-replayable even with
 `recovery: repeat`. Arbitrary shell commands must be classified by the author;
 Lobster cannot infer their effects. `LOBSTER_RUN_ID` and `LOBSTER_ACTIVITY_ID`

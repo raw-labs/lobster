@@ -1,7 +1,10 @@
 import path from "node:path";
 import { withStoreContext } from "../persistence/execution.js";
 import { bindRecorder, recorderFromEnv, sessionFromEnv } from "../persistence/context.js";
-import { readStateJsonWithLock as readStateJson } from "../state/store.js";
+import {
+	readStateJsonWithLock as readStateJson,
+	cleanupApprovalIndexByStateKey,
+} from "../state/store.js";
 import { loadWorkflowFile } from "./load.js";
 import { dryRunWorkflow } from "./dry_run.js";
 import { resolveWorkflowArgs } from "../definition/args.js";
@@ -156,6 +159,52 @@ export async function advanceWorkflowRun(options: {
 				}).run()),
 				runId: run.id,
 			};
+		} finally {
+			await store.close();
+		}
+	});
+}
+
+/**
+ * Stop a run for good: one that is blocked, was interrupted, or waits for an answer.
+ * Steps that had started are recorded as abandoned (their outcome stays unknown and
+ * nothing runs again), pending questions are withdrawn, and the run is cancelled, so
+ * retention can clean it up. Refuses while another process is executing the run.
+ */
+export async function abandonWorkflowRun(options: {
+	runId: string;
+	ctx: RunContext;
+	leaseMs?: number;
+}): Promise<{ runId: string; status: string; abandoned: string[] }> {
+	return withStoreContext({ ...options.ctx, trackRuns: true }, async (ctx) => {
+		const session = sessionFromEnv(ctx.env)!;
+		const run = await session.getRunState(options.runId);
+		if (!run || !visibleTo(run, callerId(ctx.runMetadata)))
+			throw new Error("Workflow run not found");
+		if (!run.execution) throw new Error("Run has no workflow execution to abandon");
+		if (["completed", "failed", "cancelled"].includes(run.execution.status))
+			return { runId: run.id, status: run.execution.status, abandoned: [] };
+		const store = new ExecutionStore(session, run.id, options.leaseMs);
+		try {
+			const state = (await store.claim())!;
+			const abandoned: string[] = [];
+			const waits: string[] = [];
+			for (const [path, frame] of Object.entries(state.activations)) {
+				if (frame.phase === "started" && path.endsWith("/activity")) abandoned.push(path);
+				else if (frame.phase === "waiting" && frame.waitKey) waits.push(frame.waitKey);
+				else continue;
+				frame.phase = "abandoned";
+			}
+			state.status = "cancelled";
+			state.error =
+				"Abandoned" + (abandoned.length ? `; outcome unknown for ${abandoned.join(", ")}` : "");
+			const current = await session.getRunState(run.id);
+			const pending = waits.filter((key) => current?.waits[key]?.status === "pending");
+			if (!pending.length) await store.save(state);
+			for (const key of pending) await store.save(state, { consume: { key } });
+			for (const key of waits)
+				await cleanupApprovalIndexByStateKey({ env: ctx.env, stateKey: key }).catch(() => {});
+			return { runId: run.id, status: "cancelled", abandoned };
 		} finally {
 			await store.close();
 		}

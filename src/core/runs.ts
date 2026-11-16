@@ -43,7 +43,7 @@ export async function listRuns({
 }: RunQuery = {}): Promise<RunPage> {
 	if (
 		status !== undefined &&
-		!["running", "waiting", "completed", "failed", "cancelled"].includes(status)
+		!["running", "waiting", "blocked", "completed", "failed", "cancelled"].includes(status)
 	) {
 		throw new Error("Invalid run status");
 	}

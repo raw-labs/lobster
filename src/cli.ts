@@ -19,6 +19,7 @@ import {
 	resolveWorkflowArgs,
 	runWorkflowFile,
 	advanceWorkflowRun,
+	abandonWorkflowRun,
 } from "./workflows/file.js";
 import { renderWorkflowGraph } from "./workflows/graph.js";
 import type { WorkflowGraphFormat } from "./workflows/graph.js";
@@ -110,6 +111,21 @@ async function runCliWithSignal(
 				requiresInput: null,
 				error: runtimeErrorDetails(error),
 			});
+			process.exitCode = 1;
+		}
+		return;
+	}
+
+	if (argv[0] === "runs" && argv[1] === "abandon") {
+		try {
+			if (!argv[2] || argv.length !== 3) throw new Error("runs abandon requires a run ID");
+			const result = await abandonWorkflowRun({
+				runId: argv[2],
+				ctx: createToolContext({ signal, forceTerminationSignal }),
+			});
+			process.stdout.write(JSON.stringify(result) + "\n");
+		} catch (error) {
+			process.stderr.write(`runs abandon: ${error?.message ?? String(error)}\n`);
 			process.exitCode = 1;
 		}
 		return;
@@ -847,7 +863,7 @@ function helpText() {
 		`  lobster resume --token <token> --response-json '{...}'\n` +
 		`  lobster resume --token <token> --cancel\n` +
 		`  lobster runs list [--status waiting] [--limit 20] [--after <cursor>]\n` +
-		`  lobster runs show <runId>\n  lobster runs advance <runId>\n` +
+		`  lobster runs show <runId>\n  lobster runs advance <runId>\n  lobster runs abandon <runId>\n` +
 		`  lobster waits show <waitId>\n` +
 		`  lobster resume --wait <waitId> --expected-revision <revision> --response-json '{...}'\n` +
 		`  lobster history list\n` +

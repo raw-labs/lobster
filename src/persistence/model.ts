@@ -4,7 +4,8 @@ import { createHash } from "node:crypto";
 export const SCHEMA_VERSION = 1;
 export const CAPTURE_BYTES = 4096;
 
-export type RunStatus = "running" | "waiting" | "completed" | "failed" | "cancelled";
+/** `blocked`: interrupted while a step was running; its outcome is unknown. */
+export type RunStatus = "running" | "waiting" | "blocked" | "completed" | "failed" | "cancelled";
 
 export type AttemptStatus = "started" | "completed" | "failed" | "closed" | "waiting" | "skipped";
 
@@ -342,7 +343,7 @@ export function applyTransition(
 		run.execution = action.execution;
 		if (action.consume) setCheckpoint(run, action.consume.key, null);
 		if (action.publish) setCheckpoint(run, action.publish.key, action.publish.text);
-		run.status = action.execution.status === "blocked" ? "running" : action.execution.status;
+		run.status = action.execution.status;
 	} else if (action.kind === "create" && action.checkpoint) {
 		setCheckpoint(run, action.checkpoint.key, action.checkpoint.text);
 	} else if (action.kind === "definition") {
@@ -478,7 +479,7 @@ export function validateArchive(value: unknown): asserts value is LogicalArchive
 			ids.has(run.id) ||
 			!Number.isInteger(run.revision) ||
 			run.revision < 1 ||
-			!["running", "waiting", "completed", "failed", "cancelled"].includes(run.status) ||
+			!["running", "waiting", "blocked", "completed", "failed", "cancelled"].includes(run.status) ||
 			!Array.isArray(run.events) ||
 			!Array.isArray(run.attempts) ||
 			!Array.isArray(run.definitions) ||
