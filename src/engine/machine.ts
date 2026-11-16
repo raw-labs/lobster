@@ -116,6 +116,15 @@ export class Machine {
 	defer() {}
 
 	/**
+	 * A finished run never runs again, so its step records (every intermediate
+	 * output) are dropped; status, error, final output, cost and definition remain.
+	 */
+	private finish(status: "completed" | "failed" | "cancelled") {
+		this.state.status = status;
+		this.state.activations = {};
+	}
+
+	/**
 	 * Forget the activations below a completed node. Its own frame keeps the result,
 	 * and both changes reach storage in the same snapshot, so recovery never needs them.
 	 */
@@ -397,7 +406,7 @@ export class Machine {
 		for (const [ancestor, item] of Object.entries(this.state.activations))
 			if (path.startsWith(ancestor + "/")) delete item.deadline;
 		if (decision.cancel || (wait.kind === "approval" && decision.approved === false))
-			this.state.status = "cancelled";
+			this.finish("cancelled");
 		else if (wait.kind === "approval") {
 			if (decision.approved !== true || decision.response !== undefined)
 				throw new WorkflowResumeArgumentError(
@@ -502,7 +511,7 @@ export class Machine {
 			});
 			settleUnbilledCharges(this.cost, this.ledger);
 			this.state.output = toOutputItems(result);
-			this.state.status = "completed";
+			this.finish("completed");
 			await this.save();
 			return {
 				status: "ok",
@@ -538,6 +547,7 @@ export class Machine {
 			this.state.error = running
 				? `Interrupted while ${running} was running; its outcome is unknown. Check it, then run \`lobster runs advance ${this.store.runId}\` to continue or \`lobster runs abandon ${this.store.runId}\` to stop the run.`
 				: (error?.message ?? String(error));
+			if (this.state.status === "failed") this.finish("failed");
 			await this.save();
 			throw error;
 		}

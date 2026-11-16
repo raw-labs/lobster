@@ -12,6 +12,7 @@ import { snapshotDefinition } from "../definition/normalize.js";
 import { ExecutionStore } from "../engine/store.js";
 import { Machine } from "../engine/machine.js";
 import type { RunContext } from "../engine/context.js";
+import type { ExecutionState } from "../engine/state.js";
 import type { WorkflowRunResult } from "./types.js";
 import { visibleTo, callerId } from "../persistence/waits.js";
 
@@ -77,6 +78,13 @@ export async function runWorkflowFile(
 		const session = sessionFromEnv(ctx.env)!;
 		let recorder = recorderFromEnv(ctx.env);
 		let runId: string;
+		// Load and validate first: a workflow that cannot start leaves no run behind.
+		let fresh: Pick<ExecutionState, "definition" | "args"> | undefined;
+		if (!options.resume) {
+			if (!options.filePath) throw new Error("Workflow file path required");
+			const definition = await snapshotDefinition(options.filePath, options.args ?? {});
+			fresh = { definition, args: resolveWorkflowArgs(definition.workflow.args, options.args) };
+		}
 		if (options.resume) {
 			if (!options.resume.stateKey)
 				throw new Error(
@@ -104,14 +112,11 @@ export async function runWorkflowFile(
 		try {
 			let state = await store.claim();
 			if (!state) {
-				if (options.resume) throw new UpgradeRequiredError();
-				if (!options.filePath) throw new Error("Workflow file path required");
-				const definition = await snapshotDefinition(options.filePath, options.args ?? {});
+				if (!fresh) throw new UpgradeRequiredError();
 				state = {
 					version: 1,
 					revision: 0,
-					definition,
-					args: resolveWorkflowArgs(definition.workflow.args, options.args),
+					...fresh,
 					cwd: path.resolve(ctx.cwd ?? process.cwd()),
 					activations: {},
 					status: "running",
@@ -198,6 +203,8 @@ export async function abandonWorkflowRun(options: {
 			state.status = "cancelled";
 			state.error =
 				"Abandoned" + (abandoned.length ? `; outcome unknown for ${abandoned.join(", ")}` : "");
+			// A cancelled run never runs again; the error above keeps what was abandoned.
+			state.activations = {};
 			const current = await session.getRunState(run.id);
 			const pending = waits.filter((key) => current?.waits[key]?.status === "pending");
 			if (!pending.length) await store.save(state);

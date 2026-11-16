@@ -113,3 +113,36 @@ test("advancing a run that waits for approval keeps it waiting under the same sh
 	});
 	assert.equal(approved.status, "ok", JSON.stringify(approved));
 });
+
+test("a finished run keeps its result but not every step's output", async (t) => {
+	const f = await fixture(t, [
+		{
+			id: "big",
+			run: `${JSON.stringify(process.execPath)} -e "process.stdout.write('x'.repeat(200000))"`,
+		},
+		{ id: "small", run: "echo done" },
+	]);
+	const result = await runToolRequest({ filePath: f.filePath, ctx: { env: f.env } });
+	assert.equal(result.status, "ok");
+	const [run] = (await listRuns({ status: "completed", ctx: { env: f.env } })).runs;
+	const session = await openStoreSession({ env: f.env, readOnly: true });
+	try {
+		const state = (await session.getRunState(run.id))!;
+		assert.deepEqual(state.execution!.activations, {});
+		assert.deepEqual(state.execution!.output, ["done\n"]);
+		assert.ok(JSON.stringify(state).length < 20_000, "the 200 KB intermediate output is gone");
+	} finally {
+		await session.close();
+	}
+});
+
+test("a workflow that cannot start leaves no run record", async (t) => {
+	const f = await fixture(t, [{ id: "a", run: "echo a" }]);
+	await fs.writeFile(f.filePath, "{ not json");
+	const malformed = await runToolRequest({ filePath: f.filePath, ctx: { env: f.env } });
+	assert.equal(malformed.ok, false);
+	await fs.writeFile(f.filePath, JSON.stringify({ steps: [{ id: "a" }, { id: "a" }] }));
+	const invalid = await runToolRequest({ filePath: f.filePath, ctx: { env: f.env } });
+	assert.equal(invalid.ok, false);
+	assert.deepEqual((await listRuns({ ctx: { env: f.env } })).runs, []);
+});

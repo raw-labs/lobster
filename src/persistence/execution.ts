@@ -124,6 +124,23 @@ export async function withExecution<C extends ExecutionContext, T>(
 		}
 
 		const bound = { ...runtime, env: bindRecorder(runtime.env, recorder) };
+		// A request that fails before anything started (an invalid workflow file, a
+		// pipeline that does not parse) is not a run: remove the record instead of
+		// keeping a failed run nobody can do anything with.
+		let discarded = false;
+		const discardIfUnstarted = async () => {
+			if (resumeKey) return;
+			const full = await session.getRun(recorder.runId);
+			if (
+				full &&
+				!full.execution &&
+				!full.definitions.length &&
+				!full.attempts.length &&
+				!Object.keys(full.states).length &&
+				!Object.keys(full.waits).length
+			)
+				discarded = await session.backend.removeRun(recorder.runId, "9999-12-31T00:00:00.000Z");
+		};
 		try {
 			const result = await task(bound);
 			const outcome =
@@ -142,6 +159,7 @@ export async function withExecution<C extends ExecutionContext, T>(
 			} else if (outcome?.ok === false) {
 				if (ownsExecution && !pending && run?.status === "running") {
 					await recorder.settle(runtime.signal?.aborted ? "cancelled" : "failed");
+					await discardIfUnstarted();
 				}
 			} else if (outcome?.status === "needs_approval" || outcome?.status === "needs_input") {
 				// Continuation publication already committed waiting status with its history.
@@ -152,7 +170,7 @@ export async function withExecution<C extends ExecutionContext, T>(
 				);
 			}
 
-			if (result && typeof result === "object" && Object.isExtensible(result)) {
+			if (!discarded && result && typeof result === "object" && Object.isExtensible(result)) {
 				Object.assign(result, { runId: recorder.runId });
 			}
 			return result;
@@ -165,6 +183,7 @@ export async function withExecution<C extends ExecutionContext, T>(
 			const pending = Object.values(run?.waits ?? {}).some((wait) => wait.status === "pending");
 			if (!run?.execution && (!resumeKey || recorder.ownsExecution) && !pending) {
 				await recorder.settle(runtime.signal?.aborted ? "cancelled" : "failed", error);
+				await discardIfUnstarted();
 			}
 			throw error;
 		}
