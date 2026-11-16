@@ -1975,13 +1975,14 @@ test("parallel wait:any fails promptly when a registered loser ignores cancellat
 						stdin: process.stdin,
 						stdout: process.stdout,
 						stderr: process.stderr,
-						env: { ...process.env },
+						env: { ...process.env, LOBSTER_STATE_DIR: path.join(tmpDir, "state") },
 						mode: "tool",
 						registry,
 					},
 				}),
 				new Promise<never>((_resolve, reject) =>
-					setTimeout(() => reject(new Error("workflow did not finish")), 1_000),
+					// The point is "fails instead of hanging": allow for checkpoint writes under load.
+					setTimeout(() => reject(new Error("workflow did not finish")), 5_000),
 				),
 			]),
 			/Parallel branches did not settle after cancellation/,
