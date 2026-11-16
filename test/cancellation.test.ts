@@ -3490,6 +3490,68 @@ test("a parent does not retry a child workflow after the child sends Gmail", asy
 	}
 });
 
+test("a loop is not retried after an earlier iteration sent Gmail", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "lobster-loop-send-retry-"));
+	try {
+		const repoRoot = join(__dirname, "..", "..");
+		const mockGog = join(repoRoot, "test", "fixtures", "mock-gog-cancellation.mjs");
+		const sendInvocations = join(dir, "send-invocations");
+		const node = JSON.stringify(process.execPath);
+		const flowPath = join(dir, "flow.lobster");
+		await writeFile(
+			flowPath,
+			JSON.stringify({
+				steps: [
+					{
+						id: "items",
+						run: `${node} -e "process.stdout.write(JSON.stringify([{n:0},{n:1}]))"`,
+					},
+					{
+						id: "loop",
+						for_each: "$items.json",
+						retry: { max: 2, delay_ms: 0 },
+						steps: [
+							{
+								id: "draft",
+								run: `${node} -e "process.stdout.write(JSON.stringify({to:'user@example.com',subject:'Hello',body:'World'}))"`,
+							},
+							// The first iteration sends and completes; the second fails.
+							{
+								id: "send",
+								pipeline: "gog.gmail.send",
+								stdin: "$draft.json",
+								when: "$item.json.n < 1",
+							},
+							{ id: "fail", run: `${node} -e "process.exit(1)"`, when: "$item.json.n >= 1" },
+						],
+					},
+				],
+			}),
+			"utf8",
+		);
+		const result = await runToolRequest({
+			filePath: flowPath,
+			ctx: {
+				cwd: dir,
+				registry: createDefaultRegistry(),
+				env: {
+					...process.env,
+					LOBSTER_STATE_DIR: join(dir, "state"),
+					GOG_BIN: mockGog,
+					MOCK_GOG_SEND_STARTED_FILE: join(dir, "send-started"),
+					MOCK_GOG_SEND_INVOCATIONS_FILE: sendInvocations,
+					MOCK_GOG_COMPLETION_DELAY_MS: "50",
+				},
+			},
+		});
+		assert.equal(result.ok, false);
+		const invocations = (await readFile(sendInvocations, "utf8")).trim().split(/\r?\n/);
+		assert.equal(invocations.length, 1);
+	} finally {
+		await rm(dir, { recursive: true, force: true });
+	}
+});
+
 test("approval resume token cannot replay a send after downstream cancellation", async () => {
 	const dir = await mkdtemp(join(tmpdir(), "lobster-resume-cancel-replay-"));
 	try {

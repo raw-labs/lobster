@@ -306,8 +306,10 @@ export class Machine {
 			} catch (error) {
 				this.checkAuthority(scope.ctx);
 				if (decidingApproval || this.fatal(error) || scope.ctx.signal?.aborted) throw error;
+				// Includes the attempt's own frame: a loop keeps the mark of iterations it forgot.
 				const nonRetryable = Object.entries(this.state.activations).some(
-					([path, item]) => path.startsWith(attemptKey + "/") && item.nonRetryable,
+					([path, item]) =>
+						(path === attemptKey || path.startsWith(attemptKey + "/")) && item.nonRetryable,
 				);
 				settleUnbilledCharges(this.cost, scope.ledger);
 				this.checkCost(scope);
@@ -499,8 +501,16 @@ export class Machine {
 				error instanceof ExecutionConflictError
 			)
 				throw error;
+			// Stopped (Ctrl-C, SIGTERM, host abort) while a command was running: its
+			// effects are unknown, so the run is blocked until someone advances it
+			// (repeatable steps run again) or abandons it.
+			const running = this.ctx.signal?.aborted
+				? Object.entries(this.state.activations).find(
+						([path, frame]) => path.endsWith("/activity") && frame.phase === "started",
+					)?.[0]
+				: undefined;
 			this.state.status =
-				error instanceof InterruptedActivityError
+				error instanceof InterruptedActivityError || running
 					? "blocked"
 					: this.ctx.signal?.aborted
 						? Object.values(this.state.activations).some(
@@ -509,7 +519,9 @@ export class Machine {
 							? "waiting"
 							: "running"
 						: "failed";
-			this.state.error = error?.message ?? String(error);
+			this.state.error = running
+				? `Interrupted while ${running} was running; its outcome is unknown. Check it, then run \`lobster runs advance ${this.store.runId}\` to continue or \`lobster runs abandon ${this.store.runId}\` to stop the run.`
+				: (error?.message ?? String(error));
 			await this.save();
 			throw error;
 		}
