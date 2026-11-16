@@ -146,3 +146,35 @@ test("a workflow that cannot start leaves no run record", async (t) => {
 	assert.equal(invalid.ok, false);
 	assert.deepEqual((await listRuns({ ctx: { env: f.env } })).runs, []);
 });
+
+test("finished runs older than the retention period are deleted on a later open", async (t) => {
+	const f = await fixture(t, [{ id: "ship", run: "echo '{}'", approval: "Ship?" }]);
+	await runToolRequest({ filePath: f.filePath, ctx: { env: f.env } });
+	await fs.writeFile(f.filePath, JSON.stringify({ steps: [{ id: "a", run: "echo a" }] }));
+	await runToolRequest({ filePath: f.filePath, ctx: { env: f.env } });
+	const [waiting] = (await listRuns({ status: "waiting", ctx: { env: f.env } })).runs;
+	const [done] = (await listRuns({ status: "completed", ctx: { env: f.env } })).runs;
+
+	// Age both runs by 40 days and forget when the store was last pruned.
+	const { DatabaseSync } = await import("node:sqlite");
+	const db = new DatabaseSync(path.join(f.env.LOBSTER_STATE_DIR, "lobster.sqlite"));
+	const old = new Date(Date.now() - 40 * 24 * 60 * 60 * 1000).toISOString();
+	db.prepare("UPDATE runs SET record=json_set(record, '$.updatedAt', ?)").run(old);
+	db.exec("DELETE FROM meta");
+	db.close();
+
+	const keep = await openStoreSession({ env: { ...f.env, LOBSTER_RUN_RETENTION_DAYS: "0" } });
+	await keep.close();
+	assert.equal((await listRuns({ ctx: { env: f.env } })).runs.length, 2, "0 keeps everything");
+
+	const store = await openStoreSession({ env: f.env });
+	await store.close();
+	const ids = (await listRuns({ ctx: { env: f.env } })).runs.map((run) => run.id);
+	assert.deepEqual(ids, [waiting.id], "the waiting run stays, the finished one is gone");
+	assert.ok(!ids.includes(done.id));
+
+	await assert.rejects(
+		openStoreSession({ env: { ...f.env, LOBSTER_RUN_RETENTION_DAYS: "soon" } }),
+		/LOBSTER_RUN_RETENTION_DAYS/,
+	);
+});

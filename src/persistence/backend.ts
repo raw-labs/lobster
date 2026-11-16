@@ -50,6 +50,8 @@ export interface Backend {
 	listRunSummaries(after: string, limit: number, filter?: RunFilter): Promise<RunSummary[]>;
 	inspectRun(id: string, afterSequence: number, limit: number): Promise<HistoryPage | null>;
 	removeRun(id: string, before: string): Promise<boolean>;
+	/** Remove finished runs last updated before `before`; throttled to once a day. */
+	pruneFinished(before: string, now: string): Promise<string[]>;
 
 	export(): Promise<LogicalArchive>;
 	import(data: LogicalArchive): Promise<void>;

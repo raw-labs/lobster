@@ -1,4 +1,4 @@
-// This is the only module that loads node:sqlite. Files remain usable on Node 22.0.
+// This is the only module that loads node:sqlite.
 import { WaitConflictError } from "./backend.js";
 import { assertSqliteRuntime } from "./sqlite-support.js";
 import { DatabaseSync } from "node:sqlite";
@@ -91,6 +91,10 @@ if (!workerData.readOnly) {
 			record TEXT NOT NULL,
 			PRIMARY KEY(run_id, sequence)
 		);
+		CREATE TABLE IF NOT EXISTS meta (
+			key TEXT PRIMARY KEY,
+			value TEXT NOT NULL
+		);
 		CREATE TABLE IF NOT EXISTS receipts (
 			run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
 			operation_id TEXT NOT NULL,
@@ -151,6 +155,19 @@ function getRun(id: string): RunRecord | null {
 function listRuns(): RunRecord[] {
 	const rows = prepare("SELECT id FROM runs ORDER BY id").all() as { id: string }[];
 	return rows.map((row) => getRun(row.id)!);
+}
+
+const PRUNE_INTERVAL_MS = 24 * 60 * 60 * 1000;
+const PRUNE_BATCH = 500;
+
+function removeRun(id: string, before: string): boolean {
+	const run = getRun(id);
+	if (!run || !canRetain(run, before)) {
+		return false;
+	}
+	prepare("DELETE FROM state WHERE run_id=?").run(id);
+	prepare("DELETE FROM runs WHERE id=?").run(id);
+	return true;
 }
 
 function transaction<T>(task: () => T, write = true): T {
@@ -453,15 +470,29 @@ function handle(request: WorkerRequest): WorkerResult<WorkerMethod> {
 				}
 			});
 		case "removeRun":
-			return transaction(() => {
-				const run = getRun(args.id);
-				if (!run || !canRetain(run, args.before)) {
-					return false;
-				}
-				prepare("DELETE FROM state WHERE run_id=?").run(args.id);
-				prepare("DELETE FROM runs WHERE id=?").run(args.id);
-				return true;
-			});
+			return transaction(() => removeRun(args.id, args.before));
+		case "pruneFinished": {
+			// At most once a day, and a bounded batch so opening the store stays fast;
+			// a full batch leaves the date unset so the next open continues.
+			const last = prepare("SELECT value FROM meta WHERE key='lastPrune'").get() as
+				| { value: string }
+				| undefined;
+			if (last && Date.parse(args.now) - Date.parse(last.value) < PRUNE_INTERVAL_MS) return [];
+			const ids = prepare(`SELECT id FROM runs
+				WHERE json_extract(record, '$.status') IN ('completed', 'failed', 'cancelled')
+				AND json_extract(record, '$.updatedAt') < ? LIMIT ?`).all(args.before, PRUNE_BATCH) as {
+				id: string;
+			}[];
+			const removed = ids
+				.filter((row) => transaction(() => removeRun(row.id, args.before)))
+				.map((row) => row.id);
+			if (ids.length < PRUNE_BATCH) {
+				prepare(
+					"INSERT INTO meta(key,value) VALUES('lastPrune',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+				).run(args.now);
+			}
+			return removed;
+		}
 		case "close":
 			db.close();
 			return;

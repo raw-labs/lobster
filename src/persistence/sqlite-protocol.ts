@@ -39,6 +39,7 @@ type Operations = {
 		result: HistoryPage | null;
 	};
 	removeRun: { args: { id: string; before: string }; result: boolean };
+	pruneFinished: { args: { before: string; now: string }; result: string[] };
 	export: { args: Record<string, never>; result: LogicalArchive };
 	import: { args: LogicalArchive; result: void };
 	close: { args: Record<string, never>; result: void };

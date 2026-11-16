@@ -7,6 +7,8 @@ All notable changes to Lobster will be documented in this file.
 - Keep all state in one SQLite database (`lobster.sqlite`) in the state directory, and save workflow-file progress so interrupted runs can be continued with `lobster runs advance`. Requires the same runtime as OpenClaw: Node >=24.16.0 <25 or >=26.1.0.
 - Add `lobster upgrade`, a one-off import of state saved by older versions (paused workflows and pipelines, approval IDs, `state.set` values); existing resume tokens and approval IDs keep working. Until it runs, resuming such state fails with `upgrade_required`.
 - Report runs stopped while a command was running as `blocked`, and add `lobster runs abandon <runId>` to stop them for good.
+- Delete finished runs (completed, failed or cancelled) 30 days after they last changed, at most once a day when the store is opened for writing; set `LOBSTER_RUN_RETENTION_DAYS` (or `retentionDays` when opening a store) to change this, `0` keeps them forever. Waiting and blocked runs are never deleted.
+- Update Node.js types to 24.19.2 to match the new runtime floor.
 
 ## 2026.10.1 - 2026-10-20
 

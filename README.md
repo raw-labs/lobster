@@ -220,6 +220,12 @@ lobster history prune 2026-01-01T00:00:00Z      # dry run
 lobster history prune 2026-01-01T00:00:00Z --apply
 ```
 
+Finished runs (completed, failed or cancelled) are deleted automatically 30 days
+after they last changed. The check runs at most once a day, when a command opens
+the store for writing. Set `LOBSTER_RUN_RETENTION_DAYS` to keep them longer or
+shorter (`0` keeps them forever); hosts can pass `retentionDays` to
+`openStoreSession`. Waiting and blocked runs are never deleted automatically.
+
 Retention removes only terminal runs older than the cutoff with no live
 continuation, pending wait, started attempt, or unacknowledged operation receipt.
 Valid consumed-capability markers may be removed with their terminal run; their

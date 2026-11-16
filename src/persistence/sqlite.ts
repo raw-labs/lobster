@@ -171,7 +171,7 @@ export class SqliteBackend implements Backend {
 			this.pending.set(id, {
 				resolve,
 				reject,
-				mutation: ["write", "transition", "import", "removeRun"].includes(method),
+				mutation: ["write", "transition", "import", "removeRun", "pruneFinished"].includes(method),
 				operationId,
 				runId,
 			});
@@ -275,6 +275,10 @@ export class SqliteBackend implements Backend {
 
 	removeRun(id: string, before: string): Promise<boolean> {
 		return this.request("removeRun", { id, before });
+	}
+
+	pruneFinished(before: string, now: string): Promise<string[]> {
+		return this.request("pruneFinished", { before, now });
 	}
 
 	async close(): Promise<void> {

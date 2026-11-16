@@ -53,7 +53,26 @@ export type StoreOptions = {
 	trackRuns?: boolean;
 	maxPending?: number;
 	signal?: AbortSignal;
+	/**
+	 * Days to keep finished runs (completed, failed, cancelled). Default 30, or
+	 * `LOBSTER_RUN_RETENTION_DAYS`; 0 keeps them forever.
+	 */
+	retentionDays?: number;
 };
+
+const DEFAULT_RETENTION_DAYS = 30;
+
+function retentionDays(options: StoreOptions, env: Record<string, string | undefined>): number {
+	const raw = options.retentionDays ?? env.LOBSTER_RUN_RETENTION_DAYS;
+	if (raw === undefined || raw === "") return DEFAULT_RETENTION_DAYS;
+	const days = Number(raw);
+	if (!Number.isFinite(days) || days < 0) {
+		throw new Error(
+			`LOBSTER_RUN_RETENTION_DAYS must be a number of days (0 keeps finished runs), got ${JSON.stringify(raw)}`,
+		);
+	}
+	return days;
+}
 
 export class StoreSession {
 	readonly history: boolean;
@@ -501,6 +520,7 @@ export async function openStoreSession(options: StoreOptions = {}): Promise<Stor
 	assertSqliteNodeSupport();
 	const history = options.history ?? env.LOBSTER_HISTORY === "1";
 	const trackRuns = history || (options.trackRuns ?? env.LOBSTER_RUNS === "1");
+	const keepDays = retentionDays(options, env);
 	const databasePath = path.join(directory, "lobster.sqlite");
 	const { SqliteBackend } = await import("./sqlite.js");
 	let created = false;
@@ -518,6 +538,12 @@ export async function openStoreSession(options: StoreOptions = {}): Promise<Stor
 	try {
 		backend = new SqliteBackend(databasePath, options.readOnly, options.maxPending, options.signal);
 		await backend.listRunSummaries("", 1);
+		if (!options.readOnly && keepDays > 0) {
+			const now = Date.now();
+			const before = new Date(now - keepDays * 24 * 60 * 60 * 1000).toISOString();
+			// Housekeeping: a busy or failed prune retries on a later open.
+			await backend.pruneFinished(before, new Date(now).toISOString()).catch(() => {});
+		}
 		options.signal?.throwIfAborted();
 		return new StoreSession(directory, backend, history, options.readOnly, trackRuns);
 	} catch (error) {
