@@ -10,14 +10,15 @@ import type { Backend, BackendKind } from "./backend.js";
 import { FileBackend } from "./files.js";
 import { fingerprint, validateArchive, type LogicalArchive } from "./model.js";
 
-async function assertOffline(directory: string) {
+/** Refuse while another process holds a state lock or an open persistence session. */
+export async function assertOffline(directory: string) {
 	for (const name of await fs.readdir(directory)) {
 		if (
 			name.endsWith(".lock") &&
 			name !== ".backend-selection.lock" &&
 			!(await reclaimOrphanedFileLock(path.join(directory, name)))
 		) {
-			throw new Error("State writers must be stopped before migration");
+			throw new Error("Stop other running Lobster processes first: state is locked");
 		}
 		if (!name.startsWith(".session-")) {
 			continue;
@@ -25,7 +26,7 @@ async function assertOffline(directory: string) {
 		const lease = JSON.parse(await fs.readFile(path.join(directory, name), "utf8"));
 		try {
 			process.kill(lease.pid, 0);
-			throw new Error("Close all persistence sessions before migration");
+			throw new Error("Stop other running Lobster processes first: a session is open");
 		} catch (error) {
 			if (error.code !== "ESRCH") {
 				throw error;

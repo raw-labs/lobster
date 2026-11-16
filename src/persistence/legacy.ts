@@ -2,11 +2,6 @@ import { validateCommandInputState } from "../input_request.js";
 import { compileCached } from "../validation.js";
 import { fingerprint, isRetiredCheckpoint, type LogicalArchive } from "./model.js";
 
-export type LegacyCheckpointPage = {
-	checkpoints: { checkpointId: string; kind: "pipeline" | "workflow" | "sdk" }[];
-	nextCursor: string | null;
-};
-
 /** Wrap a stored SDK input frame without changing the legacy token's state key. */
 export function legacyCheckpointText(key: string, text: string): string {
 	if (!key.startsWith("sdk_resume_")) return text;

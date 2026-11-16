@@ -45,7 +45,7 @@ function streamOf(items: unknown[]) {
 	})();
 }
 
-test("legacy embedded workflow tokens require migration", async () => {
+test("workflow tokens that embed their own state cannot be resumed", async () => {
 	const token = encodeToken({
 		protocolVersion: 1,
 		v: 1,
@@ -58,7 +58,7 @@ test("legacy embedded workflow tokens require migration", async () => {
 
 	const result = await resumeToolRequest({ token, cancel: true });
 	assert.equal(result.ok, false);
-	assert.match(result.error?.message ?? "", /migration/);
+	assert.match(result.error?.message ?? "", /cannot be resumed/);
 });
 
 test("runAbortableProcess preserves UTF-8 characters split across pipe chunks", async () => {

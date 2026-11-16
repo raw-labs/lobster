@@ -26,6 +26,17 @@ export type {
 	WorkflowRunResult,
 } from "./types.js";
 
+/** A pause saved by an older Lobster. `lobster upgrade` converts it in place. */
+export class UpgradeRequiredError extends Error {
+	readonly code = "LOBSTER_UPGRADE_REQUIRED";
+	constructor() {
+		super(
+			"This workflow was paused by an older version of Lobster. Run `lobster upgrade`, then resume it again with the same token.",
+		);
+		this.name = "UpgradeRequiredError";
+	}
+}
+
 export type WorkflowResumePayload = {
 	protocolVersion: 1;
 	v: 1;
@@ -65,15 +76,16 @@ export async function runWorkflowFile(
 		let runId: string;
 		if (options.resume) {
 			if (!options.resume.stateKey)
-				throw new Error("Legacy workflow state requires one-off migration");
+				throw new Error(
+					"This resume token is from a Lobster version that kept workflow state inside the token; it cannot be resumed",
+				);
 			const state = (await readStateJson({
 				env: ctx.env,
 				key: options.resume.stateKey,
 				signal: ctx.signal,
 			})) as { machineVersion?: number; runId?: string } | null;
 			if (!state) throw new Error("Workflow resume state not found");
-			if (state.machineVersion !== 1 || !state.runId)
-				throw new Error("Legacy workflow state requires one-off migration");
+			if (state.machineVersion !== 1 || !state.runId) throw new UpgradeRequiredError();
 			runId = state.runId;
 			ctx._onResumeStateResolved?.(options.resume.stateKey);
 		} else {
@@ -89,7 +101,7 @@ export async function runWorkflowFile(
 		try {
 			let state = await store.claim();
 			if (!state) {
-				if (options.resume) throw new Error("Legacy workflow state requires one-off migration");
+				if (options.resume) throw new UpgradeRequiredError();
 				if (!options.filePath) throw new Error("Workflow file path required");
 				const definition = await snapshotDefinition(options.filePath, options.args ?? {});
 				state = {

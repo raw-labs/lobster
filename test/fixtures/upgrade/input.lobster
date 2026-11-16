@@ -1,0 +1,1 @@
+{"steps":[{"id":"prep","command":"echo x >> __DIR__/count_prep; echo '{\"draft\":\"hi\"}'"},{"id":"review","input":{"prompt":"Review the draft","responseSchema":{"type":"object","properties":{"ok":{"type":"boolean"}},"required":["ok"]}},"stdin":"$prep.json"},{"id":"finish","command":"echo x >> __DIR__/count_finish; echo finished"}]}

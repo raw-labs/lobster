@@ -1,10 +1,4 @@
-import {
-	listRuns,
-	getRun,
-	getWait,
-	listLegacyCheckpoints,
-	adoptLegacyCheckpoint,
-} from "./core/runs.js";
+import { listRuns, getRun, getWait } from "./core/runs.js";
 import { forceTerminateAbortableProcesses } from "./abortable_process.js";
 import { createDefaultRegistry } from "./commands/registry.js";
 import { resumeToolRequest, createToolContext } from "./core/tool_runtime.js";
@@ -16,6 +10,9 @@ import { migrateStore } from "./persistence/migrate.js";
 import { openStoreSession } from "./persistence/session.js";
 import { finalizePipelineToolRun } from "./pipeline_resume_state.js";
 import { parseResumeArgs } from "./resume.js";
+import { readLineFromStream } from "./read_line.js";
+import { defaultStateDir } from "./state/store.js";
+import { pendingUpgrade, upgradeStore, type UpgradeReport } from "./workflows/upgrade.js";
 import { runPipeline } from "./runtime.js";
 import {
 	loadWorkflowFile,
@@ -74,6 +71,19 @@ async function runCliWithSignal(
 	if (argv[0] === "version" || argv[0] === "--version" || argv[0] === "-v") {
 		process.stdout.write(`${await readVersion()}\n`);
 		return;
+	}
+
+	if (argv[0] === "upgrade") {
+		await handleUpgrade(argv.slice(1));
+		return;
+	}
+
+	// Everything that can run or resume a workflow checks for pauses from an older Lobster.
+	if (
+		!["runs", "waits", "history", "storage", "doctor"].includes(argv[0]) ||
+		(argv[0] === "runs" && argv[1] === "advance")
+	) {
+		await offerUpgrade(argv, signal);
 	}
 
 	if (argv[0] === "runs" && argv[1] === "advance") {
@@ -843,10 +853,9 @@ function helpText() {
 		`  lobster history list\n` +
 		`  lobster history show <runId> [afterSequence]\n` +
 		`  lobster history prune <before> [--apply]\n` +
-		`  lobster storage legacy list [after]\n` +
-		`  lobster storage legacy adopt <checkpointId> --caller <id>\n` +
 		`  lobster storage export\n` +
 		`  lobster storage migrate files|sqlite --offline\n` +
+		`  lobster upgrade [--dry-run] [--json]\n` +
 		`  lobster doctor\n` +
 		`  lobster version\n` +
 		`  lobster help <command>\n\n` +
@@ -877,23 +886,6 @@ function graphHelpText() {
 }
 
 async function handlePersistence(argv: string[]) {
-	if (argv[0] === "storage" && argv[1] === "legacy") {
-		let result: unknown;
-		if (argv[2] === "list" && argv.length <= 4) {
-			result = await listLegacyCheckpoints({ after: argv[3] });
-		} else if (argv[2] === "adopt" && argv.length === 6 && argv[4] === "--caller") {
-			result = await adoptLegacyCheckpoint({
-				checkpointId: argv[3],
-				ctx: { runMetadata: { callerId: argv[5] } },
-			});
-		} else {
-			throw new Error(
-				"storage legacy list [after]; storage legacy adopt <checkpointId> --caller <id>",
-			);
-		}
-		process.stdout.write(JSON.stringify(result) + "\n");
-		return;
-	}
 	if (argv[0] === "storage" && argv[1] === "migrate") {
 		const backend = argv[2];
 		if (backend !== "files" && backend !== "sqlite") {
@@ -968,4 +960,81 @@ async function handleRuns(argv: string[], signal: AbortSignal) {
 		);
 	}
 	process.stdout.write(JSON.stringify(result) + "\n");
+}
+
+/**
+ * Paused workflows saved by an older Lobster must be converted once before they can
+ * resume. Ask on an interactive terminal; otherwise say what to run.
+ */
+async function offerUpgrade(argv: string[], signal: AbortSignal) {
+	const directory = defaultStateDir(process.env);
+	const pending = await pendingUpgrade(directory);
+	if (!pending.length) return;
+	const toolMode = argv.some(
+		(arg, index) => arg === "--mode=tool" || (arg === "--mode" && argv[index + 1] === "tool"),
+	);
+	const what = `${pending.length} workflow run${pending.length === 1 ? " was" : "s were"} paused by an older version of Lobster and must be converted before ${pending.length === 1 ? "it" : "they"} can be resumed.`;
+	if (toolMode || argv[0] === "resume" || !process.stdin.isTTY || !process.stderr.isTTY) {
+		process.stderr.write(`lobster: ${what} Run \`lobster upgrade\`.\n`);
+		return;
+	}
+	process.stderr.write(`${what}\nConvert now? [y/N] `);
+	const answer = String((await readLineFromStream(process.stdin, { signal })) ?? "").trim();
+	if (!/^y(es)?$/i.test(answer)) {
+		process.stderr.write("Not converted. Run `lobster upgrade` when ready.\n");
+		return;
+	}
+	try {
+		process.stderr.write(formatUpgradeReport(await upgradeStore({ directory })));
+	} catch (error) {
+		process.stderr.write(`Upgrade failed: ${error?.message ?? String(error)}\n`);
+	}
+}
+
+async function handleUpgrade(argv: string[]) {
+	const unknown = argv.filter((arg) => arg !== "--dry-run" && arg !== "--json");
+	if (unknown.length) {
+		process.stderr.write("Usage: lobster upgrade [--dry-run] [--json]\n");
+		process.exitCode = 2;
+		return;
+	}
+	let report: UpgradeReport;
+	try {
+		report = await upgradeStore({
+			directory: defaultStateDir(process.env),
+			dryRun: argv.includes("--dry-run"),
+		});
+	} catch (error) {
+		process.stderr.write(`Upgrade failed: ${error?.message ?? String(error)}\n`);
+		process.exitCode = 1;
+		return;
+	}
+	process.stdout.write(
+		argv.includes("--json") ? JSON.stringify(report) + "\n" : formatUpgradeReport(report),
+	);
+}
+
+function formatUpgradeReport(report: UpgradeReport): string {
+	const plural = (n: number) => `${n} paused workflow${n === 1 ? "" : "s"}`;
+	if (!report.converted.length && !report.skipped.length) return "Nothing to upgrade.\n";
+	const lines: string[] = [];
+	if (report.converted.length)
+		lines.push(
+			report.dryRun
+				? `Would convert ${plural(report.converted.length)}.`
+				: `Converted ${plural(report.converted.length)}. Their existing tokens and approval IDs still work.`,
+		);
+	if (report.skipped.length) {
+		lines.push(
+			`${report.dryRun ? "Would skip" : "Skipped"} ${plural(report.skipped.length)} that cannot be converted:`,
+		);
+		for (const item of report.skipped) lines.push(`  ${item.checkpointId}: ${item.reason}`);
+		const moved = report.skipped.find((item) => item.movedTo);
+		if (moved)
+			lines.push(
+				`Moved to ${moved.movedTo!.slice(0, moved.movedTo!.lastIndexOf("/"))}. To retry one, fix its workflow file, move it back and run \`lobster upgrade\` again.`,
+			);
+	}
+	if (report.backup) lines.push(`Backup of the previous state: ${report.backup}`);
+	return lines.join("\n") + "\n";
 }

@@ -237,13 +237,11 @@ function transition(request: Transition): TransitionResult {
 				? [request.action.consume?.key, request.action.publish?.key].filter((key): key is string =>
 						Boolean(key),
 					)
-				: request.action.kind === "adopt"
-					? [request.action.checkpoint.key]
-					: request.action.kind === "state"
-						? [request.action.key]
-						: request.action.kind === "handoff"
-							? [request.action.predecessor.key, request.action.successor.key]
-							: [];
+				: request.action.kind === "state"
+					? [request.action.key]
+					: request.action.kind === "handoff"
+						? [request.action.predecessor.key, request.action.successor.key]
+						: [];
 		for (const key of keys) {
 			const state = prepare("SELECT text FROM state WHERE run_id=? AND key=?").get(
 				current.id,

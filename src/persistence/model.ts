@@ -113,7 +113,6 @@ export type RunAction =
 			consume?: { key: string; expectedWaitRevision?: number };
 	  }
 	| { kind: "create"; run: RunRecord; checkpoint?: { key: string; text: string } }
-	| { kind: "adopt"; checkpoint: CheckpointGuard; metadata: RunMetadata }
 	| { kind: "definition"; fingerprint: string }
 	| { kind: "start"; attempt: Attempt }
 	| { kind: "finish"; id: string; status: AttemptStatus; summary?: unknown }
@@ -255,15 +254,6 @@ export function applyTransition(
 			return { status: "conflict", revision: current?.revision ?? 0, run: current };
 		}
 	}
-	if (
-		action.kind === "adopt" &&
-		(!current?.partialHistory ||
-			!matchesCheckpoint(current, action.checkpoint) ||
-			(current.metadata?.callerId !== undefined &&
-				current.metadata.callerId !== action.metadata.callerId))
-	) {
-		return { status: "conflict", revision: current?.revision ?? 0, run: current };
-	}
 	if (action.kind === "handoff") {
 		const { predecessor, successor } = action;
 		if (predecessor.key === successor.key || !/^[a-z0-9._-]+$/.test(successor.key)) {
@@ -357,9 +347,6 @@ export function applyTransition(
 		run.status = action.execution.status === "blocked" ? "running" : action.execution.status;
 	} else if (action.kind === "create" && action.checkpoint) {
 		setCheckpoint(run, action.checkpoint.key, action.checkpoint.text);
-	} else if (action.kind === "adopt") {
-		run.metadata = { ...run.metadata, ...captureRunMetadata(action.metadata) };
-		payload = { key: action.checkpoint.key };
 	} else if (action.kind === "definition") {
 		run.definitions.push(action.fingerprint);
 		payload = { fingerprint: action.fingerprint };

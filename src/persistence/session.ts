@@ -1,5 +1,6 @@
 import { readBackendSelection } from "./selection.js";
-import { legacyCheckpointText, validateCheckpoint, type LegacyCheckpointPage } from "./legacy.js";
+import { legacyCheckpointText, validateCheckpoint } from "./legacy.js";
+import type { ExecutionState } from "../engine/state.js";
 import { assertSqliteNodeSupport } from "./sqlite-support.js";
 import { randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
@@ -10,7 +11,6 @@ import { normalizeStateKey, resolveStateDirectory } from "../state/paths.js";
 import {
 	PersistenceError,
 	PersistenceOutcomeUnknown,
-	WaitConflictError,
 	type Backend,
 	type BackendKind,
 	type StateWriteOptions,
@@ -181,23 +181,26 @@ export class StoreSession {
 	}
 
 	private async createRecorder({
+		id = randomUUID(),
 		kind,
 		metadata,
 		partialHistory = false,
 		checkpoint,
+		execution,
 		signal,
 		assertInvocationCurrent,
 	}: {
+		id?: string;
 		kind: string;
 		metadata?: RunMetadata;
 		partialHistory?: boolean;
 		checkpoint?: { key: string; text: string };
+		execution?: ExecutionState;
 		signal?: AbortSignal;
 		assertInvocationCurrent?: () => void;
 	}): Promise<ExecutionRecorder> {
 		this.assertOpen(true);
 		await this.selectTrackedStorage(signal, assertInvocationCurrent);
-		const id = randomUUID();
 		const at = new Date().toISOString();
 		const run: RunRecord = {
 			version: 1,
@@ -216,6 +219,7 @@ export class StoreSession {
 			waits: {},
 			states: {},
 			receipts: {},
+			...(execution ? { execution } : {}),
 		};
 		const recorder = new ExecutionRecorder(this, id);
 		await recorder.action(
@@ -230,45 +234,10 @@ export class StoreSession {
 		key: string,
 		signal?: AbortSignal,
 	): Promise<ExecutionRecorder | undefined> {
-		return this.associateCheckpoint(key, undefined, signal);
-	}
-
-	/** Explicit host maintenance: attach a legacy wait to a trusted caller. */
-	async adoptCheckpoint(
-		key: string,
-		metadata: RunMetadata,
-		signal?: AbortSignal,
-		assertInvocationCurrent?: () => void,
-	): Promise<RunState> {
-		this.assertOpen(true);
-		if (
-			typeof metadata?.callerId !== "string" ||
-			!metadata.callerId.length ||
-			metadata.callerId.length > 256
-		) {
-			throw new Error("Legacy adoption requires a trusted caller ID");
-		}
-		await this.selectTrackedStorage(signal, assertInvocationCurrent);
-		const recorder = await this.associateCheckpoint(
-			key,
-			captureRunMetadata(metadata),
-			signal,
-			assertInvocationCurrent,
-		);
-		if (!recorder) throw new Error("Pending legacy checkpoint not found");
-		return this.getRunState(recorder.runId);
-	}
-
-	private async associateCheckpoint(
-		key: string,
-		metadata?: RunMetadata,
-		signal?: AbortSignal,
-		assertInvocationCurrent?: () => void,
-	): Promise<ExecutionRecorder | undefined> {
 		signal?.throwIfAborted();
 		key = normalizeStateKey(key);
 		if (!/^(pipeline_resume_|workflow[-_]resume_|sdk_resume_)[a-z0-9._-]+$/.test(key)) {
-			throw new Error("Invalid legacy checkpoint ID");
+			throw new Error("Invalid checkpoint ID");
 		}
 		if ((await this.read(key)).text === null && /^workflow[-_]resume_/.test(key)) {
 			key = key.includes("workflow-resume_")
@@ -284,37 +253,9 @@ export class StoreSession {
 				if (record.runId) {
 					const run = await this.getRunState(record.runId);
 					if (!run) return undefined;
-					const recorder = new ExecutionRecorder(this, run.id, "", run.historyEnabled !== false);
-					if (metadata) {
-						if (
-							run.waits[key]?.status !== "pending" ||
-							(run.metadata?.callerId !== undefined && run.metadata.callerId !== metadata.callerId)
-						) {
-							throw new WaitConflictError();
-						}
-						if (run.metadata?.callerId !== metadata.callerId) {
-							const result = await recorder.action(
-								{
-									kind: "adopt",
-									checkpoint: {
-										key,
-										status: "pending",
-										fingerprint: fingerprint(JSON.parse(record.text)),
-									},
-									metadata,
-								},
-								signal,
-								assertInvocationCurrent,
-							);
-							if (result.status === "conflict") throw new WaitConflictError();
-						}
-					}
-					return recorder;
+					return new ExecutionRecorder(this, run.id, "", run.historyEnabled !== false);
 				}
-				if (
-					(!this.trackRuns && !metadata) ||
-					JSON.parse(record.text)?.type === "lobster.consumed-resume-state.v1"
-				)
+				if (!this.trackRuns || JSON.parse(record.text)?.type === "lobster.consumed-resume-state.v1")
 					return undefined;
 				validateCheckpoint(key, record.text);
 				if (/^workflow[-_]resume_/.test(key)) {
@@ -326,57 +267,43 @@ export class StoreSession {
 				}
 				return this.createRecorder({
 					kind: "legacy",
-					metadata,
 					partialHistory: true,
 					checkpoint: { key, text: legacyCheckpointText(key, record.text) },
 					signal,
-					assertInvocationCurrent,
 				});
 			},
 		});
 	}
 
-	async listLegacyCheckpoints({
-		after = "",
-		limit = 20,
-	}: { after?: string; limit?: number } = {}): Promise<LegacyCheckpointPage> {
-		if (!Number.isInteger(limit) || limit < 1 || limit > 100)
-			throw new Error("Checkpoint limit must be 1..100");
-		return this.request(async () => {
-			const checkpoints: LegacyCheckpointPage["checkpoints"] = [];
-			const states = Object.assign(
-				{},
-				...(await Promise.all(
-					["pipeline_resume_", "workflow_resume_", "workflow-resume_", "sdk_resume_"].map(
-						(prefix) => this.backend.listState(prefix),
-					),
-				)),
-			);
-			for (const key of Object.keys(states)
-				.filter((key) => key > after)
-				.sort()) {
-				const record = await this.backend.read(key);
-				if (
-					record.runId ||
-					record.text === null ||
-					JSON.parse(record.text)?.type === "lobster.consumed-resume-state.v1"
-				)
-					continue;
-				validateCheckpoint(key, record.text);
-				checkpoints.push({
-					checkpointId: key,
-					kind: key.startsWith("pipeline_")
-						? "pipeline"
-						: key.startsWith("sdk_")
-							? "sdk"
-							: "workflow",
+	/**
+	 * Upgrade only: register a converted workflow pause as a run, with its execution
+	 * state and continuation, in one transition. The key keeps its old token valid.
+	 */
+	async createWaitingRun({
+		id,
+		key,
+		execution,
+		continuation,
+	}: {
+		id: string;
+		key: string;
+		execution: ExecutionState;
+		continuation: (runId: string) => string;
+	}): Promise<string> {
+		this.assertOpen(true);
+		key = normalizeStateKey(key);
+		return withFileLock({
+			filePath: path.join(this.directory, `${key}.json`),
+			task: async () => {
+				if ((await this.read(key)).runId) throw new Error("Checkpoint already belongs to a run");
+				const recorder = await this.createRecorder({
+					id,
+					kind: "workflow",
+					checkpoint: { key, text: continuation(id) },
+					execution,
 				});
-				if (checkpoints.length > limit) break;
-			}
-			return {
-				checkpoints: checkpoints.slice(0, limit),
-				nextCursor: checkpoints.length > limit ? checkpoints[limit - 1].checkpointId : null,
-			};
+				return recorder.runId;
+			},
 		});
 	}
 

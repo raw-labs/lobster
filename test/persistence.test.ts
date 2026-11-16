@@ -407,7 +407,7 @@ test("workflow checkpoint and consumed state survive interrupted backend convers
 		assert.equal(runs[0].partialHistory, false);
 		await assert.rejects(
 			migrateStore({ directory: env.LOBSTER_STATE_DIR, backend: "files", offline: true }),
-			/Close all/,
+			/a session is open/,
 		);
 	} finally {
 		await session.close();
@@ -1196,7 +1196,7 @@ for (const backend of ["files", "sqlite"] as const) {
 					backend: backend === "files" ? "sqlite" : "files",
 					offline: true,
 				}),
-				/Close all persistence sessions/,
+				/a session is open/,
 			);
 		} finally {
 			release();

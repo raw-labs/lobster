@@ -249,7 +249,7 @@ test("migration rejects a live key lock and reclaims it after its writer dies", 
 	const owner = await fs.readFile(path.join(filePath + ".lock", "owner"), "utf8");
 	await assert.rejects(
 		migrateStore({ directory, backend: "sqlite", offline: true }),
-		/State writers must be stopped/,
+		/state is locked/,
 	);
 	assert.equal(await fs.readFile(path.join(filePath + ".lock", "owner"), "utf8"), owner);
 	await assert.rejects(fs.access(path.join(directory, ".backend")), { code: "ENOENT" });

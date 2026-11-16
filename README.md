@@ -99,9 +99,9 @@ queries stream run records instead of loading all histories into memory at once.
 Legacy JSON values keep their layout
 until migration or association with a tracked continuation. New tracked tokens
 require this runtime; older binaries cannot understand the new execution state.
-Old workflow-file checkpoints require a separate one-off state migration, which
-is not implemented yet; there is no legacy executor fallback. Old pipeline and
-SDK tokens retain their existing readers. History enables run tracking. To track
+Workflow-file pauses saved by older versions need `lobster upgrade` once (see
+[Upgrading from an older version](#upgrading-from-an-older-version)). Old pipeline
+and SDK tokens retain their existing readers. History enables run tracking. To track
 standalone pipeline/SDK status without detailed history, use `LOBSTER_RUNS=1` or
 `trackRuns: true`. Each run retains its original history setting when resumed.
 
@@ -175,7 +175,7 @@ SDK function stages still require an instance supplying the original stages:
 `lobster.resumeWait({ waitId, expectedRevision, response })`. They are not
 serialized or resurrected from storage. Workflow-file and pipeline waits resume
 through `resumeToolRequest`. Existing untracked checkpoints retain token-based
-resume for pipelines/SDK stages; old workflow-file checkpoints require migration.
+resume for pipelines/SDK stages; old workflow-file pauses need `lobster upgrade`.
 Legacy records do not retroactively acquire history or a known caller. Imported
 older tracked waits may have `request: null` when the original question was not
 saved; discovery does not invent it by rereading a changed workflow file.
@@ -222,59 +222,30 @@ history. This is a backend round trip, not a binary downgrade. Source JSON must 
 valid; malformed authoritative input aborts conversion. Legacy runs have absent
 history until a stored continuation is associated with a new, explicitly partial
 record. Self-contained legacy SDK tokens remain usable with supplied SDK stages
-and cannot be discovered by scanning a directory. An owning host can build
-coordinated upgrade-time conversion on this API; automatic conversion is not enabled.
+and cannot be discovered by scanning a directory.
 
-### Adopting legacy pauses
+### Upgrading from an older version
 
-Backend migration preserves old checkpoints; it does not assign owners or invent
-run history. To make existing pauses discoverable before answering them, use
-`listLegacyCheckpoints` and `adoptLegacyCheckpoint` from either the core or SDK entry
-point. Both file and SQLite stores support the same maintenance operations.
-
-```ts
-import { listLegacyCheckpoints, adoptLegacyCheckpoint } from '@clawdbot/lobster/core';
-
-const inventory = await listLegacyCheckpoints({ ctx: { storeSession: store }, limit: 20 });
-const checkpoint = inventory.checkpoints[0];
-if (checkpoint) {
-  // The host establishes the owner mapping; checkpointId is opaque.
-  const run = await adoptLegacyCheckpoint({
-    checkpointId: checkpoint.checkpointId,
-    ctx: { storeSession: store, runMetadata: { callerId: 'host:verified-owner' } },
-  });
-  // Inspect run.pendingWaits. Legacy workflow-file state still needs conversion.
-}
-```
-
-Inventory is bounded to 100 entries per page (20 by default), using `after` and
-`nextCursor`. It lists unassociated stored checkpoints, excludes consumed tokens,
-and requires unscoped host access because those records have no known caller.
-Adoption requires a nonempty trusted caller ID, executes no workflow steps, and
-creates one partial run with its pending wait in an atomic commit. Repeating it
-for the same owner preserves run identity; competing owners cannot both adopt a
-checkpoint. An already-associated, unowned partial run can also be bound using
-its saved checkpoint ID. Adoption cannot reassign an existing owner.
-
-These are host maintenance APIs, not permission checks or model-facing tools.
-The host must establish who owns a checkpoint before adopting it; possession of
-an old token alone does not establish that identity. CLI callers can make the
-same explicit association:
+Only paused workflow files changed format. After installing this version, stop
+other Lobster processes and run once:
 
 ```sh
-lobster storage legacy list
-lobster storage legacy list <after>
-lobster storage legacy adopt <checkpointId> --caller host:verified-owner
+lobster upgrade             # or: lobster upgrade --dry-run
 ```
 
-Existing pipeline tokens and short approval IDs remain usable after adoption.
-Adopting old workflow-file state only inventories/associates it: execution still
-requires the deferred one-off conversion. Stored SDK
-command-input tokens also keep working with an instance supplying the original
-stages. Self-contained legacy SDK tokens remain outside inventory and retain
-their previous behavior. No historical events or missing review material are
-reconstructed: `getWait().request` can be `null` for an old workflow checkpoint
-that did not save the question. Workflow source is never reread to invent it.
+It converts every workflow paused by an older version (at an approval step, an
+input step, or a command asking for input) into a waiting run. Each keeps its
+state key, so tokens and short approval IDs handed out before the upgrade still
+resume it; steps that already ran are not run again. A pause whose workflow file
+is missing, or no longer has the paused step at the same position, is moved to
+`.upgrade-skipped/` in the state directory and listed in the report. A
+`.backup-*.archive` of the previous state is written first. Running it again does
+nothing. Paused pipelines, SDK pauses and approval IDs need no conversion.
+
+Until then, `lobster run` asks on a terminal whether to convert now, other
+commands print a one-line reminder on stderr, and resuming an unconverted pause
+fails with error type `upgrade_required`. Hosts embedding Lobster can call
+`upgradeStore({ directory })` from the core or SDK entry point instead.
 
 Migration validates legacy and tracked checkpoint shapes and references before
 preparing the destination, and rejects ambiguous workflow-key aliases. Already

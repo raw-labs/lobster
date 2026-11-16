@@ -24,7 +24,7 @@ export { listRuns, getRun, getWait, type RunQuery, type RunPage } from "./runs.j
 export type { RunView, WaitView, WaitSummary, WaitRequest } from "../persistence/waits.js";
 export type { RunStatus, RunSummary } from "../persistence/model.js";
 
-export { listLegacyCheckpoints, adoptLegacyCheckpoint, type LegacyCheckpointPage } from "./runs.js";
+export { upgradeStore, type UpgradeReport } from "../workflows/upgrade.js";
 
 export type { ResumeDecision, WaitResumeOptions, ResumeTarget } from "../resume_options.js";
 export type { PersistenceOptions, RunScope } from "../persistence/context.js";

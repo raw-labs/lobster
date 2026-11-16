@@ -203,6 +203,17 @@ export class Machine {
 			let decidingApproval = false;
 			try {
 				let result: WorkflowStepResult;
+				// Once the approval gate exists the node has finished and been charged; its
+				// result is the gate's subject. Never dispatch the node again to ask.
+				const gate = this.state.activations[attemptKey + "/approval"];
+				if (gate && isApprovalStep(step.approval) && !scope.nested) {
+					decidingApproval = true;
+					result = await approval(this, step, attemptKey, scope, gate.result!);
+					frame.result = result;
+					frame.phase = "completed";
+					await this.save();
+					return result;
+				}
 				switch (nodeKind(step)) {
 					case "for-each":
 						result = await forEach(this, step, attemptKey, local);
