@@ -425,7 +425,7 @@ export class FileBackend implements Backend {
 	}
 
 	async close(): Promise<void> {
-		for (const runId of [...this.pendingAcknowledgements.keys()]) {
+		for (const runId of this.pendingAcknowledgements.keys()) {
 			await withFileLock({
 				filePath: this.runPath(runId),
 				task: async () => {

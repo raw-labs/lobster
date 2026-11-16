@@ -80,3 +80,36 @@ test("abandoning a waiting run withdraws its question", async (t) => {
 		nextCursor: null,
 	});
 });
+
+test("advancing a run that waits for approval keeps it waiting under the same short ID", async (t) => {
+	const f = await fixture(t, [
+		{ id: "ship", run: "echo '{}'", approval: "Ship?" },
+		{ id: "after", run: "echo after" },
+	]);
+	const first = await runToolRequest({ filePath: f.filePath, ctx: { env: f.env } });
+	assert.equal(first.status, "needs_approval");
+	const [run] = (await listRuns({ status: "waiting", ctx: { env: f.env } })).runs;
+	for (let i = 0; i < 2; i++) {
+		const again = await advanceWorkflowRun({
+			runId: run.id,
+			ctx: createToolContext({ env: f.env }),
+		});
+		assert.equal(again.status, "needs_approval");
+		assert.equal(again.requiresApproval!.approvalId, first.requiresApproval.approvalId);
+		assert.equal(
+			(await listRuns({ status: "waiting", ctx: { env: f.env } })).runs[0]?.id,
+			run.id,
+			"still listed as waiting",
+		);
+	}
+	const indexes = (await fs.readdir(f.env.LOBSTER_STATE_DIR)).filter((name) =>
+		name.startsWith("approval_"),
+	);
+	assert.equal(indexes.length, 1);
+	const approved = await resumeToolRequest({
+		approvalId: first.requiresApproval.approvalId,
+		approved: true,
+		ctx: { env: f.env },
+	});
+	assert.equal(approved.status, "ok", JSON.stringify(approved));
+});

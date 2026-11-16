@@ -7,7 +7,11 @@ import { CostTracker, CostLimitExceededError, type CostLimit } from "../core/cos
 import { resolveRetryConfig, computeDelay } from "../core/retry.js";
 import { PersistenceError, WaitConflictError } from "../persistence/backend.js";
 import { RequestInputResumeError } from "../input_request.js";
-import { createApprovalIndex, cleanupApprovalIndexByStateKey } from "../state/store.js";
+import {
+	createApprovalIndex,
+	cleanupApprovalIndexByStateKey,
+	findApprovalIdByStateKey,
+} from "../state/store.js";
 import { resumeGuardFromEnv } from "../persistence/context.js";
 import { encodeToken } from "../token.js";
 import { enter } from "./nodes/condition.js";
@@ -73,6 +77,8 @@ export class Suspension extends Error {
 	constructor(
 		readonly key: string,
 		readonly frame: Activation,
+		/** False when the question was already asked by an earlier invocation. */
+		readonly fresh = true,
 	) {
 		super("Workflow suspended");
 	}
@@ -347,7 +353,13 @@ export class Machine {
 
 	async suspend(key: string, frame: Activation): Promise<never> {
 		this.checkAuthority();
-		if (!frame.waitKey) {
+		const fresh = !frame.waitKey;
+		if (!fresh && this.state.status !== "waiting") {
+			// Re-reaching an unanswered question (e.g. `runs advance`): still waiting.
+			this.state.status = "waiting";
+			await this.save();
+		}
+		if (fresh) {
 			frame.waitKey = "workflow_resume_" + randomUUID();
 			frame.phase = "waiting";
 			this.state.status = "waiting";
@@ -365,7 +377,7 @@ export class Machine {
 			});
 		}
 		this.ctx.signal?.throwIfAborted();
-		throw new Suspension(key, frame);
+		throw new Suspension(key, frame, fresh);
 	}
 
 	async answer(
@@ -433,7 +445,7 @@ export class Machine {
 		await cleanupApprovalIndexByStateKey({ env: this.ctx.env, stateKey: key });
 	}
 
-	async resultForSuspension(frame: Activation): Promise<WorkflowRunResult> {
+	async resultForSuspension(frame: Activation, fresh = true): Promise<WorkflowRunResult> {
 		const resumeToken = encodeToken({
 			protocolVersion: 1,
 			v: 1,
@@ -441,7 +453,11 @@ export class Machine {
 			stateKey: frame.waitKey,
 		});
 		if (frame.wait!.kind === "approval") {
-			const approvalId = await createApprovalIndex({ env: this.ctx.env, stateKey: frame.waitKey! });
+			// A question asked before keeps its short ID instead of minting another.
+			const approvalId =
+				(!fresh &&
+					(await findApprovalIdByStateKey({ env: this.ctx.env, stateKey: frame.waitKey! }))) ||
+				(await createApprovalIndex({ env: this.ctx.env, stateKey: frame.waitKey! }));
 			return {
 				status: "needs_approval",
 				output: [],
@@ -494,7 +510,7 @@ export class Machine {
 				...(this.cost.hasUsage() ? { _meta: { cost: this.cost.getSummary() } } : {}),
 			};
 		} catch (error) {
-			if (error instanceof Suspension) return this.resultForSuspension(error.frame);
+			if (error instanceof Suspension) return this.resultForSuspension(error.frame, error.fresh);
 			if (
 				error instanceof InvocationRetiredError ||
 				error instanceof PersistenceError ||
