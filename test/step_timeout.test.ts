@@ -193,7 +193,7 @@ test("external abort still propagates when timeout is configured", async () => {
 	);
 });
 
-test("timed-out llm.invoke step stops waiting for the adapter", { timeout: 20_000 }, async () => {
+test("timed-out llm.invoke step stops waiting for the adapter", { timeout: 20_000 }, async (t) => {
 	const sockets = new Set<import("node:net").Socket>();
 	let markClosed = () => {};
 	const requestClosed = new Promise<void>((resolve) => (markClosed = resolve));
@@ -209,10 +209,16 @@ test("timed-out llm.invoke step stops waiting for the adapter", { timeout: 20_00
 	});
 
 	await new Promise<void>((resolve) => server.listen(0, resolve));
+	// Cleanup must run even if the test stalls; an open server keeps the process alive.
+	server.unref();
+	t.after(async () => {
+		for (const socket of sockets) socket.destroy();
+		await new Promise<void>((resolve) => server.close(() => resolve()));
+	});
 	const addr = server.address();
 	const port = typeof addr === "object" && addr ? addr.port : 0;
 
-	try {
+	{
 		const started = Date.now();
 		await assert.rejects(
 			() =>
@@ -231,10 +237,16 @@ test("timed-out llm.invoke step stops waiting for the adapter", { timeout: 20_00
 			/timed out after 300ms/,
 		);
 		assert.ok(Date.now() - started < 10_000, "the step must not wait for the adapter");
-		await requestClosed;
-	} finally {
-		for (const socket of sockets) socket.destroy();
-		await new Promise<void>((resolve) => server.close(() => resolve()));
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		await Promise.race([
+			requestClosed,
+			new Promise((_, reject) => {
+				timer = setTimeout(
+					() => reject(new Error("the adapter request was never sent or never closed")),
+					5_000,
+				);
+			}),
+		]).finally(() => clearTimeout(timer));
 	}
 });
 
