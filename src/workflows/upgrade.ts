@@ -269,10 +269,9 @@ export async function convertWorkflowPause(key: string, old: OldWorkflowPause) {
 		const subject = results[step.id];
 		if (!subject) throw new Error("Unrecognized saved workflow state");
 		delete results[step.id];
+		// Approver rules from the workflow file stay in force; the identity saved at the
+		// pause (which also captured environment-provided values) takes precedence.
 		const approval = extractApprovalRequest(step, subject, {});
-		delete approval.initiatedBy;
-		delete approval.requiredApprover;
-		delete approval.requireDifferentApprover;
 		Object.assign(approval, old.approvalIdentity ?? {});
 		gateKey = attemptKey + "/approval";
 		wait = {

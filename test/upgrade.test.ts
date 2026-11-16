@@ -123,6 +123,31 @@ test("a rejected converted approval cancels without running anything", async (t)
 	assert.equal((await runs("count_ship")) + (await runs("count_after")), 0);
 });
 
+test("approver rules in the workflow file still apply after conversion", async (t) => {
+	const { dir, state, ctx, pauses, runs } = await setup(t);
+	const file = path.join(dir, "approve.lobster");
+	const workflow = JSON.parse(await fs.readFile(file, "utf8"));
+	workflow.steps[1].approval = { prompt: "Ship it?", required_approver: "alice" };
+	await fs.writeFile(file, JSON.stringify(workflow));
+	await upgradeStore({ directory: state });
+	const anonymous = await resumeToolRequest({ approvalId: pauses.approvalId, approved: true, ctx });
+	assert.equal(anonymous.ok, false);
+	assert.match(anonymous.error.message, /requires approver identity/);
+	const bob = await resumeToolRequest({
+		approvalId: pauses.approvalId,
+		approved: true,
+		ctx: { ...ctx, env: { ...ctx.env, LOBSTER_APPROVAL_APPROVED_BY: "bob" } },
+	});
+	assert.equal(bob.ok, false);
+	const alice = await resumeToolRequest({
+		approvalId: pauses.approvalId,
+		approved: true,
+		ctx: { ...ctx, env: { ...ctx.env, LOBSTER_APPROVAL_APPROVED_BY: "alice" } },
+	});
+	assert.equal(alice.status, "ok", JSON.stringify(alice));
+	assert.equal(await runs("count_after"), 1);
+});
+
 test("pauses whose workflow file is gone or changed are set aside, not lost", async (t) => {
 	const { dir, state, pauses } = await setup(t);
 	await fs.rm(path.join(dir, "input.lobster"));
