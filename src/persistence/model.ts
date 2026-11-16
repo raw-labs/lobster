@@ -279,12 +279,10 @@ export function applyTransition(
 	if (action.kind.startsWith("execution-") && action.kind !== "execution-claim") {
 		const owned = action as Extract<RunAction, { owner: string }>;
 		const lease = current?.executionLease;
-		if (
-			!lease ||
-			lease.owner !== owned.owner ||
-			lease.epoch !== owned.epoch ||
-			lease.expiresAt <= Date.now()
-		)
+		// Expiry only allows someone else to claim the run, and every claim moves the
+		// epoch. While the epoch is unchanged no one has, so a holder that was merely
+		// paused (laptop sleep, debugger, slow disk) keeps its run.
+		if (!lease || lease.owner !== owned.owner || lease.epoch !== owned.epoch)
 			return { status: "conflict", revision: current?.revision ?? 0, run: current };
 	}
 	if (action.kind === "execution-claim") {

@@ -303,6 +303,44 @@ finally { await store.close(); }
 			await session.close();
 		}
 	});
+	test(`machine ${backend}: an expired lease nobody claimed still belongs to its holder`, async (t) => {
+		const f = await fixture(t, backend);
+		const session = await openStoreSession({ env: f.env });
+		t.after(() => session.close());
+		const { runId } = await session.createRun("workflow");
+		const act = (operationId: string, action: any) =>
+			session.transition({ operationId, runId, action });
+		const claim = {
+			kind: "execution-claim",
+			owner: "paused",
+			epoch: 1,
+			expiresAt: Date.now() + 50,
+		};
+		assert.equal((await act("claim", claim)).status, "committed");
+		await new Promise((resolve) => setTimeout(resolve, 120)); // e.g. laptop sleep
+		const renew = {
+			kind: "execution-renew",
+			owner: "paused",
+			epoch: 1,
+			expiresAt: Date.now() + 50,
+		};
+		assert.equal((await act("renew", renew)).status, "committed");
+		await new Promise((resolve) => setTimeout(resolve, 120));
+		const takeover = {
+			kind: "execution-claim",
+			owner: "other",
+			epoch: 2,
+			expiresAt: Date.now() + 5000,
+		};
+		assert.equal((await act("takeover", takeover)).status, "committed");
+		const late = {
+			kind: "execution-renew",
+			owner: "paused",
+			epoch: 1,
+			expiresAt: Date.now() + 5000,
+		};
+		assert.equal((await act("late", late)).status, "conflict");
+	});
 	for (const boundary of ["question", "answer", "result"] as const) {
 		test(`machine ${backend}: cancellation after committed ${boundary}`, async (t) => {
 			const f = await fixture(t, backend);
