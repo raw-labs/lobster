@@ -35,7 +35,7 @@ export class UpgradeRequiredError extends Error {
 	readonly code = "LOBSTER_UPGRADE_REQUIRED";
 	constructor() {
 		super(
-			"This workflow was paused by an older version of Lobster. Run `lobster upgrade`, then resume it again with the same token.",
+			"This was paused by an older version of Lobster. Run `lobster upgrade`, then resume it again with the same token or approval ID.",
 		);
 		this.name = "UpgradeRequiredError";
 	}

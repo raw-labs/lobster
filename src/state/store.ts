@@ -1,17 +1,9 @@
 import { stableStringify } from "./serialization.js";
 import { randomBytes } from "node:crypto";
-import { promises as fsp } from "node:fs";
-import path from "node:path";
 import { recorderFromEnv, sessionFromEnv, resumeGuardFromEnv } from "../persistence/context.js";
 import { withStoreContext } from "../persistence/execution.js";
-import type { FileWriteOptions } from "../persistence/files.js";
-import {
-	atomicWriteWasPublished,
-	ensureDirectory,
-	isAtomicExclusiveUnsupportedError,
-	writeFileAtomic,
-	writeFileAtomicExclusive,
-} from "./atomic_file.js";
+import type { StateWriteOptions } from "../persistence/backend.js";
+import { atomicWriteWasPublished, isAtomicExclusiveUnsupportedError } from "./atomic_file.js";
 import type { AtomicWriteOptions, AtomicExclusiveWriteOptions } from "./atomic_file.js";
 import { FILE_LOCK_RETRY_MS, withFileLock } from "./file_lock.js";
 import { keyToPath, resolveStateDirectory } from "./paths.js";
@@ -46,6 +38,13 @@ export function isConsumedResumeState(value: unknown): value is ConsumedResumeSt
 
 export function defaultStateDir(env: Record<string, string | undefined>): string {
 	return sessionFromEnv(env)?.directory ?? resolveStateDirectory(env);
+}
+
+/** Every state operation runs inside a store session (see withStoreContext). */
+function storeOf(env: Record<string, string | undefined>) {
+	const session = sessionFromEnv(env);
+	if (!session) throw new Error("State access requires a store session");
+	return session;
 }
 
 export { stableStringify } from "./serialization.js";
@@ -90,18 +89,7 @@ async function readStateTextInternal({
 	env: Record<string, string | undefined>;
 	key: string;
 }): Promise<string | null> {
-	const session = sessionFromEnv(env);
-	if (session) {
-		return (await session.read(key)).text;
-	}
-	try {
-		return await fsp.readFile(keyToPath(defaultStateDir(env), key), "utf8");
-	} catch (error) {
-		if (error.code === "ENOENT") {
-			return null;
-		}
-		throw error;
-	}
+	return (await storeOf(env).read(key)).text;
 }
 
 async function readStateJsonInternal({
@@ -193,18 +181,14 @@ async function writeStateJsonUnlocked({
 	signal?: AbortSignal;
 	atomicWriteOptions?: Omit<AtomicWriteOptions, "signal">;
 }) {
-	const stateDir = defaultStateDir(env);
-	const filePath = keyToPath(stateDir, key);
-
-	const session = sessionFromEnv(env);
-	if (session) {
+	const session = storeOf(env);
+	{
 		const recorder = recorderFromEnv(env);
 		const guard = resumeGuardFromEnv(env);
 		const guarded = guard && !guard.admitted && guard.key === key && isConsumedResumeState(value);
-		const writeOptions: FileWriteOptions = {
+		const writeOptions: StateWriteOptions = {
 			signal,
 			assertInvocationCurrent: atomicWriteOptions?.assertInvocationCurrent,
-			atomicWriteOptions,
 			...(guarded ? { expectedWaitRevision: guard.expectedRevision } : {}),
 			...(recorder?.decisionKey === key.replace("workflow-resume_", "workflow_resume_")
 				? { decision: recorder.decision }
@@ -218,11 +202,6 @@ async function writeStateJsonUnlocked({
 		}
 		return { signalAbortedAfterCommit: result.signalAbortedAfterCommit };
 	}
-	await ensureDirectory(stateDir);
-	return writeFileAtomic(filePath, JSON.stringify(value, null, 2) + "\n", {
-		...atomicWriteOptions,
-		signal,
-	});
 }
 
 async function writeStateJsonInternal({
@@ -443,23 +422,12 @@ async function stateJsonExistsInternal({
 	env: Record<string, string | undefined>;
 	key: string;
 }) {
-	const session = sessionFromEnv(env);
-	if (session) {
-		return (await session.read(key)).text !== null;
-	}
-	const filePath = keyToPath(defaultStateDir(env), key);
-	try {
-		await fsp.access(filePath);
-		return true;
-	} catch (err: any) {
-		if (err?.code === "ENOENT") return false;
-		throw err;
-	}
+	return (await storeOf(env).read(key)).text !== null;
 }
 
 async function deleteStateJsonUnlocked({ env, key }) {
-	const session = sessionFromEnv(env);
-	if (session) {
+	const session = storeOf(env);
+	{
 		const before = await session.read(key);
 		const currentRecorder = recorderFromEnv(env);
 		const guard = resumeGuardFromEnv(env);
@@ -477,15 +445,6 @@ async function deleteStateJsonUnlocked({ env, key }) {
 				recorder.ownsExecution = true;
 			}
 		}
-		return;
-	}
-	const stateDir = defaultStateDir(env);
-	const filePath = keyToPath(stateDir, key);
-	try {
-		await fsp.unlink(filePath);
-	} catch (err) {
-		if (err?.code === "ENOENT") return;
-		throw err;
 	}
 }
 
@@ -593,29 +552,12 @@ async function writeApprovalIndexInternal({
 	approvalId: string;
 	options?: AtomicExclusiveWriteOptions;
 }) {
-	const stateDir = defaultStateDir(env);
 	const safe = sanitizeApprovalId(approvalId);
 	if (!safe) return;
-	await ensureDirectory(stateDir);
-	const indexPath = path.join(stateDir, `approval_${safe}.json`);
-	const session = sessionFromEnv(env);
-	if (session) {
-		const writeOptions: FileWriteOptions = {
-			exclusive: true,
-			atomicWriteOptions: options,
-			assertInvocationCurrent: options?.assertInvocationCurrent,
-		};
-		await session.write(
-			`approval_${safe}`,
-			JSON.stringify({ stateKey, createdAt: new Date().toISOString() }) + "\n",
-			writeOptions,
-		);
-		return;
-	}
-	await writeFileAtomicExclusive(
-		indexPath,
+	await storeOf(env).write(
+		`approval_${safe}`,
 		JSON.stringify({ stateKey, createdAt: new Date().toISOString() }) + "\n",
-		options,
+		{ exclusive: true, assertInvocationCurrent: options?.assertInvocationCurrent },
 	);
 }
 
@@ -681,33 +623,12 @@ export async function findApprovalIdByStateKey({
 	stateKey: string;
 }): Promise<string | null> {
 	return withStoreContext({ env, readOnly: true }, async (ctx) => {
-		const session = sessionFromEnv(ctx.env);
-		if (session) {
-			for (const [key, text] of Object.entries(await session.backend.listState("approval_"))) {
-				const match = /^approval_([a-f0-9]+)$/.exec(key);
-				if (!match) continue;
-				try {
-					if (JSON.parse(text)?.stateKey === stateKey) return match[1];
-				} catch {
-					/* Ignore unrelated corrupt optional indexes. */
-				}
-			}
-			return null;
-		}
-		const directory = defaultStateDir(ctx.env);
-		let files: string[];
-		try {
-			files = await fsp.readdir(directory);
-		} catch (error) {
-			if (error.code === "ENOENT") return null;
-			throw error;
-		}
-		for (const file of files) {
-			const match = /^approval_([a-f0-9]+)\.json$/.exec(file);
+		const session = storeOf(ctx.env);
+		for (const [key, text] of Object.entries(await session.backend.listState("approval_"))) {
+			const match = /^approval_([a-f0-9]+)$/.exec(key);
 			if (!match) continue;
 			try {
-				const value = JSON.parse(await fsp.readFile(path.join(directory, file), "utf8"));
-				if (value?.stateKey === stateKey) return match[1];
+				if (JSON.parse(text)?.stateKey === stateKey) return match[1];
 			} catch {
 				/* Ignore unrelated corrupt optional indexes. */
 			}
@@ -748,21 +669,9 @@ async function deleteApprovalIdInternal({
 	env: Record<string, string | undefined>;
 	approvalId: string;
 }) {
-	const stateDir = defaultStateDir(env);
 	const safe = sanitizeApprovalId(approvalId);
 	if (!safe) return;
-	const session = sessionFromEnv(env);
-	if (session) {
-		await session.write(`approval_${safe}`, null);
-		return;
-	}
-	const indexPath = path.join(stateDir, `approval_${safe}.json`);
-	try {
-		await fsp.unlink(indexPath);
-	} catch (err: any) {
-		if (err?.code === "ENOENT") return;
-		throw err;
-	}
+	await storeOf(env).write(`approval_${safe}`, null);
 }
 
 /**
@@ -777,8 +686,8 @@ async function cleanupApprovalIndexByStateKeyInternal({
 	env: Record<string, string | undefined>;
 	stateKey: string;
 }) {
-	const session = sessionFromEnv(env);
-	if (session) {
+	const session = storeOf(env);
+	{
 		for (const [key, text] of Object.entries(await session.backend.listState("approval_"))) {
 			if (!key.startsWith("approval_")) {
 				continue;
@@ -793,28 +702,6 @@ async function cleanupApprovalIndexByStateKeyInternal({
 				await session.write(key, null);
 				return;
 			}
-		}
-		return;
-	}
-	const stateDir = defaultStateDir(env);
-	let files: string[];
-	try {
-		files = await fsp.readdir(stateDir);
-	} catch (err: any) {
-		if (err?.code === "ENOENT") return;
-		throw err;
-	}
-	for (const file of files) {
-		if (!file.startsWith("approval_") || !file.endsWith(".json")) continue;
-		try {
-			const text = await fsp.readFile(path.join(stateDir, file), "utf8");
-			const data = JSON.parse(text);
-			if (data?.stateKey === stateKey) {
-				await fsp.unlink(path.join(stateDir, file)).catch(() => {});
-				return; // one index per stateKey
-			}
-		} catch {
-			/* skip corrupt files */
 		}
 	}
 }

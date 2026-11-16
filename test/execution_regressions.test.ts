@@ -7,7 +7,7 @@ import { PassThrough } from "node:stream";
 import { createToolContext } from "../src/core/tool_runtime.js";
 import { runWorkflowFile } from "../src/workflows/file.js";
 
-for (const backend of ["files", "sqlite"]) {
+for (const backend of ["sqlite"]) {
 	test(`machine ${backend}: parent budget stops further child and parent effects`, async (t) => {
 		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "lobster-budget-regression-"));
 		t.after(() => fs.rm(directory, { recursive: true, force: true }));
@@ -43,7 +43,6 @@ for (const backend of ["files", "sqlite"]) {
 					env: {
 						...process.env,
 						MARKER: marker,
-						LOBSTER_BACKEND: backend,
 						LOBSTER_STATE_DIR: path.join(directory, "state"),
 					},
 				}),
@@ -79,7 +78,6 @@ for (const backend of ["files", "sqlite"]) {
 				ctx: createToolContext({
 					env: {
 						...process.env,
-						LOBSTER_BACKEND: backend,
 						LOBSTER_STATE_DIR: path.join(directory, "state"),
 					},
 				}),
@@ -129,7 +127,6 @@ for (const backend of ["files", "sqlite"]) {
 			ctx: createToolContext({
 				env: {
 					...process.env,
-					LOBSTER_BACKEND: backend,
 					LOBSTER_STATE_DIR: path.join(directory, "state"),
 				},
 			}),
@@ -153,7 +150,6 @@ for (const backend of ["files", "sqlite"]) {
 		const ctx = createToolContext({
 			env: {
 				...process.env,
-				LOBSTER_BACKEND: backend,
 				LOBSTER_STATE_DIR: path.join(directory, "state"),
 			},
 		});

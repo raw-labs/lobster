@@ -5,16 +5,20 @@ function parseVersion(value: string | undefined): Version | null {
 	return match ? [Number(match[1]), Number(match[2]), Number(match[3])] : null;
 }
 
-/** Keep file storage usable on older Node releases without loading node:sqlite. */
+/**
+ * Run state lives in SQLite (`node:sqlite`). Same floor as OpenClaw: Node 24.16+ on 24
+ * or 26.1+. Earlier releases' `node:sqlite` truncates TEXT at embedded NULs (fixed in
+ * 24.16.0 and 26.1.0), and Node 25 is not supported.
+ */
 export function assertSqliteNodeSupport(nodeVersion = process.versions.node): void {
 	const node = parseVersion(nodeVersion);
-	if (
-		!node ||
-		node[0] < 22 ||
-		(node[0] === 22 && node[1] < 13) ||
-		(node[0] === 23 && node[1] < 4)
-	) {
-		throw new Error("SQLite backend requires Node 22.13+, 23.4+, or 24+");
+	const supported =
+		node &&
+		((node[0] === 24 && node[1] >= 16) || (node[0] === 26 && node[1] >= 1) || node[0] >= 27);
+	if (!supported) {
+		throw new Error(
+			`Lobster requires Node >=24.16.0 <25 or >=26.1.0 for its run store (node:sqlite); found ${nodeVersion}`,
+		);
 	}
 }
 
@@ -32,7 +36,7 @@ export function assertSqliteRuntime(nodeVersion: string, sqliteVersion: string |
 					(sqlite[1] === 44 && sqlite[2] >= 6))));
 	if (!patched) {
 		throw new Error(
-			`SQLite backend requires a runtime with the WAL-reset fix (SQLite 3.51.3+, or the 3.50.7/3.44.6 backports); found ${sqliteVersion ?? "unknown"}. Upgrade Node or use file storage.`,
+			`SQLite backend requires a runtime with the WAL-reset fix (SQLite 3.51.3+, or the 3.50.7/3.44.6 backports); found ${sqliteVersion ?? "unknown"}. Upgrade Node.`,
 		);
 	}
 }

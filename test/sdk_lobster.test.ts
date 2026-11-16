@@ -6,6 +6,7 @@ import path from "node:path";
 
 import { Lobster } from "../src/sdk/Lobster.js";
 import { stateSet } from "../src/sdk/primitives/state.js";
+import { openStoreSession } from "../src/persistence/session.js";
 import { decodeToken, encodeToken } from "../src/token.js";
 
 test("sdk Lobster.resume accepts structured input responses", async () => {
@@ -199,8 +200,10 @@ test("sdk Lobster preserves custom stateDir while using core runtime", async () 
 	assert.equal(result.ok, true);
 	assert.equal(result.status, "ok");
 	assert.deepEqual(result.output, [{ saved: true }]);
-	assert.equal(
-		await fsp.readFile(path.join(stateDir, "custom-key.json"), "utf8"),
-		'{\n  "saved": true\n}\n',
-	);
+	const store = await openStoreSession({ directory: stateDir, readOnly: true });
+	try {
+		assert.equal((await store.read("custom-key")).text, '{\n  "saved": true\n}\n');
+	} finally {
+		await store.close();
+	}
 });

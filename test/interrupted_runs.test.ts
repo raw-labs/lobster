@@ -102,9 +102,9 @@ test("advancing a run that waits for approval keeps it waiting under the same sh
 			"still listed as waiting",
 		);
 	}
-	const indexes = (await fs.readdir(f.env.LOBSTER_STATE_DIR)).filter((name) =>
-		name.startsWith("approval_"),
-	);
+	const store = await openStoreSession({ env: f.env, readOnly: true });
+	const indexes = Object.keys(await store.backend.listState("approval_"));
+	await store.close();
 	assert.equal(indexes.length, 1);
 	const approved = await resumeToolRequest({
 		approvalId: first.requiresApproval.approvalId,

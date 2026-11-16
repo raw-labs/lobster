@@ -13,13 +13,13 @@ import {
 } from "../src/core/index.js";
 import { Lobster } from "../src/sdk/Lobster.js";
 
-for (const backend of ["files", "sqlite"] as const) {
+for (const backend of ["sqlite"] as const) {
 	for (const gate of ["approval", "input"] as const) {
 		for (const boundary of ["definition", "start"] as const) {
 			test(`${backend}: SDK ${gate} survives a ${boundary} failure before claiming`, async (t) => {
 				const directory = await fs.mkdtemp(path.join(os.tmpdir(), "lobster-sdk-preclaim-"));
 				t.after(() => fs.rm(directory, { recursive: true, force: true }));
-				const store = await openStoreSession({ directory, backend, history: true });
+				const store = await openStoreSession({ directory, history: true });
 				t.after(() => store.close());
 				let effects = 0;
 				const lobster = new Lobster({ storeSession: store })
@@ -79,7 +79,7 @@ for (const backend of ["files", "sqlite"] as const) {
 		test(`${backend}: unused lazy output closes its history, downstream failure=${fail}`, async (t) => {
 			const directory = await fs.mkdtemp(path.join(os.tmpdir(), "lobster-unused-stage-"));
 			t.after(() => fs.rm(directory, { recursive: true, force: true }));
-			const store = await openStoreSession({ directory, backend, history: true });
+			const store = await openStoreSession({ directory, history: true });
 			t.after(() => store.close());
 			let produced = 0;
 			const registry = {
@@ -123,7 +123,7 @@ for (const backend of ["files", "sqlite"] as const) {
 		test(`${backend}: pruning a failed resumed pipeline cannot revive its token, history=${history}`, async (t) => {
 			const directory = await fs.mkdtemp(path.join(os.tmpdir(), "lobster-failed-retention-"));
 			t.after(() => fs.rm(directory, { recursive: true, force: true }));
-			const store = await openStoreSession({ directory, backend, trackRuns: true, history });
+			const store = await openStoreSession({ directory, trackRuns: true, history });
 			t.after(() => store.close());
 			let effects = 0;
 			const defaults = createDefaultRegistry();
@@ -155,11 +155,11 @@ for (const backend of ["files", "sqlite"] as const) {
 	}
 }
 
-for (const backend of ["files", "sqlite"] as const) {
+for (const backend of ["sqlite"] as const) {
 	test(`${backend}: cancelling tracked SDK command input competes with answering it`, async (t) => {
 		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "lobster-sdk-decision-race-"));
 		t.after(() => fs.rm(directory, { recursive: true, force: true }));
-		const store = await openStoreSession({ directory, backend, trackRuns: true });
+		const store = await openStoreSession({ directory, trackRuns: true });
 		t.after(() => store.close());
 		for (let iteration = 0; iteration < 3; iteration++) {
 			let effects = 0;
@@ -191,7 +191,7 @@ for (const backend of ["files", "sqlite"] as const) {
 	});
 }
 
-for (const backend of ["legacy", "files", "sqlite"] as const) {
+for (const backend of ["legacy", "sqlite"] as const) {
 	test(`${backend}: a failed for_each pipeline cannot restore an approval after an effect`, async (t) => {
 		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "lobster-loop-replay-"));
 		t.after(() => fs.rm(directory, { recursive: true, force: true }));
@@ -199,7 +199,7 @@ for (const backend of ["legacy", "files", "sqlite"] as const) {
 		const store =
 			backend === "legacy"
 				? undefined
-				: await openStoreSession({ directory: stateDir, backend, history: true });
+				: await openStoreSession({ directory: stateDir, history: true });
 		t.after(() => store?.close());
 		let effects = 0;
 		const defaults = createDefaultRegistry();
@@ -255,11 +255,11 @@ for (const backend of ["legacy", "files", "sqlite"] as const) {
 	});
 }
 
-for (const backend of ["files", "sqlite"] as const) {
+for (const backend of ["sqlite"] as const) {
 	test(`${backend}: an SDK cancellation that loses to an answer cannot report success`, async (t) => {
 		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "lobster-sdk-late-cancel-"));
 		t.after(() => fs.rm(directory, { recursive: true, force: true }));
-		const store = await openStoreSession({ directory, backend, trackRuns: true });
+		const store = await openStoreSession({ directory, trackRuns: true });
 		t.after(() => store.close());
 		let effects = 0;
 		const sdk = new Lobster({ storeSession: store }).pipe({

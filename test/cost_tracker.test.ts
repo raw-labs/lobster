@@ -16,6 +16,7 @@ import {
 import type { LlmOutstandingCharge } from "../src/core/llm_accounting.js";
 import { runWorkflowFile } from "../src/workflows/file.js";
 import { decodeToken } from "../src/token.js";
+import { openStoreSession } from "../src/persistence/session.js";
 
 test("CostTracker records usage and computes totals", () => {
 	const tracker = new CostTracker();
@@ -2082,14 +2083,15 @@ test("workflow cost tracking still bills a state value this process never wrote"
 	const provider = await startFakeProvider();
 	const cacheDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-cost-cache-"));
 	const stateDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-cost-state-"));
-	// A state file some other run -- or some other program -- left behind. It looks exactly like
-	// a replay and says so, and it is still billed: the bytes on disk were never handed to this
+	// A stored value some other run -- or some other program -- left behind. It looks exactly like
+	// a replay and says so, and it is still billed: the stored bytes were never handed to this
 	// process to be marked, so nothing about them can claim the call was already paid for.
-	await fsp.writeFile(
-		path.join(stateDir, "planted.json"),
-		JSON.stringify(forgedReplayItem("cache"), null, 2) + "\n",
-		"utf8",
-	);
+	const planter = await openStoreSession({ directory: stateDir });
+	try {
+		await planter.write("planted", JSON.stringify(forgedReplayItem("cache"), null, 2) + "\n");
+	} finally {
+		await planter.close();
+	}
 	try {
 		const { result } = await runWorkflow(
 			{ steps: [{ id: "planted", pipeline: "state.get planted | json" }] },

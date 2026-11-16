@@ -1,24 +1,20 @@
-import { readBackendSelection } from "./selection.js";
 import { legacyCheckpointText, validateCheckpoint } from "./legacy.js";
 import type { ExecutionState } from "../engine/state.js";
 import { assertSqliteNodeSupport } from "./sqlite-support.js";
-import { currentSessionMarker } from "./session_marker.js";
 import { randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
 import path from "node:path";
-import { ensureDirectory, writeFileAtomic } from "../state/atomic_file.js";
+import { ensureDirectory } from "../state/atomic_file.js";
 import { withFileLock } from "../state/file_lock.js";
 import { normalizeStateKey, resolveStateDirectory } from "../state/paths.js";
 import {
 	PersistenceError,
 	PersistenceOutcomeUnknown,
 	type Backend,
-	type BackendKind,
 	type StateWriteOptions,
 	type StateWriteResult,
 } from "./backend.js";
 import { sessionFromEnv } from "./context.js";
-import { FileBackend } from "./files.js";
 import {
 	canRetain,
 	isRetiredCheckpoint,
@@ -51,7 +47,6 @@ export { normalizeStateKey as normalizedKey } from "../state/paths.js";
 
 export type StoreOptions = {
 	directory?: string;
-	backend?: BackendKind;
 	env?: Record<string, string | undefined>;
 	readOnly?: boolean;
 	history?: boolean;
@@ -65,18 +60,15 @@ export class StoreSession {
 	private closed = false;
 	private pending = new Set<Promise<unknown>>();
 	private closePromise?: Promise<void>;
-	private selectedForTracking: boolean;
 
 	constructor(
 		readonly directory: string,
 		readonly backend: Backend,
 		history: boolean,
-		private lease?: string,
 		readonly readOnly = false,
 		readonly trackRuns = history,
 	) {
 		this.history = history;
-		this.selectedForTracking = trackRuns || backend.kind === "sqlite";
 	}
 
 	private assertOpen(write = false): void {
@@ -148,31 +140,6 @@ export class StoreSession {
 		}, true);
 	}
 
-	private async selectTrackedStorage(
-		signal?: AbortSignal,
-		assertInvocationCurrent?: () => void,
-	): Promise<void> {
-		if (this.selectedForTracking) return;
-		await withFileLock({
-			filePath: path.join(this.directory, ".backend-selection"),
-			signal,
-			task: async () => {
-				this.assertOpen(true);
-				const selected = await readBackendSelection(this.directory);
-				if (selected && selected.backend !== this.backend.kind)
-					throw new Error("Backend change requires verified migration");
-				if (!selected) {
-					await writeFileAtomic(
-						path.join(this.directory, ".backend"),
-						JSON.stringify({ version: 1, backend: this.backend.kind }) + "\n",
-						{ signal, assertInvocationCurrent },
-					);
-				}
-				this.selectedForTracking = true;
-			},
-		});
-	}
-
 	async createRun(
 		kind: string,
 		metadata?: RunMetadata,
@@ -201,7 +168,6 @@ export class StoreSession {
 		assertInvocationCurrent?: () => void;
 	}): Promise<ExecutionRecorder> {
 		this.assertOpen(true);
-		await this.selectTrackedStorage(signal, assertInvocationCurrent);
 		const at = new Date().toISOString();
 		const run: RunRecord = {
 			version: 1,
@@ -377,10 +343,6 @@ export class StoreSession {
 	}
 
 	private async acknowledgeObserved(runId: string, operationId: string): Promise<boolean> {
-		if (this.backend instanceof FileBackend) {
-			this.backend.acknowledgeLater(runId, operationId);
-			return true;
-		}
 		try {
 			await this.backend.acknowledge(runId, operationId);
 			return true;
@@ -445,17 +407,7 @@ export class StoreSession {
 		this.closed = true;
 		this.closePromise = (async () => {
 			await Promise.allSettled(this.pending);
-			try {
-				await this.backend.close();
-			} finally {
-				if (this.lease) {
-					await fs.unlink(this.lease).catch((error) => {
-						if (error.code !== "ENOENT") {
-							throw error;
-						}
-					});
-				}
-			}
+			await this.backend.close();
 		})();
 		return this.closePromise;
 	}
@@ -539,92 +491,38 @@ export class ExecutionRecorder {
 	}
 }
 
+/** Open the run store: the SQLite database `lobster.sqlite` in the state directory. */
 export async function openStoreSession(options: StoreOptions = {}): Promise<StoreSession> {
 	const env = options.env ?? process.env;
 	const directory = path.resolve(
 		options.directory ?? sessionFromEnv(env)?.directory ?? resolveStateDirectory(env),
 	);
-	const open = async () => {
+	options.signal?.throwIfAborted();
+	assertSqliteNodeSupport();
+	const history = options.history ?? env.LOBSTER_HISTORY === "1";
+	const trackRuns = history || (options.trackRuns ?? env.LOBSTER_RUNS === "1");
+	const databasePath = path.join(directory, "lobster.sqlite");
+	const { SqliteBackend } = await import("./sqlite.js");
+	let created = false;
+	try {
+		await fs.access(databasePath);
+	} catch {
+		// The schema is created by a writable connection, also for a first read.
+		await ensureDirectory(directory);
+		const handle = await fs.open(databasePath, "a", 0o600);
+		await handle.close();
+		created = true;
+	}
+	if (created && options.readOnly) await new SqliteBackend(databasePath).close();
+	let backend: Backend | undefined;
+	try {
+		backend = new SqliteBackend(databasePath, options.readOnly, options.maxPending, options.signal);
+		await backend.listRunSummaries("", 1);
 		options.signal?.throwIfAborted();
-		const selected = await readBackendSelection(directory);
-		const kind = options.backend ?? env.LOBSTER_BACKEND ?? selected?.backend ?? "files";
-		if (!["files", "sqlite"].includes(kind)) {
-			throw new Error("LOBSTER_BACKEND must be files or sqlite");
-		}
-		if (selected && selected.backend !== kind) {
-			throw new Error("Backend change requires verified migration");
-		}
-		const history = options.history ?? env.LOBSTER_HISTORY === "1";
-		const trackRuns = history || (options.trackRuns ?? env.LOBSTER_RUNS === "1");
-		let backend: Backend | undefined;
-		let lease: string | undefined;
-		try {
-			if (kind === "sqlite") {
-				assertSqliteNodeSupport();
-				if (!selected) {
-					const legacy = await new FileBackend(directory).export();
-					if (Object.keys(legacy.states).length || legacy.runs.length) {
-						throw new Error("Existing file state requires migration before SQLite selection");
-					}
-				}
-				await ensureDirectory(directory);
-				const databasePath = path.join(directory, "lobster.sqlite");
-				if (selected) {
-					try {
-						await fs.access(databasePath);
-					} catch {
-						throw new Error("Selected SQLite database is missing; restore a verified backup");
-					}
-				}
-				if (!options.readOnly) {
-					const handle = await fs.open(databasePath, "a", 0o600);
-					await handle.close();
-				}
-				const { SqliteBackend } = await import("./sqlite.js");
-				backend = new SqliteBackend(
-					databasePath,
-					options.readOnly,
-					options.maxPending,
-					options.signal,
-				);
-				await backend.listRunSummaries("", 1);
-				options.signal?.throwIfAborted();
-				if (!selected && !options.readOnly) {
-					await writeFileAtomic(
-						path.join(directory, ".backend"),
-						JSON.stringify({ version: 1, backend: kind }) + "\n",
-					);
-				}
-			} else {
-				backend = new FileBackend(directory, options.readOnly);
-			}
-			if (!selected && kind === "files" && trackRuns && !options.readOnly) {
-				await writeFileAtomic(
-					path.join(directory, ".backend"),
-					JSON.stringify({ version: 1, backend: "files" }) + "\n",
-				);
-			}
-			if (!options.readOnly) {
-				lease = path.join(directory, `.session-${process.pid}-${randomUUID()}`);
-				await fs.writeFile(lease, JSON.stringify(currentSessionMarker()), { mode: 0o600 });
-			}
-			return new StoreSession(directory, backend, history, lease, options.readOnly, trackRuns);
-		} catch (error) {
-			await backend?.close();
-			if (lease) {
-				await fs.unlink(lease).catch(() => {});
-			}
-			if (options.signal?.aborted) {
-				options.signal.throwIfAborted();
-			}
-			throw error;
-		}
-	};
-	return options.readOnly
-		? open()
-		: withFileLock({
-				filePath: path.join(directory, ".backend-selection"),
-				task: open,
-				signal: options.signal,
-			});
+		return new StoreSession(directory, backend, history, options.readOnly, trackRuns);
+	} catch (error) {
+		await backend?.close();
+		if (options.signal?.aborted) options.signal.throwIfAborted();
+		throw error;
+	}
 }

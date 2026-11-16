@@ -27,7 +27,9 @@ type StateRow = { key: string; text: string | null; run_id: string | null };
 
 type RunMetadataRecord = Omit<RunRecord, "attempts" | "waits" | "events" | "receipts" | "states">;
 
-const db = new DatabaseSync(workerData.path, { readOnly: workerData.readOnly });
+// Wait for a busy database from the very first statement: a connection opened while
+// another one recovers the WAL would otherwise fail at once with "database is locked".
+const db = new DatabaseSync(workerData.path, { readOnly: workerData.readOnly, timeout: 5000 });
 try {
 	const version = db.prepare("SELECT sqlite_version() AS version").get().version;
 	assertSqliteRuntime(process.versions.node, String(version));

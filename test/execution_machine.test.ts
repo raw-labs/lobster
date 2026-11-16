@@ -16,19 +16,18 @@ const fileUrl = pathToFileURL(path.resolve("dist/src/workflows/file.js")).href;
 const sessionUrl = pathToFileURL(path.resolve("dist/src/persistence/session.js")).href;
 const contextUrl = pathToFileURL(path.resolve("dist/src/persistence/context.js")).href;
 
-async function fixture(t: TestContext, backend: string) {
+async function fixture(t: TestContext) {
 	const directory = await fs.mkdtemp(path.join(os.tmpdir(), "lobster-machine-"));
 	t.after(() => fs.rm(directory, { recursive: true, force: true }));
 	const filePath = path.join(directory, "flow.lobster");
 	const env = {
 		...process.env,
 		LOBSTER_STATE_DIR: path.join(directory, "state"),
-		LOBSTER_BACKEND: backend,
 	};
 	return { directory, filePath, env };
 }
 
-for (const backend of ["files", "sqlite"] as const) {
+for (const backend of ["sqlite"] as const) {
 	for (const mode of [
 		"after-result",
 		"repeat",
@@ -39,7 +38,7 @@ for (const backend of ["files", "sqlite"] as const) {
 		"retry",
 	] as const) {
 		test(`machine ${backend}: fresh process recovery ${mode}`, { timeout: 45000 }, async (t) => {
-			const f = await fixture(t, backend);
+			const f = await fixture(t);
 			const counts = path.join(f.directory, "calls.jsonl");
 			const second = {
 				id: "second",
@@ -164,8 +163,7 @@ finally { await store.close(); }
 			let retryAt: number | undefined;
 			const store = await openStoreSession({ env: f.env });
 			try {
-				// Recover after the recorded lease. A kill during a file-lock owner write
-				// may also require the file backend's 30-second abandoned-owner grace.
+				// Recover after the recorded lease.
 				const run = await store.getRunState(runId);
 				retryAt = Object.values(run!.execution!.activations).find(
 					(frame) => frame.retryAt,
@@ -222,7 +220,7 @@ finally { await store.close(); }
 	}
 
 	test(`machine ${backend}: saved approval, definition and decision are authoritative`, async (t) => {
-		const f = await fixture(t, backend);
+		const f = await fixture(t);
 		await fs.writeFile(
 			f.filePath,
 			JSON.stringify({
@@ -251,7 +249,7 @@ finally { await store.close(); }
 	});
 
 	test(`machine ${backend}: ownership conflict and stale checkpoint fencing`, async (t) => {
-		const f = await fixture(t, backend);
+		const f = await fixture(t);
 		const session = await openStoreSession({ env: f.env, history: true });
 		try {
 			const recorder = await session.createRun("workflow");
@@ -304,7 +302,7 @@ finally { await store.close(); }
 		}
 	});
 	test(`machine ${backend}: an expired lease nobody claimed still belongs to its holder`, async (t) => {
-		const f = await fixture(t, backend);
+		const f = await fixture(t);
 		const session = await openStoreSession({ env: f.env });
 		t.after(() => session.close());
 		const { runId } = await session.createRun("workflow");
@@ -343,7 +341,7 @@ finally { await store.close(); }
 	});
 	for (const boundary of ["question", "answer", "result"] as const) {
 		test(`machine ${backend}: cancellation after committed ${boundary}`, async (t) => {
-			const f = await fixture(t, backend);
+			const f = await fixture(t);
 			const store = await openStoreSession({ env: f.env });
 			t.after(() => store.close());
 			let calls = 0;
@@ -431,7 +429,7 @@ finally { await store.close(); }
 	}
 
 	test(`machine ${backend}: token and short ID cannot launch competing effects`, async (t) => {
-		const f = await fixture(t, backend);
+		const f = await fixture(t);
 		await fs.writeFile(
 			f.filePath,
 			JSON.stringify({
@@ -480,7 +478,7 @@ finally { await store.close(); }
 	});
 	for (const boundary of ["answer", "dispatch", "successor"] as const) {
 		test("machine " + backend + ": host retirement before " + boundary, async (t) => {
-			const f = await fixture(t, backend);
+			const f = await fixture(t);
 			const store = await openStoreSession({ env: f.env });
 			t.after(() => store.close());
 			let calls = 0,

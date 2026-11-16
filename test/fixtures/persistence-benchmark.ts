@@ -9,9 +9,9 @@ if (!Number.isInteger(steps) || steps < 1 || steps > 10000) {
 	throw new Error("steps must be 1..10000");
 }
 
-for (const backend of ["files", "sqlite"] as const) {
+for (const backend of ["sqlite"] as const) {
 	const directory = await fs.mkdtemp(path.join(os.tmpdir(), "lobster-history-benchmark-"));
-	const store = await openStoreSession({ directory, backend, history: true });
+	const store = await openStoreSession({ directory, history: true });
 	let maxDelayMs = 0;
 	let previous = performance.now();
 	let ticks = 0;
@@ -34,10 +34,7 @@ for (const backend of ["files", "sqlite"] as const) {
 		await store.inspect(recorder.runId, { limit: 50 });
 		const queryMs = performance.now() - queryStart;
 		await store.close();
-		const storage =
-			backend === "files"
-				? path.join(directory, ".history", `${recorder.runId}.json`)
-				: path.join(directory, "lobster.sqlite");
+		const storage = path.join(directory, "lobster.sqlite");
 		process.stdout.write(
 			JSON.stringify({
 				backend,

@@ -1,20 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { promises as fsp, readFileSync } from "node:fs";
-import {
-	access,
-	chmod,
-	copyFile,
-	mkdtemp,
-	readFile,
-	readdir,
-	rm,
-	writeFile,
-} from "node:fs/promises";
+import { access, chmod, copyFile, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { spawn, spawnSync } from "node:child_process";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { PassThrough } from "node:stream";
 import { fileURLToPath } from "node:url";
 
@@ -24,6 +15,7 @@ import { resumeToolRequest, runToolRequest } from "../src/core/tool_runtime.js";
 import { decodeResumeToken } from "../src/resume.js";
 import { runPipeline } from "../src/runtime.js";
 import { openStoreSession } from "../src/persistence/session.js";
+import { SqliteBackend } from "../src/persistence/sqlite.js";
 import { keyToPath } from "../src/state/store.js";
 import { encodeToken } from "../src/token.js";
 
@@ -38,6 +30,43 @@ async function checkpointExists(env: NodeJS.ProcessEnv, key: string) {
 		await store.close();
 	}
 }
+
+/** Keys held in the run store (state lives in lobster.sqlite, not one file per key). */
+async function storedKeys(stateDir: string): Promise<string[]> {
+	try {
+		await access(join(stateDir, "lobster.sqlite"));
+	} catch {
+		return [];
+	}
+	const store = await openStoreSession({ directory: stateDir, readOnly: true });
+	try {
+		return Object.keys(await store.backend.listState("")).sort();
+	} finally {
+		await store.close();
+	}
+}
+
+/**
+ * Observe every store write (a write of `null` deletes the key). Hooks run before and
+ * after the write commits; return the restore function and call it in `finally`.
+ */
+function hookStoreWrites(
+	hook: (event: { key: string; text: string | null; phase: "before" | "after" }) => unknown,
+) {
+	const original = SqliteBackend.prototype.write;
+	SqliteBackend.prototype.write = async function (this: SqliteBackend, key, text, options) {
+		await hook({ key, text, phase: "before" });
+		const result = await original.call(this, key, text, options);
+		await hook({ key, text, phase: "after" });
+		return result;
+	};
+	return () => {
+		SqliteBackend.prototype.write = original;
+	};
+}
+
+const isConsumedMarker = (text: string | null) =>
+	text !== null && JSON.parse(text)?.type === "lobster.consumed-resume-state.v1";
 
 function streamOf(items: unknown[]) {
 	return (async function* () {
@@ -175,13 +204,14 @@ async function fileExists(path: string) {
 	}
 }
 
+/** State keys, which used to be one `<key>.json` file each, now live in the run store. */
 async function listStateFiles(stateDir: string) {
-	try {
-		return await readdir(stateDir);
-	} catch (err: any) {
-		if (err?.code === "ENOENT") return [];
-		throw err;
-	}
+	return storedKeys(stateDir);
+}
+
+/** Whether the store holds the key that `<stateDir>/<key>.json` used to name. */
+async function storedKeyExists(filePath: string) {
+	return (await storedKeys(dirname(filePath))).includes(basename(filePath).replace(/\.json$/, ""));
 }
 
 async function waitForFile(path: string, timeoutMs = 2000) {
@@ -1072,22 +1102,14 @@ test("terminal pipeline approval resume restores its original approval ID when c
 		assert.ok(first.requiresApproval?.approvalId);
 		assert.ok(first.requiresApproval?.resumeToken);
 		const payload = decodeResumeToken(first.requiresApproval.resumeToken);
-		const previousStatePath = keyToPath(stateDir, payload.stateKey);
-
 		const controller = new AbortController();
-		const originalUnlink = fsp.unlink;
 		let previousStateDeleted = false;
-		Object.defineProperty(fsp, "unlink", {
-			configurable: true,
-			writable: true,
-			async value(filePath: Parameters<typeof fsp.unlink>[0]) {
-				const result = await originalUnlink(filePath);
-				if (String(filePath) === previousStatePath && !controller.signal.aborted) {
-					previousStateDeleted = true;
-					controller.abort(new Error("abort during terminal pipeline approval cleanup"));
-				}
-				return result;
-			},
+		const restoreWrites = hookStoreWrites(({ key, text, phase }) => {
+			if (phase === "after" && key === payload.stateKey && text === null) {
+				if (controller.signal.aborted) return;
+				previousStateDeleted = true;
+				controller.abort(new Error("abort during terminal pipeline approval cleanup"));
+			}
 		});
 		let aborted;
 		try {
@@ -1097,11 +1119,7 @@ test("terminal pipeline approval resume restores its original approval ID when c
 				ctx: { env, signal: controller.signal },
 			});
 		} finally {
-			Object.defineProperty(fsp, "unlink", {
-				configurable: true,
-				writable: true,
-				value: originalUnlink,
-			});
+			restoreWrites();
 		}
 		assertCancellationEnvelope(aborted!);
 		assert.equal(previousStateDeleted, true);
@@ -1131,22 +1149,14 @@ test("pipeline approval resume restores its original capability after next-appro
 		assert.ok(first.requiresApproval?.approvalId);
 		assert.ok(first.requiresApproval?.resumeToken);
 		const payload = decodeResumeToken(first.requiresApproval.resumeToken);
-		const previousStatePath = keyToPath(stateDir, payload.stateKey);
-
 		const controller = new AbortController();
-		const originalRename = fsp.rename;
 		let previousStateClaimed = false;
-		Object.defineProperty(fsp, "rename", {
-			configurable: true,
-			writable: true,
-			async value(from: Parameters<typeof fsp.rename>[0], to: Parameters<typeof fsp.rename>[1]) {
-				const result = await originalRename(from, to);
-				if (String(to) === previousStatePath && !controller.signal.aborted) {
-					previousStateClaimed = true;
-					controller.abort(new Error("abort after previous pipeline approval state claim"));
-				}
-				return result;
-			},
+		const restoreWrites = hookStoreWrites(({ key, text, phase }) => {
+			if (phase === "after" && key === payload.stateKey && isConsumedMarker(text)) {
+				if (controller.signal.aborted) return;
+				previousStateClaimed = true;
+				controller.abort(new Error("abort after previous pipeline approval state claim"));
+			}
 		});
 		let aborted;
 		try {
@@ -1156,11 +1166,7 @@ test("pipeline approval resume restores its original capability after next-appro
 				ctx: { env, signal: controller.signal },
 			});
 		} finally {
-			Object.defineProperty(fsp, "rename", {
-				configurable: true,
-				writable: true,
-				value: originalRename,
-			});
+			restoreWrites();
 		}
 		assertCancellationEnvelope(aborted!);
 		assert.equal(previousStateClaimed, true);
@@ -1201,22 +1207,14 @@ test("pipeline approval resume restores its original capability after next-input
 		assert.ok(first.requiresApproval?.approvalId);
 		assert.ok(first.requiresApproval?.resumeToken);
 		const payload = decodeResumeToken(first.requiresApproval.resumeToken);
-		const previousStatePath = keyToPath(stateDir, payload.stateKey);
-
 		const controller = new AbortController();
-		const originalRename = fsp.rename;
 		let previousStateClaimed = false;
-		Object.defineProperty(fsp, "rename", {
-			configurable: true,
-			writable: true,
-			async value(from: Parameters<typeof fsp.rename>[0], to: Parameters<typeof fsp.rename>[1]) {
-				const result = await originalRename(from, to);
-				if (String(to) === previousStatePath && !controller.signal.aborted) {
-					previousStateClaimed = true;
-					controller.abort(new Error("abort after previous pipeline input state claim"));
-				}
-				return result;
-			},
+		const restoreWrites = hookStoreWrites(({ key, text, phase }) => {
+			if (phase === "after" && key === payload.stateKey && isConsumedMarker(text)) {
+				if (controller.signal.aborted) return;
+				previousStateClaimed = true;
+				controller.abort(new Error("abort after previous pipeline input state claim"));
+			}
 		});
 		let aborted;
 		try {
@@ -1226,11 +1224,7 @@ test("pipeline approval resume restores its original capability after next-input
 				ctx: { env, signal: controller.signal },
 			});
 		} finally {
-			Object.defineProperty(fsp, "rename", {
-				configurable: true,
-				writable: true,
-				value: originalRename,
-			});
+			restoreWrites();
 		}
 		assertCancellationEnvelope(aborted!);
 		assert.equal(previousStateClaimed, true);
@@ -1426,7 +1420,7 @@ test("workflow gate replacement retires the superseded approval index", async ()
 		assert.equal(first.status, "needs_approval");
 		assert.ok(first.requiresApproval?.approvalId);
 		const oldIndexPath = join(stateDir, `approval_${first.requiresApproval.approvalId}.json`);
-		assert.equal(await fileExists(oldIndexPath), true);
+		assert.equal(await storedKeyExists(oldIndexPath), true);
 
 		const resumed = await resumeToolRequest({
 			approvalId: first.requiresApproval.approvalId,
@@ -1434,7 +1428,7 @@ test("workflow gate replacement retires the superseded approval index", async ()
 			ctx: { cwd: dir, env },
 		});
 		assert.equal(resumed.status, "needs_input");
-		assert.equal(await fileExists(oldIndexPath), false);
+		assert.equal(await storedKeyExists(oldIndexPath), false);
 	} finally {
 		await rm(dir, { recursive: true, force: true });
 	}
@@ -1461,7 +1455,9 @@ test("terminal workflow approval resume restores its original capability when cl
 		Object.defineProperty(signal, "throwIfAborted", {
 			value() {
 				signalChecks += 1;
-				if (signalChecks === 2) {
+				// Checks 1-2 open the run store; 3-5 are the resume's own, all before its
+				// decision commits. 4 is the state-lock acquisition this test always targeted.
+				if (signalChecks === 4) {
 					controller.abort(new Error("abort during terminal workflow resume cleanup"));
 				}
 				throwIfAborted();
@@ -1473,7 +1469,7 @@ test("terminal workflow approval resume restores its original capability when cl
 			ctx: { cwd: dir, signal, env },
 		});
 		assertCancellationEnvelope(aborted);
-		assert.equal(signalChecks, 2);
+		assert.equal(signalChecks, 4);
 
 		const retried = await resumeToolRequest({
 			approvalId: first.requiresApproval.approvalId,
@@ -1540,35 +1536,22 @@ test("a cancelled stale pipeline resume cannot restore a capability settled by a
 		});
 		assert.equal(winner.status, "ok");
 		assert.equal(effects, 1);
-		assert.equal(await fileExists(statePath), false);
+		assert.equal(await storedKeyExists(statePath), false);
 
-		const originalUnlink = fsp.unlink;
-		Object.defineProperty(fsp, "unlink", {
-			configurable: true,
-			writable: true,
-			async value(filePath: Parameters<typeof fsp.unlink>[0]) {
-				try {
-					return await originalUnlink(filePath);
-				} finally {
-					if (String(filePath) === statePath && !controller.signal.aborted) {
-						controller.abort(new Error("cancel stale pipeline terminal cleanup"));
-					}
-				}
-			},
+		// Cancel the stale resume as it tries to delete the already-settled state.
+		const restoreWrites = hookStoreWrites(({ key, text }) => {
+			if (key === payload.stateKey && text === null && !controller.signal.aborted)
+				controller.abort(new Error("cancel stale pipeline terminal cleanup"));
 		});
 		let stale;
 		try {
 			releaseDelayedStage();
 			stale = await delayed;
 		} finally {
-			Object.defineProperty(fsp, "unlink", {
-				configurable: true,
-				writable: true,
-				value: originalUnlink,
-			});
+			restoreWrites();
 		}
 		assert.equal(stale.ok, false);
-		assert.equal(await fileExists(statePath), false);
+		assert.equal(await storedKeyExists(statePath), false);
 
 		const replay = await resumeToolRequest({
 			token: first.requiresApproval.resumeToken,
@@ -2532,7 +2515,7 @@ test(
 
 			assert.equal(exited.signal, null);
 			assert.equal(exited.code, 130, "CLI must retain the conventional SIGINT exit status");
-			assert.equal(await fileExists(keyToPath(stateDir, "cli_after_abort")), false);
+			assert.equal(await storedKeyExists(keyToPath(stateDir, "cli_after_abort")), false);
 		} finally {
 			cli?.child.kill("SIGKILL");
 			await rm(dir, { recursive: true, force: true });
@@ -3794,7 +3777,7 @@ test("explicit cancellation stops waiting for a state lock without orphaning its
 			);
 		}
 		assert.equal(
-			await fileExists(approvalIndexPath),
+			await storedKeyExists(approvalIndexPath),
 			true,
 			"the approval ID must remain usable after cancellation",
 		);
@@ -3807,7 +3790,7 @@ test("explicit cancellation stops waiting for a state lock without orphaning its
 
 test("a failed post-effect resume cleanup leaves a non-replayable pipeline tombstone", async () => {
 	const dir = await mkdtemp(join(tmpdir(), "lobster-consumed-pipeline-tombstone-"));
-	const originalUnlink = fsp.unlink;
+	let restoreWrites = () => {};
 	try {
 		const stateDir = join(dir, "state");
 		const env = { ...process.env, LOBSTER_STATE_DIR: stateDir };
@@ -3820,16 +3803,10 @@ test("a failed post-effect resume cleanup leaves a non-replayable pipeline tombs
 		assert.equal(first.status, "needs_approval");
 		assert.ok(first.requiresApproval?.resumeToken);
 		const payload = decodeResumeToken(first.requiresApproval.resumeToken);
-		const statePath = keyToPath(stateDir, payload.stateKey);
-		Object.defineProperty(fsp, "unlink", {
-			configurable: true,
-			writable: true,
-			async value(filePath: Parameters<typeof fsp.unlink>[0]) {
-				if (String(filePath) === statePath) {
-					throw Object.assign(new Error("injected resume unlink failure"), { code: "EIO" });
-				}
-				return originalUnlink(filePath);
-			},
+		// The final delete of the consumed state fails after the effect ran.
+		restoreWrites = hookStoreWrites(({ key, text, phase }) => {
+			if (phase === "before" && key === payload.stateKey && text === null)
+				throw Object.assign(new Error("injected resume unlink failure"), { code: "EIO" });
 		});
 
 		const resumed = await resumeToolRequest({
@@ -3850,11 +3827,7 @@ test("a failed post-effect resume cleanup leaves a non-replayable pipeline tombs
 		assert.match(replay.error?.message ?? "", /Pipeline resume state not found/);
 		assert.equal(effect.invocations, 1, "a tombstoned token must not repeat its side effect");
 	} finally {
-		Object.defineProperty(fsp, "unlink", {
-			configurable: true,
-			writable: true,
-			value: originalUnlink,
-		});
+		restoreWrites();
 		await rm(dir, { recursive: true, force: true });
 	}
 });
@@ -3867,7 +3840,7 @@ async function assertApprovalResumeIsExclusive({
 	resumeBy: "token" | "approvalId";
 }) {
 	const dir = await mkdtemp(join(tmpdir(), "lobster-exclusive-resume-"));
-	const originalRename = fsp.rename;
+	let restoreWrites = () => {};
 	let releaseFirstRename!: () => void;
 	const firstRenameReached = new Promise<void>((resolve) => {
 		releaseFirstRename = resolve;
@@ -3916,18 +3889,17 @@ async function assertApprovalResumeIsExclusive({
 		assert.ok(first.requiresApproval?.resumeToken);
 		assert.ok(first.requiresApproval?.approvalId);
 		const payload = decodeResumeToken(first.requiresApproval.resumeToken!);
-		const statePath = keyToPath(stateDir, payload.stateKey);
-
-		Object.defineProperty(fsp, "rename", {
-			configurable: true,
-			writable: true,
-			async value(from: Parameters<typeof fsp.rename>[0], to: Parameters<typeof fsp.rename>[1]) {
-				if (String(to) === statePath && !renamePaused) {
-					renamePaused = true;
-					await firstRenameReached;
-				}
-				return originalRename(from, to);
-			},
+		// Hold the first resume just before it claims the approval (writes the consumed marker).
+		restoreWrites = hookStoreWrites(async ({ key, text, phase }) => {
+			if (
+				phase === "before" &&
+				key === payload.stateKey &&
+				isConsumedMarker(text) &&
+				!renamePaused
+			) {
+				renamePaused = true;
+				await firstRenameReached;
+			}
 		});
 
 		const resumeArgs =
@@ -3939,7 +3911,10 @@ async function assertApprovalResumeIsExclusive({
 			approved: true,
 			ctx: { cwd: dir, env, registry },
 		});
-		while (!renamePaused) await new Promise((resolve) => setImmediate(resolve));
+		for (let waited = 0; !renamePaused; waited++) {
+			assert.ok(waited < 5000, "the first resume must reach its claim");
+			await new Promise((resolve) => setTimeout(resolve, 1));
+		}
 		const secondResume = resumeToolRequest({
 			...resumeArgs,
 			approved: true,
@@ -3961,11 +3936,9 @@ async function assertApprovalResumeIsExclusive({
 			/resume state not found|owned by another executor/i,
 		);
 	} finally {
-		Object.defineProperty(fsp, "rename", {
-			configurable: true,
-			writable: true,
-			value: originalRename,
-		});
+		releaseFirstRename();
+		releaseFirstEffect();
+		restoreWrites();
 		await rm(dir, { recursive: true, force: true });
 	}
 }
@@ -4039,7 +4012,8 @@ async function assertApprovalGateHandoffIsExclusive({
 		assert.equal(outcomes.filter((outcome) => !outcome.ok).length, 1);
 		assert.match(
 			outcomes.find((outcome) => !outcome.ok)?.error?.message ?? "",
-			/resume state not found|owned by another executor/i,
+			// The loser may also find the winner already retired the short approval ID.
+			/resume state not found|owned by another executor|Approval ID "[a-f0-9]+" not found or expired/i,
 		);
 
 		const completed = await resumeToolRequest({
@@ -4075,7 +4049,7 @@ async function assertCancellationCannotRetireClaimedSuccessor({
 	rejectApproval: boolean;
 }) {
 	const dir = await mkdtemp(join(tmpdir(), "lobster-cancel-claimed-successor-"));
-	const originalRename = fsp.rename;
+	let restoreWrites = () => {};
 	let releaseClaim!: () => void;
 	const claimReleased = new Promise<void>((resolve) => {
 		releaseClaim = resolve;
@@ -4111,20 +4085,13 @@ async function assertCancellationCannotRetireClaimedSuccessor({
 		assert.equal(first.status, "needs_approval");
 		assert.ok(first.requiresApproval?.resumeToken);
 		const payload = decodeResumeToken(first.requiresApproval.resumeToken!);
-		const predecessorPath = keyToPath(stateDir, payload.stateKey);
-
-		Object.defineProperty(fsp, "rename", {
-			configurable: true,
-			writable: true,
-			async value(from: Parameters<typeof fsp.rename>[0], to: Parameters<typeof fsp.rename>[1]) {
-				const result = await originalRename(from, to);
-				if (String(to) === predecessorPath && !claimPaused) {
-					claimPaused = true;
-					claimPublished();
-					await claimReleased;
-				}
-				return result;
-			},
+		// Hold the resume right after its claim on the predecessor has committed.
+		restoreWrites = hookStoreWrites(async ({ key, text, phase }) => {
+			if (phase === "after" && key === payload.stateKey && isConsumedMarker(text) && !claimPaused) {
+				claimPaused = true;
+				claimPublished();
+				await claimReleased;
+			}
 		});
 
 		const resumed = resumeToolRequest({
@@ -4154,17 +4121,14 @@ async function assertCancellationCannotRetireClaimedSuccessor({
 			/resume state not found|owned by another executor/i,
 		);
 		const successor = decodeResumeToken(resumedResult.requiresInput.resumeToken!);
-		assert.notEqual(
-			await fsp.readFile(keyToPath(stateDir, successor.stateKey), "utf8"),
-			"",
+		assert.equal(
+			await storedKeyExists(keyToPath(stateDir, successor.stateKey)),
+			true,
 			"the returned successor must remain live",
 		);
 	} finally {
-		Object.defineProperty(fsp, "rename", {
-			configurable: true,
-			writable: true,
-			value: originalRename,
-		});
+		releaseClaim();
+		restoreWrites();
 		await rm(dir, { recursive: true, force: true });
 	}
 }
@@ -4179,7 +4143,7 @@ test("cancellation and rejection cannot retire a claimed pipeline successor", as
 
 test("a cancellation immediately after pipeline resume consumption restores the unstarted approval", async () => {
 	const dir = await mkdtemp(join(tmpdir(), "lobster-consume-rename-abort-"));
-	const originalRename = fsp.rename;
+	let restoreWrites = () => {};
 	try {
 		const stateDir = join(dir, "state");
 		const env = { ...process.env, LOBSTER_STATE_DIR: stateDir };
@@ -4192,19 +4156,18 @@ test("a cancellation immediately after pipeline resume consumption restores the 
 		assert.equal(first.status, "needs_approval");
 		assert.ok(first.requiresApproval?.resumeToken);
 		const payload = decodeResumeToken(first.requiresApproval.resumeToken!);
-		const statePath = keyToPath(stateDir, payload.stateKey);
 		const controller = new AbortController();
 		let abortedAtConsumption = false;
-		Object.defineProperty(fsp, "rename", {
-			configurable: true,
-			writable: true,
-			async value(from: Parameters<typeof fsp.rename>[0], to: Parameters<typeof fsp.rename>[1]) {
-				await originalRename(from, to);
-				if (String(to) === statePath && !abortedAtConsumption) {
-					abortedAtConsumption = true;
-					controller.abort(new Error("abort after consumed resume rename"));
-				}
-			},
+		restoreWrites = hookStoreWrites(({ key, text, phase }) => {
+			if (
+				phase === "after" &&
+				key === payload.stateKey &&
+				isConsumedMarker(text) &&
+				!abortedAtConsumption
+			) {
+				abortedAtConsumption = true;
+				controller.abort(new Error("abort after consumed resume rename"));
+			}
 		});
 
 		const cancelled = await resumeToolRequest({
@@ -4224,11 +4187,7 @@ test("a cancellation immediately after pipeline resume consumption restores the 
 		assert.equal(retried.ok, true);
 		assert.equal(effect.invocations, 1);
 	} finally {
-		Object.defineProperty(fsp, "rename", {
-			configurable: true,
-			writable: true,
-			value: originalRename,
-		});
+		restoreWrites();
 		await rm(dir, { recursive: true, force: true });
 	}
 });
@@ -4291,14 +4250,14 @@ test("resumed pipeline approvals retain their short ID until the started invocat
 			});
 			await effectEntered;
 			assert.equal(
-				await fileExists(approvalIndexPath),
+				await storedKeyExists(approvalIndexPath),
 				true,
 				"the short approval ID must survive until the resumed invocation reaches a terminal outcome",
 			);
 			releaseEffect();
 			const settled = await resumed;
 			assert.equal(settled.status, "ok");
-			assert.equal(await fileExists(approvalIndexPath), false);
+			assert.equal(await storedKeyExists(approvalIndexPath), false);
 		} finally {
 			releaseEffect();
 			await rm(dir, { recursive: true, force: true });
@@ -4359,7 +4318,7 @@ test("approval rejection stops waiting for a state lock without orphaning its ap
 			);
 		}
 		assert.equal(
-			await fileExists(approvalIndexPath),
+			await storedKeyExists(approvalIndexPath),
 			true,
 			"the approval ID must remain usable after cancelled rejection cleanup",
 		);
@@ -4409,7 +4368,7 @@ test("terminal pipeline resume cleanup stops waiting for a state lock", async ()
 				/terminal pipeline cleanup stopped while waiting for a state lock/,
 			);
 		}
-		assert.equal(await fileExists(approvalIndexPath), true);
+		assert.equal(await storedKeyExists(approvalIndexPath), true);
 		assert.equal(await checkpointExists(env, payload.stateKey), true);
 		await rm(lockPath, { recursive: true, force: true });
 
@@ -4502,7 +4461,7 @@ test("pipeline gate replacement stops waiting for a state lock", async () => {
 				/pipeline gate replacement stopped while waiting for a state lock/,
 			);
 		}
-		assert.equal(await fileExists(approvalIndexPath), true);
+		assert.equal(await storedKeyExists(approvalIndexPath), true);
 		assert.equal(await checkpointExists(env, payload.stateKey), true);
 		await rm(lockPath, { recursive: true, force: true });
 
@@ -4597,7 +4556,7 @@ test("started pipeline and workflow cleanup never retries an interrupted state l
 			}
 			assert.equal(invocations, 1);
 			assert.equal(
-				await fileExists(approvalIndexPath),
+				await storedKeyExists(approvalIndexPath),
 				false,
 				"a started effect must retire its approval ID even when tombstone cleanup times out",
 			);
@@ -5193,7 +5152,7 @@ test(
 			assertCancellationEnvelope(envelope);
 			assert.equal(signalChecks, 4);
 			assert.equal(
-				await fileExists(keyToPath(stateDir, key)),
+				await storedKeyExists(keyToPath(stateDir, key)),
 				false,
 				"cancelled monitor must not persist its snapshot",
 			);

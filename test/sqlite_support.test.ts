@@ -5,11 +5,10 @@ import path from "node:path";
 import test from "node:test";
 import { once } from "node:events";
 import { Worker } from "node:worker_threads";
-import { migrateStore } from "../src/core/index.js";
 import { openStoreSession } from "../src/persistence/session.js";
 import { assertSqliteRuntime } from "../src/persistence/sqlite-support.js";
 
-for (const node of ["22.13.0", "22.23.4", "23.4.0", "24.3.0", "24.22.1", "26.0.0"]) {
+for (const node of ["24.16.0", "24.22.1", "26.1.0", "26.12.1", "27.0.0"]) {
 	test(`SQLite runtime qualification on Node ${node}`, () => {
 		for (const sqlite of ["3.44.6", "3.44.7", "3.50.7", "3.50.8", "3.51.3", "3.52.0", "4.0.0"]) {
 			assert.doesNotThrow(() => assertSqliteRuntime(node, sqlite));
@@ -20,8 +19,8 @@ for (const node of ["22.13.0", "22.23.4", "23.4.0", "24.3.0", "24.22.1", "26.0.0
 	});
 }
 
-test("SQLite qualification preserves the native-driver Node minimum", () => {
-	for (const node of ["20.19.0", "22.0.0", "22.12.0", "23.3.0", "invalid"]) {
+test("SQLite qualification requires the same Node floor as OpenClaw", () => {
+	for (const node of ["20.19.0", "22.13.0", "23.4.0", "24.15.0", "25.9.0", "26.0.0", "invalid"]) {
 		assert.throws(() => assertSqliteRuntime(node, "3.53.4"), /requires Node/);
 	}
 });
@@ -32,10 +31,9 @@ test("SQLite admission qualifies the connection instead of stale process version
 	const descriptor = Object.getOwnPropertyDescriptor(process.versions, "sqlite");
 	Object.defineProperty(process.versions, "sqlite", { value: "3.50.1", configurable: true });
 	t.after(() => Object.defineProperty(process.versions, "sqlite", descriptor));
-	const store = await openStoreSession({ directory, backend: "files" });
+	const store = await openStoreSession({ directory });
 	await store.write("saved", "42\n");
 	await store.close();
-	await migrateStore({ directory, backend: "sqlite", offline: true });
 	const sqlite = await openStoreSession({ directory });
 	try {
 		assert.equal(sqlite.backend.kind, "sqlite");

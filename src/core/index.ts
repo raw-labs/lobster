@@ -11,7 +11,6 @@ export {
 	type StoreSession,
 	type StoreOptions,
 } from "../persistence/public.js";
-export { migrateStore } from "../persistence/migrate.js";
 export {
 	PersistenceError,
 	PersistenceOutcomeUnknown,
@@ -28,7 +27,6 @@ export { upgradeStore, type UpgradeReport } from "../workflows/upgrade.js";
 
 export type { ResumeDecision, WaitResumeOptions, ResumeTarget } from "../resume_options.js";
 export type { PersistenceOptions, RunScope } from "../persistence/context.js";
-export type { MigrationOptions, MigrationPhase } from "../persistence/migrate.js";
 export type {
 	RunMetadata,
 	HistoryPage,

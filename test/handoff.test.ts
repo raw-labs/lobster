@@ -38,7 +38,7 @@ function deferred() {
 	return { promise, resolve };
 }
 
-async function fixture(t: TestContext, backend: "files" | "sqlite", history = true) {
+async function fixture(t: TestContext, backend: "sqlite", history = true) {
 	const directory = await fs.mkdtemp(path.join(os.tmpdir(), "lobster-handoff-"));
 	t.after(() => fs.rm(directory, { recursive: true, force: true }));
 	const filePath = path.join(directory, "flow.lobster");
@@ -53,7 +53,7 @@ async function fixture(t: TestContext, backend: "files" | "sqlite", history = tr
 		}),
 	);
 	const state = path.join(directory, "state");
-	let store = await openStoreSession({ directory: state, backend, trackRuns: true, history });
+	let store = await openStoreSession({ directory: state, trackRuns: true, history });
 	let effects = 0;
 	const defaults = createDefaultRegistry();
 	const registry = {
@@ -129,7 +129,7 @@ async function killAtHandoff(
 	}
 }
 
-for (const backend of ["files", "sqlite"] as const) {
+for (const backend of ["sqlite"] as const) {
 	for (const kind of ["pipeline"] as const) {
 		for (const history of [false, true]) {
 			for (const phase of ["before", "after"] as const) {
@@ -490,7 +490,7 @@ for (const backend of ["files", "sqlite"] as const) {
 	});
 }
 
-for (const backend of ["files", "sqlite"] as const) {
+for (const backend of ["sqlite"] as const) {
 	test(`${backend}: a failure inside publication rolls back checkpoints, history, and receipt`, async (t) => {
 		const f = await fixture(t, backend);
 		const first = await f.start("pipeline");
@@ -507,61 +507,19 @@ for (const backend of ["files", "sqlite"] as const) {
 				successor,
 			},
 		};
-		if (backend === "files") {
-			const rename = fs.rename.bind(fs);
-			t.mock.method(fs, "rename", async (...args) => {
-				if (String(args[1]) === path.join(f.state, ".history", `${before.id}.json`)) {
-					throw Object.assign(new Error("Injected publication failure"), { code: "EIO" });
-				}
-				return rename(...args);
-			});
-		} else {
-			const { DatabaseSync } = await import("node:sqlite");
-			const database = new DatabaseSync(path.join(f.state, "lobster.sqlite"));
-			try {
-				// saveRun has already written metadata, history, receipts, and the old
-				// checkpoint by the time this fresh successor insertion fails.
-				database.exec(`CREATE TRIGGER fail_successor BEFORE INSERT ON state
-					WHEN NEW.key = '${successor.key}'
-					BEGIN SELECT RAISE(ABORT, 'Injected publication failure'); END`);
-			} finally {
-				database.close();
-			}
+		const { DatabaseSync } = await import("node:sqlite");
+		const database = new DatabaseSync(path.join(f.state, "lobster.sqlite"));
+		try {
+			// saveRun has already written metadata, history, receipts, and the old
+			// checkpoint by the time this fresh successor insertion fails.
+			database.exec(`CREATE TRIGGER fail_successor BEFORE INSERT ON state
+				WHEN NEW.key = '${successor.key}'
+				BEGIN SELECT RAISE(ABORT, 'Injected publication failure'); END`);
+		} finally {
+			database.close();
 		}
 		await assert.rejects(f.store.transition(request), /Injected publication failure/);
 		assert.deepEqual(await f.store.getRun(before.id), before);
 		assert.equal((await f.store.read(successor.key)).text, null);
 	});
 }
-
-test("files: a directory sync failure after handoff publication reconciles its receipt", async (t) => {
-	const f = await fixture(t, "files", false);
-	const first = await f.start("pipeline");
-	const previousKey = decodeResumeToken(first.requiresInput.resumeToken).stateKey;
-	const open = fs.open.bind(fs);
-	let injected = false;
-	t.mock.method(fs, "open", async (...args) => {
-		const handle = await open(...args);
-		if (!injected && String(args[0]) === path.join(f.state, ".history") && args[1] === "r") {
-			injected = true;
-			t.mock.method(handle, "sync", async () => {
-				throw Object.assign(new Error("Injected directory sync failure"), { code: "EIO" });
-			});
-		}
-		return handle;
-	});
-	const next = await resumeToolRequest({
-		token: first.requiresInput.resumeToken,
-		response: 1,
-		ctx: f.ctx(),
-	});
-	assert.equal(injected, true);
-	assert.equal(next.status, "needs_input", JSON.stringify(next));
-	const run = await f.store.getRun(first.runId);
-	assert.equal(run.waits[previousKey].status, "retired");
-	assert.equal(Object.values(run.waits).filter((wait) => wait.status === "pending").length, 1);
-	assert.equal(
-		Object.values(run.receipts).every((receipt) => receipt.acknowledged),
-		true,
-	);
-});

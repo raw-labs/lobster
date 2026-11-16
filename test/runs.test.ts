@@ -14,7 +14,6 @@ import {
 	runToolRequest,
 	type ToolRunContext,
 } from "../src/core/index.js";
-import { migrateStore } from "../src/persistence/migrate.js";
 import { Lobster, approve, openStoreSession as openSdkStore } from "../src/sdk/index.js";
 import { openStoreSession as openCoreStore } from "../src/core/index.js";
 import { parseResumeArgs } from "../src/resume.js";
@@ -84,7 +83,7 @@ function scoped(
 	};
 }
 
-for (const backend of ["files", "sqlite"] as const) {
+for (const backend of ["sqlite"] as const) {
 	test(`${backend}: public store handles support SDK pause, reopen and wait resume`, async (t) => {
 		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "lobster-public-store-"));
 		t.after(() => fs.rm(directory, { recursive: true, force: true }));
@@ -93,7 +92,7 @@ for (const backend of ["files", "sqlite"] as const) {
 				.pipe(() => [1])
 				.pipe(approve({ prompt: "Continue?" }))
 				.pipe((items) => items.map((item) => item + 1));
-		let store = await openCoreStore({ directory, backend, trackRuns: true });
+		let store = await openCoreStore({ directory, trackRuns: true });
 		try {
 			assert.equal("backend" in store, false);
 			assert.equal("transition" in store, false);
@@ -129,14 +128,14 @@ for (const backend of ["files", "sqlite"] as const) {
 	});
 }
 
-for (const backend of ["files", "sqlite"] as const) {
+for (const backend of ["sqlite"] as const) {
 	for (const history of [false, true]) {
 		test(`${backend}: discover and answer saved reviews after reopen, history=${history}`, async (t) => {
 			const directory = await fs.mkdtemp(path.join(os.tmpdir(), "lobster-discovery-"));
 			t.after(() => fs.rm(directory, { recursive: true, force: true }));
 			const fixture = await reviewFixture(directory, true);
 			const state = path.join(directory, "state");
-			let store = await openStoreSession({ directory: state, backend, trackRuns: true, history });
+			let store = await openStoreSession({ directory: state, trackRuns: true, history });
 			try {
 				const first = await runToolRequest({
 					filePath: fixture.filePath,
@@ -241,7 +240,6 @@ for (const backend of ["files", "sqlite"] as const) {
 		);
 		let store = await openStoreSession({
 			directory: path.join(directory, "state"),
-			backend,
 			trackRuns: true,
 		});
 		try {
@@ -274,7 +272,7 @@ for (const backend of ["files", "sqlite"] as const) {
 	test(`${backend}: scope all discovery and decisions to trusted caller context`, async (t) => {
 		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "lobster-discovery-scope-"));
 		t.after(() => fs.rm(directory, { recursive: true, force: true }));
-		const store = await openStoreSession({ directory, backend, trackRuns: true });
+		const store = await openStoreSession({ directory, trackRuns: true });
 		try {
 			const a = await runToolRequest({
 				pipeline: 'ask --prompt "First" --schema \'{"type":"integer"}\'',
@@ -350,7 +348,6 @@ for (const backend of ["files", "sqlite"] as const) {
 		);
 		const store = await openStoreSession({
 			directory: path.join(directory, "state"),
-			backend,
 			trackRuns: true,
 			history: true,
 		});
@@ -388,7 +385,7 @@ for (const backend of ["files", "sqlite"] as const) {
 	test(`${backend}: answer revision is checked atomically at checkpoint consumption`, async (t) => {
 		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "lobster-discovery-cas-"));
 		t.after(() => fs.rm(directory, { recursive: true, force: true }));
-		const store = await openStoreSession({ directory, backend, trackRuns: true });
+		const store = await openStoreSession({ directory, trackRuns: true });
 		try {
 			const first = await runToolRequest({
 				pipeline: 'ask --prompt "Question" --schema \'{"type":"integer"}\'',
@@ -436,7 +433,6 @@ for (const backend of ["files", "sqlite"] as const) {
 		const fixture = await reviewFixture(directory);
 		const store = await openStoreSession({
 			directory: path.join(directory, "state"),
-			backend,
 			trackRuns: true,
 		});
 		try {
@@ -474,7 +470,7 @@ for (const backend of ["files", "sqlite"] as const) {
 	test(`${backend}: migration preserves discoverable wait identities and review context`, async (t) => {
 		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "lobster-discovery-migrate-"));
 		t.after(() => fs.rm(directory, { recursive: true, force: true }));
-		let store = await openStoreSession({ directory, backend, trackRuns: true });
+		let store = await openStoreSession({ directory, trackRuns: true });
 		try {
 			const first = await runToolRequest({
 				pipeline: 'ask --prompt "Persisted question" --schema \'{"type":"integer"}\'',
@@ -483,11 +479,6 @@ for (const backend of ["files", "sqlite"] as const) {
 			const run = await getRun({ runId: first.runId, ctx: scoped(store) });
 			const wait = await getWait({ waitId: run.pendingWaits[0].id, ctx: scoped(store) });
 			await store.close();
-			await migrateStore({
-				directory,
-				backend: backend === "files" ? "sqlite" : "files",
-				offline: true,
-			});
 			store = await openStoreSession({ directory });
 			assert.deepEqual(await getWait({ waitId: wait.id, ctx: scoped(store) }), wait);
 			assert.equal(
@@ -510,7 +501,7 @@ for (const backend of ["files", "sqlite"] as const) {
 		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "lobster-discovery-sdk-"));
 		t.after(() => fs.rm(directory, { recursive: true, force: true }));
 		let preparations = 0;
-		let store = await openStoreSession({ directory, backend, trackRuns: true });
+		let store = await openStoreSession({ directory, trackRuns: true });
 		const workflow = () =>
 			new Lobster({ storeSession: store, runMetadata: { callerId: "logical-session-a" } })
 				.pipe(() => {
@@ -567,7 +558,6 @@ for (const backend of ["files", "sqlite"] as const) {
 		const env = {
 			...process.env,
 			LOBSTER_STATE_DIR: directory,
-			LOBSTER_BACKEND: backend,
 			LOBSTER_RUNS: "1",
 			LOBSTER_HISTORY: "0",
 		};

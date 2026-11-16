@@ -10,7 +10,7 @@ import type {
 	TransitionResult,
 } from "./model.js";
 
-export type BackendKind = "files" | "sqlite";
+export type BackendKind = "sqlite";
 
 export type StateWriteOptions = {
 	exclusive?: boolean;

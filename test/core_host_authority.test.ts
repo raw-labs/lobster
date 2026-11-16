@@ -6,47 +6,10 @@ import os from "node:os";
 import path from "node:path";
 
 import { decodeResumeToken, resumeToolRequest, runToolRequest } from "../src/core/index.js";
-import { keyToPath } from "../src/state/store.js";
+import { openStoreSession } from "../src/persistence/session.js";
+import { SqliteBackend } from "../src/persistence/sqlite.js";
 
-function pauseStateRead(filePath: string) {
-	let release!: () => void;
-	let started!: () => void;
-	const gate = new Promise<void>((resolve) => {
-		release = resolve;
-	});
-	const readStarted = new Promise<void>((resolve) => {
-		started = resolve;
-	});
-	const originalReadFile = fsp.readFile;
-	let paused = false;
-	Object.defineProperty(fsp, "readFile", {
-		configurable: true,
-		writable: true,
-		async value(
-			filePathArg: Parameters<typeof fsp.readFile>[0],
-			options?: Parameters<typeof fsp.readFile>[1],
-		) {
-			if (!paused && String(filePathArg) === filePath) {
-				paused = true;
-				started();
-				await gate;
-			}
-			return originalReadFile(filePathArg, options);
-		},
-	});
-	return {
-		readStarted,
-		release,
-		restore() {
-			Object.defineProperty(fsp, "readFile", {
-				configurable: true,
-				writable: true,
-				value: originalReadFile,
-			});
-		},
-	};
-}
-
+/** state.set still serializes on a lock directory next to the key. */
 function pauseStateLock(lockPath: string) {
 	let release!: () => void;
 	let started!: () => void;
@@ -86,173 +49,83 @@ function pauseStateLock(lockPath: string) {
 	};
 }
 
-function pauseAtomicSync(filePath: string) {
+type Gate = { started: Promise<void>; release: () => void; restore: () => void };
+
+/**
+ * Pause the first SQLite backend call that matches: "before" holds it just before it
+ * is sent to the database, "after" holds it once it has committed.
+ */
+function pauseBackend(
+	method: "read" | "write",
+	match: (key: string, text?: string | null) => boolean,
+	when: "before" | "after",
+): Gate {
 	let release!: () => void;
 	let started!: () => void;
 	const gate = new Promise<void>((resolve) => {
 		release = resolve;
 	});
-	const syncStarted = new Promise<void>((resolve) => {
+	const begun = new Promise<void>((resolve) => {
 		started = resolve;
 	});
-	const originalOpen = fsp.open;
-	const tempPrefix = path.join(path.dirname(filePath), `.${path.basename(filePath)}.`);
+	const proto = SqliteBackend.prototype as unknown as Record<
+		string,
+		(...args: unknown[]) => unknown
+	>;
+	const original = proto[method];
 	let paused = false;
-	Object.defineProperty(fsp, "open", {
-		configurable: true,
-		writable: true,
-		async value(
-			filePathArg: Parameters<typeof fsp.open>[0],
-			flags: Parameters<typeof fsp.open>[1],
-			mode?: Parameters<typeof fsp.open>[2],
-		) {
-			const handle = await originalOpen(filePathArg, flags, mode);
-			if (!paused && String(filePathArg).startsWith(tempPrefix)) {
-				paused = true;
-				const originalSync = handle.sync.bind(handle);
-				Object.defineProperty(handle, "sync", {
-					configurable: true,
-					async value() {
-						started();
-						await gate;
-						return originalSync();
-					},
-				});
-			}
-			return handle;
-		},
-	});
+	proto[method] = async function (this: unknown, ...args: unknown[]) {
+		const hit = !paused && match(String(args[0]), args[1] as string | null | undefined);
+		if (hit) paused = true;
+		if (hit && when === "before") {
+			started();
+			await gate;
+		}
+		const result = await original.apply(this, args);
+		if (hit && when === "after") {
+			started();
+			await gate;
+		}
+		return result;
+	};
 	return {
-		syncStarted,
+		started: begun,
 		release,
 		restore() {
-			Object.defineProperty(fsp, "open", {
-				configurable: true,
-				writable: true,
-				value: originalOpen,
-			});
+			proto[method] = original;
 		},
 	};
 }
 
-function pauseApprovalIndexLink(stateDir: string) {
-	let release!: () => void;
-	let started!: () => void;
-	const gate = new Promise<void>((resolve) => {
-		release = resolve;
-	});
-	const linkStarted = new Promise<void>((resolve) => {
-		started = resolve;
-	});
-	const originalLink = fsp.link;
-	let paused = false;
-	Object.defineProperty(fsp, "link", {
-		configurable: true,
-		writable: true,
-		async value(
-			existingPath: Parameters<typeof fsp.link>[0],
-			newPath: Parameters<typeof fsp.link>[1],
-		) {
-			const result = await originalLink(existingPath, newPath);
-			if (!paused && String(newPath).startsWith(path.join(stateDir, "approval_"))) {
-				paused = true;
-				started();
-				await gate;
-			}
-			return result;
-		},
-	});
-	return {
-		linkStarted,
-		release,
-		restore() {
-			Object.defineProperty(fsp, "link", {
-				configurable: true,
-				writable: true,
-				value: originalLink,
-			});
-		},
-	};
+const consumedMarker = (text?: string | null) =>
+	typeof text === "string" && text.includes("lobster.consumed-resume-state.v1");
+
+/**
+ * Every value saved outside a run, read through the store. A short approval ID is
+ * compared by the state it points to: a restored ID gets a new creation time.
+ */
+async function storeSnapshot(stateDir: string): Promise<Record<string, string>> {
+	const store = await openStoreSession({ directory: stateDir, readOnly: true });
+	try {
+		const { states } = await store.backend.export();
+		return Object.fromEntries(
+			Object.entries(states).map(([key, text]) => [
+				key,
+				key.startsWith("approval_") ? JSON.parse(text).stateKey : text,
+			]),
+		);
+	} finally {
+		await store.close();
+	}
 }
 
-function pauseFileUnlink(filePath: string) {
-	let release!: () => void;
-	let started!: () => void;
-	const gate = new Promise<void>((resolve) => {
-		release = resolve;
-	});
-	const unlinkStarted = new Promise<void>((resolve) => {
-		started = resolve;
-	});
-	const originalUnlink = fsp.unlink;
-	let paused = false;
-	Object.defineProperty(fsp, "unlink", {
-		configurable: true,
-		writable: true,
-		async value(filePathArg: Parameters<typeof fsp.unlink>[0]) {
-			const result = await originalUnlink(filePathArg);
-			if (!paused && String(filePathArg) === filePath) {
-				paused = true;
-				started();
-				await gate;
-			}
-			return result;
-		},
-	});
-	return {
-		unlinkStarted,
-		started: unlinkStarted,
-		release,
-		restore() {
-			Object.defineProperty(fsp, "unlink", {
-				configurable: true,
-				writable: true,
-				value: originalUnlink,
-			});
-		},
-	};
-}
-
-function pauseStateMarkerRename(statePath: string) {
-	let release!: () => void;
-	let started!: () => void;
-	const gate = new Promise<void>((resolve) => {
-		release = resolve;
-	});
-	const renameStarted = new Promise<void>((resolve) => {
-		started = resolve;
-	});
-	const originalRename = fsp.rename;
-	const tempPrefix = path.join(path.dirname(statePath), `.${path.basename(statePath)}.`);
-	let paused = false;
-	Object.defineProperty(fsp, "rename", {
-		configurable: true,
-		writable: true,
-		async value(
-			oldPath: Parameters<typeof fsp.rename>[0],
-			newPath: Parameters<typeof fsp.rename>[1],
-		) {
-			const result = await originalRename(oldPath, newPath);
-			if (!paused && String(oldPath).startsWith(tempPrefix) && String(newPath) === statePath) {
-				paused = true;
-				started();
-				await gate;
-			}
-			return result;
-		},
-	});
-	return {
-		renameStarted,
-		started: renameStarted,
-		release,
-		restore() {
-			Object.defineProperty(fsp, "rename", {
-				configurable: true,
-				writable: true,
-				value: originalRename,
-			});
-		},
-	};
+async function storedText(stateDir: string, key: string): Promise<string | null> {
+	const store = await openStoreSession({ directory: stateDir, readOnly: true });
+	try {
+		return (await store.read(key)).text;
+	} finally {
+		await store.close();
+	}
 }
 
 async function waitForGate(gate: Promise<void>) {
@@ -284,17 +157,17 @@ function retireAfterDispatch() {
 	};
 }
 
-function resumeStatePath(stateDir: string, token: string) {
+function resumeStateKey(token: string): string {
 	const stateKey = decodeResumeToken(token).stateKey;
 	assert.ok(stateKey, "expected a persisted resume state");
-	return keyToPath(stateDir, stateKey);
+	return stateKey;
 }
 
 test("approved pipeline rechecks host authority after awaited resume-state preparation", async () => {
 	const tmp = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-host-authority-pipeline-"));
 	const stateDir = path.join(tmp, "state");
 	const env = { ...process.env, LOBSTER_STATE_DIR: stateDir };
-	let gate: ReturnType<typeof pauseStateRead> | undefined;
+	let gate: Gate | undefined;
 	try {
 		const first = await runToolRequest({
 			pipeline: 'approve --prompt "Write?" | state.set committed',
@@ -303,7 +176,8 @@ test("approved pipeline rechecks host authority after awaited resume-state prepa
 		assert.equal(first.status, "needs_approval");
 		const token = first.requiresApproval?.resumeToken;
 		assert.ok(token);
-		gate = pauseStateRead(resumeStatePath(stateDir, token));
+		const stateKey = resumeStateKey(token);
+		gate = pauseBackend("read", (key) => key === stateKey, "before");
 		let current = true;
 		let checks = 0;
 		const pending = resumeToolRequest({
@@ -318,14 +192,14 @@ test("approved pipeline rechecks host authority after awaited resume-state prepa
 				},
 			},
 		});
-		await gate.readStarted;
+		await gate.started;
 		current = false;
 		gate.release();
 		const resumed = await pending;
 		assert.equal(resumed.ok, false);
 		assert.match(resumed.error?.message ?? "", /host invocation retired/);
 		assert.ok(checks >= 1);
-		await assert.rejects(fsp.stat(path.join(stateDir, "committed.json")), { code: "ENOENT" });
+		assert.equal(await storedText(stateDir, "committed"), null);
 	} finally {
 		gate?.release();
 		gate?.restore();
@@ -369,7 +243,7 @@ test("approved state.set rechecks host authority after its lock wait", async () 
 		assert.equal(resumed.ok, false);
 		assert.match(resumed.error?.message ?? "", /host invocation retired/);
 		assert.ok(checks >= 2);
-		await assert.rejects(fsp.stat(committedPath), { code: "ENOENT" });
+		assert.equal(await storedText(stateDir, "committed"), null);
 	} finally {
 		gate?.release();
 		gate?.restore();
@@ -381,7 +255,7 @@ test("approved state.set rechecks host authority before atomic publication", asy
 	const tmp = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-host-authority-publish-"));
 	const stateDir = path.join(tmp, "state");
 	const env = { ...process.env, LOBSTER_STATE_DIR: stateDir };
-	let gate: ReturnType<typeof pauseAtomicSync> | undefined;
+	let gate: Gate | undefined;
 	try {
 		const first = await runToolRequest({
 			pipeline: 'approve --prompt "Write?" | state.set committed',
@@ -390,8 +264,7 @@ test("approved state.set rechecks host authority before atomic publication", asy
 		assert.equal(first.status, "needs_approval");
 		const token = first.requiresApproval?.resumeToken;
 		assert.ok(token);
-		const committedPath = path.join(stateDir, "committed.json");
-		gate = pauseAtomicSync(committedPath);
+		gate = pauseBackend("write", (key, text) => key === "committed" && text != null, "before");
 		let current = true;
 		const pending = resumeToolRequest({
 			token,
@@ -404,17 +277,13 @@ test("approved state.set rechecks host authority before atomic publication", asy
 				},
 			},
 		});
-		await gate.syncStarted;
+		await gate.started;
 		current = false;
 		gate.release();
 		const resumed = await pending;
 		assert.equal(resumed.ok, false);
 		assert.match(resumed.error?.message ?? "", /host invocation retired/);
-		await assert.rejects(fsp.stat(committedPath), { code: "ENOENT" });
-		assert.equal(
-			(await fsp.readdir(stateDir)).some((name) => name.startsWith(".committed.json.")),
-			false,
-		);
+		assert.equal(await storedText(stateDir, "committed"), null);
 	} finally {
 		gate?.release();
 		gate?.restore();
@@ -506,8 +375,8 @@ test("approved openclaw.invoke enforces host authority at real HTTP I/O", async 
 		response.writeHead(200, { "content-type": "application/json" });
 		response.end(JSON.stringify({ ok: true, result: { sent: true } }));
 	});
-	let claimGate: ReturnType<typeof pauseStateMarkerRename> | undefined;
-	let dispatchGate: ReturnType<typeof pauseFileUnlink> | undefined;
+	let claimGate: Gate | undefined;
+	let dispatchGate: Gate | undefined;
 	try {
 		await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
 		const port = (server.address() as { port: number }).port;
@@ -539,9 +408,13 @@ test("approved openclaw.invoke enforces host authority at real HTTP I/O", async 
 		const pendingId = pendingApproval.requiresApproval?.approvalId;
 		assert.ok(pendingToken);
 		assert.ok(pendingId);
-		const statePath = resumeStatePath(stateDir, pendingToken);
-		const checkpointBefore = await fsp.readFile(statePath, "utf8");
-		claimGate = pauseStateMarkerRename(statePath);
+		const stateKey = resumeStateKey(pendingToken);
+		const checkpointBefore = await storedText(stateDir, stateKey);
+		claimGate = pauseBackend(
+			"write",
+			(key, text) => key === stateKey && consumedMarker(text),
+			"after",
+		);
 		let claimCurrent = true;
 		const retiredBeforeIO = resumeToolRequest({
 			token: pendingToken,
@@ -554,7 +427,7 @@ test("approved openclaw.invoke enforces host authority at real HTTP I/O", async 
 				},
 			},
 		});
-		await waitForGate(claimGate.renameStarted);
+		await waitForGate(claimGate.started);
 		claimCurrent = false;
 		claimGate.release();
 		const rejected = await retiredBeforeIO;
@@ -562,7 +435,7 @@ test("approved openclaw.invoke enforces host authority at real HTTP I/O", async 
 		assert.match(rejected.error?.message ?? "", /host invocation retired/);
 		assert.equal(requests.length, 1, "retired approval must not reach the HTTP server");
 		const retiredRequests = requests.length;
-		const checkpointRestored = (await fsp.readFile(statePath, "utf8")) === checkpointBefore;
+		const checkpointRestored = (await storedText(stateDir, stateKey)) === checkpointBefore;
 		assert.equal(checkpointRestored, true);
 		claimGate.restore();
 		claimGate = undefined;
@@ -586,7 +459,11 @@ test("approved openclaw.invoke enforces host authority at real HTTP I/O", async 
 		const dispatchedId = dispatchedApproval.requiresApproval?.approvalId;
 		assert.ok(dispatchedToken);
 		assert.ok(dispatchedId);
-		dispatchGate = pauseFileUnlink(path.join(stateDir, `approval_${dispatchedId}.json`));
+		dispatchGate = pauseBackend(
+			"write",
+			(key, text) => key === `approval_${dispatchedId}` && text === null,
+			"after",
+		);
 		let dispatchCurrent = true;
 		const retiredAfterIO = resumeToolRequest({
 			token: dispatchedToken,
@@ -599,7 +476,7 @@ test("approved openclaw.invoke enforces host authority at real HTTP I/O", async 
 				},
 			},
 		});
-		await waitForGate(dispatchGate.unlinkStarted);
+		await waitForGate(dispatchGate.started);
 		assert.equal(requests.length, 3, "the HTTP effect must precede host retirement");
 		const dispatchedRequests = requests.length;
 		dispatchCurrent = false;
@@ -691,7 +568,7 @@ test("approved pipeline cannot publish a successor approval after host retiremen
 		assert.equal(first.status, "needs_approval");
 		const token = first.requiresApproval?.resumeToken;
 		assert.ok(token);
-		const before = (await fsp.readdir(tmp)).sort();
+		const before = await storeSnapshot(tmp);
 		const authority = retireAfterDispatch();
 		const resumed = await resumeToolRequest({
 			token,
@@ -700,7 +577,7 @@ test("approved pipeline cannot publish a successor approval after host retiremen
 		});
 		assert.equal(resumed.ok, false);
 		assert.match(resumed.error?.message ?? "", /host invocation retired/);
-		assert.deepEqual((await fsp.readdir(tmp)).sort(), before);
+		assert.deepEqual(await storeSnapshot(tmp), before);
 	} finally {
 		await fsp.rm(tmp, { recursive: true, force: true });
 	}
@@ -709,7 +586,7 @@ test("approved pipeline cannot publish a successor approval after host retiremen
 test("approved pipeline removes a successor linked before host retirement", async () => {
 	const tmp = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-host-authority-index-"));
 	const env = { ...process.env, LOBSTER_STATE_DIR: tmp };
-	let gate: ReturnType<typeof pauseApprovalIndexLink> | undefined;
+	let gate: Gate | undefined;
 	try {
 		const first = await runToolRequest({
 			pipeline: 'approve --prompt "First?" | approve --prompt "Second?"',
@@ -718,8 +595,12 @@ test("approved pipeline removes a successor linked before host retirement", asyn
 		assert.equal(first.status, "needs_approval");
 		const token = first.requiresApproval?.resumeToken;
 		assert.ok(token);
-		const before = (await fsp.readdir(tmp)).sort();
-		gate = pauseApprovalIndexLink(tmp);
+		const before = await storeSnapshot(tmp);
+		gate = pauseBackend(
+			"write",
+			(key, text) => key.startsWith("approval_") && text != null,
+			"after",
+		);
 		let current = true;
 		const pending = resumeToolRequest({
 			token,
@@ -732,13 +613,13 @@ test("approved pipeline removes a successor linked before host retirement", asyn
 				},
 			},
 		});
-		await gate.linkStarted;
+		await gate.started;
 		current = false;
 		gate.release();
 		const resumed = await pending;
 		assert.equal(resumed.ok, false);
 		assert.match(resumed.error?.message ?? "", /host invocation retired/);
-		assert.deepEqual((await fsp.readdir(tmp)).sort(), before);
+		assert.deepEqual(await storeSnapshot(tmp), before);
 	} finally {
 		gate?.release();
 		gate?.restore();
@@ -749,7 +630,7 @@ test("approved pipeline removes a successor linked before host retirement", asyn
 test("approved pipeline restores the predecessor after retirement during old-index cleanup", async () => {
 	const tmp = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-host-authority-old-index-"));
 	const env = { ...process.env, LOBSTER_STATE_DIR: tmp };
-	let gate: ReturnType<typeof pauseFileUnlink> | undefined;
+	let gate: Gate | undefined;
 	try {
 		const first = await runToolRequest({
 			pipeline: 'approve --prompt "First?" | approve --prompt "Second?"',
@@ -760,8 +641,12 @@ test("approved pipeline restores the predecessor after retirement during old-ind
 		const approvalId = first.requiresApproval?.approvalId;
 		assert.ok(token);
 		assert.ok(approvalId);
-		const before = (await fsp.readdir(tmp)).sort();
-		gate = pauseFileUnlink(path.join(tmp, `approval_${approvalId}.json`));
+		const before = await storeSnapshot(tmp);
+		gate = pauseBackend(
+			"write",
+			(key, text) => key === `approval_${approvalId}` && text === null,
+			"after",
+		);
 		let current = true;
 		const pending = resumeToolRequest({
 			token,
@@ -774,13 +659,13 @@ test("approved pipeline restores the predecessor after retirement during old-ind
 				},
 			},
 		});
-		await waitForGate(gate.unlinkStarted);
+		await waitForGate(gate.started);
 		current = false;
 		gate.release();
 		const resumed = await pending;
 		assert.equal(resumed.ok, false);
 		assert.match(resumed.error?.message ?? "", /host invocation retired/);
-		assert.deepEqual((await fsp.readdir(tmp)).sort(), before);
+		assert.deepEqual(await storeSnapshot(tmp), before);
 		const retried = await resumeToolRequest({
 			approvalId,
 			approved: true,
@@ -798,7 +683,7 @@ test("approved pipeline restores the predecessor after retirement during old-ind
 test("approved pipeline restores the predecessor when a successor input is retired", async () => {
 	const tmp = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-host-authority-input-"));
 	const env = { ...process.env, LOBSTER_STATE_DIR: tmp };
-	let gate: ReturnType<typeof pauseFileUnlink> | undefined;
+	let gate: Gate | undefined;
 	try {
 		const first = await runToolRequest({
 			pipeline: 'approve --prompt "First?" | ask --prompt "Name?"',
@@ -809,8 +694,12 @@ test("approved pipeline restores the predecessor when a successor input is retir
 		const approvalId = first.requiresApproval?.approvalId;
 		assert.ok(token);
 		assert.ok(approvalId);
-		const before = (await fsp.readdir(tmp)).sort();
-		gate = pauseFileUnlink(path.join(tmp, `approval_${approvalId}.json`));
+		const before = await storeSnapshot(tmp);
+		gate = pauseBackend(
+			"write",
+			(key, text) => key === `approval_${approvalId}` && text === null,
+			"after",
+		);
 		let current = true;
 		const pending = resumeToolRequest({
 			token,
@@ -823,13 +712,13 @@ test("approved pipeline restores the predecessor when a successor input is retir
 				},
 			},
 		});
-		await waitForGate(gate.unlinkStarted);
+		await waitForGate(gate.started);
 		current = false;
 		gate.release();
 		const resumed = await pending;
 		assert.equal(resumed.ok, false);
 		assert.match(resumed.error?.message ?? "", /host invocation retired/);
-		assert.deepEqual((await fsp.readdir(tmp)).sort(), before);
+		assert.deepEqual(await storeSnapshot(tmp), before);
 		const retried = await resumeToolRequest({
 			approvalId,
 			approved: true,
@@ -850,7 +739,7 @@ for (const kind of ["pipeline"] as const) {
 		const stateDir = path.join(tmp, "state");
 		const effectPath = path.join(tmp, "committed.txt");
 		const env = { ...process.env, LOBSTER_STATE_DIR: stateDir, LOBSTER_EFFECT_FILE: effectPath };
-		let gate: ReturnType<typeof pauseStateMarkerRename> | undefined;
+		let gate: Gate | undefined;
 		try {
 			const filePath = path.join(tmp, "workflow.lobster");
 			const first =
@@ -866,9 +755,13 @@ for (const kind of ["pipeline"] as const) {
 			const approvalId = first.requiresApproval?.approvalId;
 			assert.ok(token);
 			assert.ok(approvalId);
-			const statePath = resumeStatePath(stateDir, token);
-			const before = await fsp.readFile(statePath, "utf8");
-			gate = pauseStateMarkerRename(statePath);
+			const stateKey = resumeStateKey(token);
+			const before = await storedText(stateDir, stateKey);
+			gate = pauseBackend(
+				"write",
+				(key, text) => key === stateKey && consumedMarker(text),
+				"after",
+			);
 			let current = true;
 			const pending = resumeToolRequest({
 				token,
@@ -881,14 +774,14 @@ for (const kind of ["pipeline"] as const) {
 					},
 				},
 			});
-			await waitForGate(gate.renameStarted);
+			await waitForGate(gate.started);
 			current = false;
 			gate.release();
 			const resumed = await pending;
 			assert.equal(resumed.ok, false);
 			assert.match(resumed.error?.message ?? "", /host invocation retired/);
 			await assert.rejects(fsp.stat(effectPath), { code: "ENOENT" });
-			assert.equal(await fsp.readFile(statePath, "utf8"), before);
+			assert.equal(await storedText(stateDir, stateKey), before);
 			const cancelled = await resumeToolRequest({
 				approvalId,
 				cancel: true,
@@ -909,10 +802,7 @@ for (const kind of ["pipeline"] as const) {
 			const tmp = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-host-authority-terminal-"));
 			const stateDir = path.join(tmp, "state");
 			const env = { ...process.env, LOBSTER_STATE_DIR: stateDir };
-			let gate:
-				| ReturnType<typeof pauseStateMarkerRename>
-				| ReturnType<typeof pauseFileUnlink>
-				| undefined;
+			let gate: Gate | undefined;
 			try {
 				const filePath = path.join(tmp, "workflow.lobster");
 				const first =
@@ -927,9 +817,14 @@ for (const kind of ["pipeline"] as const) {
 				const approvalId = first.requiresApproval?.approvalId;
 				assert.ok(token);
 				assert.ok(approvalId);
-				const statePath = resumeStatePath(stateDir, token);
-				const before = await fsp.readFile(statePath, "utf8");
-				gate = phase === "marker" ? pauseStateMarkerRename(statePath) : pauseFileUnlink(statePath);
+				const stateKey = resumeStateKey(token);
+				const before = await storedText(stateDir, stateKey);
+				gate = pauseBackend(
+					"write",
+					(key, text) =>
+						key === stateKey && (phase === "marker" ? consumedMarker(text) : text === null),
+					"after",
+				);
 				let current = true;
 				const pending = resumeToolRequest({
 					token,
@@ -948,7 +843,7 @@ for (const kind of ["pipeline"] as const) {
 				const resumed = await pending;
 				assert.equal(resumed.ok, false);
 				assert.match(resumed.error?.message ?? "", /host invocation retired/);
-				assert.equal(await fsp.readFile(statePath, "utf8"), before);
+				assert.equal(await storedText(stateDir, stateKey), before);
 				const cancelled = await resumeToolRequest({
 					approvalId,
 					cancel: true,
@@ -970,7 +865,7 @@ for (const kind of ["pipeline"] as const) {
 		const stateDir = path.join(tmp, "state");
 		const effectPath = path.join(tmp, "committed.txt");
 		const env = { ...process.env, LOBSTER_STATE_DIR: stateDir, LOBSTER_EFFECT_FILE: effectPath };
-		let gate: ReturnType<typeof pauseFileUnlink> | undefined;
+		let gate: Gate | undefined;
 		try {
 			const command = `"${process.execPath}" -e "require('node:fs').writeFileSync(process.env.LOBSTER_EFFECT_FILE, 'committed')"`;
 			const filePath = path.join(tmp, "workflow.lobster");
@@ -986,7 +881,11 @@ for (const kind of ["pipeline"] as const) {
 			const approvalId = first.requiresApproval?.approvalId;
 			assert.ok(token);
 			assert.ok(approvalId);
-			gate = pauseFileUnlink(path.join(stateDir, `approval_${approvalId}.json`));
+			gate = pauseBackend(
+				"write",
+				(key, text) => key === `approval_${approvalId}` && text === null,
+				"after",
+			);
 			let current = true;
 			const pending = resumeToolRequest({
 				token,
@@ -999,20 +898,20 @@ for (const kind of ["pipeline"] as const) {
 					},
 				},
 			});
-			await waitForGate(gate.unlinkStarted);
+			await waitForGate(gate.started);
 			current = false;
 			gate.release();
 			const resumed = await pending;
 			assert.equal(resumed.ok, false);
 			assert.match(resumed.error?.message ?? "", /host invocation retired/);
 			assert.equal(await fsp.readFile(effectPath, "utf8"), "committed");
-			const files = await fsp.readdir(stateDir);
+			const keys = Object.keys(await storeSnapshot(stateDir));
 			assert.equal(
-				files.some((name) => name.startsWith("approval_")),
+				keys.some((name) => name.startsWith("approval_")),
 				false,
 			);
 			assert.equal(
-				files.filter((name) => /^(pipeline|workflow)_resume_/.test(name)).length,
+				keys.filter((name) => /^(pipeline|workflow)_resume_/.test(name)).length,
 				kind === "pipeline" ? 1 : 0,
 			);
 			const replay = await resumeToolRequest({ token, approved: true, ctx: { cwd: tmp, env } });

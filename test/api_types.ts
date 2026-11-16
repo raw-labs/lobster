@@ -9,8 +9,6 @@ import {
 export type {
 	SdkApprovalRequest,
 	SdkInputRequest,
-	MigrationOptions,
-	MigrationPhase,
 	PersistenceOptions,
 	RunMetadata,
 	HistoryPage,

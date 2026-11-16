@@ -1,3 +1,4 @@
+import path from "node:path";
 import { listRuns, getRun, getWait } from "./core/runs.js";
 import { forceTerminateAbortableProcesses } from "./abortable_process.js";
 import { createDefaultRegistry } from "./commands/registry.js";
@@ -6,7 +7,6 @@ import { parsePipeline } from "./parser.js";
 import { runtimeErrorDetails } from "./persistence/backend.js";
 import { recorderFromEnv } from "./persistence/context.js";
 import { withExecution } from "./persistence/execution.js";
-import { migrateStore } from "./persistence/migrate.js";
 import { openStoreSession } from "./persistence/session.js";
 import { finalizePipelineToolRun } from "./pipeline_resume_state.js";
 import { parseResumeArgs } from "./resume.js";
@@ -870,7 +870,6 @@ function helpText() {
 		`  lobster history show <runId> [afterSequence]\n` +
 		`  lobster history prune <before> [--apply]\n` +
 		`  lobster storage export\n` +
-		`  lobster storage migrate files|sqlite --offline\n` +
 		`  lobster upgrade [--dry-run] [--json]\n` +
 		`  lobster doctor\n` +
 		`  lobster version\n` +
@@ -902,20 +901,6 @@ function graphHelpText() {
 }
 
 async function handlePersistence(argv: string[]) {
-	if (argv[0] === "storage" && argv[1] === "migrate") {
-		const backend = argv[2];
-		if (backend !== "files" && backend !== "sqlite") {
-			throw new Error("storage migrate files|sqlite --offline");
-		}
-		const { defaultStateDir } = await import("./state/store.js");
-		const result = await migrateStore({
-			directory: defaultStateDir(process.env),
-			backend,
-			offline: argv.includes("--offline"),
-		});
-		process.stdout.write(JSON.stringify(result) + "\n");
-		return;
-	}
 	const session = await openStoreSession({
 		env: process.env,
 		readOnly: !(argv[0] === "history" && argv[1] === "prune" && argv.includes("--apply")),
@@ -932,7 +917,7 @@ async function handlePersistence(argv: string[]) {
 			result = await session.backend.export();
 		} else {
 			throw new Error(
-				"history list|show <runId> [afterSequence]|prune <before> [--apply]; storage export|migrate files|sqlite --offline",
+				"history list|show <runId> [afterSequence]|prune <before> [--apply]; storage export",
 			);
 		}
 		process.stdout.write(JSON.stringify(result) + "\n");
@@ -989,15 +974,15 @@ async function offerUpgrade(argv: string[], signal: AbortSignal) {
 	const toolMode = argv.some(
 		(arg, index) => arg === "--mode=tool" || (arg === "--mode" && argv[index + 1] === "tool"),
 	);
-	const what = `${pending.length} workflow run${pending.length === 1 ? " was" : "s were"} paused by an older version of Lobster and must be converted before ${pending.length === 1 ? "it" : "they"} can be resumed.`;
+	const what = `Found ${pending.length} saved item${pending.length === 1 ? "" : "s"} (paused runs, approval IDs, stored values) from an older version of Lobster. ${pending.length === 1 ? "It" : "They"} must be imported once before ${pending.length === 1 ? "it" : "they"} can be used.`;
 	if (toolMode || argv[0] === "resume" || !process.stdin.isTTY || !process.stderr.isTTY) {
 		process.stderr.write(`lobster: ${what} Run \`lobster upgrade\`.\n`);
 		return;
 	}
-	process.stderr.write(`${what}\nConvert now? [y/N] `);
+	process.stderr.write(`${what}\nImport now? [y/N] `);
 	const answer = String((await readLineFromStream(process.stdin, { signal })) ?? "").trim();
 	if (!/^y(es)?$/i.test(answer)) {
-		process.stderr.write("Not converted. Run `lobster upgrade` when ready.\n");
+		process.stderr.write("Not imported. Run `lobster upgrade` when ready.\n");
 		return;
 	}
 	try {
@@ -1031,26 +1016,32 @@ async function handleUpgrade(argv: string[]) {
 }
 
 function formatUpgradeReport(report: UpgradeReport): string {
-	const plural = (n: number) => `${n} paused workflow${n === 1 ? "" : "s"}`;
-	if (!report.converted.length && !report.skipped.length) return "Nothing to upgrade.\n";
+	const count = (n: number, what: string) => `${n} ${what}${n === 1 ? "" : "s"}`;
+	if (!report.converted.length && !report.imported.length && !report.skipped.length)
+		return "Nothing to upgrade.\n";
+	const would = (done: string, planned: string) => (report.dryRun ? planned : done);
 	const lines: string[] = [];
 	if (report.converted.length)
 		lines.push(
-			report.dryRun
-				? `Would convert ${plural(report.converted.length)}.`
-				: `Converted ${plural(report.converted.length)}. Their existing tokens and approval IDs still work.`,
+			`${would("Converted", "Would convert")} ${count(report.converted.length, "paused workflow")}.`,
 		);
+	if (report.imported.length)
+		lines.push(
+			`${would("Imported", "Would import")} ${count(report.imported.length, "other saved item")} (paused pipelines, approval IDs, stored values).`,
+		);
+	if (!report.dryRun && (report.converted.length || report.imported.length))
+		lines.push("Existing resume tokens and approval IDs still work.");
 	if (report.skipped.length) {
 		lines.push(
-			`${report.dryRun ? "Would skip" : "Skipped"} ${plural(report.skipped.length)} that cannot be converted:`,
+			`${would("Skipped", "Would skip")} ${count(report.skipped.length, "item")} that cannot be used:`,
 		);
 		for (const item of report.skipped) lines.push(`  ${item.checkpointId}: ${item.reason}`);
 		const moved = report.skipped.find((item) => item.movedTo);
 		if (moved)
 			lines.push(
-				`Moved to ${moved.movedTo!.slice(0, moved.movedTo!.lastIndexOf("/"))}. To retry one, fix its workflow file, move it back and run \`lobster upgrade\` again.`,
+				`Moved to ${path.dirname(moved.movedTo!)}. To retry one, fix the cause (for example its workflow file), move it back and run \`lobster upgrade\` again.`,
 			);
 	}
-	if (report.backup) lines.push(`Backup of the previous state: ${report.backup}`);
+	if (report.backup) lines.push(`The original files were moved to ${report.backup}`);
 	return lines.join("\n") + "\n";
 }

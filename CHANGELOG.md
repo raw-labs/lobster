@@ -4,6 +4,10 @@ All notable changes to Lobster will be documented in this file.
 
 ## Unreleased
 
+- Keep all state in one SQLite database (`lobster.sqlite`) in the state directory, and save workflow-file progress so interrupted runs can be continued with `lobster runs advance`. Requires the same runtime as OpenClaw: Node >=24.16.0 <25 or >=26.1.0.
+- Add `lobster upgrade`, a one-off import of state saved by older versions (paused workflows and pipelines, approval IDs, `state.set` values); existing resume tokens and approval IDs keep working. Until it runs, resuming such state fails with `upgrade_required`.
+- Report runs stopped while a command was running as `blocked`, and add `lobster runs abandon <runId>` to stop them for good.
+
 ## 2026.10.1 - 2026-10-20
 
 **Highlights:** Honor host invocation authority before effects, prevent unsafe resume replay, and report invalid workflow paths consistently.

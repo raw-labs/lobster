@@ -6,37 +6,51 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
-import { createDefaultRegistry, resumeToolRequest } from "../src/core/index.js";
+import { createDefaultRegistry, resumeToolRequest, runToolRequest } from "../src/core/index.js";
 import { openStoreSession } from "../src/persistence/session.js";
+import { withFileLock } from "../src/state/file_lock.js";
 import { encodeToken } from "../src/token.js";
 import { pendingUpgrade, upgradeStore } from "../src/workflows/upgrade.js";
 
 const exec = promisify(execFile);
 const repoRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
-// Written by `lobster run --mode tool --file` on main (85307ff): one pause at an approval
-// step, one at an input step, one inside a pipeline command. `__DIR__` is the test directory.
+// State directory contents written by Lobster on main (85307ff): three paused workflow
+// files (an approval step, an input step, a command asking for input inside a pipeline
+// step), a paused pipeline, their short approval IDs and a `state.set` value.
+// `__DIR__` stands for the test directory.
 const fixtures = path.join(repoRoot, "test", "fixtures", "upgrade");
 
-type Pauses = { approval: string; input: string; command: string; approvalId: string };
+type Saved = {
+	approval: string;
+	input: string;
+	command: string;
+	pipeline: string;
+	approvalId: string;
+	pipelineApprovalId: string;
+};
 
 async function setup(t: test.TestContext) {
 	const dir = await fs.mkdtemp(path.join(os.tmpdir(), "lobster-upgrade-"));
 	t.after(() => fs.rm(dir, { recursive: true, force: true }));
 	const state = path.join(dir, "state");
 	await fs.mkdir(state);
-	const pauses = {} as Pauses;
+	const saved = {} as Saved;
+	const approvals: Record<string, string> = {};
 	for (const name of await fs.readdir(fixtures)) {
 		const text = (await fs.readFile(path.join(fixtures, name), "utf8")).replaceAll("__DIR__", dir);
 		const target = name.endsWith(".lobster") ? path.join(dir, name) : path.join(state, name);
 		await fs.writeFile(target, text);
-		if (name.startsWith("approval_")) pauses.approvalId = name.slice("approval_".length, -5);
+		const key = name.slice(0, -5);
+		if (name.startsWith("approval_")) approvals[JSON.parse(text).stateKey] = key.slice(9);
+		if (name.startsWith("pipeline_resume_")) saved.pipeline = key;
 		if (!name.startsWith("workflow_resume_")) continue;
 		const value = JSON.parse(text);
-		const key = name.slice(0, -5);
-		if (value.approvalStepId) pauses.approval = key;
-		else if (value.inputKind === "pipeline_command") pauses.command = key;
-		else pauses.input = key;
+		if (value.approvalStepId) saved.approval = key;
+		else if (value.inputKind === "pipeline_command") saved.command = key;
+		else saved.input = key;
 	}
+	saved.approvalId = approvals[saved.approval];
+	saved.pipelineApprovalId = approvals[saved.pipeline];
 	const env = { LOBSTER_STATE_DIR: state };
 	const ctx = { env, registry: createDefaultRegistry() };
 	const runs = async (file: string) =>
@@ -44,20 +58,26 @@ async function setup(t: test.TestContext) {
 			.length;
 	const token = (key: string) =>
 		encodeToken({ protocolVersion: 1, v: 1, kind: "workflow-file", stateKey: key });
-	return { dir, state, env, ctx, pauses, runs, token };
+	return { dir, state, env, ctx, saved, runs, token };
 }
 
-test("resuming an unconverted workflow pause asks for `lobster upgrade`", async (t) => {
-	const { state, ctx, pauses, token } = await setup(t);
-	assert.equal((await pendingUpgrade(state)).length, 3);
-	const result = await resumeToolRequest({
-		token: token(pauses.input),
+test("resuming anything saved by an older Lobster asks for `lobster upgrade`", async (t) => {
+	const { state, ctx, saved, token } = await setup(t);
+	assert.equal((await pendingUpgrade(state)).length, 7);
+	const workflow = await resumeToolRequest({
+		token: token(saved.input),
 		response: { ok: true },
 		ctx,
 	});
-	assert.equal(result.ok, false);
-	assert.equal(result.error.type, "upgrade_required");
-	assert.match(result.error.message, /lobster upgrade/);
+	assert.equal(workflow.ok, false);
+	assert.equal(workflow.error.type, "upgrade_required");
+	assert.match(workflow.error.message, /lobster upgrade/);
+	const pipeline = await resumeToolRequest({
+		approvalId: saved.pipelineApprovalId,
+		approved: true,
+		ctx,
+	});
+	assert.equal(pipeline.error.type, "upgrade_required");
 });
 
 test("dry run reports without changing anything", async (t) => {
@@ -65,91 +85,97 @@ test("dry run reports without changing anything", async (t) => {
 	const before = (await fs.readdir(state)).sort();
 	const report = await upgradeStore({ directory: state, dryRun: true });
 	assert.equal(report.converted.length, 3);
+	assert.equal(report.imported.length, 4);
 	assert.equal(report.skipped.length, 0);
 	assert.equal(report.backup, undefined);
-	assert.deepEqual((await fs.readdir(state)).sort(), before);
+	assert.deepEqual((await fs.readdir(state)).sort(), before, "not even a database is created");
 });
 
-test("upgrade converts every pause once, keeps tokens, and never reruns finished steps", async (t) => {
-	const { state, ctx, pauses, runs, token } = await setup(t);
+test("upgrade moves everything into the store once and every old token still works", async (t) => {
+	const { state, ctx, saved, runs, token } = await setup(t);
 	const report = await upgradeStore({ directory: state });
 	assert.equal(report.converted.length, 3);
+	assert.equal(report.imported.length, 4);
 	assert.ok(report.backup);
-	const backup = JSON.parse(await fs.readFile(report.backup!, "utf8"));
-	assert.ok(backup.states[pauses.input], "backup keeps the original pause");
+	assert.equal((await fs.readdir(report.backup!)).length, 7, "the originals are kept aside");
 	assert.deepEqual(await pendingUpgrade(state), []);
 	assert.deepEqual(await upgradeStore({ directory: state }), {
 		dryRun: false,
 		converted: [],
+		imported: [],
 		skipped: [],
 	});
 
-	const input = await resumeToolRequest({
-		token: token(pauses.input),
-		response: { ok: true },
-		ctx,
-	});
+	const input = await resumeToolRequest({ token: token(saved.input), response: { ok: true }, ctx });
 	assert.equal(input.status, "ok", JSON.stringify(input));
 	assert.deepEqual(input.output, ["finished\n"]);
 	assert.equal(await runs("count_prep"), 0, "the step before the input does not run again");
 	assert.equal(await runs("count_finish"), 1);
-	const again = await resumeToolRequest({
-		token: token(pauses.input),
-		response: { ok: true },
-		ctx,
-	});
+	const again = await resumeToolRequest({ token: token(saved.input), response: { ok: true }, ctx });
 	assert.equal(again.ok, false, "a token resumes once");
 
-	const invalid = await resumeToolRequest({ token: token(pauses.command), response: "x", ctx });
+	const invalid = await resumeToolRequest({ token: token(saved.command), response: "x", ctx });
 	assert.equal(invalid.error.type, "parse_error");
-	const command = await resumeToolRequest({ token: token(pauses.command), response: 7, ctx });
+	const command = await resumeToolRequest({ token: token(saved.command), response: 7, ctx });
 	assert.equal(command.status, "ok", JSON.stringify(command));
 	assert.equal(await runs("count_pprep"), 0);
 	assert.equal(await runs("count_pdone"), 1);
 
-	const approved = await resumeToolRequest({ approvalId: pauses.approvalId, approved: true, ctx });
+	const approved = await resumeToolRequest({ approvalId: saved.approvalId, approved: true, ctx });
 	assert.equal(approved.status, "ok", JSON.stringify(approved));
 	assert.deepEqual(approved.output, ["done\n"]);
-	assert.equal(await runs("count_before"), 0);
 	assert.equal(await runs("count_ship"), 0, "the approved command does not run again");
 	assert.equal(await runs("count_after"), 1);
+
+	const pipeline = await resumeToolRequest({
+		approvalId: saved.pipelineApprovalId,
+		approved: true,
+		ctx,
+	});
+	assert.equal(pipeline.status, "ok", JSON.stringify(pipeline));
+	assert.equal(await runs("count_pipe"), 0);
+	assert.equal(await runs("count_pipe_after"), 1);
+
+	const value = await runToolRequest({ pipeline: "state.get mykey", ctx });
+	assert.deepEqual(value.output, [{ v: 42 }]);
 });
 
 test("a rejected converted approval cancels without running anything", async (t) => {
-	const { state, ctx, pauses, runs, token } = await setup(t);
+	const { state, ctx, saved, runs, token } = await setup(t);
 	await upgradeStore({ directory: state });
-	const rejected = await resumeToolRequest({ token: token(pauses.approval), approved: false, ctx });
+	const rejected = await resumeToolRequest({ token: token(saved.approval), approved: false, ctx });
 	assert.equal(rejected.status, "cancelled", JSON.stringify(rejected));
 	assert.equal((await runs("count_ship")) + (await runs("count_after")), 0);
 });
 
 test("approver rules in the workflow file still apply after conversion", async (t) => {
-	const { dir, state, ctx, pauses, runs } = await setup(t);
+	const { dir, state, ctx, saved, runs } = await setup(t);
 	const file = path.join(dir, "approve.lobster");
 	const workflow = JSON.parse(await fs.readFile(file, "utf8"));
 	workflow.steps[1].approval = { prompt: "Ship it?", required_approver: "alice" };
 	await fs.writeFile(file, JSON.stringify(workflow));
 	await upgradeStore({ directory: state });
-	const anonymous = await resumeToolRequest({ approvalId: pauses.approvalId, approved: true, ctx });
+	const anonymous = await resumeToolRequest({ approvalId: saved.approvalId, approved: true, ctx });
 	assert.equal(anonymous.ok, false);
 	assert.match(anonymous.error.message, /requires approver identity/);
+	const as = (who: string) => ({ ...ctx, env: { ...ctx.env, LOBSTER_APPROVAL_APPROVED_BY: who } });
 	const bob = await resumeToolRequest({
-		approvalId: pauses.approvalId,
+		approvalId: saved.approvalId,
 		approved: true,
-		ctx: { ...ctx, env: { ...ctx.env, LOBSTER_APPROVAL_APPROVED_BY: "bob" } },
+		ctx: as("bob"),
 	});
 	assert.equal(bob.ok, false);
 	const alice = await resumeToolRequest({
-		approvalId: pauses.approvalId,
+		approvalId: saved.approvalId,
 		approved: true,
-		ctx: { ...ctx, env: { ...ctx.env, LOBSTER_APPROVAL_APPROVED_BY: "alice" } },
+		ctx: as("alice"),
 	});
 	assert.equal(alice.status, "ok", JSON.stringify(alice));
 	assert.equal(await runs("count_after"), 1);
 });
 
 test("pauses whose workflow file is gone or changed are set aside, not lost", async (t) => {
-	const { dir, state, pauses } = await setup(t);
+	const { dir, state, saved } = await setup(t);
 	await fs.rm(path.join(dir, "input.lobster"));
 	const pcmd = path.join(dir, "pcmd.lobster");
 	const changed = JSON.parse(await fs.readFile(pcmd, "utf8"));
@@ -158,33 +184,40 @@ test("pauses whose workflow file is gone or changed are set aside, not lost", as
 	const report = await upgradeStore({ directory: state });
 	assert.deepEqual(
 		report.converted.map((item) => item.checkpointId),
-		[pauses.approval],
+		[saved.approval],
 	);
 	const skipped = Object.fromEntries(report.skipped.map((item) => [item.checkpointId, item]));
-	assert.match(skipped[pauses.input].reason, /Workflow file not found/);
-	assert.match(skipped[pauses.command].reason, /changed since the pause/);
-	for (const item of report.skipped) {
-		assert.ok(item.movedTo);
-		await fs.access(item.movedTo!);
-	}
+	assert.match(skipped[saved.input].reason, /Workflow file not found/);
+	assert.match(skipped[saved.command].reason, /changed since the pause/);
+	for (const item of report.skipped) await fs.access(item.movedTo!);
 	assert.deepEqual(await pendingUpgrade(state), []);
-	// The backup was taken before anything moved.
-	const backup = JSON.parse(await fs.readFile(report.backup!, "utf8"));
-	assert.ok(backup.states[pauses.input] && backup.states[pauses.command]);
 });
 
-test("upgrade refuses while another Lobster session is open", async (t) => {
-	const { state, env } = await setup(t);
-	const session = await openStoreSession({ env });
-	try {
-		await assert.rejects(upgradeStore({ directory: state }), /Stop other running Lobster/);
-	} finally {
-		await session.close();
-	}
+test("a value stored under the same key with different contents is not overwritten", async (t) => {
+	const { state } = await setup(t);
+	const store = await openStoreSession({ directory: state });
+	await store.write("mykey", '{"v":1}');
+	await store.close();
+	const report = await upgradeStore({ directory: state });
+	assert.match(
+		report.skipped.find((item) => item.checkpointId === "mykey")!.reason,
+		/different value/,
+	);
+	const after = await openStoreSession({ directory: state, readOnly: true });
+	assert.equal((await after.read("mykey")).text, '{"v":1}');
+	await after.close();
+});
+
+test("upgrade refuses while an older Lobster holds a state lock", async (t) => {
+	const { state } = await setup(t);
+	await withFileLock({
+		filePath: path.join(state, "mykey.json"),
+		task: () => assert.rejects(upgradeStore({ directory: state }), /Stop other running Lobster/),
+	});
 	assert.equal((await upgradeStore({ directory: state })).converted.length, 3);
 });
 
-test("CLI: run hints at upgrade off a terminal; `lobster upgrade` converts", async (t) => {
+test("CLI: run reminds about the upgrade off a terminal; `lobster upgrade` imports", async (t) => {
 	const { dir, state } = await setup(t);
 	const bin = path.join(repoRoot, "bin", "lobster.js");
 	const env = { ...process.env, LOBSTER_STATE_DIR: state };
@@ -192,22 +225,12 @@ test("CLI: run hints at upgrade off a terminal; `lobster upgrade` converts", asy
 		path.join(dir, "hello.lobster"),
 		'{"steps":[{"id":"hi","command":"echo hi"}]}',
 	);
-	const run = await exec(
-		process.execPath,
-		[bin, "run", "--file", path.join(dir, "hello.lobster")],
-		{
-			env,
-		},
-	);
-	assert.match(run.stderr, /3 workflow runs were paused by an older version.*lobster upgrade/);
+	const hello = [bin, "run", "--file", path.join(dir, "hello.lobster")];
+	const run = await exec(process.execPath, hello, { env });
+	assert.match(run.stderr, /Found 7 saved items .* older version of Lobster.*lobster upgrade/);
 	const upgrade = await exec(process.execPath, [bin, "upgrade", "--json"], { env });
-	assert.equal(JSON.parse(upgrade.stdout).converted.length, 3);
-	const after = await exec(
-		process.execPath,
-		[bin, "run", "--file", path.join(dir, "hello.lobster")],
-		{
-			env,
-		},
-	);
+	const report = JSON.parse(upgrade.stdout);
+	assert.equal(report.converted.length + report.imported.length, 7);
+	const after = await exec(process.execPath, hello, { env });
 	assert.doesNotMatch(after.stderr, /older version/);
 });

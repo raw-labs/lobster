@@ -3,12 +3,13 @@ import { waitForPid } from "./helpers/wait_for_pid.js";
 import assert from "node:assert/strict";
 import { getEventListeners } from "node:events";
 import { spawnSync } from "node:child_process";
-import { access, chmod, copyFile, mkdtemp, readdir, rm } from "node:fs/promises";
+import { access, chmod, copyFile, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { Lobster } from "../src/sdk/Lobster.js";
+import { openStoreSession } from "../src/persistence/session.js";
 import { ghPrView, prMonitor, prMonitorNotify } from "../src/recipes/github/index.js";
 
 const __filename = fileURLToPath(import.meta.url);
@@ -179,7 +180,12 @@ for (const recipe of [prMonitor, prMonitorNotify]) {
 				assert.equal(processIsRunning(pid), false, "result must wait for child exit");
 				assert.equal(await fileExists(terminated), true);
 				assert.equal(await fileExists(completed), false);
-				assert.deepEqual(await readdir(join(dir, "state")).catch(() => []), []);
+				const store = await openStoreSession({ directory: join(dir, "state"), readOnly: true });
+				try {
+					assert.deepEqual(Object.keys(await store.backend.listState("")), []);
+				} finally {
+					await store.close();
+				}
 				assert.equal(getEventListeners(controller.signal, "abort").length, 0);
 			} finally {
 				controller.abort();

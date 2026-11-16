@@ -1,6 +1,3 @@
-import { promises as fs } from "node:fs";
-import path from "node:path";
-import { resolveStateDirectory } from "../state/paths.js";
 import { PersistenceOutcomeUnknown } from "./backend.js";
 import {
 	bindRecorder,
@@ -37,26 +34,6 @@ export async function withStoreContext<C extends ExecutionContext, T>(
 	const injected = ctx.storeSession ? resolveStoreSession(ctx.storeSession) : sessionFromEnv(env);
 	if (injected) {
 		return task({ ...ctx, env: bindStoreSession(env, injected) });
-	}
-
-	let selected = false;
-	try {
-		await fs.access(path.join(resolveStateDirectory(env), ".backend"));
-		selected = true;
-	} catch (error) {
-		if (error.code !== "ENOENT") {
-			throw error;
-		}
-	}
-	if (
-		!selected &&
-		!env.LOBSTER_BACKEND &&
-		env.LOBSTER_HISTORY !== "1" &&
-		!ctx.history &&
-		env.LOBSTER_RUNS !== "1" &&
-		!ctx.trackRuns
-	) {
-		return task(ctx);
 	}
 
 	const session = await openStoreSession({

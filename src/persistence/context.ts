@@ -97,7 +97,6 @@ export function bindStoreSession(env: StoreEnvironment, handle: StoreHandle): St
 	return {
 		...env,
 		LOBSTER_STATE_DIR: session.directory,
-		LOBSTER_BACKEND: session.backend.kind,
 		[PERSISTENCE]: env[PERSISTENCE]?.session === session ? env[PERSISTENCE] : { session },
 	};
 }

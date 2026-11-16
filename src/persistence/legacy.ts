@@ -1,6 +1,6 @@
 import { validateCommandInputState } from "../input_request.js";
 import { compileCached } from "../validation.js";
-import { fingerprint, isRetiredCheckpoint, type LogicalArchive } from "./model.js";
+import { fingerprint, isRetiredCheckpoint } from "./model.js";
 
 /** Wrap a stored SDK input frame without changing the legacy token's state key. */
 export function legacyCheckpointText(key: string, text: string): string {
@@ -144,85 +144,5 @@ export function validateCheckpoint(key: string, text: string): void {
 		}
 	} catch (error) {
 		throw new Error(`Invalid saved input continuation: ${key}`, { cause: error });
-	}
-}
-
-export function validateContinuations(data: LogicalArchive): void {
-	const entries = [
-		...Object.entries(data.states),
-		...data.runs.flatMap((run) => Object.entries(run.states)),
-	];
-	const states = new Map(entries);
-	const resolve = (key: string): string | null | undefined => {
-		if (states.has(key)) return states.get(key);
-		const alternate = key.startsWith("workflow_resume_")
-			? key.replace("workflow_resume_", "workflow-resume_")
-			: key.replace("workflow-resume_", "workflow_resume_");
-		return states.get(alternate);
-	};
-	for (const [key, text] of entries) {
-		if (text === null) continue;
-		if (/^(pipeline_resume_|workflow[-_]resume_|sdk_resume_)/.test(key)) {
-			validateCheckpoint(key, text);
-			const value = JSON.parse(text);
-			if (value.machineVersion === 1) {
-				const run = data.runs.find((run) => run.id === value.runId);
-				const frame = run?.execution?.activations[value.activation];
-				if (
-					!frame ||
-					frame.waitKey !== key ||
-					frame.phase !== "waiting" ||
-					fingerprint(frame.wait) !== fingerprint(value.wait)
-				)
-					throw new Error("Orphaned workflow machine continuation: " + key);
-			}
-
-			if (
-				key.startsWith("workflow_resume_") &&
-				!isRetiredCheckpoint(text) &&
-				!isRetiredCheckpoint(
-					states.get(key.replace("workflow_resume_", "workflow-resume_")) ?? null,
-				)
-			) {
-				throw new Error(`Conflicting workflow checkpoint aliases: ${key}`);
-			}
-			if (value.supersededResumeStateKeys !== undefined) {
-				if (
-					!Array.isArray(value.supersededResumeStateKeys) ||
-					value.supersededResumeStateKeys.some(
-						(previous) =>
-							typeof previous !== "string" ||
-							!/^(pipeline_resume_|workflow[-_]resume_)[a-z0-9._-]+$/.test(previous) ||
-							previous === key ||
-							(resolve(previous) != null && !isRetiredCheckpoint(resolve(previous))),
-					)
-				) {
-					throw new Error(`Invalid superseded checkpoint reference: ${key}`);
-				}
-			}
-		} else if (/^approval_[a-f0-9]+$/.test(key)) {
-			const value = JSON.parse(text);
-			if (value.machineVersion === 1) {
-				const run = data.runs.find((run) => run.id === value.runId);
-				const frame = run?.execution?.activations[value.activation];
-				if (
-					!frame ||
-					frame.waitKey !== key ||
-					frame.phase !== "waiting" ||
-					fingerprint(frame.wait) !== fingerprint(value.wait)
-				)
-					throw new Error("Orphaned workflow machine continuation: " + key);
-			}
-
-			if (
-				!value ||
-				typeof value.stateKey !== "string" ||
-				!/^(pipeline_resume_|workflow[-_]resume_)[a-z0-9._-]+$/.test(value.stateKey)
-			) {
-				throw new Error(`Invalid approval checkpoint reference: ${key}`);
-			}
-			// A missing target is an already-expired optional short ID. Preserve it as
-			// expired; never create a checkpoint to satisfy the reference.
-		}
 	}
 }

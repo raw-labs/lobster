@@ -24,7 +24,12 @@ import {
 	consumeResumeState,
 	restoreConsumedResumeState,
 } from "../state/store.js";
-import { WorkflowResumeArgumentError, runWorkflowFile } from "../workflows/file.js";
+import {
+	WorkflowResumeArgumentError,
+	UpgradeRequiredError,
+	runWorkflowFile,
+} from "../workflows/file.js";
+import { savedByOlderVersion } from "../workflows/upgrade.js";
 
 export type ToolRunContext = PersistenceOptions & {
 	_resumeSignalAborted?: boolean;
@@ -263,6 +268,15 @@ export async function resumeToolRequest(
 			} catch {
 				/* normal parser reports the error */
 			}
+			// Still in a file an older Lobster wrote: it has to be imported first.
+			const store = sessionFromEnv(ctx.env)!;
+			const unimported =
+				key !== undefined
+					? (await store.read(key)).text === null && key
+					: resolved.approvalId &&
+						`approval_${String(resolved.approvalId).replace(/[^a-f0-9]/g, "")}`;
+			if (unimported && (await savedByOlderVersion(store.directory, unimported)))
+				return errorEnvelope("upgrade_required", new UpgradeRequiredError());
 			if (!key) {
 				return resumeToolRequestInternal({ ...resolved, ctx });
 			}

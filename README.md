@@ -41,9 +41,10 @@ Invalid workflow file paths are reported as input errors (exit code 2), whether 
 
 ## Persistence and run history
 
-File storage remains the default. Workflow-file runs always save execution progress
-on either backend. Standalone pipelines and SDK stages retain their existing
-persistence contracts. Detailed diagnostic history remains opt-in:
+Lobster keeps its state in one SQLite database, `lobster.sqlite`, in the state
+directory (`~/.lobster/state` by default, or `LOBSTER_STATE_DIR`). Workflow-file runs
+always save execution progress. Standalone pipelines and SDK stages save what they
+need to resume. Detailed diagnostic history remains opt-in:
 
 ```sh
 LOBSTER_HISTORY=1 lobster run --mode tool --file workflow.lobster
@@ -52,21 +53,14 @@ lobster history show <runId>                    # first 50 events
 lobster history show <runId> <afterSequence>    # next page
 ```
 
-For a **fresh state directory**, select SQLite explicitly:
-
-```sh
-LOBSTER_STATE_DIR=/path/to/new/state LOBSTER_BACKEND=sqlite LOBSTER_HISTORY=1 \
-  lobster run --mode tool --file workflow.lobster
-```
-
-On Node, SQLite requires 22.13+ on the Node 22 line, 23.4+ on Node 23, or Node 24+.
+Lobster needs the same runtime as OpenClaw: **Node >=24.16.0 <25 or >=26.1.0**
+(earlier `node:sqlite` builds truncate text at embedded NUL characters).
 **The SQLite library must contain the WAL-reset fix**: 3.51.3 or later,
 or the 3.50.7/3.44.6 backports and subsequent patches on those branches. The worker
 checks `sqlite_version()` on its actual connection before enabling WAL or writing
 schema. Runtime version metadata can differ from a dynamically selected library.
 Upgrade the runtime or selected SQLite library if qualification rejects it.
-The same qualification applies to migration. See the [SQLite fix](https://sqlite.org/wal.html#walreset).
-The file backend retains Node >=22 support and does not load `node:sqlite`.
+See the [SQLite fix](https://sqlite.org/wal.html#walreset).
 A worker owns the SQLite connection, prepared statements, and short transactions;
 embedded hosts receive promises. The database uses WAL, a 5-second busy timeout,
 and FULL durability. A session admits at most 256 outstanding worker requests
@@ -89,19 +83,12 @@ and operation receipts. A logical export includes full authoritative state, so
 store exports and backups privately. Continuations retain their existing full
 payloads and existing output limits; history capture adds no execution truncation.
 
-New tracked file continuations live with their events in one atomically replaced
-per-run record under `.history`. SQLite commits continuation transitions and their
-events together in indexed tables. The file backend rewrites its aggregate when
-history changes. Execution checkpoints currently replace the full execution
-snapshot on both backends; SQLite stores that snapshot with its run metadata. File-backed continuation lookup can scan
-retained runs, so use SQLite for large histories or busy embedded hosts. File
-queries stream run records instead of loading all histories into memory at once.
-Legacy JSON values keep their layout
-until migration or association with a tracked continuation. New tracked tokens
-require this runtime; older binaries cannot understand the new execution state.
-Workflow-file pauses saved by older versions need `lobster upgrade` once (see
-[Upgrading from an older version](#upgrading-from-an-older-version)). Old pipeline
-and SDK tokens retain their existing readers. History enables run tracking. To track
+SQLite commits continuation transitions and their events together in indexed
+tables. Execution checkpoints currently replace the full execution snapshot,
+stored with its run metadata. New tracked tokens require this runtime; older
+binaries cannot understand the new execution state. State saved by older
+versions as loose JSON files needs `lobster upgrade` once (see
+[Upgrading from an older version](#upgrading-from-an-older-version)). History enables run tracking. To track
 standalone pipeline/SDK status without detailed history, use `LOBSTER_RUNS=1` or
 `trackRuns: true`. Each run retains its original history setting when resumed.
 
@@ -118,7 +105,7 @@ import {
 } from '@clawdbot/lobster/core';
 
 const store = await openStoreSession({
-  directory: '/path/to/state', backend: 'sqlite', trackRuns: true,
+  directory: '/path/to/state', trackRuns: true,
 });
 const ctx = {
   storeSession: store,
@@ -199,58 +186,33 @@ history pruning. Workflow-file runs can also continue through `advanceWorkflowRu
 or `lobster runs advance`, subject to interrupted-activity recovery policy.
 No background dispatcher is included.
 
-### Migrating existing state
-
-A storage directory has one selected backend. SQLite selection refuses to create
-an empty authoritative database over existing file state. Coordinate all writers,
-including older binaries, then migrate explicitly:
-
-```sh
-LOBSTER_STATE_DIR=/path/to/state lobster storage migrate sqlite --offline
-```
-
-`--offline` declares that the caller has stopped all writers. Migration rejects
-live persistence sessions and outstanding state locks, writes a private logical
-backup, imports into a staging store, verifies it, closes it, and atomically
-activates backend selection. Retrying an interrupted conversion before activation
-keeps the source authoritative. After activation, stale files are never a fallback.
-The `.backup-*.archive` files contain full private state. Migration never scans or
-modifies OpenClaw's databases.
-
-The same command can migrate back to `files`, preserving the logical state and
-history. This is a backend round trip, not a binary downgrade. Source JSON must be
-valid; malformed authoritative input aborts conversion. Legacy runs have absent
-history until a stored continuation is associated with a new, explicitly partial
-record. Self-contained legacy SDK tokens remain usable with supplied SDK stages
-and cannot be discovered by scanning a directory.
-
 ### Upgrading from an older version
 
-Only paused workflow files changed format. After installing this version, stop
-other Lobster processes and run once:
+Older versions kept state as loose JSON files in the state directory. After
+installing this version, stop older Lobster processes and run once:
 
 ```sh
 lobster upgrade             # or: lobster upgrade --dry-run
 ```
 
-It converts every workflow paused by an older version (at an approval step, an
-input step, or a command asking for input) into a waiting run. Each keeps its
-state key, so tokens and short approval IDs handed out before the upgrade still
-resume it; steps that already ran are not run again. A pause whose workflow file
-is missing, or no longer has the paused step at the same position, is moved to
-`.upgrade-skipped/` in the state directory and listed in the report. A
-`.backup-*.archive` of the previous state is written first. Running it again does
-nothing. Paused pipelines, SDK pauses and approval IDs need no conversion.
+It moves everything into `lobster.sqlite` under the same keys, so resume tokens and
+short approval IDs handed out before keep working:
 
-Until then, `lobster run` asks on a terminal whether to convert now, other
-commands print a one-line reminder on stderr, and resuming an unconverted pause
-fails with error type `upgrade_required`. Hosts embedding Lobster can call
+- workflows paused at an approval step, an input step, or a command asking for
+  input become waiting runs; steps that already ran are not run again;
+- paused pipelines and SDK steps, approval IDs and `state.set` values are imported
+  as they are.
+
+The original files are moved to `.pre-upgrade/<time>/` in the state directory. A
+paused workflow whose workflow file is missing, or no longer has the paused step at
+the same position, is moved to `.upgrade-skipped/` and listed in the report, as is
+a value whose key already holds something different. Running it again does nothing.
+It refuses while an older Lobster process holds a state lock.
+
+Until then, `lobster run` asks on a terminal whether to import now, other commands
+print a one-line reminder on stderr, and resuming something not yet imported fails
+with error type `upgrade_required`. Hosts embedding Lobster can call
 `upgradeStore({ directory })` from the core or SDK entry point instead.
-
-Migration validates legacy and tracked checkpoint shapes and references before
-preparing the destination, and rejects ambiguous workflow-key aliases. Already
-expired optional approval IDs and references to deleted predecessor markers
-remain expired; migration never creates executable state to satisfy them.
 
 ```sh
 lobster storage export                         # versioned logical archive
@@ -261,7 +223,7 @@ lobster history prune 2026-01-01T00:00:00Z --apply
 Retention removes only terminal runs older than the cutoff with no live
 continuation, pending wait, started attempt, or unacknowledged operation receipt.
 Valid consumed-capability markers may be removed with their terminal run; their
-tokens remain unusable because neither backend falls back to an old checkpoint.
+tokens remain unusable because nothing falls back to an old checkpoint.
 Committed transitions have stable operation IDs and receipts. A lost reply is an
 unknown outcome until reconciled; it does not authorize replaying an external
 side effect. Receipts are acknowledged only after the executor observes commit,
@@ -293,7 +255,7 @@ host can reuse a session and own its lifecycle:
 import { openStoreSession, runToolRequest } from '@clawdbot/lobster/core';
 
 const store = await openStoreSession({
-  directory: '/path/to/state', backend: 'sqlite', history: true,
+  directory: '/path/to/state', history: true,
 });
 try {
   const result = await runToolRequest({
@@ -308,7 +270,7 @@ try {
 ```
 
 `close()` rejects new requests and waits for admitted operations before closing
-the backend and releasing the session's migration fence.
+the database connection.
 
 The public `StoreSession` handle exposes lifecycle and inspection only:
 `directory`, `history`, `trackRuns`, `readOnly`, `listRuns`, `getRun`, `getWait`, `inspect`, `retain`,

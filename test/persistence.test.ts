@@ -10,7 +10,6 @@ import { promisify } from "node:util";
 import type { Worker } from "node:worker_threads";
 import { runToolRequest, resumeToolRequest } from "../src/core/tool_runtime.js";
 import { PersistenceOutcomeUnknown } from "../src/persistence/backend.js";
-import { migrateStore } from "../src/persistence/migrate.js";
 import type { Transition } from "../src/persistence/model.js";
 import type { SqliteBackend } from "../src/persistence/sqlite.js";
 import { bindStoreSession, openStoreSession } from "../src/persistence/session.js";
@@ -29,11 +28,11 @@ async function processCall(mode: string, value: string, env: NodeJS.ProcessEnv) 
 	return JSON.parse(stdout);
 }
 
-for (const backend of ["files", "sqlite"] as const) {
+for (const backend of ["sqlite"] as const) {
 	test(`${backend}: writes expose complete state and run commit identities`, async (t) => {
 		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "lobster-write-outcomes-"));
 		t.after(() => fs.rm(directory, { recursive: true, force: true }));
-		const store = await openStoreSession({ directory, backend, history: true });
+		const store = await openStoreSession({ directory, history: true });
 		try {
 			const stateCommit = {
 				status: "committed",
@@ -79,7 +78,7 @@ for (const backend of ["files", "sqlite"] as const) {
 	test(`${backend}: a lost write reply returns the reconciled original run receipt`, async (t) => {
 		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "lobster-write-reconcile-"));
 		t.after(() => fs.rm(directory, { recursive: true, force: true }));
-		const store = await openStoreSession({ directory, backend, history: true });
+		const store = await openStoreSession({ directory, history: true });
 		try {
 			const recorder = await store.createRun("fixture");
 			const write = store.backend.write.bind(store.backend);
@@ -116,7 +115,7 @@ for (const backend of ["files", "sqlite"] as const) {
 		test(`${backend}: failed ${failure} reconciliation preserves the lost-write outcome`, async (t) => {
 			const directory = await fs.mkdtemp(path.join(os.tmpdir(), "lobster-unknown-write-"));
 			t.after(() => fs.rm(directory, { recursive: true, force: true }));
-			const store = await openStoreSession({ directory, backend, history: true });
+			const store = await openStoreSession({ directory, history: true });
 			t.after(() => store.close());
 			const recorder = await store.createRun("fixture");
 			const write = store.backend.write.bind(store.backend);
@@ -144,7 +143,7 @@ for (const backend of ["files", "sqlite"] as const) {
 	test(`${backend}: an unreadable write outcome bypasses retry and on_error`, async (t) => {
 		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "lobster-unknown-retry-"));
 		t.after(() => fs.rm(directory, { recursive: true, force: true }));
-		const store = await openStoreSession({ directory, backend, history: true });
+		const store = await openStoreSession({ directory, history: true });
 		t.after(() => store.close());
 		const write = store.backend.write.bind(store.backend);
 		const read = store.backend.read.bind(store.backend);
@@ -198,38 +197,10 @@ for (const backend of ["files", "sqlite"] as const) {
 	});
 }
 
-test("selected file sessions preserve legacy publication hooks and cancellation results", async (t) => {
-	const directory = await fs.mkdtemp(path.join(os.tmpdir(), "lobster-file-publication-hooks-"));
-	t.after(() => fs.rm(directory, { recursive: true, force: true }));
-	const store = await openStoreSession({ directory, backend: "files", history: true });
-	try {
-		const controller = new AbortController();
-		let publications = 0;
-		const result = await writeStateJson({
-			env: bindStoreSession(process.env, store),
-			key: "fixture",
-			value: { value: 42 },
-			signal: controller.signal,
-			atomicWriteOptions: {
-				async renameFile(from, to) {
-					await fs.rename(from, to);
-					publications++;
-					controller.abort(new Error("fixture cancelled after commit"));
-				},
-			},
-		});
-		assert.equal(publications, 1);
-		assert.deepEqual(result, { signalAbortedAfterCommit: true });
-		assert.deepEqual(JSON.parse((await store.read("fixture")).text), { value: 42 });
-	} finally {
-		await store.close();
-	}
-});
-
 test("SQLite sessions keep filesystem publication functions out of worker messages", async (t) => {
 	const directory = await fs.mkdtemp(path.join(os.tmpdir(), "lobster-sqlite-hook-boundary-"));
 	t.after(() => fs.rm(directory, { recursive: true, force: true }));
-	const store = await openStoreSession({ directory, backend: "sqlite" });
+	const store = await openStoreSession({ directory });
 	try {
 		const result = await writeStateJson({
 			env: bindStoreSession(process.env, store),
@@ -248,7 +219,7 @@ test("SQLite sessions keep filesystem publication functions out of worker messag
 	}
 });
 
-for (const backend of ["files", "sqlite"] as const) {
+for (const backend of ["sqlite"] as const) {
 	test(`${backend}: actual workflow pause/reopen/resume keeps run and attempts`, async (t) => {
 		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "lobster-persistence-"));
 		t.after(() => fs.rm(directory, { recursive: true, force: true }));
@@ -266,7 +237,6 @@ for (const backend of ["files", "sqlite"] as const) {
 		const env = {
 			...process.env,
 			LOBSTER_STATE_DIR: path.join(directory, "state"),
-			LOBSTER_BACKEND: backend,
 			LOBSTER_HISTORY: "1",
 		};
 		const first = await runToolRequest({ filePath, ctx: { env } });
@@ -308,7 +278,7 @@ for (const backend of ["files", "sqlite"] as const) {
 	});
 }
 
-for (const backend of ["files", "sqlite"] as const) {
+for (const backend of ["sqlite"] as const) {
 	test(`${backend}: different processes compete for one continuation`, async (t) => {
 		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "lobster-persistence-process-"));
 		t.after(() => fs.rm(directory, { recursive: true, force: true }));
@@ -330,7 +300,6 @@ for (const backend of ["files", "sqlite"] as const) {
 			...process.env,
 			EFFECT_FILE: effect,
 			LOBSTER_STATE_DIR: path.join(directory, "state"),
-			LOBSTER_BACKEND: backend,
 			LOBSTER_HISTORY: "1",
 		};
 		const first = await processCall("run", filePath, env);
@@ -352,83 +321,13 @@ for (const backend of ["files", "sqlite"] as const) {
 	});
 }
 
-test("workflow checkpoint and consumed state survive interrupted backend conversion", async (t) => {
-	const directory = await fs.mkdtemp(path.join(os.tmpdir(), "lobster-persistence-migrate-"));
-	t.after(() => fs.rm(directory, { recursive: true, force: true }));
-	const filePath = path.join(directory, "flow.lobster");
-	await fs.writeFile(
-		filePath,
-		JSON.stringify({
-			steps: [
-				{ id: "review", approval: "Fixture" },
-				{ id: "finish", run: 'node -e "console.log(42)"' },
-			],
-		}),
-	);
-	const env = { ...process.env, LOBSTER_STATE_DIR: path.join(directory, "state") };
-	const first = await runToolRequest({ filePath, ctx: { env } });
-	assert.equal(first.status, "needs_approval");
-	await fs.writeFile(
-		path.join(env.LOBSTER_STATE_DIR, "pipeline_resume_consumed.json"),
-		JSON.stringify({
-			type: "lobster.consumed-resume-state.v1",
-			consumedAt: new Date().toISOString(),
-			claimId: "old",
-		}),
-	);
-	await assert.rejects(
-		migrateStore({
-			directory: env.LOBSTER_STATE_DIR,
-			backend: "sqlite",
-			offline: true,
-			onPhase: async (phase) => {
-				if (phase === "prepared") {
-					throw new Error("injected interruption");
-				}
-			},
-		}),
-		/injected/,
-	);
-	const stillFiles = await openStoreSession({ env });
-	assert.equal(stillFiles.backend.kind, "files");
-	await stillFiles.close();
-	await migrateStore({ directory: env.LOBSTER_STATE_DIR, backend: "sqlite", offline: true });
-	const migratedEnv = { ...env, LOBSTER_HISTORY: "1" };
-	const resumed = await resumeToolRequest({
-		approvalId: first.requiresApproval.approvalId,
-		approved: true,
-		ctx: { env: migratedEnv },
-	});
-	assert.equal(resumed.status, "ok", JSON.stringify(resumed));
-	const session = await openStoreSession({ env: migratedEnv });
-	try {
-		assert.equal(JSON.parse((await session.read("pipeline_resume_consumed")).text).claimId, "old");
-		const { runs } = await session.listRuns();
-		assert.equal(runs[0].partialHistory, false);
-		await assert.rejects(
-			migrateStore({ directory: env.LOBSTER_STATE_DIR, backend: "files", offline: true }),
-			/a session is open/,
-		);
-	} finally {
-		await session.close();
-	}
-	await migrateStore({ directory: env.LOBSTER_STATE_DIR, backend: "files", offline: true });
-	const roundtrip = await openStoreSession({ env: migratedEnv });
-	try {
-		assert.equal((await roundtrip.listRuns()).runs[0].status, "completed");
-	} finally {
-		await roundtrip.close();
-	}
-});
-
-for (const backend of ["files", "sqlite"] as const) {
+for (const backend of ["sqlite"] as const) {
 	test(`${backend}: lazy failure and early closure are truthful without draining`, async (t) => {
 		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "lobster-history-stream-"));
 		t.after(() => fs.rm(directory, { recursive: true, force: true }));
 		const env = {
 			...process.env,
 			LOBSTER_STATE_DIR: directory,
-			LOBSTER_BACKEND: backend,
 			LOBSTER_HISTORY: "1",
 		};
 		let produced = 0;
@@ -488,7 +387,6 @@ for (const backend of ["files", "sqlite"] as const) {
 		const env = {
 			...process.env,
 			LOBSTER_STATE_DIR: directory,
-			LOBSTER_BACKEND: backend,
 			LOBSTER_HISTORY: "1",
 		};
 		const lobster = new Lobster({ env })
@@ -529,7 +427,7 @@ for (const backend of ["files", "sqlite"] as const) {
 	test(`${backend}: asynchronous paired cache publication rolls state back under the shared barrier`, async (t) => {
 		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "lobster-history-cache-"));
 		t.after(() => fs.rm(directory, { recursive: true, force: true }));
-		const session = await openStoreSession({ directory, backend });
+		const session = await openStoreSession({ directory });
 		const env = bindStoreSession(process.env, session);
 		try {
 			await diffAndStore({ env, key: "reuse", value: { old: true } });
@@ -562,11 +460,11 @@ for (const backend of ["files", "sqlite"] as const) {
 	});
 }
 
-for (const backend of ["files", "sqlite"] as const) {
+for (const backend of ["sqlite"] as const) {
 	test(`${backend}: revisions, receipts, invalid transitions and retention`, async (t) => {
 		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "lobster-history-contract-"));
 		t.after(() => fs.rm(directory, { recursive: true, force: true }));
-		const session = await openStoreSession({ directory, backend, history: true });
+		const session = await openStoreSession({ directory, history: true });
 		try {
 			const recorder = await session.createRun("fixture");
 			const operation = {
@@ -611,7 +509,6 @@ for (const backend of ["files", "sqlite"] as const) {
 			...process.env,
 			LOBSTER_STATE_DIR: path.join(directory, "state"),
 			LOBSTER_CACHE_DIR: path.join(directory, "cache"),
-			LOBSTER_BACKEND: backend,
 			LOBSTER_HISTORY: "1",
 			LOBSTER_LLM_MODEL: "test/model",
 		};
@@ -652,7 +549,7 @@ for (const backend of ["files", "sqlite"] as const) {
 test("SQLite lost acknowledgement reconciles a receipt after real worker termination", async (t) => {
 	const directory = await fs.mkdtemp(path.join(os.tmpdir(), "lobster-history-worker-"));
 	t.after(() => fs.rm(directory, { recursive: true, force: true }));
-	const session = await openStoreSession({ directory, backend: "sqlite", history: true });
+	const session = await openStoreSession({ directory, history: true });
 	try {
 		const recorder = await session.createRun("fixture");
 		const operation = {
@@ -686,14 +583,13 @@ test("SQLite lost acknowledgement reconciles a receipt after real worker termina
 	}
 });
 
-for (const backend of ["files", "sqlite"] as const) {
+for (const backend of ["sqlite"] as const) {
 	test(`${backend}: retries, input validation, cancellation and nested occurrences`, async (t) => {
 		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "lobster-history-behaviors-"));
 		t.after(() => fs.rm(directory, { recursive: true, force: true }));
 		const env = {
 			...process.env,
 			LOBSTER_STATE_DIR: path.join(directory, "state"),
-			LOBSTER_BACKEND: backend,
 			LOBSTER_HISTORY: "1",
 		};
 		let tries = 0;
@@ -783,11 +679,11 @@ for (const backend of ["files", "sqlite"] as const) {
 	});
 }
 
-for (const backend of ["files", "sqlite"] as const) {
+for (const backend of ["sqlite"] as const) {
 	test(`${backend}: retention protects an unacknowledged terminal receipt`, async (t) => {
 		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "lobster-retention-receipt-"));
 		t.after(() => fs.rm(directory, { recursive: true, force: true }));
-		const session = await openStoreSession({ directory, backend, history: true });
+		const session = await openStoreSession({ directory, history: true });
 		try {
 			const recorder = await session.createRun("fixture");
 			const operationId = randomUUID();
@@ -812,7 +708,6 @@ test("SQLite admission is bounded while a database lock leaves the caller respon
 	t.after(() => fs.rm(directory, { recursive: true, force: true }));
 	const session = await openStoreSession({
 		directory,
-		backend: "sqlite",
 		history: true,
 		maxPending: 1,
 	});
@@ -869,7 +764,7 @@ test("SQLite admission is bounded while a database lock leaves the caller respon
 test("SQLite worker death before dispatch leaves no committed operation receipt", async (t) => {
 	const directory = await fs.mkdtemp(path.join(os.tmpdir(), "lobster-worker-before-"));
 	t.after(() => fs.rm(directory, { recursive: true, force: true }));
-	const session = await openStoreSession({ directory, backend: "sqlite", history: true });
+	const session = await openStoreSession({ directory, history: true });
 	try {
 		const recorder = await session.createRun("fixture");
 		const operationId = randomUUID();
@@ -892,11 +787,11 @@ test("SQLite worker death before dispatch leaves no committed operation receipt"
 	}
 });
 
-for (const backend of ["files", "sqlite"] as const) {
+for (const backend of ["sqlite"] as const) {
 	test(`${backend}: cancellation during receipt acknowledgement restores the pre-dispatch wait`, async (t) => {
 		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "lobster-ack-cancel-"));
 		t.after(() => fs.rm(directory, { recursive: true, force: true }));
-		const session = await openStoreSession({ directory, backend, history: true });
+		const session = await openStoreSession({ directory, history: true });
 		try {
 			let effects = 0;
 			const registry = {
@@ -933,21 +828,11 @@ for (const backend of ["files", "sqlite"] as const) {
 					controller.abort(new Error("fixture cancel after receipt"));
 				}
 			};
-			if (backend === "files") {
-				// The file backend acknowledges in memory; cancel right after the commit instead.
-				const transition = session.backend.transition.bind(session.backend);
-				session.backend.transition = async (...args: any[]) => {
-					const result = await (transition as any)(...args);
-					await cancelOnceConsumed(args[0].runId);
-					return result;
-				};
-			} else {
-				const acknowledge = session.backend.acknowledge.bind(session.backend);
-				session.backend.acknowledge = async (runId, operationId) => {
-					await acknowledge(runId, operationId);
-					await cancelOnceConsumed(runId);
-				};
-			}
+			const acknowledge = session.backend.acknowledge.bind(session.backend);
+			session.backend.acknowledge = async (runId, operationId) => {
+				await acknowledge(runId, operationId);
+				await cancelOnceConsumed(runId);
+			};
 			const stopped = await resumeToolRequest({
 				token: first.requiresApproval.resumeToken,
 				approved: true,
@@ -969,58 +854,13 @@ for (const backend of ["files", "sqlite"] as const) {
 	});
 }
 
-for (const phase of ["backed_up", "imported", "verified", "prepared", "activated"] as const) {
-	test(`migration interrupted at ${phase} keeps exactly one authority`, async (t) => {
-		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "lobster-migration-phase-"));
-		t.after(() => fs.rm(directory, { recursive: true, force: true }));
-		await fs.writeFile(path.join(directory, "legacy.json"), '{"version":7}\n');
-		await assert.rejects(
-			migrateStore({
-				directory,
-				backend: "sqlite",
-				offline: true,
-				onPhase: async (current) => {
-					if (current === phase) {
-						throw new Error("fixture interruption");
-					}
-				},
-			}),
-			/fixture interruption/,
-		);
-		const selected = await openStoreSession({ directory });
-		try {
-			assert.equal(selected.backend.kind, phase === "activated" ? "sqlite" : "files");
-			assert.deepEqual(JSON.parse((await selected.read("legacy")).text), { version: 7 });
-		} finally {
-			await selected.close();
-		}
-		await migrateStore({ directory, backend: "sqlite", offline: true });
-		const retried = await openStoreSession({ directory });
-		try {
-			assert.equal(retried.backend.kind, "sqlite");
-			assert.deepEqual(JSON.parse((await retried.read("legacy")).text), { version: 7 });
-		} finally {
-			await retried.close();
-		}
-	});
-}
-
-test("corrupt source cannot activate a SQLite migration", async (t) => {
-	const directory = await fs.mkdtemp(path.join(os.tmpdir(), "lobster-migration-corrupt-"));
-	t.after(() => fs.rm(directory, { recursive: true, force: true }));
-	await fs.writeFile(path.join(directory, "broken.json"), "{invalid");
-	await assert.rejects(migrateStore({ directory, backend: "sqlite", offline: true }), SyntaxError);
-	await assert.rejects(fs.access(path.join(directory, ".backend")), { code: "ENOENT" });
-});
-
-for (const backend of ["files", "sqlite"] as const) {
+for (const backend of ["sqlite"] as const) {
 	test(`${backend}: tracked waits survive history being disabled and inspection is read-only`, async (t) => {
 		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "lobster-history-disabled-"));
 		t.after(() => fs.rm(directory, { recursive: true, force: true }));
 		const env = {
 			...process.env,
 			LOBSTER_STATE_DIR: directory,
-			LOBSTER_BACKEND: backend,
 			LOBSTER_HISTORY: "1",
 		};
 		const first = await runToolRequest({ pipeline: 'approve --prompt "Fixture"', ctx: { env } });
@@ -1045,7 +885,7 @@ for (const backend of ["files", "sqlite"] as const) {
 		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "lobster-sdk-input-"));
 		t.after(() => fs.rm(directory, { recursive: true, force: true }));
 		const lobster = new Lobster({
-			env: { ...process.env, LOBSTER_STATE_DIR: directory, LOBSTER_BACKEND: backend },
+			env: { ...process.env, LOBSTER_STATE_DIR: directory },
 			history: true,
 		}).pipe({
 			async run({ ctx }) {
@@ -1068,7 +908,7 @@ for (const backend of ["files", "sqlite"] as const) {
 	});
 }
 
-for (const backend of ["files", "sqlite"] as const) {
+for (const backend of ["sqlite"] as const) {
 	test(`${backend}: CLI records history and dry-run does not initialize storage`, async (t) => {
 		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "lobster-cli-history-"));
 		t.after(() => fs.rm(directory, { recursive: true, force: true }));
@@ -1080,7 +920,6 @@ for (const backend of ["files", "sqlite"] as const) {
 		const env = {
 			...process.env,
 			LOBSTER_STATE_DIR: path.join(directory, "state"),
-			LOBSTER_BACKEND: backend,
 			LOBSTER_HISTORY: "1",
 		};
 		const bin = fileURLToPath(new URL("../../bin/lobster.js", import.meta.url));
@@ -1111,7 +950,6 @@ for (const backend of ["files", "sqlite"] as const) {
 		const env = {
 			...process.env,
 			LOBSTER_STATE_DIR: path.join(directory, "state"),
-			LOBSTER_BACKEND: backend,
 			LOBSTER_HISTORY: "1",
 		};
 		const fixture = fileURLToPath(new URL("./fixtures/persistence-process.js", import.meta.url));
@@ -1138,7 +976,6 @@ test("injected sessions keep nested roots in the explicit storage scope", async 
 	const first = await openStoreSession({ directory: path.join(directory, "one"), history: true });
 	const second = await openStoreSession({
 		directory: path.join(directory, "two"),
-		backend: "sqlite",
 		history: true,
 	});
 	try {
@@ -1181,11 +1018,11 @@ test("injected sessions keep nested roots in the explicit storage scope", async 
 	}
 });
 
-for (const backend of ["files", "sqlite"] as const) {
+for (const backend of ["sqlite"] as const) {
 	test(`${backend}: close waits for admitted writes and keeps migration fenced`, async (t) => {
 		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "lobster-close-drain-"));
 		t.after(() => fs.rm(directory, { recursive: true, force: true }));
-		const store = await openStoreSession({ directory, backend });
+		const store = await openStoreSession({ directory });
 		let release: () => void;
 		const gate = new Promise<void>((resolve) => {
 			release = resolve;
@@ -1203,14 +1040,6 @@ for (const backend of ["files", "sqlite"] as const) {
 		try {
 			await new Promise((resolve) => setImmediate(resolve));
 			assert.equal(closed, false);
-			await assert.rejects(
-				migrateStore({
-					directory,
-					backend: backend === "files" ? "sqlite" : "files",
-					offline: true,
-				}),
-				/a session is open/,
-			);
 		} finally {
 			release();
 			await write;
@@ -1226,7 +1055,7 @@ for (const backend of ["files", "sqlite"] as const) {
 	test(`${backend}: closing a session rejects new history and state operations`, async (t) => {
 		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "lobster-session-close-"));
 		t.after(() => fs.rm(directory, { recursive: true, force: true }));
-		const session = await openStoreSession({ directory, backend, history: true });
+		const session = await openStoreSession({ directory, history: true });
 		const recorder = await session.createRun("fixture");
 		await session.close();
 		await assert.rejects(session.read("fixture"), /closed/);
@@ -1246,17 +1075,14 @@ test("SQLite opening failure closes its connection and permits a clean retry", a
 	const directory = await fs.mkdtemp(path.join(os.tmpdir(), "lobster-session-open-"));
 	t.after(() => fs.rm(directory, { recursive: true, force: true }));
 	const { SqliteBackend } = await import("../src/persistence/sqlite.js");
-	const originalWrite = fs.writeFile;
 	const close = t.mock.method(SqliteBackend.prototype, "close");
-	const write = t.mock.method(fs, "writeFile", async (...args: Parameters<typeof fs.writeFile>) => {
-		if (String(args[0]).includes(".session-")) {
-			throw new Error("fixture lease failure");
-		}
-		return originalWrite(...args);
+	// Fail the first query after the connection opened.
+	const probe = t.mock.method(SqliteBackend.prototype, "listRunSummaries", async () => {
+		throw new Error("fixture open failure");
 	});
-	await assert.rejects(openStoreSession({ directory, backend: "sqlite" }), /fixture lease failure/);
+	await assert.rejects(openStoreSession({ directory }), /fixture open failure/);
 	assert.equal(close.mock.callCount(), 1);
-	write.mock.restore();
+	probe.mock.restore();
 	close.mock.restore();
 	const retried = await openStoreSession({ directory });
 	try {
@@ -1271,7 +1097,7 @@ test("SQLite opening failure closes its connection and permits a clean retry", a
 test("SQLite rejects an undispatchable request without occupying admission", async (t) => {
 	const directory = await fs.mkdtemp(path.join(os.tmpdir(), "lobster-worker-dispatch-"));
 	t.after(() => fs.rm(directory, { recursive: true, force: true }));
-	const store = await openStoreSession({ directory, backend: "sqlite", maxPending: 1 });
+	const store = await openStoreSession({ directory, maxPending: 1 });
 	try {
 		// Extra uncloneable data deliberately exercises failure before worker admission.
 		const request = { key: "fixture", invalid: () => {} };
@@ -1288,7 +1114,7 @@ test("SQLite rejects an undispatchable request without occupying admission", asy
 test("SQLite cannot reconcile another writer's identical exclusive value as its own insert", async (t) => {
 	const directory = await fs.mkdtemp(path.join(os.tmpdir(), "lobster-exclusive-reconcile-"));
 	t.after(() => fs.rm(directory, { recursive: true, force: true }));
-	const store = await openStoreSession({ directory, backend: "sqlite" });
+	const store = await openStoreSession({ directory });
 	try {
 		await store.write("fixture", "42");
 		t.mock.method(store.backend, "write", async () => {
@@ -1304,11 +1130,11 @@ test("SQLite cannot reconcile another writer's identical exclusive value as its 
 	}
 });
 
-for (const backend of ["files", "sqlite"] as const) {
+for (const backend of ["sqlite"] as const) {
 	test(`${backend}: a shared session isolates 50 concurrent roots and paginates their history`, async (t) => {
 		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "lobster-concurrent-history-"));
 		t.after(() => fs.rm(directory, { recursive: true, force: true }));
-		const store = await openStoreSession({ directory, backend, history: true });
+		const store = await openStoreSession({ directory, history: true });
 		const registry = {
 			get() {
 				return {
@@ -1366,7 +1192,6 @@ for (const backend of ["files", "sqlite"] as const) {
 			t.after(() => fs.rm(directory, { recursive: true, force: true }));
 			const store = await openStoreSession({
 				directory: path.join(directory, "state"),
-				backend,
 				history: true,
 			});
 			const filePath = path.join(directory, "flow.lobster");
@@ -1441,7 +1266,6 @@ for (const backend of ["files", "sqlite"] as const) {
 		t.after(() => fs.rm(directory, { recursive: true, force: true }));
 		const store = await openStoreSession({
 			directory: path.join(directory, "state"),
-			backend,
 			history: true,
 		});
 		const filePath = path.join(directory, "flow.lobster");
@@ -1492,7 +1316,6 @@ for (const backend of ["files", "sqlite"] as const) {
 		t.after(() => fs.rm(directory, { recursive: true, force: true }));
 		const store = await openStoreSession({
 			directory: path.join(directory, "state"),
-			backend,
 			history: true,
 		});
 		const filePath = path.join(directory, "flow.lobster");
