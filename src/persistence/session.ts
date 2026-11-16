@@ -2,6 +2,7 @@ import { readBackendSelection } from "./selection.js";
 import { legacyCheckpointText, validateCheckpoint } from "./legacy.js";
 import type { ExecutionState } from "../engine/state.js";
 import { assertSqliteNodeSupport } from "./sqlite-support.js";
+import { currentSessionMarker } from "./session_marker.js";
 import { randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
 import path from "node:path";
@@ -605,7 +606,7 @@ export async function openStoreSession(options: StoreOptions = {}): Promise<Stor
 			}
 			if (!options.readOnly) {
 				lease = path.join(directory, `.session-${process.pid}-${randomUUID()}`);
-				await fs.writeFile(lease, JSON.stringify({ pid: process.pid }), { mode: 0o600 });
+				await fs.writeFile(lease, JSON.stringify(currentSessionMarker()), { mode: 0o600 });
 			}
 			return new StoreSession(directory, backend, history, lease, options.readOnly, trackRuns);
 		} catch (error) {

@@ -1,5 +1,6 @@
 import { readBackendSelection } from "./selection.js";
 import { validateContinuations } from "./legacy.js";
+import { liveSessionMarkers } from "./session_marker.js";
 import { assertSqliteNodeSupport } from "./sqlite-support.js";
 import { randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
@@ -20,19 +21,13 @@ export async function assertOffline(directory: string) {
 		) {
 			throw new Error("Stop other running Lobster processes first: state is locked");
 		}
-		if (!name.startsWith(".session-")) {
-			continue;
-		}
-		const lease = JSON.parse(await fs.readFile(path.join(directory, name), "utf8"));
-		try {
-			process.kill(lease.pid, 0);
-			throw new Error("Stop other running Lobster processes first: a session is open");
-		} catch (error) {
-			if (error.code !== "ESRCH") {
-				throw error;
-			}
-		}
-		await fs.unlink(path.join(directory, name));
+	}
+	const [live] = await liveSessionMarkers(directory);
+	if (live) {
+		throw new Error(
+			`Stop other running Lobster processes first: a session is open (${live}). ` +
+				"If no Lobster process is running, delete that file and try again.",
+		);
 	}
 }
 
