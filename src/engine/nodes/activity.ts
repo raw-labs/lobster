@@ -64,6 +64,7 @@ export async function activity(machine: Machine, step: WorkflowStep, key: string
 	const historyId = await history?.start("activity", step.id);
 	record.phase = "started";
 	await machine.save();
+	scope.startTimeout?.();
 	scope.ctx.signal?.throwIfAborted();
 	machine.checkAuthority(scope.ctx);
 	await scope.ctx._onExecutionStarted?.();

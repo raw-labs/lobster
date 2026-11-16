@@ -8,6 +8,7 @@ import { PassThrough } from "node:stream";
 
 import { loadWorkflowFile, runWorkflowFile } from "../src/workflows/file.js";
 import { createDefaultRegistry } from "../src/commands/registry.js";
+import { decodeResumeToken } from "../src/resume.js";
 
 async function runWorkflow(
 	workflow: unknown,
@@ -297,3 +298,54 @@ test(
 		);
 	},
 );
+
+test("a step's timeout does not count the time a person takes to answer it", async (t) => {
+	const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-step-timeout-wait-"));
+	t.after(() => fsp.rm(tmpDir, { recursive: true, force: true }));
+	const filePath = path.join(tmpDir, "workflow.lobster");
+	await fsp.writeFile(
+		filePath,
+		JSON.stringify({
+			steps: [
+				{ id: "review", pipeline: "choose", timeout_ms: 400 },
+				{ id: "after", command: "echo after" },
+			],
+		}),
+	);
+	const schema = { type: "object", properties: { decision: { type: "string" } } };
+	let calls = 0;
+	const choose = {
+		name: "choose",
+		async run({ ctx }: any) {
+			calls++;
+			const answer = await ctx.requestInput({ prompt: "Review?", responseSchema: schema });
+			return {
+				output: (async function* () {
+					yield answer;
+				})(),
+			};
+		},
+	};
+	const defaults = createDefaultRegistry();
+	const registry = { get: (name: string) => (name === "choose" ? choose : defaults.get(name)) };
+	const ctx = {
+		stdin: process.stdin,
+		stdout: process.stdout,
+		stderr: new PassThrough(),
+		env: { ...process.env, LOBSTER_STATE_DIR: path.join(tmpDir, "state") },
+		mode: "tool" as const,
+		registry: registry as any,
+	};
+	const first = await runWorkflowFile({ filePath, ctx });
+	assert.equal(first.status, "needs_input");
+	await new Promise((resolve) => setTimeout(resolve, 700)); // longer than timeout_ms
+	const resumed = await runWorkflowFile({
+		filePath,
+		ctx,
+		resume: decodeResumeToken(first.requiresInput!.resumeToken) as any,
+		response: { decision: "ok" },
+	});
+	assert.equal(resumed.status, "ok");
+	assert.deepEqual(resumed.output, ["after\n"]);
+	assert.equal(calls, 2, "the command resumes with the answer");
+});

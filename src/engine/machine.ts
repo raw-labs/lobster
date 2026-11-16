@@ -65,6 +65,8 @@ export type Scope = {
 	accountAs?: string;
 	nested?: boolean;
 	timeoutSignal?: AbortSignal;
+	/** Start the enclosing step's timeout; activities call it right before dispatch. */
+	startTimeout?: () => void;
 };
 
 export class Suspension extends Error {
@@ -182,24 +184,32 @@ export class Machine {
 			const attemptKey = key + "/attempt-" + frame.attempt;
 			const timeout = new AbortController();
 			let timer: ReturnType<typeof setTimeout> | undefined;
-			if (step.timeout_ms) {
+			// The clock measures the step's own work. An activity starts it once its
+			// pre-dispatch checkpoint is written, so slow storage never eats the budget;
+			// the deadline is persisted by the next save and survives a crash.
+			const startTimeout = () => {
+				if (!step.timeout_ms || timer || timeout.signal.aborted) return;
 				frame.deadline ??= Date.now() + step.timeout_ms;
-				await this.save();
-				if (frame.deadline <= Date.now())
+				if (frame.deadline <= Date.now()) {
 					timeout.abort(new Error("Step timeout expired during interruption"));
+					return;
+				}
 				timer = setTimeout(
 					() => timeout.abort(new Error(`Step '${step.id}' timed out after ${step.timeout_ms}ms`)),
-					Math.max(0, frame.deadline - Date.now()),
+					frame.deadline - Date.now(),
 				);
-			}
-			const local = {
+			};
+			const local: Scope = {
 				...scope,
 				timeoutSignal: timeout.signal,
+				startTimeout,
 				ctx: {
 					...scope.ctx,
 					signal: AbortSignal.any([scope.ctx.signal, timeout.signal].filter(Boolean)),
 				},
 			};
+			// Control nodes are timed as a whole. Input gates wait for people, not work.
+			if (nodeKind(step) !== "activity" && nodeKind(step) !== "input") startTimeout();
 			let decidingApproval = false;
 			try {
 				let result: WorkflowStepResult;
@@ -344,6 +354,10 @@ export class Machine {
 		if (!entry) throw new Error("Workflow resume state not found");
 		const [path, frame] = entry;
 		const wait = frame.wait!;
+		// A step's timeout covers its work, not the time people take to answer it:
+		// the steps enclosing this gate get a fresh budget when it is answered.
+		for (const [ancestor, item] of Object.entries(this.state.activations))
+			if (path.startsWith(ancestor + "/")) delete item.deadline;
 		if (decision.cancel || (wait.kind === "approval" && decision.approved === false))
 			this.state.status = "cancelled";
 		else if (wait.kind === "approval") {

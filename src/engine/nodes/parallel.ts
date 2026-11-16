@@ -11,8 +11,8 @@ export async function parallel(machine: Machine, step: WorkflowStep, key: string
 	const timeout = new AbortController();
 	let timer: ReturnType<typeof setTimeout> | undefined;
 	if (config.timeout_ms) {
+		// Persisted by the branches' first checkpoint; writing it first would spend the budget.
 		frame.deadline ??= Date.now() + config.timeout_ms;
-		await machine.save();
 		timer = setTimeout(
 			() =>
 				timeout.abort(new Error(`Parallel step ${step.id} timed out after ${config.timeout_ms}ms`)),
