@@ -3931,9 +3931,11 @@ async function assertApprovalResumeIsExclusive({
 		assert.equal(invocations, 1, "one approval may dispatch exactly one effect");
 		assert.equal(outcomes.filter((outcome) => outcome.ok).length, 1);
 		assert.equal(outcomes.filter((outcome) => !outcome.ok).length, 1);
+		// The loser is refused either at its claim or, when the winner has already
+		// retired the short ID, at the ID lookup. Both refuse without dispatching.
 		assert.match(
 			outcomes.find((outcome) => !outcome.ok)?.error?.message ?? "",
-			/resume state not found|owned by another executor/i,
+			/resume state not found|owned by another executor|not found or expired/i,
 		);
 	} finally {
 		releaseFirstRename();
