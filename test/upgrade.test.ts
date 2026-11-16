@@ -10,7 +10,7 @@ import { createDefaultRegistry, resumeToolRequest, runToolRequest } from "../src
 import { openStoreSession } from "../src/persistence/session.js";
 import { withFileLock } from "../src/state/file_lock.js";
 import { encodeToken } from "../src/token.js";
-import { pendingUpgrade, upgradeStore } from "../src/workflows/upgrade.js";
+import { pendingUpgrade, savedByOlderVersion, upgradeStore } from "../src/workflows/upgrade.js";
 
 const exec = promisify(execFile);
 const repoRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
@@ -78,6 +78,13 @@ test("resuming anything saved by an older Lobster asks for `lobster upgrade`", a
 		ctx,
 	});
 	assert.equal(pipeline.error.type, "upgrade_required");
+});
+
+test("a crafted key cannot probe for files outside the state directory", async (t) => {
+	const { dir, state } = await setup(t);
+	await fs.writeFile(path.join(dir, "outside.json"), "{}");
+	assert.equal(await savedByOlderVersion(state, "../outside"), false);
+	assert.equal(await savedByOlderVersion(state, "mykey"), true);
 });
 
 test("dry run reports without changing anything", async (t) => {

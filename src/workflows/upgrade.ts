@@ -4,6 +4,7 @@ import { randomUUID } from "node:crypto";
 import { openStoreSession } from "../persistence/session.js";
 import { ensureDirectory } from "../state/atomic_file.js";
 import { reclaimOrphanedFileLock } from "../state/file_lock.js";
+import { keyToPath } from "../state/paths.js";
 import { snapshotDefinition } from "../definition/normalize.js";
 import { resolveWorkflowArgs } from "../definition/args.js";
 import { extractApprovalRequest } from "../engine/gates.js";
@@ -97,8 +98,15 @@ export async function pendingUpgrade(directory: string): Promise<string[]> {
 
 /** True when the state directory still holds a value an older Lobster saved under this key. */
 export async function savedByOlderVersion(directory: string, key: string): Promise<boolean> {
+	// Keys can come from a caller's token: normalize so the name never leaves the directory.
+	let file: string;
+	try {
+		file = keyToPath(directory, key);
+	} catch {
+		return false;
+	}
 	return fs
-		.access(path.join(directory, `${key}.json`))
+		.access(file)
 		.then(() => true)
 		.catch(() => false);
 }
