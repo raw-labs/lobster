@@ -472,24 +472,32 @@ function handle(request: WorkerRequest): WorkerResult<WorkerMethod> {
 		case "removeRun":
 			return transaction(() => removeRun(args.id, args.before));
 		case "pruneFinished": {
-			// At most once a day, and a bounded batch so opening the store stays fast;
-			// a full batch leaves the date unset so the next open continues.
-			const last = prepare("SELECT value FROM meta WHERE key='lastPrune'").get() as
-				| { value: string }
-				| undefined;
-			if (last && Date.parse(args.now) - Date.parse(last.value) < PRUNE_INTERVAL_MS) return [];
-			const ids = prepare(`SELECT id FROM runs
-				WHERE json_extract(record, '$.status') IN ('completed', 'failed', 'cancelled')
-				AND json_extract(record, '$.updatedAt') < ? LIMIT ?`).all(args.before, PRUNE_BATCH) as {
-				id: string;
-			}[];
+			// At most once a day. Each open checks a bounded batch so opening stays fast,
+			// and a saved cursor moves past runs that cannot be removed yet.
+			const meta = (key: string) =>
+				(prepare("SELECT value FROM meta WHERE key=?").get(key) as { value: string } | undefined)
+					?.value;
+			const setMeta = (key: string, value: string) =>
+				prepare(
+					"INSERT INTO meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+				).run(key, value);
+			const last = meta("lastPrune");
+			if (last && Date.parse(args.now) - Date.parse(last) < PRUNE_INTERVAL_MS) return [];
+			const ids = prepare(`SELECT id FROM runs WHERE id > ?
+				AND json_extract(record, '$.status') IN ('completed', 'failed', 'cancelled')
+				AND json_extract(record, '$.updatedAt') < ? ORDER BY id LIMIT ?`).all(
+				meta("pruneCursor") ?? "",
+				args.before,
+				PRUNE_BATCH,
+			) as { id: string }[];
 			const removed = ids
 				.filter((row) => transaction(() => removeRun(row.id, args.before)))
 				.map((row) => row.id);
 			if (ids.length < PRUNE_BATCH) {
-				prepare(
-					"INSERT INTO meta(key,value) VALUES('lastPrune',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-				).run(args.now);
+				setMeta("pruneCursor", "");
+				setMeta("lastPrune", args.now);
+			} else {
+				setMeta("pruneCursor", ids.at(-1)!.id);
 			}
 			return removed;
 		}

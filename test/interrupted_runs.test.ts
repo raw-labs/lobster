@@ -178,3 +178,40 @@ test("finished runs older than the retention period are deleted on a later open"
 		/LOBSTER_RUN_RETENTION_DAYS/,
 	);
 });
+
+test("retention moves past finished runs it cannot delete yet", async (t) => {
+	const f = await fixture(t, [{ id: "a", run: "echo a" }]);
+	await runToolRequest({ filePath: f.filePath, ctx: { env: f.env } });
+	const [done] = (await listRuns({ status: "completed", ctx: { env: f.env } })).runs;
+
+	// 500 old finished runs that sort first and keep an unacknowledged receipt.
+	const { DatabaseSync } = await import("node:sqlite");
+	const db = new DatabaseSync(path.join(f.env.LOBSTER_STATE_DIR, "lobster.sqlite"));
+	const old = new Date(Date.now() - 40 * 24 * 60 * 60 * 1000).toISOString();
+	db.prepare("UPDATE runs SET record=json_set(record, '$.updatedAt', ?)").run(old);
+	const { record } = db.prepare("SELECT record FROM runs WHERE id=?").get(done.id) as {
+		record: string;
+	};
+	db.exec("BEGIN");
+	for (let i = 0; i < 500; i++) {
+		const id = `0-stuck-${String(i).padStart(3, "0")}`;
+		db.prepare("INSERT INTO runs(id,record) VALUES(?,json_set(?, '$.id', ?))").run(id, record, id);
+		db.prepare("INSERT INTO receipts(run_id,operation_id,record) VALUES(?,?,?)").run(
+			id,
+			"op",
+			JSON.stringify({ acknowledged: false }),
+		);
+	}
+	// Put the deletable run last in table order too.
+	db.prepare("DELETE FROM runs WHERE id=?").run(done.id);
+	db.prepare("INSERT INTO runs(id,record) VALUES(?,?)").run(done.id, record);
+	db.exec("COMMIT; DELETE FROM meta");
+	db.close();
+
+	for (let open = 0; open < 2; open++) await (await openStoreSession({ env: f.env })).close();
+	const check = new DatabaseSync(path.join(f.env.LOBSTER_STATE_DIR, "lobster.sqlite"));
+	const ids = (check.prepare("SELECT id FROM runs").all() as { id: string }[]).map((r) => r.id);
+	check.close();
+	assert.equal(ids.length, 500, "the stuck runs stay");
+	assert.ok(!ids.includes(done.id), "the deletable run after them is reached on the next open");
+});
