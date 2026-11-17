@@ -2,6 +2,7 @@ import path from "node:path";
 import { listRuns, getRun, getWait } from "./core/runs.js";
 import { forceTerminateAbortableProcesses } from "./process/abortable_process.js";
 import { createDefaultRegistry } from "./commands/registry.js";
+import type { CommandRegistry } from "./commands/types.js";
 import { resumeToolRequest, createToolContext } from "./core/tool_runtime.js";
 import { parsePipeline } from "./pipeline/parser.js";
 import { runtimeErrorDetails } from "./persistence/backend.js";
@@ -52,14 +53,14 @@ async function runCliWithSignal(
 	}
 
 	if (argv.length === 0 || argv.includes("-h") || argv.includes("--help")) {
-		process.stdout.write(helpText());
+		process.stdout.write(helpText(registry));
 		return;
 	}
 
 	if (argv[0] === "help") {
 		const topic = argv[1];
 		if (!topic) {
-			process.stdout.write(helpText());
+			process.stdout.write(helpText(registry));
 			return;
 		}
 		if (topic === "graph") {
@@ -68,7 +69,7 @@ async function runCliWithSignal(
 		}
 		// These built-ins are documented in the top-level usage, which `<topic> --help` prints too.
 		if (USAGE_TOPICS.has(topic)) {
-			process.stdout.write(helpText());
+			process.stdout.write(helpText(registry));
 			return;
 		}
 		const cmd = registry.get(topic);
@@ -842,7 +843,7 @@ function writeToolEnvelope(payload) {
 	process.stdout.write("\n");
 }
 
-function helpText() {
+function helpText(registry: CommandRegistry) {
 	return (
 		`lobster — OpenClaw-native typed shell\n\n` +
 		`Usage:\n` +
@@ -879,7 +880,7 @@ function helpText() {
 		`  lobster 'exec --json "echo [1,2,3]" | json'\n` +
 		`  lobster run --mode tool 'exec --json "echo [1]" | approve --prompt "ok?"'\n\n` +
 		`Commands:\n` +
-		`  exec, head, json, pick, table, where, approve, ask, openclaw.agent, openclaw.invoke, llm.invoke, llm_task.invoke, state.get, state.set, diff.last, commands.list, workflows.list, workflows.run, graph\n`
+		`  ${registry.list().join(", ")}\n`
 	);
 }
 

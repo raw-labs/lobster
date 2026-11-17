@@ -3,6 +3,7 @@
 // `repeatable` setting the engine enforces. Adding a command makes these run for it too.
 import test from "node:test";
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { promises as fs } from "node:fs";
 import path from "node:path";
@@ -258,4 +259,12 @@ test("crash recovery does not re-run a step whose pipeline sends email", async (
 	assert.equal(outcome.killed, true);
 	assert.match(outcome.recovered.error?.message ?? "", /interrupted without a saved result/);
 	assert.equal(sends(), 1, "the email is not sent a second time");
+});
+
+test("lobster --help lists every command the registry knows", () => {
+	const help = spawnSync(process.execPath, [path.join(repoRoot, "bin", "lobster.js"), "--help"], {
+		encoding: "utf8",
+	}).stdout;
+	const listed = help.split("Commands:\n")[1]?.trim().split(", ");
+	assert.deepEqual(listed, registry.list());
 });
