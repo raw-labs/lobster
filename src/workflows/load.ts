@@ -315,8 +315,28 @@ export async function loadWorkflowFile(filePath: string): Promise<WorkflowFile> 
 				);
 			}
 		}
+		// Anything else would silently drop the gate and run the step unapproved.
+		if (
+			step.approval !== undefined &&
+			typeof step.approval !== "boolean" &&
+			typeof step.approval !== "string" &&
+			!isPlainObject(step.approval)
+		) {
+			throw new Error(
+				`Workflow step ${step.id} approval must be true, a prompt string, or an object`,
+			);
+		}
+		if (typeof step.approval === "string" && !step.approval.trim()) {
+			throw new Error(`Workflow step ${step.id} approval prompt cannot be blank`);
+		}
 		if (step.approval && typeof step.approval === "object" && !Array.isArray(step.approval)) {
 			const approval = step.approval as Record<string, unknown>;
+			for (const key of ["prompt", "preview"])
+				if (approval[key] !== undefined && typeof approval[key] !== "string")
+					throw new Error(`Workflow step ${step.id} approval.${key} must be a string`);
+			if (approval.items !== undefined && !Array.isArray(approval.items)) {
+				throw new Error(`Workflow step ${step.id} approval.items must be a list`);
+			}
 			if (approval.initiated_by !== undefined && typeof approval.initiated_by !== "string") {
 				throw new Error(`Workflow step ${step.id} approval.initiated_by must be a string`);
 			}

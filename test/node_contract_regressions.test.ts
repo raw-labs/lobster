@@ -51,3 +51,25 @@ test("a for_each sub-step's timeout_ms, retry, on_error and when are validated",
 	const result = await fx.run(loop({ timeout_ms: 5000, retry: { max: 2 }, on_error: "continue" }));
 	assert.equal(result.status, "ok");
 });
+
+test("an approval of the wrong type is rejected, not dropped", async (t) => {
+	const fx = await workflowFixture(t);
+	const gated = (approval: unknown) => ({
+		steps: [{ id: "deploy", pipeline: "fake --name deploy", approval }],
+	});
+	// A number or a list used to mean "no approval": the step ran unasked.
+	for (const approval of [5, ["yes"], null])
+		await assert.rejects(
+			fx.run(gated(approval)),
+			/Workflow step deploy approval must be true, a prompt string, or an object/,
+		);
+	for (const approval of ["", "  "])
+		await assert.rejects(fx.run(gated(approval)), /approval prompt cannot be blank/);
+	await assert.rejects(fx.run(gated({ prompt: 5 })), /approval\.prompt must be a string/);
+	await assert.rejects(fx.run(gated({ preview: {} })), /approval\.preview must be a string/);
+	await assert.rejects(fx.run(gated({ items: "all" })), /approval\.items must be a list/);
+	assert.equal(fx.fake.calls("deploy"), 0);
+	for (const approval of [true, "Deploy?", { prompt: "Deploy?", items: [1], preview: "diff" }])
+		assert.equal((await fx.run(gated(approval))).status, "needs_approval");
+	assert.equal((await fx.run(gated(false))).status, "ok");
+});
