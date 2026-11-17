@@ -16,6 +16,11 @@ All notable changes to Lobster will be documented in this file.
 - Validate `timeout_ms`, `retry`, `on_error` and `when` of `for_each` sub-steps like those of any other step. A quoted `timeout_ms: "5000"` inside a loop made the step time out at once.
 - Refuse an approval or input gate inside a sub-workflow before its command runs; the command used to run and only then fail the run.
 - Dry-run no longer lists a step as skipped when its condition reads an earlier step's output; the step is planned with its condition marked as unknown at plan time.
+- Group commands into packs (`stdlib`, `openclaw`, `google`, `github`) and give every command a declared contract (`defineCommand`): description, flag schema, side-effect labels and whether it is `repeatable`. Hosts can build registries from packs with `createRegistry` and `builtinPacks` from `@clawdbot/lobster/core`; a name defined twice is an error.
+- Reject a flag a command does not declare, suggesting the intended flag for likely typos, instead of ignoring it.
+- Read boolean flags from each command's schema: a boolean flag no longer takes the next word as its value, and `--flag false` now means false (it used to be the truthy string `"false"`).
+- Never re-run a step on crash recovery, even with `recovery: repeat`, when its pipeline contains a command that may not be repeated (`openclaw.invoke`, `openclaw.agent`, `gog.gmail.send`). Only `openclaw.agent` was covered before, so a crash right after `gog.gmail.send` sent could send again. A step whose pipeline fails before `openclaw.agent` dispatches can now be retried like the others.
+- Keep `clawd.invoke` as an alias of `openclaw.invoke` and `llm_task.invoke` as a configured variant of `llm.invoke`; `commands.list` reports `aliasOf` and `repeatable`.
 
 ## 2026.11.2 - 2026-11-15
 
