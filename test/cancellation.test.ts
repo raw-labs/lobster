@@ -192,10 +192,22 @@ async function storedKeyExists(filePath: string) {
 	return (await storedKeys(dirname(filePath))).includes(basename(filePath).replace(/\.json$/, ""));
 }
 
-async function waitForFile(path: string, timeoutMs = 2000) {
+/**
+ * Waits for `path` to appear. With `run`, fails as soon as the run settles
+ * without creating it, reporting how the run ended.
+ */
+async function waitForFile(path: string, timeoutMs = 2000, run?: Promise<unknown>) {
+	let ended: { value: unknown } | undefined;
+	run?.then(
+		(value) => (ended = { value }),
+		(error) => (ended = { value: String(error) }),
+	);
 	const deadline = Date.now() + timeoutMs;
 	while (Date.now() < deadline) {
 		if (await fileExists(path)) return;
+		if (ended) {
+			throw new Error(`The run ended before ${path} appeared: ${JSON.stringify(ended.value)}`);
+		}
 		await new Promise((resolve) => setTimeout(resolve, 10));
 	}
 	throw new Error(`Timed out waiting for ${path}`);
@@ -2672,7 +2684,7 @@ test("an in-flight gog.gmail.send is terminated and the pipeline halts after can
 			},
 		});
 
-		await waitForFile(sendStarted);
+		await waitForFile(sendStarted, 10000, run);
 		const childPid = await waitForPid(sendStarted);
 		controller.abort();
 		const immediate = await observeSettlement(run, 50);
@@ -2841,7 +2853,7 @@ test("workflow pipeline terminates an in-flight send and halts under cancellatio
 			},
 		});
 
-		await waitForFile(sendStarted);
+		await waitForFile(sendStarted, 10000, run);
 		const childPid = await waitForPid(sendStarted);
 		controller.abort();
 		const immediate = await observeSettlement(run, 50);
@@ -2885,7 +2897,7 @@ test("parallel timeout kills in-flight sends without retrying", async () => {
 						id: "send",
 						retry: { max: 2, delay_ms: 0 },
 						parallel: {
-							timeout_ms: 3000,
+							timeout_ms: 5000,
 							branches: [
 								{
 									id: "mail",
@@ -2917,7 +2929,7 @@ test("parallel timeout kills in-flight sends without retrying", async () => {
 			},
 		});
 
-		await waitForFile(sendStarted, 10000);
+		await waitForFile(sendStarted, 10000, run);
 		const result = await run;
 		assert.equal(result.ok, false);
 		assert.match(result.error?.message ?? "", /timed out|timeout|abort|cancel/i);
@@ -2958,7 +2970,7 @@ test("a templated Gmail send pipeline is not retried after timeout", async () =>
 						id: "send",
 						pipeline: "${send_pipeline}",
 						stdin: "$draft.json",
-						timeout_ms: 3000,
+						timeout_ms: 5000,
 						retry: { max: 2, delay_ms: 0 },
 					},
 				],
@@ -2982,7 +2994,7 @@ test("a templated Gmail send pipeline is not retried after timeout", async () =>
 			},
 		});
 
-		await waitForFile(sendStarted, 10000);
+		await waitForFile(sendStarted, 10000, run);
 		const result = await run;
 		assert.equal(result.ok, false);
 		assert.match(result.error?.message ?? "", /timed out|timeout|abort|cancel/i);
