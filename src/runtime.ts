@@ -1,3 +1,4 @@
+import { assertKnownFlags } from "./commands/define.js";
 import { PersistenceError } from "./persistence/backend.js";
 import type { LlmSpendLedger } from "./core/llm_accounting.js";
 import {
@@ -123,6 +124,7 @@ export async function runPipeline({
 			if (!command) {
 				throw new Error(`Unknown command: ${stage.name}`);
 			}
+			assertKnownFlags(command, stage.name, stage.args ?? {});
 			const history = recorderFromEnv(env);
 			const attemptId = await history?.start(
 				`pipeline/${history.pipelineOffset + idx}`,
@@ -174,6 +176,8 @@ export async function runPipeline({
 			});
 			const ctx = {
 				...baseCtx,
+				// The name used to invoke it, which may be an alias.
+				commandName: stage.name,
 				stdout: stageStdout,
 				render: createRecordingJsonRenderer(stageStdout, renderedItems),
 			};
@@ -352,6 +356,7 @@ function dryRunPipeline({
 		if (!command) {
 			throw new Error(`Unknown command: ${stage.name}`);
 		}
+		assertKnownFlags(command, stage.name, stage.args ?? {});
 		const formattedArgs = stage.args ? formatStageArgs(stage.args) : "";
 		const argsStr = formattedArgs ? `  args: ${formattedArgs}` : "";
 		lines.push(`  ${idx + 1}. ${stage.name}${argsStr}`);

@@ -10,7 +10,7 @@
  *   .pipe(pr => console.log(pr.state));
  */
 
-import { runGithubPr, parseGithubPr } from "../read_pr.js";
+import { runGithubPr, parseGithubPr } from "./read_pr.js";
 
 /**
  * Create a GitHub PR view stage

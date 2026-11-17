@@ -1,4 +1,6 @@
 import { tokenizeCommand } from "./command_tokens.js";
+import { booleanFlags } from "./commands/define.js";
+import type { CommandRegistry } from "./commands/types.js";
 
 function splitPipes(input) {
 	const parts = [];
@@ -61,7 +63,15 @@ function parseArgs(tokens, booleanFlags: readonly string[] = []) {
 
 			const key = tok.slice(2);
 			const next = tokens[i + 1];
-			if (booleanFlags.includes(key) || next === undefined || next.startsWith("--")) {
+			if (booleanFlags.includes(key)) {
+				// A boolean flag never takes the next word, except an explicit true or false.
+				if (next === "true" || next === "false") {
+					args[key] = next === "true";
+					i++;
+				} else args[key] = true;
+				continue;
+			}
+			if (next === undefined || next.startsWith("--")) {
 				args[key] = true;
 				continue;
 			}
@@ -76,7 +86,11 @@ function parseArgs(tokens, booleanFlags: readonly string[] = []) {
 	return args;
 }
 
-export function parsePipeline(input) {
+/**
+ * Split a pipeline into stages. With a registry, each command's boolean flags come from its
+ * schema, so `exec --json node -e ...` keeps `node` as the program rather than the flag value.
+ */
+export function parsePipeline(input: string, registry?: Pick<CommandRegistry, "get">) {
 	const stages = splitPipes(input);
 	if (stages.length === 0) throw new Error("Empty pipeline");
 
@@ -84,8 +98,7 @@ export function parsePipeline(input) {
 		const tokens = tokenizeCommand(stage);
 		if (tokens.length === 0) throw new Error("Empty command stage");
 		const name = tokens[0];
-		// exec's JSON switch must not consume the child executable as its value.
-		const args = parseArgs(tokens.slice(1), name === "exec" ? ["json"] : []);
+		const args = parseArgs(tokens.slice(1), booleanFlags(registry?.get(name)));
 		return { name, args, raw: stage };
 	});
 }

@@ -79,7 +79,7 @@ export async function runPipelineStep({
 }) {
 	let pipeline;
 	try {
-		const currentPipeline = parsePipeline(pipelineText);
+		const currentPipeline = parsePipeline(pipelineText, ctx.registry);
 		if (resume) {
 			if (!isDeepStrictEqual(currentPipeline, resume.pipelineInput.pipeline)) {
 				throw new RequestInputResumeError("workflow pipeline changed since input request");

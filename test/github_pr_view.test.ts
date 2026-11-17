@@ -10,7 +10,7 @@ import { fileURLToPath } from "node:url";
 
 import { Lobster } from "../src/sdk/Lobster.js";
 import { openStoreSession } from "../src/persistence/session.js";
-import { ghPrView, prMonitor, prMonitorNotify } from "../src/recipes/github/index.js";
+import { ghPrView, prMonitor, prMonitorNotify } from "../src/packs/github/recipes.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);

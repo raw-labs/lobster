@@ -49,8 +49,8 @@
 			"default": "./dist/src/core/index.js"
 		},
 		"./recipes/github": {
-			"types": "./dist/src/recipes/github/index.d.ts",
-			"default": "./dist/src/recipes/github/index.js"
+			"types": "./dist/src/packs/github/recipes.d.ts",
+			"default": "./dist/src/packs/github/recipes.js"
 		}
 	},
 	"scripts": {

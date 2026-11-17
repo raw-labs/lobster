@@ -1,3 +1,4 @@
+import { defineCommand } from "../define.js";
 function parsePredicate(expr) {
 	const m = expr.match(/^([a-zA-Z0-9_.]+)\s*(==|=|!=|<=|>=|<|>)\s*(.+)$/);
 	if (!m) throw new Error(`Invalid where expression: ${expr}`);
@@ -41,7 +42,7 @@ function compare(left, op, right) {
 	}
 }
 
-export const whereCommand = {
+export const whereCommand = defineCommand({
 	name: "where",
 	meta: {
 		description: "Filter objects by a simple predicate",
@@ -57,6 +58,7 @@ export const whereCommand = {
 			required: ["_"],
 		},
 		sideEffects: [],
+		repeatable: true,
 	},
 	help() {
 		return `where — filter objects by a simple predicate\n\nUsage:\n  ... | where unread=true\n  ... | where minutes>=30\n  ... | where sender.domain==example.com\n`;
@@ -75,4 +77,4 @@ export const whereCommand = {
 			})(),
 		};
 	},
-};
+});

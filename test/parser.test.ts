@@ -1,6 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { parsePipeline } from "../src/parser.js";
+import { createDefaultRegistry } from "../src/commands/registry.js";
+
+const registry = createDefaultRegistry();
 
 test("parsePipeline splits stages and args", () => {
 	const p = parsePipeline("exec echo hi | where a=1 | pick id,subject");
@@ -69,7 +72,7 @@ test("parsePipeline treats --flag followed by another --flag as boolean", () => 
 
 test("parsePipeline keeps the command after exec --json", () => {
 	for (const command of ["cat rows.json", "'echo [1,2,3]'"]) {
-		const stage = parsePipeline(`exec --json ${command}`)[0];
+		const stage = parsePipeline(`exec --json ${command}`, registry)[0];
 		assert.equal(stage.args["json"], true);
 		assert.deepEqual(
 			stage.args._,
@@ -79,11 +82,19 @@ test("parsePipeline keeps the command after exec --json", () => {
 });
 
 test("parsePipeline preserves value-taking options beside exec --json", () => {
-	const stage = parsePipeline("exec --stdin json --json cat")[0];
+	const stage = parsePipeline("exec --stdin json --json cat", registry)[0];
 	assert.equal(stage.args["stdin"], "json");
 	assert.equal(stage.args["json"], true);
 	assert.deepEqual(stage.args._, ["cat"]);
-	assert.equal(parsePipeline("custom --json payload")[0].args["json"], "payload");
+	assert.equal(parsePipeline("custom --json payload", registry)[0].args["json"], "payload");
+});
+
+test("a declared boolean flag takes only an explicit true or false as its value", () => {
+	const [stage] = parsePipeline("openclaw.invoke --dry-run false --each true --tool t", registry);
+	assert.equal(stage.args["dry-run"], false);
+	assert.equal(stage.args["each"], true);
+	assert.equal(stage.args["tool"], "t");
+	assert.deepEqual(parsePipeline("sort --desc key", registry)[0].args, { _: ["key"], desc: true });
 });
 
 test("parsePipeline unescapes \\$ and \\` inside double quotes", () => {

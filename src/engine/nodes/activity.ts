@@ -29,7 +29,12 @@ export async function activity(machine: Machine, step: WorkflowStep, key: string
 		await input(machine, step, gateKey, scope, record.wait);
 		record.response = activation(machine.state, gateKey).result!.response;
 	} else if (record.phase === "started") {
-		if (record.input?.kind !== "none" && (step.recovery !== "repeat" || record.nonRetryable))
+		if (
+			record.input?.kind !== "none" &&
+			(step.recovery !== "repeat" ||
+				record.nonRetryable ||
+				containsUnrepeatable(record.input, scope.ctx.registry))
+		)
 			throw new InterruptedActivityError(key);
 		record.phase = "ready";
 	}
@@ -50,10 +55,6 @@ export async function activity(machine: Machine, step: WorkflowStep, key: string
 		};
 	}
 	const saved = record.input;
-	if (saved.kind === "pipeline")
-		record.nonRetryable ||= parsePipeline(saved.text!).some((stage) =>
-			scope.ctx.registry?.get(stage.name)?.meta?.sideEffects?.includes("calls_openclaw_agent"),
-		);
 
 	const activityKey = key.slice(0, key.lastIndexOf("/attempt-"));
 	if (record.phase !== "waiting") {
@@ -144,4 +145,19 @@ export async function activity(machine: Machine, step: WorkflowStep, key: string
 		await machine.save();
 		throw error;
 	}
+}
+
+/**
+ * A crash leaves no record of whether a command that may not be repeated already acted, so a
+ * step running one is never re-run on recovery, whatever its `recovery` says. Retries in the
+ * same process stay precise: the command reports dispatch through `onNonRetryableSideEffect`.
+ */
+function containsUnrepeatable(
+	saved: { kind: string; text?: string } | undefined,
+	registry: { get(name: string): { meta?: { repeatable?: boolean } } | undefined } | undefined,
+) {
+	if (saved?.kind !== "pipeline" || !saved.text || !registry) return false;
+	return parsePipeline(saved.text, registry as any).some(
+		(stage) => registry.get(stage.name)?.meta?.repeatable === false,
+	);
 }

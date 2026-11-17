@@ -1,3 +1,4 @@
+import { defineCommand } from "../define.js";
 import { markLlmItem } from "../../core/llm_accounting.js";
 import type { LlmChargeCost, LlmSpendLedger, LlmProvenance } from "../../core/llm_accounting.js";
 import path from "node:path";
@@ -17,7 +18,6 @@ import {
 	writeFileAtomic,
 } from "../../state/store.js";
 import { createCompileCached } from "../../validation.js";
-import type { LobsterCommand } from "../types.js";
 import { httpResponseLimitFromEnv, readResponseTextCapped } from "../../read_response_text.js";
 
 const ajv = new Ajv({ allErrors: true, strict: false });
@@ -192,7 +192,7 @@ type CacheEntry = {
 	storedAt: string;
 };
 
-type CommandConfig = {
+export type CommandConfig = {
 	name: string;
 	itemKind: string;
 	stateType: string;
@@ -266,31 +266,8 @@ export const llmInvokeCommand = createLlmInvokeCommand({
 	legacyEnvCompat: true,
 });
 
-export const llmTaskInvokeCommand = createLlmInvokeCommand({
-	name: "llm_task.invoke",
-	itemKind: "llm_task.invoke",
-	stateType: "llm_task.invoke",
-	cacheNamespace: "llm_task.invoke",
-	defaultProvider: "openclaw",
-	description: "Backward-compatible alias for llm.invoke using the OpenClaw adapter",
-	helpTitle: "llm_task.invoke — backward-compatible alias for llm.invoke using OpenClaw",
-	helpConfig: [
-		"Requires OPENCLAW_URL (or CLAWD_URL) and optionally OPENCLAW_TOKEN.",
-		"Use llm.invoke for new workflows and non-OpenClaw adapters.",
-	],
-	helpExamples: [
-		"llm_task.invoke --prompt 'Write summary'",
-		"llm_task.invoke --model claude-3-sonnet --prompt 'Write summary'",
-		"cat artifacts.json | llm_task.invoke --prompt 'Score each item'",
-	],
-	sourceForProvider() {
-		return "clawd";
-	},
-	legacyEnvCompat: true,
-});
-
-export function createLlmInvokeCommand(config: CommandConfig): LobsterCommand {
-	return {
+export function createLlmInvokeCommand(config: CommandConfig) {
+	return defineCommand({
 		name: config.name,
 		meta: {
 			description: config.description,
@@ -332,6 +309,8 @@ export function createLlmInvokeCommand(config: CommandConfig): LobsterCommand {
 				required: [],
 			},
 			sideEffects: ["calls_llm"],
+			// Answers are cached and replayed, so a repeated call does not repeat the work.
+			repeatable: true,
 		},
 		help() {
 			const lines = [
@@ -354,7 +333,7 @@ export function createLlmInvokeCommand(config: CommandConfig): LobsterCommand {
 		async run({ input, args, ctx }) {
 			return runLlmInvoke({ input, args, ctx, config });
 		},
-	} satisfies LobsterCommand;
+	});
 }
 
 async function runLlmInvoke({

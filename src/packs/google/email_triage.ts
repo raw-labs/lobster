@@ -1,3 +1,4 @@
+import { defineCommand } from "../../commands/define.js";
 type EmailLike = {
 	id?: string;
 	threadId?: string;
@@ -176,7 +177,7 @@ const TRIAGE_OUTPUT_SCHEMA = {
 	additionalProperties: false,
 };
 
-export const emailTriageCommand = {
+export const emailTriageCommand = defineCommand({
 	name: "email.triage",
 	meta: {
 		description: "Email triage (deterministic by default, optionally LLM-assisted via llm.invoke)",
@@ -211,6 +212,7 @@ export const emailTriageCommand = {
 			required: [],
 		},
 		sideEffects: [],
+		repeatable: true,
 	},
 	help() {
 		return (
@@ -345,7 +347,7 @@ export const emailTriageCommand = {
 
 		return { output: streamOf([report]) };
 	},
-};
+});
 
 async function* streamOf(items: any[]) {
 	for (const item of items) yield item;

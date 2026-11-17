@@ -1,7 +1,7 @@
-import { diffAndStore } from "../state/store.js";
-import { runGithubPr, parseGithubPr } from "../recipes/github/read_pr.js";
-import { buildPrChangeSummary, formatPrChangeMessage } from "../recipes/github/snapshot.js";
-export { buildPrChangeSummary } from "../recipes/github/snapshot.js";
+import { diffAndStore } from "../../state/store.js";
+import { runGithubPr, parseGithubPr } from "./read_pr.js";
+import { buildPrChangeSummary, formatPrChangeMessage } from "./snapshot.js";
+export { buildPrChangeSummary } from "./snapshot.js";
 
 export async function runGithubPrMonitorWorkflow({ args, ctx }) {
 	ctx.signal?.throwIfAborted();

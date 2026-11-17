@@ -1,4 +1,5 @@
-export const pickCommand = {
+import { defineCommand } from "../define.js";
+export const pickCommand = defineCommand({
 	name: "pick",
 	meta: {
 		description: "Project fields from objects",
@@ -14,6 +15,7 @@ export const pickCommand = {
 			required: ["_"],
 		},
 		sideEffects: [],
+		repeatable: true,
 	},
 	help() {
 		return `pick — project fields from objects\n\nUsage:\n  ... | pick id,subject,from\n`;
@@ -38,4 +40,4 @@ export const pickCommand = {
 			})(),
 		};
 	},
-};
+});

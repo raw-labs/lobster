@@ -77,7 +77,7 @@ async function runCliWithSignal(
 			process.exitCode = 2;
 			return;
 		}
-		process.stdout.write(cmd.help());
+		process.stdout.write(cmd.help(topic));
 		return;
 	}
 
@@ -432,7 +432,7 @@ async function handleRunInternal({
 
 	let pipeline;
 	try {
-		pipeline = parsePipeline(pipelineString);
+		pipeline = parsePipeline(pipelineString, registry);
 	} catch (err) {
 		reportRunError(normalizedMode, "parse_error", err, undefined, emit);
 		return { ok: false };
@@ -789,7 +789,7 @@ async function handleDoctor({
 	const pipeline = "exec --json --shell 'echo [1]'";
 	const output: any = await (async () => {
 		try {
-			const parsed = parsePipeline(pipeline);
+			const parsed = parsePipeline(pipeline, registry);
 			return await runPipeline({
 				pipeline: parsed,
 				registry,

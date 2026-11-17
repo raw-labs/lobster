@@ -1,3 +1,4 @@
+import { defineCommand } from "../define.js";
 import { compileCached } from "../../validation.js";
 
 function isInteractive(stdin) {
@@ -34,7 +35,7 @@ function parseInteractiveCandidates(text) {
 	return [parsed];
 }
 
-export const askCommand = {
+export const askCommand = defineCommand({
 	name: "ask",
 	meta: {
 		description: "Pause and request structured input from the user",
@@ -51,12 +52,14 @@ export const askCommand = {
 					type: "boolean",
 					description: "Use stdin content as the subject (preview text)",
 				},
+				subjectFromStdin: { type: "boolean", description: "Alias for subject-from-stdin" },
 				emit: { type: "boolean", description: "Force emit mode" },
 				_: { type: "array", items: { type: "string" } },
 			},
 			required: [],
 		},
 		sideEffects: [],
+		repeatable: true,
 		resumeSafeBeforeInput: true,
 		resumeSafeAfterInput: true,
 	},
@@ -174,7 +177,7 @@ export const askCommand = {
 		}
 		throw lastError ?? new Error("ask response failed schema validation");
 	},
-};
+});
 
 async function* asStream(items) {
 	for (const item of items) yield item;
