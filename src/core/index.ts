@@ -1,4 +1,12 @@
-export { createDefaultRegistry } from "../commands/registry.js";
+export { createDefaultRegistry, createRegistry, builtinPacks } from "../commands/registry.js";
+export { defineCommand } from "../commands/define.js";
+export type {
+	CommandPack,
+	CommandRegistry,
+	DefinedCommand,
+	LobsterCommand,
+	NamedWorkflow,
+} from "../commands/types.js";
 export { parsePipeline } from "../pipeline/parser.js";
 export { runPipeline } from "../pipeline/runtime.js";
 export { runWorkflowFile, advanceWorkflowRun, abandonWorkflowRun } from "../workflows/file.js";

@@ -362,6 +362,61 @@ conventional interrupt exit status.
 
 In top-level `--mode tool` pipelines (including resumes and the core tool API), `json` and `table` preserve typed items in the single JSON envelope instead of writing terminal output. Human-mode rendering and rendered output captured within workflow-file steps remain unchanged.
 
+### Command packs
+
+Commands come in packs. The default registry enables all of them:
+
+| Pack | Commands |
+|---|---|
+| `stdlib` | `where`, `pick`, `map`, `sort`, `head`, `dedupe`, `groupBy`, `template`, `diff.last`, `json`, `table`, `exec`, `state.get`, `state.set`, `approve`, `ask`, `llm.invoke`, `commands.list`, `workflows.list`, `workflows.run` |
+| `openclaw` | `openclaw.invoke` (alias `clawd.invoke`), `openclaw.agent`, `llm_task.invoke` |
+| `google` | `gog.gmail.search`, `gog.gmail.send`, `email.triage` |
+| `github` | named workflows `github.pr.monitor` and `github.pr.monitor.notify`; SDK recipes in `@clawdbot/lobster/recipes/github` |
+
+Every command declares a contract with `defineCommand`: a description, a schema of its flags,
+labels for what it touches, and whether it is `repeatable`. Lobster enforces it:
+
+- A flag the command does not declare fails the stage before it runs, with a suggestion for
+  likely typos (`head --m 2` → `did you mean --n?`).
+- A flag declared as a boolean never takes the next word as its value; only an explicit
+  `true` or `false` does (`--dry-run false` is false).
+- A command declared `repeatable: false` (`openclaw.invoke`, `openclaw.agent`,
+  `gog.gmail.send`) is never repeated automatically; see
+  [Retries after external dispatch](#retries-after-external-dispatch).
+
+Older names keep working without special cases. `clawd.invoke` is an alias: the same command,
+which learns the name it was invoked by from `ctx.commandName`. `llm_task.invoke` is a variant
+of `llm.invoke` fixed to the OpenClaw adapter, kept separate because its cache and saved-run
+namespaces are its own. `commands.list` reports `aliasOf` and `repeatable` for each name.
+
+Hosts embedding Lobster can choose packs or add their own through the core entry point:
+
+```ts
+import { builtinPacks, createRegistry, defineCommand, runToolRequest } from "@clawdbot/lobster/core";
+
+const notify = defineCommand({
+	name: "acme.notify",
+	meta: {
+		description: "Post a message to the Acme channel",
+		argsSchema: { type: "object", properties: { channel: { type: "string" } } },
+		sideEffects: ["sends_message"],
+		repeatable: false,
+	},
+	help: () => "acme.notify --channel <name>\n",
+	async run({ input, args, ctx }) {
+		ctx.onNonRetryableSideEffect?.(); // report dispatch right before acting
+		// ...
+		return { output: (async function* () {})() };
+	},
+});
+const registry = createRegistry({
+	packs: [...builtinPacks, { name: "acme", description: "Acme", commands: [notify] }],
+});
+await runToolRequest({ pipeline: "acme.notify --channel ops", ctx: { registry } });
+```
+
+A name or alias defined by two packs is an error rather than an override.
+
 ## SDK cancellation
 
 Pass an `AbortSignal` to `new Lobster({ signal })` to cancel SDK `exec()` stages,
@@ -533,9 +588,14 @@ Notes:
   - `LOBSTER_APPROVAL_INITIATED_BY` can provide a default initiator id at run time.
   - `LOBSTER_APPROVAL_APPROVED_BY` is used at resume/approval time for identity checks.
 
-### Retries after OpenClaw dispatch
+### Retries after external dispatch
 
-`openclaw.invoke` (including `clawd.invoke`) and `openclaw.agent` suppress automatic workflow-step retries once dispatch is attempted. This applies to timeouts, HTTP or process failures, and errors in later commands of the same pipeline step, even when `retry.max` is greater than one. A failed local request cannot establish whether a remote action already completed. Read-only and dry-run requests use the same conservative rule: Lobster does not know the remote tool’s retry guarantees, and the [OpenClaw gateway currently ignores `dryRun`](https://docs.openclaw.ai/gateway/tools-invoke-http-api#request-body). The flag does not prevent tool execution. Check the remote outcome before manually running the step again. `llm.invoke` retains its existing retry policy.
+Commands declared `repeatable: false` — `openclaw.invoke` (including `clawd.invoke`),
+`openclaw.agent` and `gog.gmail.send` — are never repeated automatically. After a crash, a step
+whose pipeline contains one is reported as `blocked` instead of being re-run, even with
+`recovery: repeat`, because nothing records whether it had already acted.
+
+Within a run, these commands suppress automatic workflow-step retries once dispatch is attempted. This applies to timeouts, HTTP or process failures, and errors in later commands of the same pipeline step, even when `retry.max` is greater than one. A failed local request cannot establish whether a remote action already completed. Read-only and dry-run requests use the same conservative rule: Lobster does not know the remote tool’s retry guarantees, and the [OpenClaw gateway currently ignores `dryRun`](https://docs.openclaw.ai/gateway/tools-invoke-http-api#request-body). The flag does not prevent tool execution. Check the remote outcome before manually running the step again. `llm.invoke` retains its existing retry policy.
 
 ### Command-level input requests
 
@@ -715,7 +775,22 @@ post-dispatch errors; `llm.invoke` retains its existing retry policy.
 
 ## Development
 
-The source is one TypeScript package. `src/core` contains the embeddable tool API, cost tracking, and LLM accounting; `src/sdk` provides pipeline composition; `src/commands` holds the command registry and standard library. Workflow loading, expressions and dry-run rendering live under `src/workflows`; `src/definition` snapshots definitions, `src/engine` owns saved execution and node handlers, and `src/activities` runs commands/pipelines. `src/state` owns atomic file persistence, locks, and resume capabilities. GitHub SDK recipes and built-in workflows share transport and snapshot helpers.
+The source is one TypeScript package; only `src/cli.ts` sits at the top of `src`.
+
+| Folder | Holds |
+|---|---|
+| `src/core` | The embeddable tool API (public entry point), tool runtime and run queries |
+| `src/sdk` | Pipeline composition for the SDK entry point |
+| `src/commands` | The command contract (`defineCommand`), the pack registry and the `stdlib` pack |
+| `src/packs` | The `openclaw`, `google` and `github` packs |
+| `src/pipeline` | Pipeline parsing, the stage runtime, input requests and pipeline resume state |
+| `src/workflows` | Workflow loading, expressions, definition snapshots, dry runs, graphs and `lobster upgrade` |
+| `src/engine` | Saved execution, node handlers, activities and the retry policy |
+| `src/persistence` | The SQLite run store, sessions, history and waits |
+| `src/state` | State keys, file locks and atomic writes |
+| `src/resume` | Resume arguments, options and tokens |
+| `src/llm` | LLM spend accounting and cost tracking |
+| `src/process`, `src/io`, `src/util` | Child processes, stream and HTTP reads, small shared helpers |
 
 Run `pnpm test`, `pnpm typecheck`, and `pnpm lint` before submitting changes. Tests compile into `dist/test` and use Node's test runner; platform-specific process tests run only where their OS primitives exist. Dependencies observe the two-day release-age policy in `pnpm-workspace.yaml`.
 
