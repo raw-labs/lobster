@@ -42,9 +42,10 @@ Invalid workflow file paths are reported as input errors (exit code 2), whether 
 ## Persistence and run history
 
 Lobster keeps its state in one SQLite database, `lobster.sqlite`, in the state
-directory (`~/.lobster/state` by default, or `LOBSTER_STATE_DIR`). Workflow-file runs
-always save execution progress. Standalone pipelines and SDK stages save what they
-need to resume. Detailed diagnostic history remains opt-in:
+directory (`~/.lobster/state` by default, or `LOBSTER_STATE_DIR`). Every run saves its
+progress: workflow files, standalone pipelines (`lobster '...'`, `runToolRequest({ pipeline })`)
+and SDK pipelines all run on the same engine, so they pause, resume and recover the same
+way. Detailed diagnostic history remains opt-in:
 
 ```sh
 LOBSTER_HISTORY=1 lobster run --mode tool --file workflow.lobster
@@ -144,7 +145,8 @@ reusable old approval. Publication and consumption use ownership fencing and
 revision checks. Lost checkpoint replies are reconciled against their receipts;
 an unreadable receipt leaves the outcome explicitly unknown.
 
-Standalone tracked pipeline and SDK pauses retain their atomic handoff protocol.
+A pipeline is a run of one step whose command is the pipeline, so all of this applies
+to pipelines and SDK pipelines too.
 
 Invalid answers remain correctable; changed, consumed, or foreign waits return
 `wait_conflict`. The old token and approval-ID paths continue to use the same
@@ -158,11 +160,15 @@ keep it stable across the resets they intend to support. Unscoped local callers
 can inspect all runs in their store. Lobster owns saved execution facts; the host
 owns identity, conversation routing, and presentation.
 
-SDK function stages still require an instance supplying the original stages:
-`lobster.resumeWait({ waitId, expectedRevision, response })`. They are not
-serialized or resurrected from storage. Workflow-file and pipeline waits resume
-through `resumeToolRequest`. Existing untracked checkpoints retain token-based
-resume for pipelines/SDK stages; old workflow-file pauses need `lobster upgrade`.
+SDK function stages are closures, so a run saves only their position
+(`sdk.stage.0 | sdk.stage.1 | ...`) and an instance with the same stages resumes it:
+`lobster.resume(token, decision)` or `lobster.resumeWait({ waitId, expectedRevision, response })`.
+An instance with a different number of stages is refused and the run is left as it was.
+`lobster.advance(runId)` continues an SDK run that stopped without a question (its
+process stopped, or it failed). `lobster runs advance` refuses SDK runs and
+`runs advance --due` skips them: only their host has the stages. Like every token, an
+SDK token resumes once; a token handed out by an older version is honoured once, then
+refused. Workflow-file and pipeline waits resume through `resumeToolRequest`.
 Legacy records do not retroactively acquire history or a known caller. Imported
 older tracked waits may have `request: null` when the original question was not
 saved; discovery does not invent it by rereading a changed workflow file.
@@ -184,8 +190,11 @@ Full wait inspection is an explicit read of private review material; callers mus
 apply their own display limits. If a durable workflow question cannot fit the
 bounded tool envelope, the call reports a rendering error with its run ID and the
 saved question remains discoverable. Pending waits are protected from terminal
-history pruning. Workflow-file runs can also continue through `advanceWorkflowRun`
-or `lobster runs advance`, subject to interrupted-activity recovery policy.
+history pruning. Runs can also continue through `advanceWorkflowRun` or
+`lobster runs advance`, subject to interrupted-activity recovery policy. A failed run
+is retried from the step that failed: steps that completed keep their results, and a
+step that reported dispatch of a command that may not be repeated is not run again.
+Failed runs keep their step records for this until retention deletes them.
 No background dispatcher is included.
 
 ### Upgrading from an older version
@@ -201,9 +210,11 @@ It moves everything into `lobster.sqlite` under the same keys, so resume tokens 
 short approval IDs handed out before keep working:
 
 - workflows paused at an approval step, an input step, or a command asking for
-  input become waiting runs; steps that already ran are not run again;
-- paused pipelines and SDK steps, approval IDs and `state.set` values are imported
-  as they are.
+  input, and pipelines paused at `approve`, `ask` or a command asking for input,
+  become waiting runs; steps and stages that already ran are not run again;
+- paused SDK steps, approval IDs and `state.set` values are imported as they are. A
+  paused SDK step becomes a run the first time its host resumes it, since only the
+  host has its stages.
 
 The original files are moved to `.pre-upgrade/<time>/` in the state directory. A
 paused workflow whose workflow file is missing, or no longer has the paused step at
@@ -698,7 +709,7 @@ Within a run, these commands suppress automatic workflow-step retries once dispa
 
 ### Command-level input requests
 
-Pipeline commands can call `ctx.requestInput({ prompt, responseSchema, defaults, subject, suspendedState })` to pause in tool mode, workflows, or the SDK and resume the same command after a structured response. CLI/tool resume tokens store only a state key; the persisted state validates the suspended request metadata before returning the submitted response to the command. SDK same-command resumes store the command frame in the configured SDK state directory.
+Pipeline commands can call `ctx.requestInput({ prompt, responseSchema, defaults, subject, suspendedState })` to pause in tool mode, workflows, or the SDK and resume the same command after a structured response. Resume tokens store only a state key; the run saves the suspended command's frame and validates the suspended request metadata before returning the submitted response to the command. This is the same for the CLI, tool mode and the SDK.
 
 Commands are re-run on resume, so they must be idempotent until `requestInput` returns. Array-backed command input is snapshotted with bounds for replay; lazy stream input is not buffered and requires a compact JSON `suspendedState` supplied by the command. On resume, call `ctx.requestInput.getSuspendedState()` before reading lazy input to restore that command-owned continuation state.
 

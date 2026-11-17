@@ -228,7 +228,6 @@ function saveRun(run: RunRecord): void {
 function transition(request: Transition): TransitionResult {
 	const current = metadata(request.runId);
 	let previousAttempts: number | undefined;
-	let successorExists = false;
 	if (current) {
 		const receipt = prepare("SELECT record FROM receipts WHERE run_id=? AND operation_id=?").get(
 			current.id,
@@ -268,9 +267,7 @@ function transition(request: Transition): TransitionResult {
 					)
 				: request.action.kind === "state"
 					? [request.action.key]
-					: request.action.kind === "handoff"
-						? [request.action.predecessor.key, request.action.successor.key]
-						: [];
+					: [];
 		for (const key of keys) {
 			const state = prepare("SELECT text FROM state WHERE run_id=? AND key=?").get(
 				current.id,
@@ -289,12 +286,7 @@ function transition(request: Transition): TransitionResult {
 		}
 	}
 
-	if (request.action.kind === "handoff") {
-		successorExists = Boolean(
-			prepare("SELECT key FROM state WHERE key=?").get(request.action.successor.key),
-		);
-	}
-	const applied = applyTransition(current, request, { previousAttempts, successorExists });
+	const applied = applyTransition(current, request, { previousAttempts });
 	if (applied.status === "committed" && applied.run !== current) {
 		saveRun(applied.run);
 	}
@@ -325,6 +317,7 @@ function handle(request: WorkerRequest): WorkerResult<WorkerMethod> {
 				const row = prepare("SELECT run_id FROM state WHERE key=?").get(args.key) as
 					| Pick<StateRow, "run_id">
 					| undefined;
+				// A key a run owns changes through that run, so its wait status stays right.
 				const runId = row?.run_id ?? args.runId;
 				if (runId) {
 					const result = transition({
@@ -335,7 +328,6 @@ function handle(request: WorkerRequest): WorkerResult<WorkerMethod> {
 							key: args.key,
 							text: args.text,
 							expectedWaitRevision: args.expectedWaitRevision,
-							...(args.decision ? { decision: args.decision } : {}),
 						},
 					});
 					if (result.status === "conflict") {
@@ -521,16 +513,20 @@ function handle(request: WorkerRequest): WorkerResult<WorkerMethod> {
 		}
 		case "dueRuns":
 			return (
-				prepare(`SELECT id FROM runs
+				// SDK runs are advanced by the host holding their stages, never from here.
+				(
+					prepare(`SELECT id FROM runs
 				WHERE json_extract(record, '$.wakeAt') <= ?
+				AND json_extract(record, '$.kind') IS NOT 'sdk'
 				AND (? IS NULL OR json_extract(record, '$.metadata.callerId') = ?)
 				ORDER BY json_extract(record, '$.wakeAt'), id LIMIT ?`).all(
-					args.now,
-					args.callerId ?? null,
-					args.callerId ?? null,
-					args.limit,
-				) as { id: string }[]
-			).map((row) => row.id);
+						args.now,
+						args.callerId ?? null,
+						args.callerId ?? null,
+						args.limit,
+					) as { id: string }[]
+				).map((row) => row.id)
+			);
 		case "appendEvent": {
 			const result = prepare(
 				"INSERT INTO event_inbox(owner,id,name,data,at) VALUES(?,?,?,?,?) ON CONFLICT(owner,id) DO NOTHING",

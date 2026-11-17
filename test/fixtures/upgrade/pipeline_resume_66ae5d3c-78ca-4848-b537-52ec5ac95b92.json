@@ -1,0 +1,57 @@
+{
+	"pipeline": [
+		{
+			"name": "exec",
+			"args": {
+				"_": [],
+				"json": true,
+				"shell": "echo x >> __DIR__/count_ask; echo [1,2]"
+			},
+			"raw": "exec --json --shell 'echo x >> __DIR__/count_ask; echo [1,2]'"
+		},
+		{
+			"name": "ask",
+			"args": {
+				"_": [],
+				"prompt": "How many?",
+				"schema": "{\"type\":\"integer\"}"
+			},
+			"raw": "ask --prompt 'How many?' --schema '{\"type\":\"integer\"}'"
+		},
+		{
+			"name": "exec",
+			"args": {
+				"_": [],
+				"json": true,
+				"shell": "echo x >> __DIR__/count_ask_after; cat"
+			},
+			"raw": "exec --json --shell 'echo x >> __DIR__/count_ask_after; cat'"
+		}
+	],
+	"resumeAtIndex": 1,
+	"items": [],
+	"haltType": "input_request",
+	"resumeMode": "same_stage",
+	"inputSchema": {
+		"type": "integer"
+	},
+	"prompt": "How many?",
+	"commandInput": {
+		"pending": {
+			"requestIndex": 0,
+			"metadata": {
+				"prompt": "How many?",
+				"responseSchema": {
+					"type": "integer"
+				},
+				"signature": "{\"prompt\":\"How many?\",\"responseSchema\":{\"type\":\"integer\"}}"
+			},
+			"suspendedState": {
+				"type": "ask"
+			}
+		},
+		"history": []
+	},
+	"supersededResumeStateKeys": [],
+	"createdAt": "2026-11-17T17:30:31.951Z"
+}

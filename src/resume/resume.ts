@@ -1,24 +1,6 @@
 import { decodeToken, encodeToken } from "./token.js";
-import { decodeWorkflowResumePayload } from "../workflows/file.js";
+import { decodeWorkflowResumePayload, type WorkflowResumePayload } from "../workflows/file.js";
 import { findStateKeyByApprovalId } from "../state/store.js";
-
-/**
- * Determine the resume payload kind from a state key prefix.
- * State keys use naming conventions: pipeline_resume_<uuid> or workflow_resume_<uuid>.
- */
-export function kindFromStateKey(stateKey: string): "pipeline-resume" | "workflow-file" {
-	if (stateKey.startsWith("pipeline_resume_")) return "pipeline-resume";
-	if (stateKey.startsWith("workflow_resume_")) return "workflow-file";
-	// Fallback for unknown prefixes — workflow-file is the original behavior
-	return "workflow-file";
-}
-
-export type PipelineResumePayload = {
-	protocolVersion: 1;
-	v: 1;
-	kind: "pipeline-resume";
-	stateKey: string;
-};
 
 const APPROVAL_ID = /^[0-9a-f]{8}$/;
 const WAIT_ID = /^[0-9a-f-]{36}\.[0-9a-f]{64}$/;
@@ -182,10 +164,7 @@ function parseBooleanArg(value: string): boolean | null {
 	return null;
 }
 
-/**
- * Resolve an approval ID to a resume token by looking up the state key.
- * Detects the kind (workflow-file vs pipeline-resume) from the state key prefix.
- */
+/** Resolve an approval ID to a resume token by looking up the state key. */
 export async function resolveApprovalId(
 	approvalId: string,
 	env: Record<string, string | undefined>,
@@ -195,12 +174,10 @@ export async function resolveApprovalId(
 		throw new Error(`Approval ID "${approvalId}" not found or expired`);
 	}
 
-	const kind = kindFromStateKey(stateKey);
-
 	return encodeToken({
 		protocolVersion: 1,
 		v: 1,
-		kind,
+		kind: "workflow-file",
 		stateKey,
 	});
 }
@@ -210,23 +187,18 @@ export function decodeResumeToken(token) {
 	if (!payload || typeof payload !== "object") throw new Error("Invalid token");
 	if (payload.protocolVersion !== 1) throw new Error("Unsupported protocol version");
 	if (payload.v !== 1) throw new Error("Unsupported token version");
+	// Tokens handed out for paused pipelines before they became runs name their state key
+	// the same way; `lobster upgrade` converted that state into a run under the same key.
+	if (payload.kind === "pipeline-resume") {
+		if (!payload.stateKey || typeof payload.stateKey !== "string") throw new Error("Invalid token");
+		return {
+			protocolVersion: 1,
+			v: 1,
+			kind: "workflow-file",
+			stateKey: payload.stateKey,
+		} satisfies WorkflowResumePayload as WorkflowResumePayload;
+	}
 	const workflowPayload = decodeWorkflowResumePayload(payload);
 	if (workflowPayload) return workflowPayload;
-	const pipelinePayload = decodePipelineResumePayload(payload);
-	if (pipelinePayload) return pipelinePayload;
 	throw new Error("Invalid token");
-}
-
-function decodePipelineResumePayload(payload: unknown): PipelineResumePayload | null {
-	if (!payload || typeof payload !== "object") return null;
-	const data = payload as Partial<PipelineResumePayload>;
-	if (data.kind !== "pipeline-resume") return null;
-	if (data.protocolVersion !== 1 || data.v !== 1) throw new Error("Unsupported token version");
-	if (!data.stateKey || typeof data.stateKey !== "string") throw new Error("Invalid token");
-	return {
-		protocolVersion: 1,
-		v: 1,
-		kind: "pipeline-resume",
-		stateKey: data.stateKey,
-	};
 }

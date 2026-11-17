@@ -9,7 +9,6 @@ import { runtimeErrorDetails } from "./persistence/backend.js";
 import { recorderFromEnv } from "./persistence/context.js";
 import { withExecution } from "./persistence/execution.js";
 import { openStoreSession } from "./persistence/session.js";
-import { finalizePipelineToolRun } from "./pipeline/resume_state.js";
 import { parseResumeArgs } from "./resume/resume.js";
 import { readLineFromStream } from "./io/read_line.js";
 import { defaultStateDir } from "./state/store.js";
@@ -23,6 +22,7 @@ import {
 	abandonWorkflowRun,
 	advanceDueRuns,
 	signalEvent,
+	runPipelineText,
 } from "./workflows/file.js";
 import { renderWorkflowGraph } from "./workflows/graph.js";
 import { parseWorkflowArgsJson } from "./workflows/values.js";
@@ -364,10 +364,10 @@ async function handleRun(options: RunOptions) {
 				env: process.env,
 				signal: options.signal,
 				dryRun: prepared.dryRun,
-				...(prepared.workflowFile ? { trackRuns: true } : {}),
+				// Every run is recorded: pipelines run on the engine as one-step workflows.
+				...(prepared.dryRun ? {} : { trackRuns: true }),
 			},
-			"cli",
-			undefined,
+			prepared.workflowFile ? "cli" : "pipeline",
 			(ctx) =>
 				handleRunInternal({
 					...options,
@@ -535,50 +535,77 @@ async function handleRunInternal({
 		return { ok: false };
 	}
 
-	try {
-		const output = await runPipeline({
-			pipeline,
-			registry,
-			input: [],
-			stdin: process.stdin,
-			stdout: process.stdout,
-			stderr: process.stderr,
-			env: env,
-			mode: normalizedMode,
-			renderOutput: normalizedMode !== "tool",
-			dryRun,
-			signal,
-			forceTerminationSignal,
-			haltAfterStageOnAbort: true,
-		});
-
-		if (normalizedMode === "tool") {
-			const finalized = await finalizePipelineToolRun({
-				env: env,
+	if (dryRun) {
+		try {
+			const output = await runPipeline({
 				pipeline,
-				output,
+				registry,
+				input: [],
+				stdin: process.stdin,
+				stdout: process.stdout,
+				stderr: process.stderr,
+				env: env,
+				mode: normalizedMode,
+				renderOutput: normalizedMode !== "tool",
+				dryRun,
 				signal,
+				forceTerminationSignal,
+				haltAfterStageOnAbort: true,
 			});
+			if (normalizedMode === "tool") emit({ ok: true, status: "ok", output: output.items });
+			return { status: "ok", output: output.items };
+		} catch (err) {
+			reportRunError(normalizedMode, "runtime_error", err, undefined, emit);
+			return { ok: false, error: runtimeErrorDetails(err) };
+		}
+	}
+
+	try {
+		const output = await runPipelineText({
+			pipeline: pipelineString,
+			ctx: {
+				stdin: process.stdin,
+				stdout: process.stdout,
+				stderr: process.stderr,
+				env: env,
+				mode: normalizedMode,
+				registry,
+				signal,
+				forceTerminationSignal,
+			},
+		});
+		if (normalizedMode === "tool") {
 			emit({
 				ok: true,
-				status: finalized.status,
-				output: finalized.output,
-				requiresApproval: finalized.requiresApproval,
-				requiresInput: finalized.requiresInput,
+				status: output.status,
+				output: output.status === "ok" ? output.output : [],
+				requiresApproval: output.requiresApproval ?? null,
+				requiresInput: output.requiresInput ?? null,
+				...(output.waitingFor ? { waitingFor: output.waitingFor } : {}),
 			});
-			return finalized;
+			return output;
 		}
-
-		if (output.halted && isPipelineInputRequest(output.items)) {
-			throw new Error("requestInput requires --mode tool when stdin is not interactive");
+		if (output.status === "needs_approval" || output.status === "needs_input") {
+			process.stdout.write(
+				JSON.stringify(
+					{
+						status: output.status,
+						output: [],
+						requiresApproval: output.requiresApproval ?? null,
+						requiresInput: output.requiresInput ?? null,
+					},
+					null,
+					2,
+				) + "\n",
+			);
+			return output;
 		}
-
 		// Human mode: if the last command didn't render, print JSON.
-		if (!output.rendered) {
-			process.stdout.write(JSON.stringify(output.items, null, 2));
+		if (output.status === "ok" && !output.rendered) {
+			process.stdout.write(JSON.stringify(output.output, null, 2));
 			process.stdout.write("\n");
 		}
-		return { status: "ok", output: output.items };
+		return output;
 	} catch (err) {
 		reportRunError(normalizedMode, "runtime_error", err, undefined, emit);
 		return { ok: false, error: runtimeErrorDetails(err) };
@@ -607,12 +634,6 @@ async function prepareRunTarget(parsed: ReturnType<typeof parseRunArgs>) {
 		? await resolveWorkflowFile(filePath)
 		: await detectWorkflowFile(rest);
 	return { rest, workflowFile, dryRun };
-}
-
-function isPipelineInputRequest(items) {
-	return (
-		items.length === 1 && items[0]?.type === "input_request" && items[0]?.commandInput !== undefined
-	);
 }
 
 function parseRunArgs(argv) {

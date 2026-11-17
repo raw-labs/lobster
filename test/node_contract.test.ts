@@ -487,7 +487,13 @@ function scriptWork(
 async function expectSettled(fx: WorkflowFixture, status: string) {
 	const execution = await fx.execution();
 	assert.equal(execution.status, status);
-	assert.deepEqual(execution.activations, {}, "a finished run keeps no step records");
+	if (status === "failed")
+		// Kept so the run can be retried from the step that failed.
+		assert.ok(
+			Object.values(execution.activations).some((frame) => frame.phase === "failed"),
+			"a failed run keeps the records a retry needs",
+		);
+	else assert.deepEqual(execution.activations, {}, "a finished run keeps no step records");
 }
 
 const GENERIC: Record<Concern, Custom> = {

@@ -1,11 +1,10 @@
 import { stableStringify } from "./serialization.js";
 import { randomBytes } from "node:crypto";
-import { recorderFromEnv, sessionFromEnv, resumeGuardFromEnv } from "../persistence/context.js";
+import { sessionFromEnv } from "../persistence/context.js";
 import { withStoreContext } from "../persistence/execution.js";
-import type { StateWriteOptions } from "../persistence/backend.js";
 import { atomicWriteWasPublished, isAtomicExclusiveUnsupportedError } from "./atomic_file.js";
 import type { AtomicWriteOptions, AtomicExclusiveWriteOptions } from "./atomic_file.js";
-import { FILE_LOCK_RETRY_MS, withFileLock } from "./file_lock.js";
+import { withFileLock } from "./file_lock.js";
 import { keyToPath, resolveStateDirectory } from "./paths.js";
 
 export { withFileLock } from "./file_lock.js";
@@ -20,22 +19,6 @@ export {
 	stripExtendedLengthPrefix,
 } from "./atomic_file.js";
 
-const CONSUMED_RESUME_STATE_TYPE = "lobster.consumed-resume-state.v1";
-
-export type ConsumedResumeState = {
-	type: typeof CONSUMED_RESUME_STATE_TYPE;
-	consumedAt: string;
-	claimId: string;
-};
-
-export function isConsumedResumeState(value: unknown): value is ConsumedResumeState {
-	return (
-		value !== null &&
-		typeof value === "object" &&
-		(value as { type?: unknown }).type === CONSUMED_RESUME_STATE_TYPE
-	);
-}
-
 export function defaultStateDir(env: Record<string, string | undefined>): string {
 	return sessionFromEnv(env)?.directory ?? resolveStateDirectory(env);
 }
@@ -48,8 +31,6 @@ function storeOf(env: Record<string, string | undefined>) {
 }
 
 export { stableStringify } from "./serialization.js";
-
-const TERMINAL_RESUME_CLEANUP_TIMEOUT_MS = FILE_LOCK_RETRY_MS * 10;
 
 export function isJsonSyntaxError(err) {
 	return err instanceof SyntaxError;
@@ -144,30 +125,6 @@ async function readStateJsonWithLockInternal({
 	}
 }
 
-function isContinuationValue(key: string, value: unknown): boolean {
-	if (!value || typeof value !== "object") {
-		return false;
-	}
-	const record = value as Record<string, unknown>;
-	if (key.startsWith("pipeline_resume_")) {
-		return Array.isArray(record.pipeline) && Number.isInteger(record.resumeAtIndex);
-	}
-	if (key.startsWith("workflow_resume_")) {
-		return (
-			typeof record.filePath === "string" &&
-			Boolean(record.steps) &&
-			Number.isInteger(record.resumeAtIndex)
-		);
-	}
-	if (key.startsWith("sdk_resume_")) {
-		return (
-			record.type === "lobster.sdk-tracked.v1" ||
-			(Boolean(record.commandInput) && Number.isInteger(record.resumeAtIndex))
-		);
-	}
-	return false;
-}
-
 async function writeStateJsonUnlocked({
 	env,
 	key,
@@ -181,27 +138,11 @@ async function writeStateJsonUnlocked({
 	signal?: AbortSignal;
 	atomicWriteOptions?: Omit<AtomicWriteOptions, "signal">;
 }) {
-	const session = storeOf(env);
-	{
-		const recorder = recorderFromEnv(env);
-		const guard = resumeGuardFromEnv(env);
-		const guarded = guard && !guard.admitted && guard.key === key && isConsumedResumeState(value);
-		const writeOptions: StateWriteOptions = {
-			signal,
-			assertInvocationCurrent: atomicWriteOptions?.assertInvocationCurrent,
-			...(guarded ? { expectedWaitRevision: guard.expectedRevision } : {}),
-			...(recorder?.decisionKey === key.replace("workflow-resume_", "workflow_resume_")
-				? { decision: recorder.decision }
-				: {}),
-			...(isContinuationValue(key, value) && recorder ? { runId: recorder.runId } : {}),
-		};
-		const result = await session.write(key, JSON.stringify(value, null, 2) + "\n", writeOptions);
-		if (guarded) guard.admitted = true;
-		if (recorder && isConsumedResumeState(value)) {
-			recorder.ownsExecution = true;
-		}
-		return { signalAbortedAfterCommit: result.signalAbortedAfterCommit };
-	}
+	const result = await storeOf(env).write(key, JSON.stringify(value, null, 2) + "\n", {
+		signal,
+		assertInvocationCurrent: atomicWriteOptions?.assertInvocationCurrent,
+	});
+	return { signalAbortedAfterCommit: result.signalAbortedAfterCommit };
 }
 
 async function writeStateJsonInternal({
@@ -225,196 +166,6 @@ async function writeStateJsonInternal({
 	});
 }
 
-/**
- * Retire a resume capability before its first unsafe execution boundary. The
- * replacement is deliberately persistent: a failed later unlink must not make
- * the original token replayable.
- */
-async function consumeResumeStateInternal({
-	env,
-	key,
-	expectedState,
-	signal = undefined,
-}: {
-	env: Record<string, string | undefined>;
-	key: string;
-	expectedState: unknown;
-	signal?: AbortSignal;
-}) {
-	return withStateKeyLock({
-		env,
-		key,
-		signal,
-		task: async () => {
-			const currentState = await readStateJson({ env, key });
-			// A resume snapshot is loaded before command/workflow setup. Re-check it
-			// while holding the state lock so two callers cannot both turn the same
-			// approval into an executable invocation.
-			if (
-				isConsumedResumeState(currentState) ||
-				stableStringify(currentState) !== stableStringify(expectedState)
-			) {
-				return { consumed: false as const };
-			}
-			const claimId = randomBytes(16).toString("hex");
-			try {
-				const result = await writeStateJsonUnlocked({
-					env,
-					key,
-					value: {
-						type: CONSUMED_RESUME_STATE_TYPE,
-						consumedAt: new Date().toISOString(),
-						claimId,
-					},
-					signal,
-				});
-				return {
-					consumed: true as const,
-					claimId,
-					signalAbortedAfterCommit: result?.signalAbortedAfterCommit === true,
-				};
-			} catch (err) {
-				if (atomicWriteWasPublished(err)) {
-					const latest = await readStateJson({ env, key });
-					if (isConsumedResumeState(latest) && latest.claimId === claimId) {
-						await writeStateJsonUnlocked({ env, key, value: expectedState });
-						const recorder = recorderFromEnv(env);
-						if (recorder) {
-							recorder.ownsExecution = false;
-						}
-					}
-				}
-				throw err;
-			}
-		},
-	});
-}
-
-/**
- * Undo a just-published consumed marker only when it is still owned by the
- * caller's pre-dispatch claim. This never overwrites a replacement state or a
- * concurrent claimant's marker.
- */
-async function restoreConsumedResumeStateInternal({
-	env,
-	key,
-	expectedState,
-	claimId,
-	approvalId,
-}: {
-	env: Record<string, string | undefined>;
-	key: string;
-	expectedState: unknown;
-	claimId: string;
-	approvalId?: string;
-}) {
-	return withStateKeyLock({
-		env,
-		key,
-		task: async () => {
-			const currentState = await readStateJson({ env, key });
-			if (!isConsumedResumeState(currentState) || currentState.claimId !== claimId) {
-				return false;
-			}
-			await writeStateJsonUnlocked({ env, key, value: expectedState });
-			const recorder = recorderFromEnv(env);
-			if (recorder) {
-				recorder.ownsExecution = false;
-			}
-			if (approvalId) {
-				await restoreApprovalIndex({ env, stateKey: key, approvalId }).catch(() => {});
-			}
-			return true;
-		},
-	});
-}
-
-/**
- * Retire an unconsumed capability at a safe terminal boundary. The snapshot is
- * first replaced by a caller-owned marker under the state lock, so a
- * cancellation can restore only the state this caller claimed. A stale resume
- * that merely observed an earlier snapshot can never recreate a state another
- * resume has already settled.
- */
-async function deleteResumeStateWithRollbackInternal({
-	env,
-	key,
-	expectedState,
-	signal = undefined,
-	assertInvocationCurrent = undefined,
-}: {
-	env: Record<string, string | undefined>;
-	key: string;
-	expectedState: unknown;
-	signal?: AbortSignal;
-	assertInvocationCurrent?: () => void;
-}): Promise<boolean> {
-	return withStateKeyLock({
-		env,
-		key,
-		signal,
-		task: async () => {
-			signal?.throwIfAborted();
-			assertInvocationCurrent?.();
-			const currentState = await readStateJson({ env, key });
-			if (stableStringify(currentState) !== stableStringify(expectedState)) return false;
-
-			const claimId = randomBytes(16).toString("hex");
-			let claimPublished = false;
-			let claimMayBePublished = false;
-			try {
-				let result;
-				try {
-					result = await writeStateJsonUnlocked({
-						env,
-						key,
-						value: {
-							type: CONSUMED_RESUME_STATE_TYPE,
-							consumedAt: new Date().toISOString(),
-							claimId,
-						},
-						signal,
-						atomicWriteOptions: { assertInvocationCurrent },
-					});
-				} catch (err) {
-					claimMayBePublished = atomicWriteWasPublished(err);
-					throw err;
-				}
-				claimPublished = true;
-				if (result?.signalAbortedAfterCommit) signal?.throwIfAborted();
-				signal?.throwIfAborted();
-				assertInvocationCurrent?.();
-				await deleteStateJsonUnlocked({ env, key });
-				signal?.throwIfAborted();
-				assertInvocationCurrent?.();
-				return true;
-			} catch (err) {
-				if (
-					((signal?.aborted || assertInvocationCurrent) && claimPublished) ||
-					claimMayBePublished
-				) {
-					const latest = await readStateJson({ env, key });
-					if (
-						(claimPublished && latest === null) ||
-						(isConsumedResumeState(latest) && latest.claimId === claimId)
-					) {
-						await writeStateJsonUnlocked({ env, key, value: expectedState });
-						const recorder = recorderFromEnv(env);
-						if (recorder) {
-							recorder.ownsExecution = false;
-						}
-					}
-				}
-				throw err;
-			}
-		},
-	});
-}
-
-/**
- * Check physical state presence without parsing it. Cancellation uses this to
- * retain the authoritative workflow spelling even if the state file is corrupt.
- */
 async function stateJsonExistsInternal({
 	env,
 	key,
@@ -426,26 +177,7 @@ async function stateJsonExistsInternal({
 }
 
 async function deleteStateJsonUnlocked({ env, key }) {
-	const session = storeOf(env);
-	{
-		const before = await session.read(key);
-		const currentRecorder = recorderFromEnv(env);
-		const guard = resumeGuardFromEnv(env);
-		const guarded = guard && !guard.admitted && guard.key === key;
-		await session.write(key, null, {
-			...(guarded ? { expectedWaitRevision: guard.expectedRevision } : {}),
-			...(currentRecorder?.decisionKey === key.replace("workflow-resume_", "workflow_resume_")
-				? { decision: currentRecorder.decision }
-				: {}),
-		});
-		if (guarded) guard.admitted = true;
-		if (before.runId && before.text !== null) {
-			const recorder = recorderFromEnv(env);
-			if (recorder?.runId === before.runId) {
-				recorder.ownsExecution = true;
-			}
-		}
-	}
+	await storeOf(env).write(key, null);
 }
 
 async function deleteStateJsonInternal({
@@ -462,65 +194,6 @@ async function deleteStateJsonInternal({
 		key,
 		signal,
 		task: () => deleteStateJsonUnlocked({ env, key }),
-	});
-}
-
-/**
- * After an effect has started, its consumed marker already prevents replay.
- * Give terminal cleanup a small, bounded opportunity to remove that marker,
- * but never let a live state writer turn cancellation into an unbounded wait.
- */
-async function deleteStateJsonWithBoundedResumeCleanupInternal({
-	env,
-	key,
-}: {
-	env: Record<string, string | undefined>;
-	key: string;
-}) {
-	const controller = new AbortController();
-	const timeout = setTimeout(() => controller.abort(), TERMINAL_RESUME_CLEANUP_TIMEOUT_MS);
-	try {
-		await deleteStateJson({ env, key, signal: controller.signal });
-	} finally {
-		clearTimeout(timeout);
-	}
-}
-
-/**
- * Retire a resume capability only while it is still a live, unclaimed state.
- * A consumed marker belongs to a resume that has already started its atomic
- * predecessor-to-successor handoff, so cancellation must not delete it and
- * report success while that successor remains executable.
- */
-async function deleteUnconsumedResumeStateInternal({
-	env,
-	key,
-	signal = undefined,
-}: {
-	env: Record<string, string | undefined>;
-	key: string;
-	signal?: AbortSignal;
-}): Promise<"deleted" | "missing" | "claimed"> {
-	return withStateKeyLock({
-		env,
-		key,
-		signal,
-		task: async () => {
-			let currentState: unknown;
-			try {
-				currentState = await readStateJson({ env, key });
-			} catch (err) {
-				// A corrupt state is not resumable, so explicit cancellation may still
-				// remove it. This keeps the legacy workflow-alias recovery behavior.
-				if (!isJsonSyntaxError(err)) throw err;
-				await deleteStateJsonUnlocked({ env, key });
-				return "deleted";
-			}
-			if (currentState === null) return "missing";
-			if (isConsumedResumeState(currentState)) return "claimed";
-			await deleteStateJsonUnlocked({ env, key });
-			return "deleted";
-		},
 	});
 }
 
@@ -635,28 +308,6 @@ export async function findApprovalIdByStateKey({
 		}
 		return null;
 	});
-}
-
-/** Restore only a missing mapping; another allocation must never be overwritten. */
-async function restoreApprovalIndex({
-	env,
-	stateKey,
-	approvalId,
-}: {
-	env: Record<string, string | undefined>;
-	stateKey: string;
-	approvalId: string;
-}): Promise<boolean> {
-	const mappedStateKey = await findStateKeyByApprovalId({ env, approvalId });
-	if (mappedStateKey === stateKey) return true;
-	if (mappedStateKey !== null) return false;
-	try {
-		await writeApprovalIndex({ env, stateKey, approvalId });
-		return true;
-	} catch (err: any) {
-		if (err?.code !== "EEXIST") throw err;
-		return (await findStateKeyByApprovalId({ env, approvalId })) === stateKey;
-	}
 }
 
 /**
@@ -791,30 +442,6 @@ export async function writeStateJson(
 	);
 }
 
-export async function consumeResumeState(
-	options: Parameters<typeof consumeResumeStateInternal>[0],
-): ReturnType<typeof consumeResumeStateInternal> {
-	return withStoreContext({ env: options.env, signal: options.signal }, (ctx) =>
-		consumeResumeStateInternal({ ...options, env: ctx.env }),
-	);
-}
-
-export async function restoreConsumedResumeState(
-	options: Parameters<typeof restoreConsumedResumeStateInternal>[0],
-): ReturnType<typeof restoreConsumedResumeStateInternal> {
-	return withStoreContext({ env: options.env }, (ctx) =>
-		restoreConsumedResumeStateInternal({ ...options, env: ctx.env }),
-	);
-}
-
-export async function deleteResumeStateWithRollback(
-	options: Parameters<typeof deleteResumeStateWithRollbackInternal>[0],
-): ReturnType<typeof deleteResumeStateWithRollbackInternal> {
-	return withStoreContext({ env: options.env, signal: options.signal }, (ctx) =>
-		deleteResumeStateWithRollbackInternal({ ...options, env: ctx.env }),
-	);
-}
-
 export async function stateJsonExists(
 	options: Parameters<typeof stateJsonExistsInternal>[0],
 ): ReturnType<typeof stateJsonExistsInternal> {
@@ -828,22 +455,6 @@ export async function deleteStateJson(
 ): ReturnType<typeof deleteStateJsonInternal> {
 	return withStoreContext({ env: options.env, signal: options.signal }, (ctx) =>
 		deleteStateJsonInternal({ ...options, env: ctx.env }),
-	);
-}
-
-export async function deleteStateJsonWithBoundedResumeCleanup(
-	options: Parameters<typeof deleteStateJsonWithBoundedResumeCleanupInternal>[0],
-): ReturnType<typeof deleteStateJsonWithBoundedResumeCleanupInternal> {
-	return withStoreContext({ env: options.env }, (ctx) =>
-		deleteStateJsonWithBoundedResumeCleanupInternal({ ...options, env: ctx.env }),
-	);
-}
-
-export async function deleteUnconsumedResumeState(
-	options: Parameters<typeof deleteUnconsumedResumeStateInternal>[0],
-): ReturnType<typeof deleteUnconsumedResumeStateInternal> {
-	return withStoreContext({ env: options.env, signal: options.signal }, (ctx) =>
-		deleteUnconsumedResumeStateInternal({ ...options, env: ctx.env }),
 	);
 }
 

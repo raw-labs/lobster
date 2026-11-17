@@ -103,8 +103,14 @@ export class ExecutionStore {
 	async close() {
 		if (this.heartbeat) clearInterval(this.heartbeat);
 		await this.tail;
-		if (!this.failure)
-			await this.transition({ kind: "execution-release", owner: this.owner, epoch: this.epoch });
+		const release = { kind: "execution-release" as const, owner: this.owner, epoch: this.epoch };
+		if (!this.failure) await this.transition(release);
+		else if (this.failure instanceof ExecutionConflictError)
+			// A refused save (a stale answer, say) need not mean the lease was lost: hand it back
+			// so the run is not locked until it expires. Without the lease, this changes nothing.
+			await this.session
+				.transition({ runId: this.runId, operationId: randomUUID(), action: release })
+				.catch(() => {});
 		this.closed = true;
 	}
 }

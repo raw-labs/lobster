@@ -8,7 +8,6 @@ import {
 	type PersistenceOptions,
 	resolveStoreSession,
 } from "./context.js";
-import { fingerprint } from "./model.js";
 import { openStoreSession, type ExecutionRecorder } from "./session.js";
 
 type ExecutionContext = PersistenceOptions & {
@@ -16,7 +15,6 @@ type ExecutionContext = PersistenceOptions & {
 	readOnly?: boolean;
 	signal?: AbortSignal;
 	dryRun?: boolean;
-	_decision?: { approved?: boolean; cancel?: boolean; response?: unknown };
 };
 
 type ExecutionOutcome = {
@@ -50,17 +48,20 @@ export async function withStoreContext<C extends ExecutionContext, T>(
 	}
 }
 
+/**
+ * Record a run around `task` (a `lobster run` or a tool request). Runs on the engine settle
+ * their own status; this only settles requests that never reached it, and drops the record of
+ * one that failed before anything started.
+ */
 export function withExecution<C extends ExecutionContext, T>(
 	ctx: C,
 	kind: string,
-	resumeKey: string | undefined,
 	task: (ctx: C) => Promise<T>,
 ): Promise<T & { runId?: string }>;
 
 export async function withExecution<C extends ExecutionContext, T>(
 	ctx: C,
 	kind: string,
-	resumeKey: string | undefined,
 	task: (ctx: C) => Promise<T>,
 ): Promise<T> {
 	if (ctx.dryRun) {
@@ -71,34 +72,14 @@ export async function withExecution<C extends ExecutionContext, T>(
 		const session = sessionFromEnv(runtime.env);
 		if (
 			!session ||
-			(!session.trackRuns && !runtime.trackRuns && !resumeKey) ||
+			(!session.trackRuns && !runtime.trackRuns) ||
 			recorderFromEnv(runtime.env) ||
 			runtime.dryRun
 		) {
 			return task(runtime);
 		}
 
-		let recorder: ExecutionRecorder;
-		if (resumeKey) {
-			recorder = await session.recorderForState(resumeKey, runtime.signal);
-			if (!recorder) {
-				return task(runtime);
-			}
-		} else {
-			recorder = await session.createRun(kind, runtime.runMetadata);
-		}
-
-		if (resumeKey && runtime._decision) {
-			const decision = runtime._decision;
-			recorder.decisionKey = resumeKey.replace("workflow-resume_", "workflow_resume_");
-			recorder.decision = {
-				...(typeof decision.approved === "boolean" ? { approved: decision.approved } : {}),
-				...(decision.cancel === true ? { cancel: true } : {}),
-				...(decision.response !== undefined
-					? { responseHash: fingerprint(decision.response) }
-					: {}),
-			};
-		}
+		const recorder: ExecutionRecorder = await session.createRun(kind, runtime.runMetadata);
 
 		const bound = { ...runtime, env: bindRecorder(runtime.env, recorder) };
 		// A request that fails before anything started (an invalid workflow file, a
@@ -106,7 +87,6 @@ export async function withExecution<C extends ExecutionContext, T>(
 		// keeping a failed run nobody can do anything with.
 		let discarded = false;
 		const discardIfUnstarted = async () => {
-			if (resumeKey) return;
 			const full = await session.getRun(recorder.runId);
 			if (
 				full &&
@@ -127,20 +107,19 @@ export async function withExecution<C extends ExecutionContext, T>(
 					? null
 					: await session.getRunState(recorder.runId);
 			const pending = Object.values(run?.waits ?? {}).some((wait) => wait.status === "pending");
-			const ownsExecution = !resumeKey || recorder.ownsExecution;
 
 			if (run?.execution) {
 				// The saved-state workflow engine owns status, including recoverable interruption.
 			} else if (outcome?.error?.type === "persistence_outcome_unknown") {
 				// Reconcile the admitted mutation before assigning an execution outcome.
 			} else if (outcome?.ok === false) {
-				if (ownsExecution && !pending && run?.status === "running") {
+				if (!pending && run?.status === "running") {
 					await recorder.settle(runtime.signal?.aborted ? "cancelled" : "failed");
 					await discardIfUnstarted();
 				}
 			} else if (outcome?.status === "needs_approval" || outcome?.status === "needs_input") {
 				// Continuation publication already committed waiting status with its history.
-			} else if (ownsExecution && !pending) {
+			} else if (!pending) {
 				await recorder.settle(
 					outcome?.status === "cancelled" ? "cancelled" : "completed",
 					outcome?.output,
@@ -158,7 +137,7 @@ export async function withExecution<C extends ExecutionContext, T>(
 
 			const run = await session.getRunState(recorder.runId);
 			const pending = Object.values(run?.waits ?? {}).some((wait) => wait.status === "pending");
-			if (!run?.execution && (!resumeKey || recorder.ownsExecution) && !pending) {
+			if (!run?.execution && !pending) {
 				await recorder.settle(runtime.signal?.aborted ? "cancelled" : "failed", error);
 				await discardIfUnstarted();
 			}

@@ -15,8 +15,8 @@ export type BackendKind = "sqlite";
 export type StateWriteOptions = {
 	exclusive?: boolean;
 	expectedWaitRevision?: number;
+	/** Write the key as part of this run (the run then owns it). */
 	runId?: string;
-	decision?: unknown;
 	signal?: AbortSignal;
 	assertInvocationCurrent?: () => void;
 };

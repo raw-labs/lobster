@@ -1,3 +1,4 @@
+import { combineSignals } from "../../process/owner_signal.js";
 import { activation, occurrence } from "../state.js";
 import type { Machine, Scope } from "../machine.js";
 import type { WorkflowStep, WorkflowStepResult } from "../../workflows/types.js";
@@ -19,7 +20,7 @@ export async function parallel(machine: Machine, step: WorkflowStep, key: string
 			Math.max(0, frame.deadline - Date.now()),
 		);
 	}
-	const signal = AbortSignal.any([scope.ctx.signal!, abort.signal, timeout.signal].filter(Boolean));
+	const signal = combineSignals(scope.ctx.signal, abort.signal, timeout.signal);
 	let onAbort: () => void;
 	const interrupted = new Promise<never>((_, reject) => {
 		onAbort = () => reject(signal.reason);

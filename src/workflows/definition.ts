@@ -48,3 +48,15 @@ export async function snapshotDefinition(
 		children,
 	};
 }
+
+/** A standalone pipeline as a one-step workflow definition, fed `input` items as they are. */
+export function pipelineDefinition(text: string, input?: unknown[]): Definition {
+	return {
+		filePath: "",
+		hash: fingerprint({ pipeline: text, input: input ?? null }),
+		workflow: { steps: [{ id: "pipeline", pipeline: text }] },
+		children: {},
+		standalone: true,
+		...(input !== undefined ? { input } : {}),
+	};
+}

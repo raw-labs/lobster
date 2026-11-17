@@ -14,6 +14,14 @@ export type Definition = {
 	hash: string;
 	workflow: WorkflowFile;
 	children: Record<string, Definition>;
+	/**
+	 * A standalone pipeline (`lobster '...'`, `runToolRequest({ pipeline })`) run as a one-step
+	 * workflow: its output is the pipeline's items as they are, and in human mode renderers write
+	 * to the terminal as the pipeline runs.
+	 */
+	standalone?: boolean;
+	/** A standalone pipeline's input items, used as they are (never read as templates). */
+	input?: unknown[];
 };
 
 export type ActivityInput = {

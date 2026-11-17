@@ -117,6 +117,9 @@ export type WorkflowStepResult = {
 	skipped?: boolean;
 	/** A question or event wait reached its timeout with `on_timeout: continue`. */
 	timedOut?: boolean;
+	/** A standalone pipeline's items as they are, and whether a renderer already showed them. */
+	items?: unknown[];
+	rendered?: boolean;
 	error?: boolean;
 	errorMessage?: string;
 };
@@ -129,6 +132,8 @@ export type WorkflowWaitingFor =
 export type WorkflowRunResult = {
 	status: "ok" | "needs_approval" | "needs_input" | "waiting" | "cancelled";
 	output: unknown[];
+	/** A standalone pipeline whose renderer (`table`, `json`) already wrote its output. */
+	rendered?: boolean;
 	waitingFor?: WorkflowWaitingFor;
 	requiresApproval?: {
 		type: "approval_request";

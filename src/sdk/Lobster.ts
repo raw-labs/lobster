@@ -1,33 +1,32 @@
 import type { ResumeDecision, WaitResumeOptions } from "../resume/options.js";
 import type { SdkResult } from "./types.js";
-import { randomUUID } from "node:crypto";
-import { validateCommandInputState, type CommandInputState } from "../pipeline/input_request.js";
-import {
-	publishTrackedCheckpoint,
-	type ContinuationPredecessor,
-} from "../persistence/continuations.js";
+import { createHash, randomUUID } from "node:crypto";
+import { Writable } from "node:stream";
+import { validateCommandInputState } from "../pipeline/input_request.js";
+import { parsePipeline } from "../pipeline/parser.js";
 import { runtimeErrorDetails } from "../persistence/backend.js";
-import { recorderFromEnv, sessionFromEnv, bindResumeGuard } from "../persistence/context.js";
-import { withExecution, withStoreContext } from "../persistence/execution.js";
+import { sessionFromEnv, bindResumeGuard } from "../persistence/context.js";
+import { withStoreContext } from "../persistence/execution.js";
 import type { PersistenceOptions } from "../persistence/context.js";
-import {
-	consumeResumeState,
-	restoreConsumedResumeState,
-	deleteUnconsumedResumeState,
-	deleteStateJson,
-	readStateJsonWithLock,
-	writeStateJson,
-} from "../state/store.js";
 import { resolveWait, callerId } from "../persistence/waits.js";
-import { encodeToken, decodeToken } from "../resume/token.js";
-import { compileCached } from "../util/validation.js";
-import { runPipelineInternal } from "./runtime.js";
+import { decodeToken } from "../resume/token.js";
+import type { RunContext } from "../engine/context.js";
+import { pipelineDefinition } from "../workflows/definition.js";
+import {
+	advanceWorkflowRun,
+	runWorkflowFile,
+	ResumeRefusedError,
+	WorkflowResumeArgumentError,
+	type WorkflowRunResult,
+} from "../workflows/file.js";
+import { waitingPipelineRun, type PausedPipeline } from "../workflows/upgrade.js";
+import { sdkInputItems, sdkPipelineText, sdkStageRegistry } from "./runtime.js";
 import { stateEnv } from "./state_env.js";
 
-type SdkResumePayload = {
+/** A token handed out by Lobster versions before SDK pipelines became runs. */
+type LegacySdkToken = {
 	protocolVersion: 1;
 	v: 1;
-	stageIndex?: number;
 	resumeAtIndex: number;
 	items?: unknown[];
 	prompt?: string;
@@ -37,39 +36,21 @@ type SdkResumePayload = {
 	stateKey?: string;
 };
 
-type SdkPauseResult = {
-	status?: string;
-	requiresApproval?: { resumeToken: string } | null;
-	requiresInput?: { resumeToken: string } | null;
-};
-
-type SdkTrackedResumePayload = {
-	protocolVersion: 1;
-	v: 2;
-	kind: "sdk-tracked";
-	stateKey: string;
-};
-
-type SdkCommandInputResumeState = {
-	resumeAtIndex: number;
-	items: unknown[];
-	inputSchema: unknown;
-	inputSubject?: unknown;
-	commandInput: CommandInputState;
-};
-
 export type LobsterOptions = PersistenceOptions & {
 	env?: NodeJS.ProcessEnv;
 	stateDir?: string;
 	signal?: AbortSignal;
 };
 
+/**
+ * An SDK pipeline. Every run is a run of the workflow engine: a pipeline of the stages
+ * `sdk.stage.0 | sdk.stage.1 | ...`, which the instance supplies. A paused run is resumed by
+ * an instance with the same stages, once per token, like any other run.
+ */
 export class Lobster {
 	#stages = [];
 	#options: LobsterOptions;
-	#onExecutionStart?: () => Promise<void>;
 	#meta = null;
-	#commandInputCheckpoint?: { key: string; state: SdkCommandInputResumeState };
 
 	constructor(options: LobsterOptions = {}) {
 		this.#options = {
@@ -101,155 +82,19 @@ export class Lobster {
 	}
 
 	async run(initialInput = []): Promise<SdkResult> {
-		return withExecution(
-			{ ...this.#options, env: stateEnv(this.#options) },
-			"sdk",
-			undefined,
-			async (ctx) => {
-				const instance = new Lobster({
-					...this.#options,
-					env: ctx.env,
-					storeSession: sessionFromEnv(ctx.env),
-				});
-				instance.#stages = this.#stages;
-				const result = await instance.#runStages(instance.#stages, initialInput);
-				return instance.#trackPause(result);
-			},
-		).catch((err) => {
-			const error = runtimeErrorDetails(err);
-			return {
-				ok: false,
-				status: "error",
-				runId: error.runId,
-				output: [],
-				requiresApproval: null,
-				requiresInput: null,
-				error,
-			};
-		});
-	}
-
-	async #runStages(
-		stages,
-		initialInput,
-		requestInputResume = undefined,
-		stageOffset = 0,
-		fallbackIndex = -1,
-	): Promise<SdkResult> {
-		const ctx = {
-			env: stateEnv(this.#options),
-			_onExecutionStart: this.#onExecutionStart,
-			stateDir: this.#options.stateDir,
-			mode: "sdk",
-			signal: this.#options.signal,
-		};
-
-		const recorder = recorderFromEnv(ctx.env);
-		if (recorder) {
-			recorder.pipelineOffset = stageOffset;
-		}
 		try {
-			const result = await runPipelineInternal({
-				stages,
-				ctx,
-				input: initialInput,
-				requestInputResume,
-			});
-
-			if (
-				result.halted &&
-				result.items.length === 1 &&
-				result.items[0]?.type === "approval_request"
-			) {
-				const approval = result.items[0];
-				const resumeToken = encodeToken({
-					protocolVersion: 1,
-					v: 1,
-					stageIndex: stageOffset + (result.haltedAt?.index ?? fallbackIndex),
-					resumeAtIndex: stageOffset + (result.haltedAt?.index ?? fallbackIndex) + 1,
-					items: approval.items,
-					prompt: approval.prompt,
-				});
-
-				return {
-					ok: true,
-					status: "needs_approval",
-					output: [],
-					requiresApproval: {
-						prompt: approval.prompt,
-						items: approval.items,
-						resumeToken,
-					},
-					requiresInput: null,
-				};
-			}
-
-			if (result.halted && result.items.length === 1 && result.items[0]?.type === "input_request") {
-				const input = result.items[0];
-				const resumeMode = input.commandInput ? "same_stage" : "next_stage";
-				const resumeAtIndex =
-					resumeMode === "same_stage"
-						? stageOffset + (result.haltedAt?.index ?? fallbackIndex)
-						: stageOffset + (result.haltedAt?.index ?? fallbackIndex) + 1;
-				let stateKey: string | undefined;
-				if (resumeMode === "same_stage") {
-					const state: SdkCommandInputResumeState = {
-						resumeAtIndex,
-						items: input.items ?? [],
-						inputSchema: input.responseSchema,
-						...(input.subject !== undefined ? { inputSubject: input.subject } : {}),
-						commandInput: input.commandInput,
-					};
-					if (recorder) {
-						stateKey = `sdk_resume_${randomUUID()}`;
-						this.#commandInputCheckpoint = { key: stateKey, state };
-					} else {
-						stateKey = await saveSdkCommandInputResumeState(this.#options, state);
-					}
-				}
-				const resumeToken = encodeToken({
-					protocolVersion: 1,
-					v: 1,
-					stageIndex: stageOffset + (result.haltedAt?.index ?? fallbackIndex),
-					resumeAtIndex,
-					resumeMode,
-					...(resumeMode === "same_stage"
-						? { stateKey }
-						: { items: [], inputSchema: input.responseSchema }),
-					inputSubject: input.subject,
-				});
-
-				return {
-					ok: true,
-					status: "needs_input",
-					output: [],
-					requiresApproval: null,
-					requiresInput: {
-						prompt: input.prompt,
-						responseSchema: input.responseSchema,
-						defaults: input.defaults,
-						subject: input.subject,
-						resumeToken,
-					},
-				};
-			}
-
-			return {
-				ok: true,
-				status: "ok",
-				output: result.items,
-				requiresApproval: null,
-				requiresInput: null,
-			};
+			const input = await sdkInputItems(initialInput);
+			if (!this.#stages.length) return finished({ status: "ok", output: input });
+			return await this.#execute(this.#options.env, (ctx) =>
+				runWorkflowFile({
+					definition: pipelineDefinition(this.#pipeline(), input),
+					kind: "sdk",
+					sdk: { pipeline: this.#pipeline() },
+					ctx,
+				}),
+			);
 		} catch (err) {
-			return {
-				ok: false,
-				status: "error",
-				output: [],
-				requiresApproval: null,
-				requiresInput: null,
-				error: runtimeErrorDetails(err),
-			};
+			return failed(err);
 		}
 	}
 
@@ -258,151 +103,26 @@ export class Lobster {
 		token: string,
 		options: { approved?: boolean; response?: unknown; cancel?: boolean } = {},
 	): Promise<SdkResult> {
-		const decoded = decodeToken(token) as SdkResumePayload | SdkTrackedResumePayload;
-		if (decoded?.v === 2 && decoded.kind === "sdk-tracked") {
-			return this.#resumeTracked(decoded.stateKey, options as ResumeDecision);
+		assertOneDecision(options);
+		const payload = decodeToken(token) as Record<string, unknown> | null;
+		if (!payload || typeof payload !== "object" || payload.protocolVersion !== 1)
+			throw new Error("Invalid token");
+		if (payload.kind === "workflow-file") {
+			if (payload.v !== 1 || typeof payload.stateKey !== "string" || !payload.stateKey)
+				throw new Error("Invalid token");
+			return this.#resumeKey(payload.stateKey, options, this.#options.env);
 		}
-		const { approved, response, cancel } = options;
-		const intentCount =
-			Number(typeof approved === "boolean") +
-			Number(response !== undefined) +
-			Number(cancel === true);
-		if (intentCount > 1) {
-			throw new Error("resume accepts only one of approved, response, or cancel");
-		}
-		if (intentCount === 0) {
-			throw new Error("resume requires approved, response, or cancel");
-		}
-
-		const payload = decodeSdkResumePayload(token);
-
-		let sdkCommandInputState: SdkCommandInputResumeState | undefined;
-		if (payload.resumeMode === "same_stage") {
-			sdkCommandInputState = await loadSdkCommandInputResumeState(this.#options, payload.stateKey!);
-			if (
-				!this.#onExecutionStart &&
-				"type" in sdkCommandInputState &&
-				sdkCommandInputState.type === "lobster.sdk-tracked.v1"
-			) {
-				return this.#resumeTracked(payload.stateKey!, options as ResumeDecision);
-			}
-		}
-
-		if (cancel === true) {
-			if (payload.resumeMode === "same_stage" && !this.#onExecutionStart) {
-				await deleteStateJson({ env: stateEnv(this.#options), key: payload.stateKey! });
-			}
-			return {
-				ok: true,
-				status: "cancelled",
-				output: [],
-				requiresApproval: null,
-				requiresInput: null,
-			};
-		}
-
-		const expectsInput = payload.inputSchema !== undefined || payload.resumeMode === "same_stage";
-		if (expectsInput) {
-			if (approved !== undefined) {
-				throw new Error("resume token expects an input response, not approved");
-			}
-			if (response === undefined) {
-				throw new Error("resume token expects response");
-			}
-		} else {
-			if (response !== undefined) {
-				throw new Error("resume token expects approved=true|false, not response");
-			}
-			if (typeof approved !== "boolean") {
-				throw new Error("resume token expects approved=true|false");
-			}
-			if (approved === false) {
-				return {
-					ok: true,
-					status: "cancelled",
-					output: [],
-					requiresApproval: null,
-					requiresInput: null,
-				};
-			}
-		}
-
-		const resumeIndex = sdkCommandInputState?.resumeAtIndex ?? payload.resumeAtIndex ?? 0;
-		let resumeItems = sdkCommandInputState?.items ?? payload.items ?? [];
-		let requestInputResume;
-		if (response !== undefined) {
-			const schema = sdkCommandInputState?.inputSchema ?? payload.inputSchema;
-			if (schema === undefined) {
-				throw new Error("resume token does not support input responses");
-			}
-			let validator;
-			try {
-				validator = compileCached(schema as any);
-			} catch {
-				throw new Error("resume token input schema is invalid");
-			}
-			const ok = validator(response);
-			if (!ok) {
-				const first = validator.errors?.[0];
-				throw new Error(
-					`response does not match schema at ${first?.instancePath || "/"}: ${first?.message || "invalid"}`,
-				);
-			}
-			if (payload.resumeMode === "same_stage") {
-				resumeItems = sdkCommandInputState!.items;
-				requestInputResume = {
-					state: sdkCommandInputState!.commandInput,
-					response,
-					onConsumed: async () => {
-						if (!this.#onExecutionStart) {
-							await deleteStateJson({ env: stateEnv(this.#options), key: payload.stateKey! });
-						}
-					},
-				};
-			} else {
-				resumeItems = [response];
-			}
-		}
-
-		const remainingStages = this.#stages.slice(resumeIndex);
-		return this.#runStages(remainingStages, resumeItems, requestInputResume, resumeIndex, 0);
+		const legacy = decodeLegacyToken(payload);
+		return this.#resumeKey(
+			(env) => this.#convertLegacyToken(token, legacy, env),
+			options,
+			this.#options.env,
+		);
 	}
 
-	async #trackPause<T extends SdkPauseResult>(
-		result: T,
-		predecessor?: ContinuationPredecessor,
-	): Promise<T> {
-		const env = stateEnv(this.#options);
-		if (!recorderFromEnv(env) || !["needs_approval", "needs_input"].includes(result.status)) {
-			return result;
-		}
-		const request = result.requiresApproval ?? result.requiresInput;
-		const payload = decodeSdkResumePayload(request.resumeToken);
-		const stateKey =
-			payload.resumeMode === "same_stage" ? payload.stateKey : `sdk_resume_${randomUUID()}`;
-		const commandState =
-			payload.resumeMode === "same_stage"
-				? (this.#commandInputCheckpoint?.state ??
-					(await readStateJsonWithLock({ env, key: stateKey })))
-				: {};
-		const { resumeToken: _token, ...question } = request;
-		await publishTrackedCheckpoint({
-			env,
-			key: stateKey,
-			predecessor,
-			signal: this.#options.signal,
-			state: {
-				...commandState,
-				type: "lobster.sdk-tracked.v1",
-				payload,
-				wait: { ...question, kind: result.requiresInput ? "input" : "approval" },
-			},
-		});
-		request.resumeToken = encodeToken({ protocolVersion: 1, v: 2, kind: "sdk-tracked", stateKey });
-		return result;
-	}
-
+	/** Answer a wait found with `getRun`/`getWait`, checking it is still at `expectedRevision`. */
 	async resumeWait(options: WaitResumeOptions): Promise<SdkResult> {
+		assertOneDecision(options);
 		return withStoreContext(
 			{ ...this.#options, env: stateEnv(this.#options), trackRuns: true },
 			async (ctx) => {
@@ -414,88 +134,169 @@ export class Lobster {
 					options.expectedRevision,
 					callerId(this.#options.runMetadata),
 				);
-				if (!wait.key.startsWith("sdk_resume_"))
-					throw new Error("This wait is not an SDK checkpoint");
-				const instance = new Lobster({
-					...this.#options,
-					storeSession: store,
-					env: bindResumeGuard(ctx.env, {
-						key: wait.key,
-						expectedRevision: options.expectedRevision,
-						admitted: false,
-					}),
-				});
-				instance.#stages = this.#stages;
-				return instance.#resumeTracked(wait.key, options);
+				const { waitId: _waitId, expectedRevision, ...decision } = options;
+				return this.#resumeKey(
+					wait.key,
+					decision,
+					bindResumeGuard(ctx.env, { key: wait.key, expectedRevision, admitted: false }),
+				);
 			},
 		);
 	}
 
-	async #resumeTracked(key: string, decision: ResumeDecision): Promise<SdkResult> {
-		if (typeof key !== "string" || !/^sdk_resume_[a-f0-9-]+$/.test(key)) {
-			throw new Error("Invalid SDK tracked token");
+	/**
+	 * Continue a run of these stages that stopped without a question to answer: one whose
+	 * process stopped, or one that failed (it is retried from the stage step that failed).
+	 */
+	async advance(runId: string): Promise<SdkResult> {
+		try {
+			return await this.#execute(this.#options.env, (ctx) =>
+				advanceWorkflowRun({ runId, ctx, sdk: { pipeline: this.#pipeline() } }),
+			);
+		} catch (err) {
+			if (err instanceof ResumeRefusedError) throw err;
+			return failed(err, runId);
 		}
-		return withExecution(
-			{ ...this.#options, env: stateEnv(this.#options), _decision: decision },
-			"sdk",
-			key,
-			async (ctx) => {
-				const state = await readStateJsonWithLock({ env: ctx.env, key, signal: ctx.signal });
-				if (state?.type !== "lobster.sdk-tracked.v1") {
-					throw new Error("SDK resume state not found");
-				}
-				const instance = new Lobster({
-					...this.#options,
-					env: ctx.env,
-					storeSession: sessionFromEnv(ctx.env),
+	}
+
+	async #resumeKey(
+		key: string | ((env: NodeJS.ProcessEnv) => Promise<string>),
+		decision: { approved?: boolean; response?: unknown; cancel?: boolean },
+		env: NodeJS.ProcessEnv,
+	): Promise<SdkResult> {
+		try {
+			return await this.#execute(env, async (ctx) => {
+				const stateKey = typeof key === "string" ? key : await key(ctx.env as NodeJS.ProcessEnv);
+				return runWorkflowFile({
+					resume: { protocolVersion: 1, v: 1, kind: "workflow-file", stateKey },
+					...decision,
+					sdk: { pipeline: this.#pipeline() },
+					ctx,
 				});
-				instance.#stages = this.#stages;
-				let claimed = false;
-				let claimId: string | undefined;
-				instance.#onExecutionStart = async () => {
-					if (claimed) {
-						return;
-					}
-					const claim = await consumeResumeState({
-						env: ctx.env,
-						key,
-						expectedState: state,
-						signal: ctx.signal,
-					});
-					if (!claim.consumed) {
-						throw new Error("SDK resume state not found");
-					}
-					if (claim.signalAbortedAfterCommit) {
-						await restoreConsumedResumeState({
-							env: ctx.env,
-							key,
-							expectedState: state,
-							claimId: claim.claimId,
-						});
-						ctx.signal?.throwIfAborted();
-					}
-					claimId = claim.claimId;
-					claimed = true;
-				};
-				const result = await instance.resume(encodeToken(state.payload), decision);
-				const paused = ["needs_approval", "needs_input"].includes(result.status);
-				if (result.ok && !paused && !claimed) {
-					const deletion = await deleteUnconsumedResumeState({
-						env: ctx.env,
-						key,
-						signal: ctx.signal,
-					});
-					if (deletion !== "deleted") {
-						throw new Error("SDK resume state not found");
-					}
-				}
-				const tracked = await instance.#trackPause(result, { key, state, claimId });
-				if (claimed && !paused) {
-					await deleteStateJson({ env: ctx.env, key });
-				}
-				return tracked;
-			},
+			});
+		} catch (err) {
+			// Nothing ran: the token, the answer or this instance does not fit the paused run.
+			if (
+				err instanceof WorkflowResumeArgumentError ||
+				err instanceof ResumeRefusedError ||
+				(err as Error)?.message === "Invalid token"
+			)
+				throw err;
+			return failed(err);
+		}
+	}
+
+	async #execute(
+		env: NodeJS.ProcessEnv | undefined,
+		task: (ctx: RunContext) => Promise<WorkflowRunResult & { runId?: string }>,
+	): Promise<SdkResult> {
+		return withStoreContext(
+			{ ...this.#options, env: stateEnv({ ...this.#options, env }), trackRuns: true },
+			async (store) =>
+				finished(
+					await task({
+						env: store.env!,
+						mode: "sdk",
+						stdin: { isTTY: false } as unknown as NodeJS.ReadableStream,
+						stdout: discard(),
+						stderr: discard(),
+						cwd: process.cwd(),
+						signal: this.#options.signal,
+						registry: sdkStageRegistry(this.#stages, { stateDir: this.#options.stateDir }),
+						runMetadata: this.#options.runMetadata,
+					}),
+				),
 		);
+	}
+
+	#pipeline() {
+		return sdkPipelineText(this.#stages.length);
+	}
+
+	/**
+	 * Turn a pause saved by an older Lobster into a waiting run, once. Its token then
+	 * resumes that run, and a token used before is refused instead of acting again.
+	 */
+	async #convertLegacyToken(token: string, legacy: LegacySdkToken, env: NodeJS.ProcessEnv) {
+		const session = sessionFromEnv(env);
+		if (!session) throw new Error("SDK resume requires a persistence session");
+		let key: string;
+		let pause: PausedPipeline;
+		if (legacy.resumeMode === "same_stage") {
+			// The state lives under its key; once a run owns the key, it is that run's.
+			key = legacy.stateKey!;
+			const record = await session.read(key);
+			if (record.runId) return key;
+			if (record.text === null) throw new ResumeRefusedError();
+			const state = JSON.parse(record.text);
+			if (
+				!Number.isSafeInteger(state?.resumeAtIndex) ||
+				state.resumeAtIndex < 0 ||
+				!Array.isArray(state.items) ||
+				state.inputSchema === undefined
+			)
+				throw new Error("Invalid SDK resume state");
+			pause = {
+				gate: "same_stage",
+				resumeAtIndex: state.resumeAtIndex,
+				items: state.items,
+				inputSchema: state.inputSchema,
+				commandInput: validateCommandInputState(state.commandInput) as any,
+			};
+		} else {
+			// Older tokens carried their whole state, so nothing marked them used: mark it now,
+			// for good, before the run exists. A token marked earlier is never converted again.
+			const hash = createHash("sha256").update(token).digest("hex");
+			key = `sdk_resume_${hash.slice(0, 32)}`;
+			const marker = `sdk_token_${hash}`;
+			if ((await session.read(marker)).text !== null) return key;
+			try {
+				await session.write(marker, JSON.stringify({ usedAt: new Date().toISOString() }) + "\n", {
+					exclusive: true,
+				});
+			} catch {
+				return key;
+			}
+			pause =
+				legacy.inputSchema !== undefined
+					? {
+							gate: "input",
+							resumeAtIndex: legacy.resumeAtIndex,
+							prompt: legacy.prompt ?? "Input required",
+							inputSchema: legacy.inputSchema,
+							subject: legacy.inputSubject,
+						}
+					: {
+							gate: "approval",
+							resumeAtIndex: legacy.resumeAtIndex,
+							items: legacy.items ?? [],
+							prompt: legacy.prompt ?? "Approve?",
+						};
+		}
+		if (pause.resumeAtIndex > this.#stages.length)
+			throw new ResumeRefusedError(
+				`This Lobster instance has ${this.#stages.length} stages; the paused pipeline had more`,
+			);
+		const text = this.#pipeline();
+		const registry = sdkStageRegistry(this.#stages);
+		const stages = parsePipeline(text, registry as any).map((stage) => ({
+			name: stage.name,
+			args: stage.args,
+			raw: stage.raw,
+		}));
+		const { execution, continuation } = waitingPipelineRun(
+			key,
+			pipelineDefinition(text, []),
+			stages,
+			pause,
+		);
+		await session
+			.createWaitingRun({ id: randomUUID(), kind: "sdk", key, execution, continuation })
+			.catch((error) => {
+				// Another resume converted it first: resume that run.
+				if (!/already belongs to a run/.test(error?.message)) throw error;
+			});
+		return key;
 	}
 
 	clone() {
@@ -506,15 +307,17 @@ export class Lobster {
 	}
 }
 
-function decodeSdkResumePayload(token: string): SdkResumePayload {
-	const payload = decodeToken(token);
-	if (!payload || typeof payload !== "object") {
-		throw new Error("Invalid token");
-	}
-	const data = payload as Record<string, unknown>;
-	if (data.protocolVersion !== 1 || data.v !== 1) {
-		throw new Error("Invalid token");
-	}
+function assertOneDecision(options: { approved?: boolean; response?: unknown; cancel?: boolean }) {
+	const count =
+		Number(typeof options.approved === "boolean") +
+		Number(options.response !== undefined) +
+		Number(options.cancel === true);
+	if (count > 1) throw new Error("resume accepts only one of approved, response, or cancel");
+	if (count === 0) throw new Error("resume requires approved, response, or cancel");
+}
+
+function decodeLegacyToken(data: Record<string, unknown>): LegacySdkToken {
+	if (data.v !== 1) throw new Error("Invalid token");
 	if (
 		typeof data.resumeAtIndex !== "number" ||
 		!Number.isInteger(data.resumeAtIndex) ||
@@ -522,9 +325,7 @@ function decodeSdkResumePayload(token: string): SdkResumePayload {
 	) {
 		throw new Error("Invalid token");
 	}
-	if (data.items !== undefined && !Array.isArray(data.items)) {
-		throw new Error("Invalid token");
-	}
+	if (data.items !== undefined && !Array.isArray(data.items)) throw new Error("Invalid token");
 	if (
 		data.resumeMode !== undefined &&
 		(typeof data.resumeMode !== "string" || !["next_stage", "same_stage"].includes(data.resumeMode))
@@ -532,45 +333,75 @@ function decodeSdkResumePayload(token: string): SdkResumePayload {
 		throw new Error("Invalid token");
 	}
 	if (data.resumeMode === "same_stage") {
-		if (typeof data.stateKey !== "string" || data.stateKey.length === 0) {
+		if (typeof data.stateKey !== "string" || !/^sdk_resume_[a-z0-9-]+$/.test(data.stateKey)) {
 			throw new Error("Invalid token");
 		}
 	} else if (data.stateKey !== undefined) {
 		throw new Error("Invalid token");
 	}
 	if (data.commandInput !== undefined) throw new Error("Invalid token");
-	return data as unknown as SdkResumePayload;
+	return data as unknown as LegacySdkToken;
 }
 
-async function saveSdkCommandInputResumeState(
-	options: LobsterOptions,
-	state: SdkCommandInputResumeState,
-) {
-	const stateKey = `sdk_resume_${randomUUID()}`;
-	await writeStateJson({ env: stateEnv(options), key: stateKey, value: state });
-	return stateKey;
+/** The SDK's result shape for a finished run step. */
+function finished(output: Partial<WorkflowRunResult> & { runId?: string }): SdkResult {
+	const runId = output.runId ? { runId: output.runId } : {};
+	if (output.status === "needs_approval")
+		return {
+			...runId,
+			ok: true,
+			status: "needs_approval",
+			output: [],
+			requiresApproval: output.requiresApproval as any,
+			requiresInput: null,
+		};
+	if (output.status === "needs_input")
+		return {
+			...runId,
+			ok: true,
+			status: "needs_input",
+			output: [],
+			requiresApproval: null,
+			requiresInput: output.requiresInput as any,
+		};
+	if (output.status === "cancelled")
+		return {
+			...runId,
+			ok: true,
+			status: "cancelled",
+			output: [],
+			requiresApproval: null,
+			requiresInput: null,
+		};
+	if (output.status === "waiting")
+		return failed(new Error("SDK pipelines cannot wait for timers or events"), output.runId);
+	return {
+		...runId,
+		ok: true,
+		status: "ok",
+		output: (output.output ?? []) as unknown[],
+		requiresApproval: null,
+		requiresInput: null,
+	};
 }
 
-async function loadSdkCommandInputResumeState(
-	options: LobsterOptions,
-	stateKey: string,
-): Promise<SdkCommandInputResumeState> {
-	const stored = await readStateJsonWithLock({
-		env: stateEnv(options),
-		key: stateKey,
-		signal: options?.signal,
+function failed(err: unknown, runId = (err as { runId?: string })?.runId): SdkResult {
+	const error = runtimeErrorDetails(err);
+	return {
+		ok: false,
+		status: "error",
+		...(error.runId || runId ? { runId: error.runId ?? runId } : {}),
+		output: [],
+		requiresApproval: null,
+		requiresInput: null,
+		error,
+	};
+}
+
+function discard() {
+	return new Writable({
+		write(_chunk, _encoding, callback) {
+			callback();
+		},
 	});
-	if (!stored || typeof stored !== "object") throw new Error("SDK resume state not found");
-	const data = stored as Partial<SdkCommandInputResumeState>;
-	if (
-		typeof data.resumeAtIndex !== "number" ||
-		!Number.isInteger(data.resumeAtIndex) ||
-		data.resumeAtIndex < 0
-	) {
-		throw new Error("Invalid SDK resume state");
-	}
-	if (!Array.isArray(data.items)) throw new Error("Invalid SDK resume state");
-	if (data.inputSchema === undefined) throw new Error("Invalid SDK resume state");
-	data.commandInput = validateCommandInputState(data.commandInput);
-	return data as SdkCommandInputResumeState;
 }

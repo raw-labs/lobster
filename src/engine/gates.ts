@@ -1,4 +1,5 @@
 import { parseDuration } from "../util/duration.js";
+import { combineSignals } from "../process/owner_signal.js";
 import { readLineFromStream } from "../io/read_line.js";
 import type {
 	WorkflowStep,
@@ -14,6 +15,17 @@ export class WorkflowResumeArgumentError extends Error {
 	constructor(message: string) {
 		super(message);
 		this.name = "WorkflowResumeArgumentError";
+	}
+}
+
+/**
+ * The reference cannot be resumed here: already answered or cancelled, unknown, or a run
+ * this caller cannot continue. Nothing ran.
+ */
+export class ResumeRefusedError extends Error {
+	constructor(message = "Resume state not found") {
+		super(message);
+		this.name = "ResumeRefusedError";
 	}
 }
 
@@ -206,7 +218,8 @@ export function parseResponseJson(raw: string): unknown {
 export function validateInputResponse(params: {
 	schema: unknown;
 	response: unknown;
-	stepId: string;
+	/** The step that asked; none for a standalone pipeline, which has only the one. */
+	stepId?: string;
 }) {
 	const validator = compileCached(params.schema as object);
 	const ok = validator(params.response);
@@ -214,9 +227,8 @@ export function validateInputResponse(params: {
 	const first = validator.errors?.[0];
 	const pathValue = first?.instancePath || "/";
 	const reason = first?.message ? ` ${first.message}` : "";
-	throw new Error(
-		`Workflow input step ${params.stepId} response failed schema validation at ${pathValue}:${reason}`,
-	);
+	const asker = params.stepId === undefined ? "Input" : `Workflow input step ${params.stepId}`;
+	throw new Error(`${asker} response failed schema validation at ${pathValue}:${reason}`);
 }
 
 export function resolveInputSubject(params: {
@@ -435,7 +447,7 @@ export async function readAnswer(
 	try {
 		const answer = await readLineFromStream(scope.ctx.stdin, {
 			timeoutMs: parseApprovalTimeoutMs(scope.ctx.env),
-			signal: AbortSignal.any([scope.ctx.signal, expiry.signal].filter(Boolean) as AbortSignal[]),
+			signal: combineSignals(scope.ctx.signal, expiry.signal),
 		});
 		return { answer };
 	} catch (error) {

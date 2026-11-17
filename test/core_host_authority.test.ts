@@ -97,9 +97,6 @@ function pauseBackend(
 	};
 }
 
-const consumedMarker = (text?: string | null) =>
-	typeof text === "string" && text.includes("lobster.consumed-resume-state.v1");
-
 /**
  * Every value saved outside a run, read through the store. A short approval ID is
  * compared by the state it points to: a restored ID gets a new creation time.
@@ -125,20 +122,6 @@ async function storedText(stateDir: string, key: string): Promise<string | null>
 		return (await store.read(key)).text;
 	} finally {
 		await store.close();
-	}
-}
-
-async function waitForGate(gate: Promise<void>) {
-	let timer: ReturnType<typeof setTimeout> | undefined;
-	try {
-		await Promise.race([
-			gate,
-			new Promise<never>((_resolve, reject) => {
-				timer = setTimeout(() => reject(new Error("authority test gate timed out")), 2_000);
-			}),
-		]);
-	} finally {
-		if (timer) clearTimeout(timer);
 	}
 }
 
@@ -372,11 +355,11 @@ test("approved openclaw.invoke enforces host authority at real HTTP I/O", async 
 			path: request.url,
 			body: JSON.parse(Buffer.concat(chunks).toString("utf8")),
 		});
+		retireOnRequest?.();
 		response.writeHead(200, { "content-type": "application/json" });
 		response.end(JSON.stringify({ ok: true, result: { sent: true } }));
 	});
-	let claimGate: Gate | undefined;
-	let dispatchGate: Gate | undefined;
+	let retireOnRequest: (() => void) | undefined;
 	try {
 		await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
 		const port = (server.address() as { port: number }).port;
@@ -408,37 +391,22 @@ test("approved openclaw.invoke enforces host authority at real HTTP I/O", async 
 		const pendingId = pendingApproval.requiresApproval?.approvalId;
 		assert.ok(pendingToken);
 		assert.ok(pendingId);
-		const stateKey = resumeStateKey(pendingToken);
-		const checkpointBefore = await storedText(stateDir, stateKey);
-		claimGate = pauseBackend(
-			"write",
-			(key, text) => key === stateKey && consumedMarker(text),
-			"after",
-		);
-		let claimCurrent = true;
-		const retiredBeforeIO = resumeToolRequest({
+		// A host that has already retired this invocation: nothing is saved, nothing is sent.
+		const rejected = await resumeToolRequest({
 			token: pendingToken,
 			approved: true,
 			ctx: {
 				cwd: tmp,
 				env,
 				assertInvocationCurrent: () => {
-					if (!claimCurrent) throw new Error("host invocation retired");
+					throw new Error("host invocation retired");
 				},
 			},
 		});
-		await waitForGate(claimGate.started);
-		claimCurrent = false;
-		claimGate.release();
-		const rejected = await retiredBeforeIO;
 		assert.equal(rejected.ok, false);
 		assert.match(rejected.error?.message ?? "", /host invocation retired/);
 		assert.equal(requests.length, 1, "retired approval must not reach the HTTP server");
 		const retiredRequests = requests.length;
-		const checkpointRestored = (await storedText(stateDir, stateKey)) === checkpointBefore;
-		assert.equal(checkpointRestored, true);
-		claimGate.restore();
-		claimGate = undefined;
 
 		const recovered = await resumeToolRequest({
 			approvalId: pendingId,
@@ -447,25 +415,22 @@ test("approved openclaw.invoke enforces host authority at real HTTP I/O", async 
 		});
 		assert.equal(recovered.status, "ok");
 		assert.deepEqual(recovered.output, [{ sent: true }]);
-		assert.equal(requests.length, 2, "safe checkpoint must remain actionable");
+		assert.equal(requests.length, 2, "the approval stays answerable");
 		const recoveredRequests = requests.length;
 
+		// The host retires once the HTTP request went out: the effect is not repeated.
 		const dispatchedApproval = await runToolRequest({
 			pipeline: `${pipeline} | approve --prompt "Next?"`,
 			ctx: { cwd: tmp, env },
 		});
 		assert.equal(dispatchedApproval.status, "needs_approval");
 		const dispatchedToken = dispatchedApproval.requiresApproval?.resumeToken;
-		const dispatchedId = dispatchedApproval.requiresApproval?.approvalId;
 		assert.ok(dispatchedToken);
-		assert.ok(dispatchedId);
-		dispatchGate = pauseBackend(
-			"write",
-			(key, text) => key === `approval_${dispatchedId}` && text === null,
-			"after",
-		);
 		let dispatchCurrent = true;
-		const retiredAfterIO = resumeToolRequest({
+		retireOnRequest = () => {
+			dispatchCurrent = false;
+		};
+		const interrupted = await resumeToolRequest({
 			token: dispatchedToken,
 			approved: true,
 			ctx: {
@@ -476,12 +441,9 @@ test("approved openclaw.invoke enforces host authority at real HTTP I/O", async 
 				},
 			},
 		});
-		await waitForGate(dispatchGate.started);
-		assert.equal(requests.length, 3, "the HTTP effect must precede host retirement");
+		retireOnRequest = undefined;
+		assert.equal(requests.length, 3, "the HTTP effect precedes host retirement");
 		const dispatchedRequests = requests.length;
-		dispatchCurrent = false;
-		dispatchGate.release();
-		const interrupted = await retiredAfterIO;
 		assert.equal(interrupted.ok, false);
 		assert.match(interrupted.error?.message ?? "", /host invocation retired/);
 		const replay = await resumeToolRequest({
@@ -496,17 +458,12 @@ test("approved openclaw.invoke enforces host authority at real HTTP I/O", async 
 				transport: "loopback POST /tools/invoke",
 				current: allowedRequests,
 				retiredBeforeIO: retiredRequests - allowedRequests,
-				safeCheckpointRestored: checkpointRestored,
 				recovered: recoveredRequests - retiredRequests,
 				dispatchedBeforeRetirement: dispatchedRequests - recoveredRequests,
 				replay: requests.length - dispatchedRequests,
 			}),
 		);
 	} finally {
-		claimGate?.release();
-		claimGate?.restore();
-		dispatchGate?.release();
-		dispatchGate?.restore();
 		if (server.listening) {
 			server.closeAllConnections();
 			await new Promise<void>((resolve) => server.close(() => resolve()));
@@ -582,345 +539,3 @@ test("approved pipeline cannot publish a successor approval after host retiremen
 		await fsp.rm(tmp, { recursive: true, force: true });
 	}
 });
-
-test("approved pipeline removes a successor linked before host retirement", async () => {
-	const tmp = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-host-authority-index-"));
-	const env = { ...process.env, LOBSTER_STATE_DIR: tmp };
-	let gate: Gate | undefined;
-	try {
-		const first = await runToolRequest({
-			pipeline: 'approve --prompt "First?" | approve --prompt "Second?"',
-			ctx: { cwd: tmp, env },
-		});
-		assert.equal(first.status, "needs_approval");
-		const token = first.requiresApproval?.resumeToken;
-		assert.ok(token);
-		const before = await storeSnapshot(tmp);
-		gate = pauseBackend(
-			"write",
-			(key, text) => key.startsWith("approval_") && text != null,
-			"after",
-		);
-		let current = true;
-		const pending = resumeToolRequest({
-			token,
-			approved: true,
-			ctx: {
-				cwd: tmp,
-				env,
-				assertInvocationCurrent: () => {
-					if (!current) throw new Error("host invocation retired");
-				},
-			},
-		});
-		await gate.started;
-		current = false;
-		gate.release();
-		const resumed = await pending;
-		assert.equal(resumed.ok, false);
-		assert.match(resumed.error?.message ?? "", /host invocation retired/);
-		assert.deepEqual(await storeSnapshot(tmp), before);
-	} finally {
-		gate?.release();
-		gate?.restore();
-		await fsp.rm(tmp, { recursive: true, force: true });
-	}
-});
-
-test("approved pipeline restores the predecessor after retirement during old-index cleanup", async () => {
-	const tmp = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-host-authority-old-index-"));
-	const env = { ...process.env, LOBSTER_STATE_DIR: tmp };
-	let gate: Gate | undefined;
-	try {
-		const first = await runToolRequest({
-			pipeline: 'approve --prompt "First?" | approve --prompt "Second?"',
-			ctx: { cwd: tmp, env },
-		});
-		assert.equal(first.status, "needs_approval");
-		const token = first.requiresApproval?.resumeToken;
-		const approvalId = first.requiresApproval?.approvalId;
-		assert.ok(token);
-		assert.ok(approvalId);
-		const before = await storeSnapshot(tmp);
-		gate = pauseBackend(
-			"write",
-			(key, text) => key === `approval_${approvalId}` && text === null,
-			"after",
-		);
-		let current = true;
-		const pending = resumeToolRequest({
-			token,
-			approved: true,
-			ctx: {
-				cwd: tmp,
-				env,
-				assertInvocationCurrent: () => {
-					if (!current) throw new Error("host invocation retired");
-				},
-			},
-		});
-		await waitForGate(gate.started);
-		current = false;
-		gate.release();
-		const resumed = await pending;
-		assert.equal(resumed.ok, false);
-		assert.match(resumed.error?.message ?? "", /host invocation retired/);
-		assert.deepEqual(await storeSnapshot(tmp), before);
-		const retried = await resumeToolRequest({
-			approvalId,
-			approved: true,
-			ctx: { cwd: tmp, env },
-		});
-		assert.equal(retried.status, "needs_approval");
-		assert.equal(retried.requiresApproval?.prompt, "Second?");
-	} finally {
-		gate?.release();
-		gate?.restore();
-		await fsp.rm(tmp, { recursive: true, force: true });
-	}
-});
-
-test("approved pipeline restores the predecessor when a successor input is retired", async () => {
-	const tmp = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-host-authority-input-"));
-	const env = { ...process.env, LOBSTER_STATE_DIR: tmp };
-	let gate: Gate | undefined;
-	try {
-		const first = await runToolRequest({
-			pipeline: 'approve --prompt "First?" | ask --prompt "Name?"',
-			ctx: { cwd: tmp, env },
-		});
-		assert.equal(first.status, "needs_approval");
-		const token = first.requiresApproval?.resumeToken;
-		const approvalId = first.requiresApproval?.approvalId;
-		assert.ok(token);
-		assert.ok(approvalId);
-		const before = await storeSnapshot(tmp);
-		gate = pauseBackend(
-			"write",
-			(key, text) => key === `approval_${approvalId}` && text === null,
-			"after",
-		);
-		let current = true;
-		const pending = resumeToolRequest({
-			token,
-			approved: true,
-			ctx: {
-				cwd: tmp,
-				env,
-				assertInvocationCurrent: () => {
-					if (!current) throw new Error("host invocation retired");
-				},
-			},
-		});
-		await waitForGate(gate.started);
-		current = false;
-		gate.release();
-		const resumed = await pending;
-		assert.equal(resumed.ok, false);
-		assert.match(resumed.error?.message ?? "", /host invocation retired/);
-		assert.deepEqual(await storeSnapshot(tmp), before);
-		const retried = await resumeToolRequest({
-			approvalId,
-			approved: true,
-			ctx: { cwd: tmp, env },
-		});
-		assert.equal(retried.status, "needs_input");
-		assert.equal(retried.requiresInput?.prompt, "Name?");
-	} finally {
-		gate?.release();
-		gate?.restore();
-		await fsp.rm(tmp, { recursive: true, force: true });
-	}
-});
-
-for (const kind of ["pipeline"] as const) {
-	test(`approved ${kind} restores a pre-dispatch claim when host authority retires`, async () => {
-		const tmp = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-host-authority-claim-"));
-		const stateDir = path.join(tmp, "state");
-		const effectPath = path.join(tmp, "committed.txt");
-		const env = { ...process.env, LOBSTER_STATE_DIR: stateDir, LOBSTER_EFFECT_FILE: effectPath };
-		let gate: Gate | undefined;
-		try {
-			const filePath = path.join(tmp, "workflow.lobster");
-			const first =
-				kind === "pipeline"
-					? await runToolRequest({
-							pipeline:
-								"approve --prompt \"Write?\" | exec node -e \"require('node:fs').writeFileSync(process.env.LOBSTER_EFFECT_FILE, 'committed')\"",
-							ctx: { cwd: tmp, env },
-						})
-					: await runToolRequest({ filePath, ctx: { cwd: tmp, env } });
-			assert.equal(first.status, "needs_approval");
-			const token = first.requiresApproval?.resumeToken;
-			const approvalId = first.requiresApproval?.approvalId;
-			assert.ok(token);
-			assert.ok(approvalId);
-			const stateKey = resumeStateKey(token);
-			const before = await storedText(stateDir, stateKey);
-			gate = pauseBackend(
-				"write",
-				(key, text) => key === stateKey && consumedMarker(text),
-				"after",
-			);
-			let current = true;
-			const pending = resumeToolRequest({
-				token,
-				approved: true,
-				ctx: {
-					cwd: tmp,
-					env,
-					assertInvocationCurrent: () => {
-						if (!current) throw new Error("host invocation retired");
-					},
-				},
-			});
-			await waitForGate(gate.started);
-			current = false;
-			gate.release();
-			const resumed = await pending;
-			assert.equal(resumed.ok, false);
-			assert.match(resumed.error?.message ?? "", /host invocation retired/);
-			await assert.rejects(fsp.stat(effectPath), { code: "ENOENT" });
-			assert.equal(await storedText(stateDir, stateKey), before);
-			const cancelled = await resumeToolRequest({
-				approvalId,
-				cancel: true,
-				ctx: { cwd: tmp, env },
-			});
-			assert.equal(cancelled.status, "cancelled");
-		} finally {
-			gate?.release();
-			gate?.restore();
-			await fsp.rm(tmp, { recursive: true, force: true });
-		}
-	});
-}
-
-for (const kind of ["pipeline"] as const) {
-	for (const phase of ["marker", "delete"] as const) {
-		test(`approved terminal ${kind} preserves its checkpoint after retirement during ${phase}`, async () => {
-			const tmp = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-host-authority-terminal-"));
-			const stateDir = path.join(tmp, "state");
-			const env = { ...process.env, LOBSTER_STATE_DIR: stateDir };
-			let gate: Gate | undefined;
-			try {
-				const filePath = path.join(tmp, "workflow.lobster");
-				const first =
-					kind === "pipeline"
-						? await runToolRequest({
-								pipeline: 'approve --prompt "Finish?"',
-								ctx: { cwd: tmp, env },
-							})
-						: await runToolRequest({ filePath, ctx: { cwd: tmp, env } });
-				assert.equal(first.status, "needs_approval");
-				const token = first.requiresApproval?.resumeToken;
-				const approvalId = first.requiresApproval?.approvalId;
-				assert.ok(token);
-				assert.ok(approvalId);
-				const stateKey = resumeStateKey(token);
-				const before = await storedText(stateDir, stateKey);
-				gate = pauseBackend(
-					"write",
-					(key, text) =>
-						key === stateKey && (phase === "marker" ? consumedMarker(text) : text === null),
-					"after",
-				);
-				let current = true;
-				const pending = resumeToolRequest({
-					token,
-					approved: true,
-					ctx: {
-						cwd: tmp,
-						env,
-						assertInvocationCurrent: () => {
-							if (!current) throw new Error("host invocation retired");
-						},
-					},
-				});
-				await waitForGate(gate.started);
-				current = false;
-				gate.release();
-				const resumed = await pending;
-				assert.equal(resumed.ok, false);
-				assert.match(resumed.error?.message ?? "", /host invocation retired/);
-				assert.equal(await storedText(stateDir, stateKey), before);
-				const cancelled = await resumeToolRequest({
-					approvalId,
-					cancel: true,
-					ctx: { cwd: tmp, env },
-				});
-				assert.equal(cancelled.status, "cancelled");
-			} finally {
-				gate?.release();
-				gate?.restore();
-				await fsp.rm(tmp, { recursive: true, force: true });
-			}
-		});
-	}
-}
-
-for (const kind of ["pipeline"] as const) {
-	test(`approved ${kind} does not restore a predecessor after unsafe dispatch`, async () => {
-		const tmp = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-host-authority-effect-"));
-		const stateDir = path.join(tmp, "state");
-		const effectPath = path.join(tmp, "committed.txt");
-		const env = { ...process.env, LOBSTER_STATE_DIR: stateDir, LOBSTER_EFFECT_FILE: effectPath };
-		let gate: Gate | undefined;
-		try {
-			const command = `"${process.execPath}" -e "require('node:fs').writeFileSync(process.env.LOBSTER_EFFECT_FILE, 'committed')"`;
-			const filePath = path.join(tmp, "workflow.lobster");
-			const first =
-				kind === "pipeline"
-					? await runToolRequest({
-							pipeline: `approve --prompt "First?" | exec ${command} | approve --prompt "Second?"`,
-							ctx: { cwd: tmp, env },
-						})
-					: await runToolRequest({ filePath, ctx: { cwd: tmp, env } });
-			assert.equal(first.status, "needs_approval");
-			const token = first.requiresApproval?.resumeToken;
-			const approvalId = first.requiresApproval?.approvalId;
-			assert.ok(token);
-			assert.ok(approvalId);
-			gate = pauseBackend(
-				"write",
-				(key, text) => key === `approval_${approvalId}` && text === null,
-				"after",
-			);
-			let current = true;
-			const pending = resumeToolRequest({
-				token,
-				approved: true,
-				ctx: {
-					cwd: tmp,
-					env,
-					assertInvocationCurrent: () => {
-						if (!current) throw new Error("host invocation retired");
-					},
-				},
-			});
-			await waitForGate(gate.started);
-			current = false;
-			gate.release();
-			const resumed = await pending;
-			assert.equal(resumed.ok, false);
-			assert.match(resumed.error?.message ?? "", /host invocation retired/);
-			assert.equal(await fsp.readFile(effectPath, "utf8"), "committed");
-			const keys = Object.keys(await storeSnapshot(stateDir));
-			assert.equal(
-				keys.some((name) => name.startsWith("approval_")),
-				false,
-			);
-			assert.equal(
-				keys.filter((name) => /^(pipeline|workflow)_resume_/.test(name)).length,
-				kind === "pipeline" ? 1 : 0,
-			);
-			const replay = await resumeToolRequest({ token, approved: true, ctx: { cwd: tmp, env } });
-			assert.equal(replay.ok, false);
-			assert.equal(await fsp.readFile(effectPath, "utf8"), "committed");
-		} finally {
-			gate?.release();
-			gate?.restore();
-			await fsp.rm(tmp, { recursive: true, force: true });
-		}
-	});
-}

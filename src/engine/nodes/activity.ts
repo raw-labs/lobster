@@ -61,7 +61,10 @@ export async function activity(machine: Machine, step: WorkflowStep, key: string
 			...(execution.kind !== "none"
 				? { text: resolveTemplate(execution.value, scope.args, scope.results) }
 				: {}),
-			input: resolveInputValue(step.stdin, scope.args, scope.results),
+			input:
+				scope.definition.standalone && scope.definition.input !== undefined
+					? scope.definition.input
+					: resolveInputValue(step.stdin, scope.args, scope.results),
 			// Do not persist the host environment or credentials. Resolve only explicit workflow values.
 			env: mergeEnv(scope.baseEnv ?? {}, scope.env, step.env, scope.args, scope.results),
 			cwd: resolveCwd(step.cwd ?? scope.cwd, scope.args) ?? scope.ctx.cwd,
@@ -83,6 +86,8 @@ export async function activity(machine: Machine, step: WorkflowStep, key: string
 	machine.checkAuthority(scope.ctx);
 	await scope.ctx._onExecutionStarted?.();
 	let result;
+	// Whether a command may have started. Until then, stopping leaves nothing to inspect.
+	let dispatched = saved.kind === "shell";
 	try {
 		const ctx = {
 			...scope.ctx,
@@ -130,7 +135,11 @@ export async function activity(machine: Machine, step: WorkflowStep, key: string
 				resume: record.pipelineInput
 					? { pipelineInput: record.pipelineInput, response: record.response }
 					: undefined,
-				onExecutionStart: () => ctx._onExecutionStarted?.(),
+				onExecutionStart: () => {
+					dispatched = true;
+					return ctx._onExecutionStarted?.();
+				},
+				standalone: scope.definition.standalone,
 			});
 		} else result = createSyntheticStepResult(step.id, saved.input);
 		ctx.signal?.throwIfAborted();
@@ -153,8 +162,18 @@ export async function activity(machine: Machine, step: WorkflowStep, key: string
 			await machine.save();
 			return activity(machine, step, key, scope);
 		}
+		if (machine.fatal(error) || scope.ctx.signal?.aborted) {
+			// Stopped before any command started (a history write failed, Ctrl-C while
+			// preparing): the step can simply start again. If this save fails too, it stays
+			// started and is treated as interrupted, which is never wrong.
+			if (!dispatched && !(error instanceof InterruptedActivityError)) {
+				record.phase = "ready";
+				if (historyId) await history!.finish(historyId, "closed").catch(() => {});
+				await machine.save().catch(() => {});
+			}
+			throw error;
+		}
 		machine.checkAuthority(scope.ctx);
-		if (machine.fatal(error) || scope.ctx.signal?.aborted) throw error;
 		record.phase = "failed";
 		record.error = error?.message ?? String(error);
 		if (historyId) await history!.finish(historyId, "failed", error);

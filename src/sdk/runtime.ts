@@ -32,17 +32,6 @@ function normalizeSdkOutput(output) {
 	return [output];
 }
 
-function createNullWritable() {
-	return {
-		write() {
-			return true;
-		},
-		end() {
-			return undefined;
-		},
-	};
-}
-
 /**
  * Run a pipeline of stages
  *
@@ -52,22 +41,21 @@ function createNullWritable() {
  * @param {any[]} [options.input] - Initial input items
  * @returns {Promise<PipelineResult>}
  */
-export async function runPipelineInternal({
-	stages,
-	ctx,
-	input = [],
-	requestInputResume = undefined,
-}) {
-	const runtimeCtx = ctx ?? {};
-	const pipeline = stages.map((_stage, index) => ({
-		name: `sdk.stage.${index}`,
-		args: {},
-		raw: `sdk.stage.${index}`,
-	}));
+/** The pipeline text naming SDK stages: `sdk.stage.0 | sdk.stage.1 | ...`. */
+export function sdkPipelineText(count: number) {
+	return Array.from({ length: count }, (_stage, index) => `sdk.stage.${index}`).join(" | ");
+}
+
+/**
+ * Commands named `sdk.stage.<n>` that run an SDK instance's stages. A run saves only these
+ * names, so the instance that resumes it supplies the stages again.
+ */
+export function sdkStageRegistry(stages, runtimeCtx: Record<string, unknown> = {}) {
 	const commands = new Map(
 		stages.map((stage, index) => [
 			`sdk.stage.${index}`,
 			{
+				meta: { description: `SDK stage ${index}`, argsSchema: { type: "object" } },
 				async run({ input, ctx }) {
 					const stageCtx = { ...runtimeCtx, ...ctx };
 					if (typeof stage === "function") {
@@ -97,28 +85,21 @@ export async function runPipelineInternal({
 			},
 		]),
 	);
-	const stdout = runtimeCtx.stdout ?? createNullWritable();
-	const stderr = runtimeCtx.stderr ?? createNullWritable();
-
-	return runCorePipeline({
-		pipeline,
-		registry: {
-			get(name) {
-				return commands.get(name);
-			},
+	return {
+		get(name: string) {
+			return commands.get(name);
 		},
-		stdin: runtimeCtx.stdin ?? { isTTY: false },
-		stdout,
-		stderr,
-		env: runtimeCtx.env ?? process.env,
-		mode: runtimeCtx.mode ?? "sdk",
-		cwd: runtimeCtx.cwd,
-		llmAdapters: runtimeCtx.llmAdapters,
-		signal: runtimeCtx.signal,
-		input: normalizeSdkOutput(input),
-		requestInputResume,
-		onExecutionStart: runtimeCtx._onExecutionStart,
-	});
+		list() {
+			return [...commands.keys()];
+		},
+	};
+}
+
+/** SDK input as the items a run saves: iterables are read once, a single value is one item. */
+export async function sdkInputItems(input: unknown): Promise<unknown[]> {
+	const normalized = normalizeSdkOutput(input);
+	if (Array.isArray(normalized)) return normalized;
+	return collectItems(normalized);
 }
 
 /**

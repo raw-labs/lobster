@@ -1,3 +1,4 @@
+import { advanceWorkflowRun } from "../src/workflows/file.js";
 import assert from "node:assert/strict";
 import { execFile, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
@@ -416,8 +417,9 @@ for (const backend of ["sqlite"] as const) {
 			assert.equal(runs.length, 1);
 			assert.equal(runs[0].status, "completed");
 			const run = await session.getRun(runs[0].id);
+			// Stage ordinals continue across the pause (the pipeline's own step has none).
 			assert.deepEqual(
-				run.attempts.map((a) => a.ordinal),
+				run.attempts.filter((a) => a.ordinal !== undefined).map((a) => a.ordinal),
 				[0, 1, 2],
 			);
 		} finally {
@@ -788,7 +790,7 @@ test("SQLite worker death before dispatch leaves no committed operation receipt"
 });
 
 for (const backend of ["sqlite"] as const) {
-	test(`${backend}: cancellation during receipt acknowledgement restores the pre-dispatch wait`, async (t) => {
+	test(`${backend}: cancellation right after an answer is saved keeps the answer, nothing runs twice`, async (t) => {
 		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "lobster-ack-cancel-"));
 		t.after(() => fs.rm(directory, { recursive: true, force: true }));
 		const session = await openStoreSession({ directory, history: true });
@@ -823,7 +825,7 @@ for (const backend of ["sqlite"] as const) {
 				const run = await session.getRun(runId);
 				if (
 					!controller.signal.aborted &&
-					Object.values(run.waits).some((wait) => wait.status === "consumed")
+					Object.values(run.waits).some((wait) => wait.status === "retired")
 				) {
 					controller.abort(new Error("fixture cancel after receipt"));
 				}
@@ -840,13 +842,27 @@ for (const backend of ["sqlite"] as const) {
 			}).catch(() => ({ ok: false }));
 			assert.equal(stopped.ok, false);
 			assert.equal(effects, 0);
-			assert.equal((await session.listRuns()).runs[0].status, "waiting");
-			const resumed = await resumeToolRequest({
+			// The approval was saved; nothing started, so the run simply continues when advanced.
+			assert.equal((await session.listRuns()).runs[0].status, "running");
+			const again = await resumeToolRequest({
 				token: first.requiresApproval.resumeToken,
 				approved: true,
 				ctx: { storeSession: session, registry },
 			});
-			assert.equal(resumed.status, "ok", JSON.stringify(resumed));
+			assert.match(again.error?.message ?? "", /Resume state not found/);
+			const advanced = await advanceWorkflowRun({
+				runId: first.runId,
+				ctx: {
+					storeSession: session,
+					registry,
+					env: { ...process.env },
+					mode: "tool",
+					stdin: process.stdin,
+					stdout: process.stdout,
+					stderr: process.stderr,
+				},
+			});
+			assert.equal(advanced.status, "ok", JSON.stringify(advanced));
 			assert.equal(effects, 1);
 		} finally {
 			await session.close();
@@ -1167,7 +1183,8 @@ for (const backend of ["sqlite"] as const) {
 				assert.deepEqual(run.metadata, { hostRunId: String(index) });
 				assert.deepEqual(
 					run.attempts.map((a) => a.name),
-					["first", "second"],
+					// A pipeline runs as one step named "pipeline"; its stages are recorded under it.
+					["pipeline", "first", "second"],
 				);
 			}
 			const ids: string[] = [];

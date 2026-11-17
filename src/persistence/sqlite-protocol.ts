@@ -18,7 +18,6 @@ type WriteRequest = {
 	exclusive?: boolean;
 	expectedWaitRevision?: number;
 	runId?: string;
-	decision?: unknown;
 };
 
 type Operations = {

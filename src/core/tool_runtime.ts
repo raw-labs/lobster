@@ -1,34 +1,22 @@
-import type { WorkflowWaitingFor } from "../workflows/types.js";
+import type { WorkflowRunResult, WorkflowWaitingFor } from "../workflows/types.js";
 import type { ResumeDecision, ResumeTarget } from "../resume/options.js";
 import path from "node:path";
 import { Writable } from "node:stream";
 import { createDefaultRegistry } from "../commands/registry.js";
 import { parsePipeline } from "../pipeline/parser.js";
 import { runtimeErrorDetails } from "../persistence/backend.js";
-import { recorderFromEnv, bindResumeGuard, sessionFromEnv } from "../persistence/context.js";
+import { bindResumeGuard, sessionFromEnv } from "../persistence/context.js";
 import { resolveWait, callerId } from "../persistence/waits.js";
 import { encodeToken } from "../resume/token.js";
 import { withExecution, withStoreContext } from "../persistence/execution.js";
 import type { PersistenceOptions } from "../persistence/context.js";
-import {
-	finalizePipelineToolRun,
-	loadPipelineResumeState,
-	validatePipelineInputResponse,
-} from "../pipeline/resume_state.js";
-import { decodeResumeToken, resolveApprovalId, kindFromStateKey } from "../resume/resume.js";
-import { runPipeline } from "../pipeline/runtime.js";
-import {
-	deleteStateJsonWithBoundedResumeCleanup,
-	deleteUnconsumedResumeState,
-	deleteApprovalId,
-	cleanupApprovalIndexByStateKey,
-	consumeResumeState,
-	restoreConsumedResumeState,
-} from "../state/store.js";
+import { decodeResumeToken, resolveApprovalId } from "../resume/resume.js";
+import { deleteApprovalId, cleanupApprovalIndexByStateKey } from "../state/store.js";
 import {
 	WorkflowResumeArgumentError,
 	UpgradeRequiredError,
 	runWorkflowFile,
+	runPipelineText,
 } from "../workflows/file.js";
 import { savedByOlderVersion } from "../workflows/upgrade.js";
 
@@ -83,10 +71,10 @@ export async function runToolRequest(
 	options: Parameters<typeof runToolRequestInternal>[0],
 ): Promise<ToolEnvelope> {
 	try {
+		// Every run is recorded: pipelines run on the workflow engine as one-step workflows.
 		return await withExecution(
-			createToolContext({ ...options.ctx, ...(options.filePath ? { trackRuns: true } : {}) }),
+			createToolContext({ ...options.ctx, trackRuns: true }),
 			options.filePath ? "workflow" : "pipeline",
-			undefined,
 			(ctx) => runToolRequestInternal({ ...options, ctx }),
 		);
 	} catch (error) {
@@ -138,7 +126,10 @@ async function runToolRequestInternal({
 				return okEnvelope("needs_input", [], null, output.requiresInput ?? null);
 			}
 			if (output.status === "waiting") {
-				return { ...okEnvelope("waiting", [], null, null), waitingFor: output.waitingFor };
+				return {
+					...okEnvelope("waiting", [], null, null),
+					waitingFor: output.waitingFor,
+				};
 			}
 			if (output.status === "cancelled") {
 				return okEnvelope("cancelled", [], null, null);
@@ -149,48 +140,36 @@ async function runToolRequestInternal({
 		}
 	}
 
-	let parsed;
 	try {
-		parsed = parsePipeline(String(pipeline), runtime.registry);
+		parsePipeline(String(pipeline), runtime.registry);
 	} catch (err: any) {
 		return errorEnvelope("parse_error", err?.message ?? String(err));
 	}
 
 	try {
-		const output = await runPipeline({
-			pipeline: parsed,
-			registry: runtime.registry,
-			input: [],
-			stdin: runtime.stdin,
-			stdout: runtime.stdout,
-			stderr: runtime.stderr,
-			env: runtime.env,
-			mode: "tool",
-			renderOutput: false,
-			cwd: runtime.cwd,
-			llmAdapters: runtime.llmAdapters,
-			signal: runtime.signal,
-			forceTerminationSignal: runtime.forceTerminationSignal,
-			haltAfterStageOnAbort: true,
-			assertInvocationCurrent: runtime.assertInvocationCurrent,
-		});
-
-		const finalized = await finalizePipelineToolRun({
-			env: runtime.env,
-			pipeline: parsed,
-			output,
-			signal: runtime.signal,
-			assertInvocationCurrent: runtime.assertInvocationCurrent,
-		});
-		return okEnvelope(
-			finalized.status,
-			finalized.output,
-			finalized.requiresApproval,
-			finalized.requiresInput,
+		return runEnvelope(
+			await runPipelineText({
+				pipeline: String(pipeline),
+				ctx: { ...runtime, mode: "tool" },
+			}),
 		);
 	} catch (err: any) {
 		return errorEnvelope("runtime_error", err);
 	}
+}
+
+/** The tool envelope for a workflow or pipeline run result. */
+function runEnvelope(output: WorkflowRunResult & { runId?: string }): ToolEnvelope {
+	const runId = output.runId ? { runId: output.runId } : {};
+	if (output.status === "needs_approval")
+		return { ...okEnvelope("needs_approval", [], output.requiresApproval ?? null, null), ...runId };
+	if (output.status === "needs_input")
+		return { ...okEnvelope("needs_input", [], null, output.requiresInput ?? null), ...runId };
+	if (output.status === "waiting")
+		return { ...okEnvelope("waiting", [], null, null), waitingFor: output.waitingFor, ...runId };
+	if (output.status === "cancelled")
+		return { ...okEnvelope("cancelled", [], null, null), ...runId };
+	return { ...okEnvelope("ok", output.output, null, null), ...runId };
 }
 
 export type ResumeToolOptions = ResumeTarget & ResumeDecision & { ctx?: ToolRunContext };
@@ -237,12 +216,6 @@ export async function resumeToolRequest(
 					options.expectedRevision,
 					callerId(ctx.runMetadata),
 				);
-				if (wait.key.startsWith("sdk_resume_")) {
-					return errorEnvelope(
-						"parse_error",
-						"SDK waits require Lobster.resumeWait on an instance with the original stages",
-					);
-				}
 				ctx = {
 					...ctx,
 					env: bindResumeGuard(ctx.env, {
@@ -256,7 +229,7 @@ export async function resumeToolRequest(
 					token: encodeToken({
 						protocolVersion: 1,
 						v: 1,
-						kind: kindFromStateKey(wait.key),
+						kind: "workflow-file",
 						stateKey: wait.key,
 					}),
 				};
@@ -283,12 +256,7 @@ export async function resumeToolRequest(
 						`approval_${String(resolved.approvalId).replace(/[^a-f0-9]/g, "")}`;
 			if (unimported && (await savedByOlderVersion(store.directory, unimported)))
 				return errorEnvelope("upgrade_required", new UpgradeRequiredError());
-			if (!key) {
-				return resumeToolRequestInternal({ ...resolved, ctx });
-			}
-			return withExecution({ ...ctx, _decision: options }, "resume", key, (runtime) =>
-				resumeToolRequestInternal({ ...resolved, ctx: runtime }),
-			);
+			return resumeToolRequestInternal({ ...resolved, ctx });
 		});
 	} catch (error) {
 		if (
@@ -317,11 +285,8 @@ async function resumeToolRequestInternal({
 	ctx?: ToolRunContext;
 }): Promise<ToolEnvelope> {
 	const runtime = createToolContext(ctx);
-	let payload: any;
-	let resolvedApprovalId = approvalId ?? null;
-
+	let payload: ReturnType<typeof decodeResumeToken>;
 	try {
-		// Resolve short approval ID to token if provided
 		let resolvedToken: string;
 		if (approvalId) {
 			resolvedToken = await resolveApprovalId(approvalId, runtime.env);
@@ -335,266 +300,32 @@ async function resumeToolRequestInternal({
 		return errorEnvelope("parse_error", err?.message ?? String(err));
 	}
 
-	// Helper: clean up approval ID index after successful use
-	const cleanupIndex = async (stateKey = payload?.stateKey) => {
-		if (resolvedApprovalId) {
-			await deleteApprovalId({ env: runtime.env, approvalId: resolvedApprovalId });
-		} else if (stateKey) {
-			await cleanupApprovalIndexByStateKey({ env: runtime.env, stateKey });
-		}
-	};
-
-	if (cancel === true && payload.kind !== "workflow-file") {
-		const stateKeys = payload.stateKey ? [payload.stateKey] : [];
-		// Keep the capability indexed until every state deletion succeeds. A
-		// cancelled request must not orphan a resume state by dropping its
-		// approval ID while waiting on another writer's state lock.
-		const deletionResults = [];
-		for (const stateKey of new Set(stateKeys)) {
-			deletionResults.push(
-				await deleteUnconsumedResumeState({
-					env: runtime.env,
-					key: stateKey,
-					signal: runtime.signal,
-				}),
-			);
-		}
-		if (
-			stateKeys.length > 0 &&
-			(deletionResults.includes("claimed") ||
-				deletionResults.every((result) => result === "missing"))
-		) {
-			return errorEnvelope("runtime_error", "Resume state not found");
-		}
-		if (resolvedApprovalId) {
-			await cleanupIndex();
-		} else {
-			for (const stateKey of stateKeys) await cleanupIndex(stateKey);
-		}
-		return okEnvelope("cancelled", [], null, null);
-	}
-
-	if (payload.kind === "workflow-file") {
-		let workflowResumeStateKey = payload.stateKey;
-		try {
-			const output = await runWorkflowFile({
-				filePath: payload.filePath,
-				ctx: {
-					...runtime,
-					_onResumeStateResolved: (stateKey) => {
-						workflowResumeStateKey = stateKey;
-					},
+	// Pipelines and workflow files are both runs: one resume path for every token.
+	let stateKey = payload.stateKey;
+	try {
+		const output = await runWorkflowFile({
+			filePath: payload.filePath,
+			ctx: {
+				...runtime,
+				_onResumeStateResolved: (key) => {
+					stateKey = key;
 				},
-				resume: payload,
-				approved,
-				response,
-				cancel,
-			});
-
-			if (output.status === "needs_approval") {
-				return okEnvelope("needs_approval", [], output.requiresApproval ?? null, null);
-			}
-			if (output.status === "needs_input") {
-				return okEnvelope("needs_input", [], null, output.requiresInput ?? null);
-			}
-			await cleanupIndex(workflowResumeStateKey);
-			if (output.status === "waiting") {
-				return { ...okEnvelope("waiting", [], null, null), waitingFor: output.waitingFor };
-			}
-			if (output.status === "cancelled") {
-				return okEnvelope("cancelled", [], null, null);
-			}
-			return okEnvelope("ok", output.output, null, null);
-		} catch (err: any) {
-			if (err instanceof WorkflowResumeArgumentError) {
-				return errorEnvelope("parse_error", err.message);
-			}
-			// Non-abort failures and cancellations before step execution remain retryable.
-			return errorEnvelope("runtime_error", err);
-		}
-	}
-
-	if (runtime.signal?.aborted) {
-		if (approved === false && runtime._resumeSignalAborted === false) {
-			throw runtime.signal.reason;
-		}
-		return errorEnvelope(
-			"runtime_error",
-			runtime.signal.reason instanceof Error
-				? runtime.signal.reason.message
-				: "This operation was aborted",
-		);
-	}
-
-	let resumeState;
-	try {
-		// No state has been claimed yet, so a cancelled resume can return before
-		// touching the lock and leave its capability safely retryable.
-		resumeState = await loadPipelineResumeState(runtime.env, payload.stateKey, runtime.signal);
-	} catch (err: any) {
-		// Approval rejection historically reaches the signal-aware deletion path
-		// below. Keep its direct cancellation propagation while other resume modes
-		// retain their structured tool envelope.
-		if (runtime.signal?.aborted && approved === false) throw err;
-		return errorEnvelope("runtime_error", err);
-	}
-
-	if (resumeState.haltType === "input_request") {
-		if (approved !== undefined) {
-			return errorEnvelope("parse_error", "pipeline input resumes require response");
-		}
-		if (response === undefined) {
-			return errorEnvelope("parse_error", "pipeline input resumes require response");
-		}
-		try {
-			validatePipelineInputResponse(resumeState.inputSchema, response);
-		} catch (err: any) {
-			return errorEnvelope("parse_error", err?.message ?? String(err));
-		}
-	} else {
-		if (response !== undefined) {
-			return errorEnvelope(
-				"parse_error",
-				"approval resumes require approved=true|false, not response",
-			);
-		}
-		if (approved !== true) {
-			// Keep the approval ID usable while this may still be waiting on a
-			// concurrent state writer. Dropping the index first would orphan the
-			// capability if cancellation interrupts the deletion.
-			const deletion = await deleteUnconsumedResumeState({
-				env: runtime.env,
-				key: payload.stateKey,
-				signal: runtime.signal,
-			});
-			if (deletion !== "deleted") {
-				return errorEnvelope("runtime_error", "Pipeline resume state not found");
-			}
-			await cleanupIndex();
-			return okEnvelope("cancelled", [], null, null);
-		}
-	}
-
-	const isSameStageInput =
-		resumeState.haltType === "input_request" && resumeState.resumeMode === "same_stage";
-	const history = recorderFromEnv(runtime.env);
-	if (history) {
-		history.pipelineOffset = (resumeState.historyOffset ?? 0) + resumeState.resumeAtIndex;
-	}
-	const remaining = resumeState.pipeline.slice(resumeState.resumeAtIndex);
-	const input = isSameStageInput
-		? resumeState.items
-		: resumeState.haltType === "input_request"
-			? [response]
-			: resumeState.items;
-	const abortedBeforeResume = runtime.signal?.aborted === true;
-	let pipelineResumeStateRestored = false;
-	let pipelineUnsafeDispatchStarted = false;
-	let pipelineResumeStateClaimId: string | undefined;
-	const requestInputResume = isSameStageInput
-		? {
-				state: resumeState.commandInput!,
-				response,
-			}
-		: undefined;
-
-	try {
-		const output = await runPipeline({
-			pipeline: remaining,
-			registry: runtime.registry,
-			stdin: runtime.stdin,
-			stdout: runtime.stdout,
-			stderr: runtime.stderr,
-			env: runtime.env,
-			mode: "tool",
-			renderOutput: false,
-			cwd: runtime.cwd,
-			llmAdapters: runtime.llmAdapters,
-			signal: runtime.signal,
-			forceTerminationSignal: runtime.forceTerminationSignal,
-			haltAfterStageOnAbort: true,
-			assertInvocationCurrent: runtime.assertInvocationCurrent,
-			input,
-			requestInputResume,
-			onExecutionStart: async () => {
-				const consumption = await consumeResumeState({
-					env: runtime.env,
-					key: payload.stateKey,
-					expectedState: resumeState,
-					signal: runtime.signal,
-				});
-				if (!consumption.consumed) {
-					throw new Error("Pipeline resume state not found");
-				}
-				pipelineResumeStateClaimId = consumption.claimId;
-				if (consumption.signalAbortedAfterCommit) {
-					const restored = await restoreConsumedResumeState({
-						env: runtime.env,
-						key: payload.stateKey,
-						expectedState: resumeState,
-						claimId: consumption.claimId,
-					});
-					if (restored) {
-						pipelineResumeStateRestored = true;
-						pipelineResumeStateClaimId = undefined;
-					}
-					runtime.signal?.throwIfAborted();
-				}
-				runtime.signal?.throwIfAborted();
 			},
-			onUnsafeCommandDispatch: () => {
-				pipelineUnsafeDispatchStarted = true;
-			},
+			resume: payload,
+			approved,
+			response,
+			cancel,
 		});
-
-		const finalized = await finalizePipelineToolRun({
-			env: runtime.env,
-			pipeline: remaining,
-			output,
-			assertInvocationCurrent: runtime.assertInvocationCurrent,
-			previousStateKey: payload.stateKey,
-			previousState: resumeState,
-			previousStateConsumed: pipelineUnsafeDispatchStarted,
-			previousStateClaimId: pipelineResumeStateClaimId,
-			restorePreviousStateOnAbort: !pipelineUnsafeDispatchStarted,
-			onPreviousStateRestored: () => {
-				pipelineResumeStateRestored = true;
-			},
-			signal: runtime.signal,
-		});
-		if (finalized.status === "ok" && pipelineUnsafeDispatchStarted) await cleanupIndex();
-		return okEnvelope(
-			finalized.status,
-			finalized.output,
-			finalized.requiresApproval,
-			finalized.requiresInput,
-		);
+		if (output.status !== "needs_approval" && output.status !== "needs_input") {
+			if (approvalId) await deleteApprovalId({ env: runtime.env, approvalId });
+			else if (stateKey) await cleanupApprovalIndexByStateKey({ env: runtime.env, stateKey });
+		}
+		return runEnvelope(output);
 	} catch (err: any) {
-		const abortedResume = runtime.signal?.aborted === true;
-		if (
-			!pipelineUnsafeDispatchStarted &&
-			!pipelineResumeStateRestored &&
-			pipelineResumeStateClaimId
-		) {
-			pipelineResumeStateRestored = await restoreConsumedResumeState({
-				env: runtime.env,
-				key: payload.stateKey,
-				expectedState: resumeState,
-				claimId: pipelineResumeStateClaimId,
-			}).catch(() => false);
+		if (err instanceof WorkflowResumeArgumentError) {
+			return errorEnvelope("parse_error", err.message);
 		}
-		if (pipelineUnsafeDispatchStarted && !pipelineResumeStateRestored) {
-			if (abortedResume && !abortedBeforeResume) {
-				await deleteStateJsonWithBoundedResumeCleanup({
-					env: runtime.env,
-					key: payload.stateKey,
-				}).catch(() => {});
-			}
-			// Once an unsafe stage has actually entered, replay is not safe even if
-			// a later effect-site check prevented its external side effect.
-			await cleanupIndex().catch(() => {});
-		}
-		// Only a restored pre-dispatch claim remains retryable.
+		// Non-abort failures and cancellations before step execution remain retryable.
 		return errorEnvelope("runtime_error", err);
 	}
 }

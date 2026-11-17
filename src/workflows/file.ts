@@ -9,17 +9,18 @@ import {
 import { loadWorkflowFile } from "./load.js";
 import { dryRunWorkflow } from "./dry_run.js";
 import { resolveWorkflowArgs } from "./args.js";
-import { snapshotDefinition } from "./definition.js";
+import { pipelineDefinition, snapshotDefinition } from "./definition.js";
 import { ExecutionStore } from "../engine/store.js";
 import { Machine, matchesEvent } from "../engine/machine.js";
 import type { RunContext } from "../engine/context.js";
-import { ExecutionConflictError, type ExecutionState } from "../engine/state.js";
+import { ExecutionConflictError, type Definition, type ExecutionState } from "../engine/state.js";
 import type { WorkflowRunResult } from "./types.js";
 import { visibleTo, callerId } from "../persistence/waits.js";
 
 export { loadWorkflowFile } from "./load.js";
 export { resolveWorkflowArgs } from "./args.js";
-export { WorkflowResumeArgumentError } from "../engine/gates.js";
+export { WorkflowResumeArgumentError, ResumeRefusedError } from "../engine/gates.js";
+import { ResumeRefusedError } from "../engine/gates.js";
 export type {
 	WorkflowFile,
 	ParallelBranch,
@@ -60,7 +61,44 @@ export type WorkflowRunOptions = {
 	cancel?: boolean;
 	/** Host execution lease; not a workflow setting. */
 	leaseMs?: number;
+	/** Run this definition instead of loading `filePath` (a standalone pipeline). */
+	definition?: Definition;
+	/** The kind recorded for a new run: "workflow" (default), "pipeline" or "sdk". */
+	kind?: string;
+	/**
+	 * Set by the Lobster SDK, whose stages are closures only its host has: the run's pipeline
+	 * must name exactly these stages. Runs of kind "sdk" are refused without it.
+	 */
+	sdk?: { pipeline: string };
 };
+
+const SDK_RUN_ELSEWHERE =
+	"This run was started by the Lobster SDK: resume it with Lobster.resume on an instance with the same stages";
+
+/** SDK runs need their host's stages; everything else must not claim to be one. */
+function assertRunnableHere(kind: string, sdk: WorkflowRunOptions["sdk"]) {
+	if (kind === "sdk" && !sdk) throw new ResumeRefusedError(SDK_RUN_ELSEWHERE);
+	if (kind !== "sdk" && sdk)
+		throw new ResumeRefusedError("This run was not started by the Lobster SDK");
+}
+
+/**
+ * Run a standalone pipeline (`lobster '...'`, `runToolRequest({ pipeline })`) as a one-step
+ * workflow, so it pauses, resumes and recovers exactly like workflow files do.
+ */
+export async function runPipelineText(options: {
+	pipeline: string;
+	input?: unknown[];
+	ctx: RunContext;
+	leaseMs?: number;
+}): Promise<WorkflowRunResult & { runId?: string }> {
+	return runWorkflowFile({
+		definition: pipelineDefinition(options.pipeline, options.input),
+		kind: "pipeline",
+		ctx: options.ctx,
+		leaseMs: options.leaseMs,
+	});
+}
 
 export async function runWorkflowFile(
 	options: WorkflowRunOptions,
@@ -82,8 +120,9 @@ export async function runWorkflowFile(
 		// Load and validate first: a workflow that cannot start leaves no run behind.
 		let fresh: Pick<ExecutionState, "definition" | "args"> | undefined;
 		if (!options.resume) {
-			if (!options.filePath) throw new Error("Workflow file path required");
-			const definition = await snapshotDefinition(options.filePath, options.args ?? {});
+			if (!options.filePath && !options.definition) throw new Error("Workflow file path required");
+			const definition =
+				options.definition ?? (await snapshotDefinition(options.filePath!, options.args ?? {}));
 			fresh = { definition, args: resolveWorkflowArgs(definition.workflow.args, options.args) };
 		}
 		if (options.resume) {
@@ -95,18 +134,21 @@ export async function runWorkflowFile(
 				env: ctx.env,
 				key: options.resume.stateKey,
 				signal: ctx.signal,
-			})) as { machineVersion?: number; runId?: string } | null;
-			if (!state) throw new Error("Workflow resume state not found");
+			})) as { machineVersion?: number; runId?: string; type?: string } | null;
+			// A token an older Lobster already used left this marker behind.
+			if (!state || state.type === "lobster.consumed-resume-state.v1")
+				throw new ResumeRefusedError();
 			if (state.machineVersion !== 1 || !state.runId) throw new UpgradeRequiredError();
 			runId = state.runId;
 			ctx._onResumeStateResolved?.(options.resume.stateKey);
 		} else {
-			recorder ??= await session.createRun("workflow", ctx.runMetadata);
+			recorder ??= await session.createRun(options.kind ?? "workflow", ctx.runMetadata);
 			runId = recorder.runId;
 		}
 		const run = await session.getRunState(runId);
 		if (!run || !visibleTo(run, callerId(ctx.runMetadata)))
 			throw new Error("Workflow run not found");
+		assertRunnableHere(run.kind, options.sdk);
 		recorder ??= await session.recorderForState(options.resume!.stateKey!);
 		const bound = { ...ctx, env: recorder ? bindRecorder(ctx.env, recorder) : ctx.env };
 		const store = new ExecutionStore(session, runId, options.leaseMs);
@@ -125,24 +167,31 @@ export async function runWorkflowFile(
 				};
 			}
 			if (state.version !== 1) throw new Error("Unsupported workflow execution version");
+			if (options.sdk) assertSdkPipeline(state, options.sdk);
 			const machine = new Machine(state, store, bound);
 			if (!state.revision) await machine.save();
 			if (options.resume) {
 				await machine.answer(options.resume.stateKey!, options);
-				if (recorder) recorder.ownsExecution = true;
 			}
 			return { ...(await machine.run()), runId };
+		} catch (error) {
+			throw withRunId(error, runId);
 		} finally {
 			await store.close();
 		}
 	});
 }
 
-/** Continue a saved workflow after process restart. No conversation is required. */
+/**
+ * Continue a saved run: after a process restart, a lapsed timer or a crash. A failed run is
+ * retried from the step that failed. No conversation is required.
+ */
 export async function advanceWorkflowRun(options: {
 	runId: string;
 	ctx: RunContext;
 	leaseMs?: number;
+	/** Set by the Lobster SDK for its own runs (see `WorkflowRunOptions.sdk`). */
+	sdk?: { pipeline: string };
 }): Promise<WorkflowRunResult & { runId: string }> {
 	return withStoreContext({ ...options.ctx, trackRuns: true }, async (ctx) => {
 		const session = sessionFromEnv(ctx.env)!;
@@ -153,19 +202,22 @@ export async function advanceWorkflowRun(options: {
 			throw new Error(
 				"Run has no restartable workflow checkpoint; migration or inspection required",
 			);
+		assertRunnableHere(run.kind, options.sdk);
 		const store = new ExecutionStore(session, run.id, options.leaseMs);
 		try {
 			const state = await store.claim();
 			if (state!.version !== 1) throw new Error("Unsupported workflow execution version");
+			if (options.sdk) assertSdkPipeline(state!, options.sdk);
 			const { ExecutionRecorder } = await import("../persistence/session.js");
 			const recorder = new ExecutionRecorder(session, run.id, "", run.historyEnabled !== false);
-			return {
-				...(await new Machine(state!, store, {
-					...ctx,
-					env: bindRecorder(ctx.env, recorder),
-				}).run()),
-				runId: run.id,
-			};
+			const machine = new Machine(state!, store, { ...ctx, env: bindRecorder(ctx.env, recorder) });
+			if (state!.status === "failed") {
+				machine.retryFailed();
+				await machine.save();
+			}
+			return { ...(await machine.run()), runId: run.id };
+		} catch (error) {
+			throw withRunId(error, run.id);
 		} finally {
 			await store.close();
 		}
@@ -351,4 +403,24 @@ export function decodeWorkflowResumePayload(payload: unknown): WorkflowResumePay
 	const value = payload as WorkflowResumePayload;
 	if (value.protocolVersion !== 1 || value.v !== 1) throw new Error("Unsupported token version");
 	return value;
+}
+
+function stageCount(pipeline: string) {
+	return pipeline ? pipeline.split(" | ").length : 0;
+}
+
+/** An SDK instance continues only a run of the same stages. */
+function assertSdkPipeline(state: ExecutionState, sdk: { pipeline: string }) {
+	const saved = String(state.definition.workflow.steps[0]?.pipeline ?? "");
+	if (saved !== sdk.pipeline)
+		throw new ResumeRefusedError(
+			`This Lobster instance has ${stageCount(sdk.pipeline)} stages; the paused run has ${stageCount(saved)}`,
+		);
+}
+
+/** Name the run an error stopped, so a host can inspect or retry it. */
+function withRunId(error: unknown, runId: string) {
+	if (error && typeof error === "object" && !("runId" in error) && Object.isExtensible(error))
+		Object.defineProperty(error, "runId", { value: runId, configurable: true });
+	return error;
 }

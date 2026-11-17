@@ -16,7 +16,7 @@ import { Lobster } from "../src/sdk/Lobster.js";
 for (const backend of ["sqlite"] as const) {
 	for (const gate of ["approval", "input"] as const) {
 		for (const boundary of ["definition", "start"] as const) {
-			test(`${backend}: SDK ${gate} survives a ${boundary} failure before claiming`, async (t) => {
+			test(`${backend}: SDK ${gate} continues after a ${boundary} history failure following the answer`, async (t) => {
 				const directory = await fs.mkdtemp(path.join(os.tmpdir(), "lobster-sdk-preclaim-"));
 				t.after(() => fs.rm(directory, { recursive: true, force: true }));
 				const store = await openStoreSession({ directory, history: true });
@@ -64,11 +64,14 @@ for (const backend of ["sqlite"] as const) {
 				assert.equal(resumed.ok, false);
 				assert.equal(resumed.error.type, "persistence_error");
 				assert.equal(effects, 0);
-				assert.deepEqual(await getWait({ waitId: wait.id, ctx }), wait);
-				assert.equal((await getRun({ runId: first.runId, ctx })).status, "waiting");
-				const retried = await lobster.resume(request.resumeToken, decision);
-				assert.equal(retried.ok, true, JSON.stringify(retried));
-				assert.equal(retried.runId, first.runId);
+				// The answer was saved before history failed: it is not asked for again, and the
+				// run continues where it stopped.
+				assert.equal(await getWait({ waitId: wait.id, ctx }), null);
+				assert.equal((await getRun({ runId: first.runId, ctx })).status, "running");
+				await assert.rejects(lobster.resume(request.resumeToken, decision), /not found/);
+				const advanced = await lobster.advance(first.runId);
+				assert.equal(advanced.ok, true, JSON.stringify(advanced));
+				assert.equal(advanced.runId, first.runId);
 				assert.equal(effects, 1);
 				assert.equal((await getRun({ runId: first.runId, ctx })).status, "completed");
 			});
@@ -113,7 +116,8 @@ for (const backend of ["sqlite"] as const) {
 			assert.equal(run.status, fail ? "failed" : "completed");
 			assert.deepEqual(
 				run.attempts.map((attempt) => attempt.status),
-				["closed", fail ? "failed" : "completed"],
+				// The pipeline's own step comes first, then its stages.
+				[fail ? "failed" : "completed", "closed", fail ? "failed" : "completed"],
 			);
 			assert.deepEqual(await store.retain({ before: "2099-01-01", dryRun: false }), [run.id]);
 		});
@@ -245,7 +249,7 @@ for (const backend of ["legacy", "sqlite"] as const) {
 		assert.match(failed.error.message, /Effect failed after dispatch/);
 		const repeated = await resumeToolRequest({ token, approved: true, ctx });
 		assert.equal(repeated.ok, false);
-		assert.match(repeated.error.message, /resume state not found/);
+		assert.match(repeated.error.message, /resume state not found/i);
 		assert.equal(effects, 1);
 		if (store) {
 			const run = await getRun({ runId: first.runId, ctx });
@@ -276,52 +280,31 @@ for (const backend of ["sqlite"] as const) {
 		const ctx = { storeSession: store };
 		const run = await getRun({ runId: first.runId, ctx });
 		const wait = run.pendingWaits[0];
-		let prepared!: () => void;
-		let release!: () => void;
-		const cancellationPrepared = new Promise<void>((resolve) => {
-			prepared = resolve;
-		});
-		const cleanupAllowed = new Promise<void>((resolve) => {
-			release = resolve;
-		});
-		const resume = Lobster.prototype.resume;
-		// Hold the cancellation after loading its SDK frame but before retiring the
-		// checkpoint, so the answer can consume it and finish first.
-		Lobster.prototype.resume = async function (...args) {
-			const result = await resume.apply(this, args);
-			if (args[1]?.cancel) {
-				prepared();
-				await cleanupAllowed;
-			}
-			return result;
-		};
-		const cancellation = sdk
-			.resumeWait({ waitId: wait.id, expectedRevision: wait.revision, cancel: true })
-			.then(
-				(result) => result,
-				(error) => ({ ok: false, error }),
-			);
-		try {
-			await Promise.race([
-				cancellationPrepared,
-				cancellation.then(() => {
-					throw new Error("Cancellation settled before the prepared decision");
-				}),
-			]);
-			const answered = await sdk.resumeWait({
-				waitId: wait.id,
-				expectedRevision: wait.revision,
-				response: 7,
-			});
-			assert.equal(answered.ok, true, JSON.stringify(answered));
-			release();
-			assert.equal((await cancellation).ok, false);
-			assert.equal(effects, 1);
-			assert.equal((await getRun({ runId: first.runId, ctx })).status, "completed");
-		} finally {
-			release();
-			Lobster.prototype.resume = resume;
-			await cancellation;
-		}
+		// The answer and the cancellation race for the same wait: exactly one may win.
+		const [answered, cancelled] = await Promise.all(
+			[
+				sdk.resumeWait({ waitId: wait.id, expectedRevision: wait.revision, response: 7 }),
+				sdk.resumeWait({ waitId: wait.id, expectedRevision: wait.revision, cancel: true }),
+			].map((attempt) =>
+				attempt.then(
+					(result) => result,
+					(error) => ({ ok: false, error }),
+				),
+			),
+		);
+		assert.equal(
+			Number(answered.ok) + Number(cancelled.ok),
+			1,
+			JSON.stringify([answered, cancelled]),
+		);
+		assert.equal(effects, answered.ok ? 1 : 0);
+		assert.equal(
+			(await getRun({ runId: first.runId, ctx })).status,
+			answered.ok ? "completed" : "cancelled",
+		);
+		// Once one of them won, the other is refused for good.
+		await assert.rejects(
+			sdk.resumeWait({ waitId: wait.id, expectedRevision: wait.revision, cancel: true }),
+		);
 	});
 }

@@ -2,7 +2,7 @@
 
 ## Scope
 
-Replace the workflow-file executor with a saved-state interpreter. Keep YAML, commands, expressions and accounting; persist runs in one SQLite store, and import state saved by older versions once with `lobster upgrade`. Add durable sleeps, external-event waits and deadlines as pauses (see Time, events and liveness). Do not add task planning or a Gateway service in this change. Standalone pipelines and SDK function stages retain their existing execution contracts; they are not secretly restartable workflows.
+Replace the workflow-file executor with a saved-state interpreter. Keep YAML, commands, expressions and accounting; persist runs in one SQLite store, and import state saved by older versions once with `lobster upgrade`. Add durable sleeps, external-event waits and deadlines as pauses (see Time, events and liveness). Do not add task planning or a Gateway service in this change. Standalone pipelines and SDK pipelines run on the same interpreter (see Pipelines and the SDK), so there is one pause, resume and recovery mechanism.
 
 ## Source layout
 
@@ -34,6 +34,18 @@ Explicit configured retry creates a new attempt; recovery of a process does not 
 
 Snapshot definitions and static child references before execution. Dynamic child references are pinned when resolved, before entering the child. Relative paths retain their original source directory. Executable scripts, tools and environments are not snapshotted. Reject unsupported execution versions. Old workflow checkpoints require a separate one-off migration; do not retain the old executor as a fallback.
 
+## Pipelines and the SDK
+
+A standalone pipeline (`lobster '...'`, `runToolRequest({ pipeline })`) is a one-step definition whose step is the pipeline (`standalone: true`); its output is the pipeline's items as they are, and in human mode renderers write to the terminal as it runs. An SDK pipeline is the same, with the stages named `sdk.stage.0 | sdk.stage.1 | ...` and supplied by the instance as a registry; its input items are saved with the definition, never read as templates. Because closures cannot be saved, an SDK run is resumed or advanced only by an instance whose stages produce the same pipeline text, and the CLI and `runs advance --due` leave SDK runs alone.
+
+A pipeline pauses inside its step. `approve` and `ask --emit` halt after their stage, and the run continues with the next stage, fed the approved items or `[response]`. A command calling `ctx.requestInput` is resumed in the same stage with its saved frame. Either way the paused activity saves the parsed stages, position, items and command frame, and a gate activation publishes the question, so answering, deadlines, approval IDs and wait discovery work as for workflow steps. A rejection cancels the run.
+
+`lobster upgrade` converts pipeline pauses saved by older versions into such waiting runs under the same key, so old tokens keep working. Paused SDK steps cannot be converted without their stages: they become runs on the first resume by their host. A stateless token from an older SDK is marked used, for good, before its run is created, so it is honoured once even after the run is deleted.
+
+## Failed runs
+
+A failed run keeps its activation records. `runs advance` (core `advanceWorkflowRun`, SDK `Lobster.advance`) retries it: the deepest failed activations and everything below them are cleared, enclosing activations that failed because of them are reopened, and the run continues. Completed activations keep their results, and the retried step starts with its full retry budget. A failed step that reported dispatch of a command that may not be repeated is refused. An activity stopped before any command started (a history write failed, Ctrl-C while preparing) returns to `ready`, so the step simply starts again; if that save fails too, it stays `started` and is treated as interrupted.
+
 ## Host boundary
 
 Start/advance/resume/signal execute until finished or suspended. The host, or a scheduler calling `lobster runs advance --due`, advances unfinished runs. The engine does not assume a conversation exists, start a background service or promise that agent launch can be deduplicated by session name. The Gateway adapter's external-run reconciliation is a separate integration.
@@ -60,7 +72,7 @@ Timers, deadlines and event waits are gates: like approvals and input requests t
 
 `test/execution_machine.test.ts` kills a real child process and starts a fresh process against the SQLite store. Cases cover result committed before cursor advancement, explicitly repeatable and uncertain activities, loop iteration progress, parallel branch progress, child-definition snapshots and retry count/deadline recovery. Counters prove which effects executed. The same file checks competing owners, stale checkpoint writes, interruption after question/decision/result commits, token versus short-ID competition, and host retirement before decision, dispatch or successor publication.
 
-Existing suites cover conditions, retries, timeouts, cancellation, composition, accounting, pipelines, input protocols, storage and packaging. Old workflow tests tied to physical legacy checkpoint renames are replaced by execution-transition checks; standalone pipeline/SDK handoff tests remain.
+Existing suites cover conditions, retries, timeouts, cancellation, composition, accounting, pipelines, input protocols, storage and packaging. Old workflow and pipeline tests tied to the previous checkpoint protocol (claims, consumed markers, handoffs, tombstones) are replaced by execution-transition checks; `failed_run_retry.test.ts` covers retries, and `upgrade.test.ts` resumes pipeline pauses written by the previous version.
 
 ## Limits
 

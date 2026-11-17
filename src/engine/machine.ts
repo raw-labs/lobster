@@ -16,6 +16,7 @@ import {
 	findApprovalIdByStateKey,
 } from "../state/store.js";
 import { resumeGuardFromEnv } from "../persistence/context.js";
+import { combineSignals } from "../process/owner_signal.js";
 import { encodeToken } from "../resume/token.js";
 import { enter } from "./nodes/condition.js";
 import { isApprovalStep } from "../workflows/load.js";
@@ -54,6 +55,7 @@ import {
 	resolveToolEnvelopeMaxBytes,
 	validateInputResponse,
 	WorkflowResumeArgumentError,
+	ResumeRefusedError,
 	enforceApprovalIdentity,
 	approvalIdentityFromRequest,
 } from "./gates.js";
@@ -104,7 +106,7 @@ export class Machine {
 		this.ctx = {
 			...ctx,
 			cwd: state.cwd,
-			signal: AbortSignal.any([ctx.signal, store.lost.signal].filter(Boolean)),
+			signal: combineSignals(ctx.signal, store.lost.signal),
 		};
 		this.cost = new CostTracker(CostTracker.parsePricingFromEnv(ctx.env, ctx.stderr), ctx.stderr);
 		this.cost.restore(state.cost?.byStep);
@@ -123,12 +125,56 @@ export class Machine {
 	defer() {}
 
 	/**
-	 * A finished run never runs again, so its step records (every intermediate
-	 * output) are dropped; status, error, final output, cost and definition remain.
+	 * A completed or cancelled run never runs again, so its step records (every intermediate
+	 * output) are dropped; status, error, final output, cost and definition remain. A failed
+	 * run keeps them: it can be retried from the step that failed.
 	 */
 	private finish(status: "completed" | "failed" | "cancelled") {
 		this.state.status = status;
-		this.state.activations = {};
+		if (status !== "failed") this.state.activations = {};
+	}
+
+	/**
+	 * Prepare a failed run to continue from the step that failed: that step starts over (with
+	 * its retry budget), the steps that completed keep their results, and an enclosing step
+	 * that failed because of it (a child workflow, a loop) continues where it was. A step that
+	 * reported dispatch of a command that may not be repeated is never run again.
+	 */
+	retryFailed() {
+		if (this.state.status !== "failed") throw new Error("Only a failed run can be retried");
+		const failed = Object.keys(this.state.activations).filter(
+			(path) => this.state.activations[path].phase === "failed",
+		);
+		if (!failed.length)
+			throw new Error(
+				"This run failed before Lobster kept what a retry needs; start it again instead",
+			);
+		const below = (path: string) =>
+			Object.keys(this.state.activations).filter((item) => item.startsWith(path + "/"));
+		const deepest = failed.filter(
+			(path) => !below(path).some((item) => this.state.activations[item].phase === "failed"),
+		);
+		for (const path of deepest) {
+			const acted = [path, ...below(path)].find(
+				(item) => this.state.activations[item].nonRetryable,
+			);
+			if (acted)
+				throw new Error(
+					`Step ${path.split("/").map(decodeURIComponent).slice(1).join("/")} may have acted before it failed (it ran a command that may not be repeated); Lobster will not run it again. Run \`lobster runs abandon ${this.store.runId}\` to close the run.`,
+				);
+		}
+		for (const path of deepest) {
+			for (const item of below(path)) delete this.state.activations[item];
+			delete this.state.activations[path];
+		}
+		for (const path of failed) {
+			const frame = this.state.activations[path];
+			if (!frame) continue;
+			frame.phase = "started";
+			delete frame.error;
+		}
+		this.state.status = "running";
+		delete this.state.error;
 	}
 
 	/**
@@ -183,6 +229,7 @@ export class Machine {
 			error instanceof RequestInputResumeError ||
 			error instanceof CostLimitExceededError ||
 			error instanceof WorkflowResumeArgumentError ||
+			error instanceof ResumeRefusedError ||
 			error instanceof WaitConflictError ||
 			error instanceof RunCancelled
 		);
@@ -286,7 +333,7 @@ export class Machine {
 				startTimeout,
 				ctx: {
 					...scope.ctx,
-					signal: AbortSignal.any([scope.ctx.signal, timeout.signal].filter(Boolean)),
+					signal: combineSignals(scope.ctx.signal, timeout.signal),
 					...(heartbeatFile
 						? {
 								env: { ...scope.ctx.env, LOBSTER_HEARTBEAT_FILE: heartbeatFile },
@@ -525,7 +572,7 @@ export class Machine {
 		const entry = Object.entries(this.state.activations).find(
 			([, frame]) => frame.waitKey === key && frame.phase === "waiting",
 		);
-		if (!entry) throw new Error("Workflow resume state not found");
+		if (!entry) throw new ResumeRefusedError();
 		const [path, frame] = entry;
 		const wait = frame.wait!;
 		if (wait.kind === "timer" || wait.kind === "event")
@@ -568,7 +615,7 @@ export class Machine {
 				validateInputResponse({
 					schema: wait.responseSchema,
 					response: decision.response,
-					stepId: path,
+					...(this.state.definition.standalone ? {} : { stepId: path }),
 				});
 			} catch (error) {
 				throw new WorkflowResumeArgumentError(error.message);
@@ -582,12 +629,22 @@ export class Machine {
 			this.state.status = "running";
 		}
 		const guard = resumeGuardFromEnv(this.ctx.env);
-		await this.save({
-			consume: {
-				key,
-				...(guard?.key === key ? { expectedWaitRevision: guard.expectedRevision } : {}),
-			},
-		});
+		try {
+			await this.save({
+				consume: {
+					key,
+					...(guard?.key === key ? { expectedWaitRevision: guard.expectedRevision } : {}),
+				},
+			});
+		} catch (error) {
+			// The answer was for a revision of the wait that is no longer current.
+			if (error instanceof ExecutionConflictError && guard?.key === key) {
+				const wait = (await this.store.session.getRunState(this.store.runId))?.waits[key];
+				if (wait?.status !== "pending" || (wait.revision ?? 0) !== guard.expectedRevision)
+					throw new WaitConflictError();
+			}
+			throw error;
+		}
 		await cleanupApprovalIndexByStateKey({ env: this.ctx.env, stateKey: key });
 	}
 
@@ -666,12 +723,15 @@ export class Machine {
 				costPrefix: "",
 			});
 			settleUnbilledCharges(this.cost, this.ledger);
-			this.state.output = toOutputItems(result);
+			// A standalone pipeline's output is its items as they are.
+			const standalone = this.state.definition.standalone && Array.isArray(result.items);
+			this.state.output = standalone ? result.items! : toOutputItems(result);
 			this.finish("completed");
 			await this.save();
 			return {
 				status: "ok",
 				output: this.state.output,
+				...(standalone && result.rendered ? { rendered: true } : {}),
 				...(this.cost.hasUsage() ? { _meta: { cost: this.cost.getSummary() } } : {}),
 			};
 		} catch (error) {

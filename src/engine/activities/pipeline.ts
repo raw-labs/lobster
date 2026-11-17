@@ -70,6 +70,7 @@ export async function runPipelineStep({
 	resume,
 	requestInputEnabled = true,
 	onExecutionStart,
+	standalone = false,
 }: {
 	stepId: string;
 	pipelineText: string;
@@ -85,6 +86,8 @@ export async function runPipelineStep({
 	};
 	requestInputEnabled?: boolean;
 	onExecutionStart?: () => void | Promise<void>;
+	/** A standalone pipeline: render to the terminal in human mode and keep its items. */
+	standalone?: boolean;
 }) {
 	let pipeline;
 	try {
@@ -104,7 +107,10 @@ export async function runPipelineStep({
 		);
 	}
 
+	// A standalone pipeline in human mode renders straight to the terminal, as it always did.
+	const live = standalone && ctx.mode !== "tool";
 	const stdout = new PassThrough();
+	if (live) stdout.pipe(ctx.stdout as NodeJS.WritableStream, { end: false });
 	let renderedStdout = "";
 	stdout.setEncoding("utf8");
 	stdout.on("data", (chunk) => {
@@ -119,6 +125,7 @@ export async function runPipelineStep({
 	}
 	const result = await runPipeline({
 		pipeline: remainingPipeline,
+		...(standalone ? { renderOutput: live } : {}),
 		registry: ctx.registry,
 		stdin: ctx.stdin,
 		stdout,
@@ -226,6 +233,7 @@ export async function runPipelineStep({
 		id: stepId,
 		stdout: normalizedStdout,
 		json,
+		...(standalone ? { items: result.items, rendered: Boolean(result.rendered) } : {}),
 	};
 	// Only when a renderer consumed the pipeline: otherwise `json` already is those items.
 	if (!result.items.length && result.renderedItems.length) {

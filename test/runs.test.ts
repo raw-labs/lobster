@@ -393,14 +393,16 @@ for (const backend of ["sqlite"] as const) {
 				ctx: scoped(store),
 			});
 			const wait = (await getRun({ runId: first.runId, ctx: scoped(store) })).pendingWaits[0];
-			const original = store.backend.write.bind(store.backend);
+			// Just before the run consumes the answer, someone else changes the wait.
+			const transition = store.backend.transition.bind(store.backend);
 			let changed = false;
-			store.backend.write = async (key, text, options) => {
-				if (options?.expectedWaitRevision !== undefined && !changed) {
+			store.backend.transition = async (request, ...rest) => {
+				const consume = request.action.kind === "execution-save" && request.action.consume;
+				if (consume && !changed) {
 					changed = true;
-					await original(key, (await store.read(key)).text);
+					await store.backend.write(consume.key, (await store.read(consume.key)).text);
 				}
-				return original(key, text, options);
+				return transition(request, ...rest);
 			};
 			const result = await resumeToolRequest({
 				waitId: wait.id,
@@ -412,17 +414,13 @@ for (const backend of ["sqlite"] as const) {
 			assert.equal(result.error.type, "wait_conflict");
 			const current = await getWait({ waitId: wait.id, ctx: scoped(store) });
 			assert.ok(current.revision > wait.revision);
-			assert.equal(
-				(
-					await resumeToolRequest({
-						waitId: current.id,
-						expectedRevision: current.revision,
-						response: 42,
-						ctx: scoped(store),
-					})
-				).status,
-				"ok",
-			);
+			const retried = await resumeToolRequest({
+				waitId: current.id,
+				expectedRevision: current.revision,
+				response: 42,
+				ctx: scoped(store),
+			});
+			assert.equal(retried.status, "ok", JSON.stringify(retried));
 		} finally {
 			await store.close();
 		}

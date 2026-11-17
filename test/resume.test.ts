@@ -29,8 +29,9 @@ test("state-backed resume token roundtrip and resume pipeline continues", async 
 	assert.equal(firstJson.status, "needs_approval");
 	assert.ok(firstJson.requiresApproval?.resumeToken);
 
+	// A pipeline is a run: its token names the run's saved question, like a workflow's.
 	const payload = decodeResumeToken(firstJson.requiresApproval.resumeToken);
-	assert.equal(payload.kind, "pipeline-resume");
+	assert.equal(payload.kind, "workflow-file");
 	assert.equal(typeof payload.stateKey, "string");
 
 	const resumed = runCli(

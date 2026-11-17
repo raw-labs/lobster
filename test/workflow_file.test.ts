@@ -318,7 +318,7 @@ test("direct workflow resume consumes its capability after cancellation starts a
 				resume: payload,
 				approved: true,
 			}),
-		/Workflow resume state not found/,
+		/Resume state not found/,
 	);
 	assert.equal((await fsp.readFile(effectPath, "utf8")).trim().split(/\r?\n/).length, 1);
 });
@@ -503,7 +503,7 @@ test("workflow resume consumes its capability after a step timeout starts an eff
 				resume: payload,
 				approved: true,
 			}),
-		/Workflow resume state not found/,
+		/Resume state not found/,
 	);
 	assert.equal((await fsp.readFile(effectPath, "utf8")).trim().split(/\r?\n/).length, 1);
 });
@@ -756,7 +756,7 @@ test("workflow resume consumes its capability after a parallel timeout starts an
 				resume: payload,
 				approved: true,
 			}),
-		/Workflow resume state not found/,
+		/Resume state not found/,
 	);
 	assert.equal((await fsp.readFile(effectPath, "utf8")).trim().split(/\r?\n/).length, 1);
 });
@@ -819,7 +819,7 @@ test("rewriting a new workflow token key does not create another continuation", 
 				resume: aliasedPayload,
 				approved: true,
 			}),
-		/Workflow resume state not found/,
+		/Resume state not found/,
 	);
 	const resumed = await runWorkflowFile({
 		ctx: {

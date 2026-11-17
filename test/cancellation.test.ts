@@ -15,9 +15,9 @@ import { resumeToolRequest, runToolRequest } from "../src/core/tool_runtime.js";
 import { decodeResumeToken } from "../src/resume/resume.js";
 import { runPipeline } from "../src/pipeline/runtime.js";
 import { openStoreSession } from "../src/persistence/session.js";
-import { SqliteBackend } from "../src/persistence/sqlite.js";
 import { keyToPath } from "../src/state/store.js";
 import { encodeToken } from "../src/resume/token.js";
+import { advanceWorkflowRun } from "../src/workflows/file.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -45,28 +45,6 @@ async function storedKeys(stateDir: string): Promise<string[]> {
 		await store.close();
 	}
 }
-
-/**
- * Observe every store write (a write of `null` deletes the key). Hooks run before and
- * after the write commits; return the restore function and call it in `finally`.
- */
-function hookStoreWrites(
-	hook: (event: { key: string; text: string | null; phase: "before" | "after" }) => unknown,
-) {
-	const original = SqliteBackend.prototype.write;
-	SqliteBackend.prototype.write = async function (this: SqliteBackend, key, text, options) {
-		await hook({ key, text, phase: "before" });
-		const result = await original.call(this, key, text, options);
-		await hook({ key, text, phase: "after" });
-		return result;
-	};
-	return () => {
-		SqliteBackend.prototype.write = original;
-	};
-}
-
-const isConsumedMarker = (text: string | null) =>
-	text !== null && JSON.parse(text)?.type === "lobster.consumed-resume-state.v1";
 
 function streamOf(items: unknown[]) {
 	return (async function* () {
@@ -518,82 +496,6 @@ test("pre-aborted workflow shell does not start its process", async () => {
 	}
 });
 
-test("pipeline input cancellation after state publication does not return a live resume token", async () => {
-	const dir = await mkdtemp(join(tmpdir(), "lobster-pipeline-gate-cancel-"));
-	try {
-		const stateDir = join(dir, "state");
-		const controller = new AbortController();
-		const signal = controller.signal;
-		const throwIfAborted = signal.throwIfAborted.bind(signal);
-		let signalChecks = 0;
-		Object.defineProperty(signal, "throwIfAborted", {
-			value() {
-				signalChecks += 1;
-				if (signalChecks === 6) {
-					controller.abort(new Error("abort after pipeline input state publication"));
-				}
-				throwIfAborted();
-			},
-		});
-
-		const envelope = await runToolRequest({
-			pipeline: `ask --emit --prompt Continue? --schema '${JSON.stringify({ type: "object" })}'`,
-			ctx: { env: { ...process.env, LOBSTER_STATE_DIR: stateDir }, signal },
-		});
-
-		assertCancellationEnvelope(envelope);
-		assert.equal(signalChecks, 6);
-		assert.deepEqual(await listStateFiles(stateDir), [], "cancelled input state must be removed");
-	} finally {
-		await rm(dir, { recursive: true, force: true });
-	}
-});
-
-test("pipeline approval cancellation after index publication removes the state and index", async () => {
-	const dir = await mkdtemp(join(tmpdir(), "lobster-pipeline-approval-cancel-"));
-	try {
-		const stateDir = join(dir, "state");
-		const controller = new AbortController();
-		const signal = controller.signal;
-		const throwIfAborted = signal.throwIfAborted.bind(signal);
-		let signalChecks = 0;
-		Object.defineProperty(signal, "throwIfAborted", {
-			value() {
-				signalChecks += 1;
-				if (signalChecks === 9) {
-					controller.abort(new Error("abort after pipeline approval index publication"));
-				}
-				throwIfAborted();
-			},
-		});
-		const source = {
-			name: "test.gate-source",
-			async run() {
-				return { output: streamOf([{ value: 1 }]) };
-			},
-		};
-
-		const envelope = await runToolRequest({
-			pipeline: "test.gate-source | approve --prompt Continue?",
-			ctx: {
-				env: { ...process.env, LOBSTER_STATE_DIR: stateDir },
-				signal,
-				registry: withCommands(createDefaultRegistry(), source),
-			},
-		});
-
-		assertCancellationEnvelope(envelope);
-		assert.equal(signalChecks, 9);
-		assert.deepEqual(
-			await listStateFiles(stateDir),
-			[],
-			"cancelled approval state must be removed",
-		);
-	} finally {
-		await rm(dir, { recursive: true, force: true });
-	}
-});
-
 test("pre-aborted pipeline approval resume remains retryable", async () => {
 	const dir = await mkdtemp(join(tmpdir(), "lobster-pre-abort-approval-resume-"));
 	try {
@@ -713,101 +615,6 @@ test("pre-aborted pipeline input resume remains retryable", async () => {
 		});
 		assert.equal(retried.ok, true);
 		assert.deepEqual(retried.output, [{ value: 1 }]);
-		assert.equal(sideEffect.invocations, 1);
-	} finally {
-		await rm(dir, { recursive: true, force: true });
-	}
-});
-
-test("pipeline approval resume remains retryable when a resume-safe stage aborts before input", async () => {
-	const dir = await mkdtemp(join(tmpdir(), "lobster-safe-input-setup-abort-"));
-	try {
-		const env = { ...process.env, LOBSTER_STATE_DIR: join(dir, "state") };
-		const controller = new AbortController();
-		let abortBeforeInput = true;
-		const safeInput = {
-			name: "test.resume-safe-before-input",
-			meta: { resumeSafeBeforeInput: true },
-			async run({ ctx }: any) {
-				if (abortBeforeInput) {
-					abortBeforeInput = false;
-					controller.abort(new Error("abort before resume-safe input"));
-				}
-				await ctx.requestInput({
-					prompt: "Second?",
-					responseSchema: { type: "object" },
-				});
-				return { output: [] };
-			},
-		};
-		const registry = withCommands(createDefaultRegistry(), safeInput);
-		const first = await runToolRequest({
-			pipeline: "approve --prompt First? | test.resume-safe-before-input",
-			ctx: { env, registry },
-		});
-		assert.equal(first.status, "needs_approval");
-		assert.ok(first.requiresApproval?.approvalId);
-
-		const aborted = await resumeToolRequest({
-			approvalId: first.requiresApproval.approvalId,
-			approved: true,
-			ctx: { env, registry, signal: controller.signal },
-		});
-		assertCancellationEnvelope(aborted);
-
-		const retried = await resumeToolRequest({
-			approvalId: first.requiresApproval.approvalId,
-			approved: true,
-			ctx: { env, registry },
-		});
-		assert.equal(retried.status, "needs_input");
-		assert.equal(retried.requiresInput?.prompt, "Second?");
-	} finally {
-		await rm(dir, { recursive: true, force: true });
-	}
-});
-
-test("same-stage ask resume restores its token when cancellation wins before execution", async () => {
-	const dir = await mkdtemp(join(tmpdir(), "lobster-same-stage-ask-cancel-"));
-	try {
-		const stateDir = join(dir, "state");
-		const env = { ...process.env, LOBSTER_STATE_DIR: stateDir };
-		const sideEffect = createCountingSideEffect("test.same-stage-ask-side-effect");
-		let activeController: AbortController | undefined;
-		const inputGate = {
-			name: "test.same-stage-ask-gate",
-			meta: { resumeSafeBeforeInput: true, resumeSafeAfterInput: true },
-			async run({ ctx }: any) {
-				await ctx.requestInput({ prompt: "First?", responseSchema: { type: "object" } });
-				activeController?.abort(new Error("abort after same-stage input delivery"));
-				return { output: streamOf([]) };
-			},
-		};
-		const registry = withCommands(createDefaultRegistry(), inputGate, sideEffect.command);
-		const first = await runToolRequest({
-			pipeline: "test.same-stage-ask-gate | test.same-stage-ask-side-effect",
-			ctx: { env, registry },
-		});
-		assert.equal(first.status, "needs_input");
-		assert.ok(first.requiresInput?.resumeToken);
-
-		const controller = new AbortController();
-		activeController = controller;
-		const aborted = await resumeToolRequest({
-			token: first.requiresInput.resumeToken,
-			response: { decision: "approve" },
-			ctx: { env, registry, signal: controller.signal },
-		});
-		activeController = undefined;
-		assertCancellationEnvelope(aborted);
-		assert.equal(sideEffect.invocations, 0);
-
-		const retried = await resumeToolRequest({
-			token: first.requiresInput.resumeToken,
-			response: { decision: "approve" },
-			ctx: { env, registry },
-		});
-		assert.equal(retried.ok, true);
 		assert.equal(sideEffect.invocations, 1);
 	} finally {
 		await rm(dir, { recursive: true, force: true });
@@ -1090,169 +897,6 @@ test("workflow approval resume remains retryable when cancellation creates its n
 	}
 });
 
-test("terminal pipeline approval resume restores its original approval ID when cleanup is cancelled", async () => {
-	const dir = await mkdtemp(join(tmpdir(), "lobster-terminal-pipeline-cleanup-abort-"));
-	try {
-		const stateDir = join(dir, "state");
-		const env = { ...process.env, LOBSTER_STATE_DIR: stateDir };
-		const first = await runToolRequest({
-			pipeline: "approve --prompt First?",
-			ctx: { env },
-		});
-		assert.equal(first.status, "needs_approval");
-		assert.ok(first.requiresApproval?.approvalId);
-		assert.ok(first.requiresApproval?.resumeToken);
-		const payload = decodeResumeToken(first.requiresApproval.resumeToken);
-		const controller = new AbortController();
-		let previousStateDeleted = false;
-		const restoreWrites = hookStoreWrites(({ key, text, phase }) => {
-			if (phase === "after" && key === payload.stateKey && text === null) {
-				if (controller.signal.aborted) return;
-				previousStateDeleted = true;
-				controller.abort(new Error("abort during terminal pipeline approval cleanup"));
-			}
-		});
-		let aborted;
-		try {
-			aborted = await resumeToolRequest({
-				approvalId: first.requiresApproval.approvalId,
-				approved: true,
-				ctx: { env, signal: controller.signal },
-			});
-		} finally {
-			restoreWrites();
-		}
-		assertCancellationEnvelope(aborted!);
-		assert.equal(previousStateDeleted, true);
-
-		const retried = await resumeToolRequest({
-			approvalId: first.requiresApproval.approvalId,
-			approved: true,
-			ctx: { env },
-		});
-		assert.equal(retried.ok, true);
-		assert.equal(retried.status, "ok");
-	} finally {
-		await rm(dir, { recursive: true, force: true });
-	}
-});
-
-test("pipeline approval resume restores its original capability after next-approval cleanup is cancelled", async () => {
-	const dir = await mkdtemp(join(tmpdir(), "lobster-pipeline-approval-cleanup-abort-"));
-	try {
-		const stateDir = join(dir, "state");
-		const env = { ...process.env, LOBSTER_STATE_DIR: stateDir };
-		const first = await runToolRequest({
-			pipeline: "approve --prompt First? | approve --prompt Second?",
-			ctx: { env },
-		});
-		assert.equal(first.status, "needs_approval");
-		assert.ok(first.requiresApproval?.approvalId);
-		assert.ok(first.requiresApproval?.resumeToken);
-		const payload = decodeResumeToken(first.requiresApproval.resumeToken);
-		const controller = new AbortController();
-		let previousStateClaimed = false;
-		const restoreWrites = hookStoreWrites(({ key, text, phase }) => {
-			if (phase === "after" && key === payload.stateKey && isConsumedMarker(text)) {
-				if (controller.signal.aborted) return;
-				previousStateClaimed = true;
-				controller.abort(new Error("abort after previous pipeline approval state claim"));
-			}
-		});
-		let aborted;
-		try {
-			aborted = await resumeToolRequest({
-				approvalId: first.requiresApproval.approvalId,
-				approved: true,
-				ctx: { env, signal: controller.signal },
-			});
-		} finally {
-			restoreWrites();
-		}
-		assertCancellationEnvelope(aborted!);
-		assert.equal(previousStateClaimed, true);
-		const stateFilesAfterAbort = await listStateFiles(stateDir);
-		assert.equal(
-			stateFilesAfterAbort.filter((name) => name.startsWith("pipeline_resume_")).length,
-			1,
-			"cancellation must discard the unpublished next approval state",
-		);
-		assert.equal(
-			stateFilesAfterAbort.filter((name) => name.startsWith("approval_")).length,
-			1,
-			"cancellation must discard the unpublished next approval index",
-		);
-
-		const retried = await resumeToolRequest({
-			approvalId: first.requiresApproval.approvalId,
-			approved: true,
-			ctx: { env },
-		});
-		assert.equal(retried.status, "needs_approval");
-		assert.equal(retried.requiresApproval?.prompt, "Second?");
-	} finally {
-		await rm(dir, { recursive: true, force: true });
-	}
-});
-
-test("pipeline approval resume restores its original capability after next-input cleanup is cancelled", async () => {
-	const dir = await mkdtemp(join(tmpdir(), "lobster-pipeline-input-cleanup-abort-"));
-	try {
-		const stateDir = join(dir, "state");
-		const env = { ...process.env, LOBSTER_STATE_DIR: stateDir };
-		const first = await runToolRequest({
-			pipeline: `approve --prompt First? | ask --emit --prompt Second? --schema '${JSON.stringify({ type: "object" })}'`,
-			ctx: { env },
-		});
-		assert.equal(first.status, "needs_approval");
-		assert.ok(first.requiresApproval?.approvalId);
-		assert.ok(first.requiresApproval?.resumeToken);
-		const payload = decodeResumeToken(first.requiresApproval.resumeToken);
-		const controller = new AbortController();
-		let previousStateClaimed = false;
-		const restoreWrites = hookStoreWrites(({ key, text, phase }) => {
-			if (phase === "after" && key === payload.stateKey && isConsumedMarker(text)) {
-				if (controller.signal.aborted) return;
-				previousStateClaimed = true;
-				controller.abort(new Error("abort after previous pipeline input state claim"));
-			}
-		});
-		let aborted;
-		try {
-			aborted = await resumeToolRequest({
-				approvalId: first.requiresApproval.approvalId,
-				approved: true,
-				ctx: { env, signal: controller.signal },
-			});
-		} finally {
-			restoreWrites();
-		}
-		assertCancellationEnvelope(aborted!);
-		assert.equal(previousStateClaimed, true);
-		const stateFilesAfterAbort = await listStateFiles(stateDir);
-		assert.equal(
-			stateFilesAfterAbort.filter((name) => name.startsWith("pipeline_resume_")).length,
-			1,
-			"cancellation must discard the unpublished next input state",
-		);
-		assert.equal(
-			stateFilesAfterAbort.filter((name) => name.startsWith("approval_")).length,
-			1,
-			"cancellation must discard the unpublished next input index",
-		);
-
-		const retried = await resumeToolRequest({
-			approvalId: first.requiresApproval.approvalId,
-			approved: true,
-			ctx: { env },
-		});
-		assert.equal(retried.status, "needs_input");
-		assert.equal(retried.requiresInput?.prompt, "Second?");
-	} finally {
-		await rm(dir, { recursive: true, force: true });
-	}
-});
-
 test("pipeline cancellation after side effects does not restore the consumed approval capability", async () => {
 	const dir = await mkdtemp(join(tmpdir(), "lobster-pipeline-side-effect-gate-cancel-"));
 	try {
@@ -1350,11 +994,11 @@ test("same-stage resumed input consumes its capability before a custom command a
 	}
 });
 
-test("workflow approval resume restores its original capability after next-input cleanup is cancelled", async () => {
+test("a workflow approval stopped after its answer is saved keeps the answer", async () => {
 	const dir = await mkdtemp(join(tmpdir(), "lobster-input-gate-cleanup-abort-workflow-resume-"));
+	const store = await openStoreSession({ directory: join(dir, "state") });
 	try {
 		const filePath = join(dir, "workflow.lobster");
-		const env = { ...process.env, LOBSTER_STATE_DIR: join(dir, "state") };
 		await writeFile(
 			filePath,
 			JSON.stringify({
@@ -1365,38 +1009,49 @@ test("workflow approval resume restores its original capability after next-input
 			}),
 			"utf8",
 		);
-		const first = await runToolRequest({ filePath, ctx: { cwd: dir, env } });
+		const first = await runToolRequest({ filePath, ctx: { cwd: dir, storeSession: store } });
 		assert.equal(first.status, "needs_approval");
 		assert.ok(first.requiresApproval?.approvalId);
 
+		// Stop right after the save that consumes the approval.
 		const controller = new AbortController();
-		const signal = controller.signal;
-		const throwIfAborted = signal.throwIfAborted.bind(signal);
-		let signalChecks = 0;
-		Object.defineProperty(signal, "throwIfAborted", {
-			value() {
-				signalChecks += 1;
-				if (signalChecks === 5) {
-					controller.abort(new Error("abort after next-input state replaced the approval state"));
-				}
-				throwIfAborted();
-			},
-		});
+		const transition = store.backend.transition.bind(store.backend);
+		store.backend.transition = async (request, ...rest) => {
+			const result = await transition(request, ...rest);
+			if (request.action.kind === "execution-save" && request.action.consume)
+				controller.abort(new Error("abort for the test"));
+			return result;
+		};
 		const aborted = await resumeToolRequest({
 			approvalId: first.requiresApproval.approvalId,
 			approved: true,
-			ctx: { cwd: dir, signal, env },
+			ctx: { cwd: dir, signal: controller.signal, storeSession: store },
 		});
-		assertCancellationEnvelope(aborted);
-		assert.equal(signalChecks, 5);
+		store.backend.transition = transition;
+		assert.equal(aborted.ok, false);
 
-		const retried = await resumeToolRequest({
+		// The approval was saved: it is not asked again, and the run goes on to the next question.
+		const again = await resumeToolRequest({
 			approvalId: first.requiresApproval.approvalId,
 			approved: true,
-			ctx: { cwd: dir, env },
+			ctx: { cwd: dir, storeSession: store },
 		});
-		assert.equal(retried.status, "needs_input");
+		assert.equal(again.ok, false);
+		const advanced = await advanceWorkflowRun({
+			runId: first.runId!,
+			ctx: {
+				cwd: dir,
+				storeSession: store,
+				env: { ...process.env },
+				mode: "tool",
+				stdin: process.stdin,
+				stdout: process.stdout,
+				stderr: process.stderr,
+			},
+		});
+		assert.equal(advanced.status, "needs_input");
 	} finally {
+		await store.close();
 		await rm(dir, { recursive: true, force: true });
 	}
 });
@@ -1435,133 +1090,45 @@ test("workflow gate replacement retires the superseded approval index", async ()
 	}
 });
 
-test("terminal workflow approval resume restores its original capability when cleanup is cancelled", async () => {
+test("a workflow approval stopped before its answer is saved can be answered again", async () => {
 	const dir = await mkdtemp(join(tmpdir(), "lobster-terminal-cleanup-abort-workflow-resume-"));
+	const store = await openStoreSession({ directory: join(dir, "state") });
 	try {
 		const filePath = join(dir, "workflow.lobster");
-		const env = { ...process.env, LOBSTER_STATE_DIR: join(dir, "state") };
 		await writeFile(
 			filePath,
 			JSON.stringify({ steps: [{ id: "confirm", approval: "Continue?" }] }),
 			"utf8",
 		);
-		const first = await runToolRequest({ filePath, ctx: { cwd: dir, env } });
+		const first = await runToolRequest({ filePath, ctx: { cwd: dir, storeSession: store } });
 		assert.equal(first.status, "needs_approval");
 		assert.ok(first.requiresApproval?.approvalId);
 
+		// Stop right after the resume claims the run, before the decision is saved.
 		const controller = new AbortController();
-		const signal = controller.signal;
-		const throwIfAborted = signal.throwIfAborted.bind(signal);
-		let signalChecks = 0;
-		Object.defineProperty(signal, "throwIfAborted", {
-			value() {
-				signalChecks += 1;
-				// Checks 1-2 open the run store; 3-5 are the resume's own, all before its
-				// decision commits. 4 is the state-lock acquisition this test always targeted.
-				if (signalChecks === 4) {
-					controller.abort(new Error("abort during terminal workflow resume cleanup"));
-				}
-				throwIfAborted();
-			},
-		});
+		const transition = store.backend.transition.bind(store.backend);
+		store.backend.transition = async (request, ...rest) => {
+			const result = await transition(request, ...rest);
+			if (request.action.kind === "execution-claim")
+				controller.abort(new Error("abort for the test"));
+			return result;
+		};
 		const aborted = await resumeToolRequest({
 			approvalId: first.requiresApproval.approvalId,
 			approved: true,
-			ctx: { cwd: dir, signal, env },
+			ctx: { cwd: dir, signal: controller.signal, storeSession: store },
 		});
+		store.backend.transition = transition;
 		assertCancellationEnvelope(aborted);
-		assert.equal(signalChecks, 4);
 
 		const retried = await resumeToolRequest({
 			approvalId: first.requiresApproval.approvalId,
 			approved: true,
-			ctx: { cwd: dir, env },
+			ctx: { cwd: dir, storeSession: store },
 		});
-		assert.equal(retried.ok, true);
+		assert.equal(retried.ok, true, JSON.stringify(retried));
 	} finally {
-		await rm(dir, { recursive: true, force: true });
-	}
-});
-
-test("a cancelled stale pipeline resume cannot restore a capability settled by another resume", async () => {
-	const dir = await mkdtemp(join(tmpdir(), "lobster-stale-pipeline-resume-"));
-	try {
-		const stateDir = join(dir, "state");
-		const env = { ...process.env, LOBSTER_STATE_DIR: stateDir };
-		let delayedStageEntered!: () => void;
-		const delayedStageReady = new Promise<void>((resolve) => {
-			delayedStageEntered = resolve;
-		});
-		let releaseDelayedStage!: () => void;
-		const delayedStageReleased = new Promise<void>((resolve) => {
-			releaseDelayedStage = resolve;
-		});
-		let runs = 0;
-		let effects = 0;
-		const terminal = {
-			name: "test.stale-safe-terminal",
-			meta: { resumeSafeBeforeInput: true },
-			async run() {
-				runs += 1;
-				if (runs === 1) {
-					delayedStageEntered();
-					await delayedStageReleased;
-				} else {
-					effects += 1;
-				}
-				return { output: [] };
-			},
-		};
-		const registry = withCommands(createDefaultRegistry(), terminal);
-		const first = await runToolRequest({
-			pipeline: "approve --prompt First? | test.stale-safe-terminal",
-			ctx: { env, registry },
-		});
-		assert.equal(first.status, "needs_approval");
-		assert.ok(first.requiresApproval?.resumeToken);
-		const payload = decodeResumeToken(first.requiresApproval.resumeToken);
-		const statePath = keyToPath(stateDir, payload.stateKey);
-
-		const controller = new AbortController();
-		const delayed = resumeToolRequest({
-			token: first.requiresApproval.resumeToken,
-			approved: true,
-			ctx: { env, registry, signal: controller.signal },
-		});
-		await delayedStageReady;
-
-		const winner = await resumeToolRequest({
-			token: first.requiresApproval.resumeToken,
-			approved: true,
-			ctx: { env, registry },
-		});
-		assert.equal(winner.status, "ok");
-		assert.equal(effects, 1);
-		assert.equal(await storedKeyExists(statePath), false);
-
-		// Cancel the stale resume as it tries to delete the already-settled state.
-		const restoreWrites = hookStoreWrites(({ key, text }) => {
-			if (key === payload.stateKey && text === null && !controller.signal.aborted)
-				controller.abort(new Error("cancel stale pipeline terminal cleanup"));
-		});
-		let stale;
-		try {
-			releaseDelayedStage();
-			stale = await delayed;
-		} finally {
-			restoreWrites();
-		}
-		assert.equal(stale.ok, false);
-		assert.equal(await storedKeyExists(statePath), false);
-
-		const replay = await resumeToolRequest({
-			token: first.requiresApproval.resumeToken,
-			approved: true,
-			ctx: { env, registry },
-		});
-		assert.equal(replay.ok, false);
-		assert.equal(effects, 1);
-	} finally {
+		await store.close();
 		await rm(dir, { recursive: true, force: true });
 	}
 });
@@ -2747,7 +2314,7 @@ test(
 			});
 			const tokenReplay = await replayByToken.result;
 			assert.equal(tokenReplay.code, 1);
-			assert.match(tokenReplay.stdout, /Pipeline resume state not found/);
+			assert.match(tokenReplay.stdout, /Resume state not found/);
 			assert.equal(
 				(await readFile(sendInvocations, "utf8")).trim().split(/\r?\n/).length,
 				1,
@@ -2896,7 +2463,7 @@ test(
 			});
 			const tokenReplay = await replayByToken.result;
 			assert.equal(tokenReplay.code, 1);
-			assert.match(tokenReplay.stdout, /Workflow resume state not found/);
+			assert.match(tokenReplay.stdout, /Resume state not found/);
 			assert.equal(
 				(await readFile(sendInvocations, "utf8")).trim().split(/\r?\n/).length,
 				1,
@@ -2915,16 +2482,20 @@ test("cancellation after Gmail search completion stops the next pipeline stage",
 		const repoRoot = join(__dirname, "..", "..");
 		const mockGog = join(repoRoot, "test", "fixtures", "mock-gog-cancellation.mjs");
 		const controller = new AbortController();
-		const signal = controller.signal;
-		const throwIfAborted = signal.throwIfAborted.bind(signal);
-		let signalChecks = 0;
-		Object.defineProperty(signal, "throwIfAborted", {
-			value() {
-				signalChecks += 1;
-				if (signalChecks === 3) controller.abort();
-				throwIfAborted();
+		const base = createDefaultRegistry();
+		const realSearch = base.get("gog.gmail.search")!;
+		let searchCompleted = false;
+		// The search finishes, then cancellation arrives before the next stage starts.
+		const search = {
+			...realSearch,
+			name: "gog.gmail.search",
+			async run(params: any) {
+				const result = await realSearch.run(params);
+				searchCompleted = true;
+				controller.abort();
+				return result;
 			},
-		});
+		};
 
 		let downstreamStarted = false;
 		const downstream = {
@@ -2940,10 +2511,12 @@ test("cancellation after Gmail search completion stops the next pipeline stage",
 		const envelope = await runToolRequest({
 			pipeline: "gog.gmail.search --query newer_than:1d | test.side-effect",
 			ctx: {
-				registry: withCommands(createDefaultRegistry(), downstream),
-				signal,
+				cwd: dir,
+				registry: withCommands(base, search, downstream),
+				signal: controller.signal,
 				env: {
 					...process.env,
+					LOBSTER_STATE_DIR: join(dir, "state"),
 					GOG_BIN: mockGog,
 					MOCK_GOG_COMPLETION_DELAY_MS: "0",
 				},
@@ -2951,7 +2524,7 @@ test("cancellation after Gmail search completion stops the next pipeline stage",
 		});
 
 		assertCancellationEnvelope(envelope);
-		assert.equal(signalChecks, 3);
+		assert.equal(searchCompleted, true);
 		assert.equal(downstreamStarted, false, "cancellation must stop downstream side effects");
 	} finally {
 		await rm(dir, { recursive: true, force: true });
@@ -3623,7 +3196,7 @@ test("approval resume token cannot replay a send after downstream cancellation",
 			},
 		});
 		assert.equal(replayByToken.ok, false);
-		assert.match(replayByToken.error?.message ?? "", /Pipeline resume state not found/);
+		assert.match(replayByToken.error?.message ?? "", /Resume state not found/);
 		invocations = (await readFile(sendInvocations, "utf8")).trim().split(/\r?\n/);
 		assert.equal(invocations.length, 1, "retrying an aborted resume token must not resend");
 	} finally {
@@ -3668,7 +3241,7 @@ test("pipeline resume state is consumed when cancellation uses a custom reason",
 			ctx: { registry, env },
 		});
 		assert.equal(replay.ok, false);
-		assert.match(replay.error?.message ?? "", /Pipeline resume state not found/);
+		assert.match(replay.error?.message ?? "", /Resume state not found/);
 		assert.equal(
 			sideEffect.invocations,
 			1,
@@ -3722,7 +3295,7 @@ test("workflow resume state is consumed when cancellation uses a custom reason",
 			ctx: { cwd: dir, registry, env },
 		});
 		assert.equal(replay.ok, false);
-		assert.match(replay.error?.message ?? "", /Workflow resume state not found/);
+		assert.match(replay.error?.message ?? "", /Resume state not found/);
 		assert.equal(
 			sideEffect.invocations,
 			1,
@@ -3798,166 +3371,49 @@ test("explicit cancellation stops waiting for a state lock without orphaning its
 	}
 });
 
-test("a failed post-effect resume cleanup leaves a non-replayable pipeline tombstone", async () => {
-	const dir = await mkdtemp(join(tmpdir(), "lobster-consumed-pipeline-tombstone-"));
-	let restoreWrites = () => {};
+test("a pipeline approval answered by token and short ID at once dispatches its effect once", async () => {
+	const dir = await mkdtemp(join(tmpdir(), "lobster-pipeline-exclusive-"));
 	try {
-		const stateDir = join(dir, "state");
-		const env = { ...process.env, LOBSTER_STATE_DIR: stateDir };
-		const effect = createCountingSideEffect("test.tombstone-effect");
-		const registry = withCommands(createDefaultRegistry(), effect.command);
-		const first = await runToolRequest({
-			pipeline: "approve --prompt Continue? | test.tombstone-effect",
-			ctx: { cwd: dir, env, registry },
-		});
-		assert.equal(first.status, "needs_approval");
-		assert.ok(first.requiresApproval?.resumeToken);
-		const payload = decodeResumeToken(first.requiresApproval.resumeToken);
-		// The final delete of the consumed state fails after the effect ran.
-		restoreWrites = hookStoreWrites(({ key, text, phase }) => {
-			if (phase === "before" && key === payload.stateKey && text === null)
-				throw Object.assign(new Error("injected resume unlink failure"), { code: "EIO" });
-		});
-
-		const resumed = await resumeToolRequest({
-			token: first.requiresApproval.resumeToken,
-			approved: true,
-			ctx: { cwd: dir, env, registry },
-		});
-		assert.equal(resumed.ok, false);
-		assert.match(resumed.error?.message ?? "", /injected resume unlink failure/);
-		assert.equal(effect.invocations, 1);
-
-		const replay = await resumeToolRequest({
-			token: first.requiresApproval.resumeToken,
-			approved: true,
-			ctx: { cwd: dir, env, registry },
-		});
-		assert.equal(replay.ok, false);
-		assert.match(replay.error?.message ?? "", /Pipeline resume state not found/);
-		assert.equal(effect.invocations, 1, "a tombstoned token must not repeat its side effect");
-	} finally {
-		restoreWrites();
-		await rm(dir, { recursive: true, force: true });
-	}
-});
-
-async function assertApprovalResumeIsExclusive({
-	workflow,
-	resumeBy,
-}: {
-	workflow: boolean;
-	resumeBy: "token" | "approvalId";
-}) {
-	const dir = await mkdtemp(join(tmpdir(), "lobster-exclusive-resume-"));
-	let restoreWrites = () => {};
-	let releaseFirstRename!: () => void;
-	const firstRenameReached = new Promise<void>((resolve) => {
-		releaseFirstRename = resolve;
-	});
-	let renamePaused = false;
-	let releaseFirstEffect!: () => void;
-	const firstEffectMayFinish = new Promise<void>((resolve) => {
-		releaseFirstEffect = resolve;
-	});
-	let invocations = 0;
-	try {
-		const stateDir = join(dir, "state");
-		const env = { ...process.env, LOBSTER_STATE_DIR: stateDir };
+		const env = { ...process.env, LOBSTER_STATE_DIR: join(dir, "state") };
+		let invocations = 0;
 		const effect = {
-			name: "test.exclusive-resume-effect",
+			name: "test.exclusive-effect",
 			async run({ input }: { input: AsyncIterable<unknown> }) {
+				for await (const _item of input) {
+					// drain
+				}
 				invocations += 1;
-				const items = [];
-				for await (const item of input) items.push(item);
-				if (invocations === 1) await firstEffectMayFinish;
-				return { output: streamOf(items.length ? items : [{ ok: true }]) };
+				return { output: streamOf([{ ok: true }]) };
 			},
 		};
 		const registry = withCommands(createDefaultRegistry(), effect);
-		let first;
-		if (workflow) {
-			const filePath = join(dir, "workflow.lobster");
-			await writeFile(
-				filePath,
-				JSON.stringify({
-					steps: [
-						{ id: "approve", approval: "Continue?" },
-						{ id: "effect", pipeline: "test.exclusive-resume-effect" },
-					],
-				}),
-				"utf8",
-			);
-			first = await runToolRequest({ filePath, ctx: { cwd: dir, env, registry } });
-		} else {
-			first = await runToolRequest({
-				pipeline: "approve --prompt Continue? | test.exclusive-resume-effect",
+		const first = await runToolRequest({
+			pipeline: "approve --prompt Send? | test.exclusive-effect",
+			ctx: { cwd: dir, env, registry },
+		});
+		assert.equal(first.status, "needs_approval");
+		const { resumeToken, approvalId } = first.requiresApproval!;
+		const results = await Promise.all([
+			resumeToolRequest({ token: resumeToken!, approved: true, ctx: { cwd: dir, env, registry } }),
+			resumeToolRequest({
+				approvalId: approvalId!,
+				approved: true,
+				ctx: { cwd: dir, env, registry },
+			}),
+		]);
+		assert.equal(results.filter((result) => result.ok).length, 1, JSON.stringify(results));
+		assert.equal(invocations, 1);
+		for (const ref of [{ token: resumeToken! }, { approvalId: approvalId! }]) {
+			const again = await resumeToolRequest({
+				...ref,
+				approved: true,
 				ctx: { cwd: dir, env, registry },
 			});
+			assert.equal(again.ok, false);
 		}
-		assert.equal(first.status, "needs_approval");
-		assert.ok(first.requiresApproval?.resumeToken);
-		assert.ok(first.requiresApproval?.approvalId);
-		const payload = decodeResumeToken(first.requiresApproval.resumeToken!);
-		// Hold the first resume just before it claims the approval (writes the consumed marker).
-		restoreWrites = hookStoreWrites(async ({ key, text, phase }) => {
-			if (
-				phase === "before" &&
-				key === payload.stateKey &&
-				isConsumedMarker(text) &&
-				!renamePaused
-			) {
-				renamePaused = true;
-				await firstRenameReached;
-			}
-		});
-
-		const resumeArgs =
-			resumeBy === "token"
-				? { token: first.requiresApproval.resumeToken! }
-				: { approvalId: first.requiresApproval.approvalId! };
-		const firstResume = resumeToolRequest({
-			...resumeArgs,
-			approved: true,
-			ctx: { cwd: dir, env, registry },
-		});
-		for (let waited = 0; !renamePaused; waited++) {
-			assert.ok(waited < 5000, "the first resume must reach its claim");
-			await new Promise((resolve) => setTimeout(resolve, 1));
-		}
-		const secondResume = resumeToolRequest({
-			...resumeArgs,
-			approved: true,
-			ctx: { cwd: dir, env, registry },
-		});
-		releaseFirstRename();
-		// The first effect is held open. The second request has enough time to
-		// reach the guarded claim, but cannot be allowed to observe cleanup as a
-		// missing-state retry opportunity.
-		await new Promise((resolve) => setTimeout(resolve, 30));
-		releaseFirstEffect();
-		const outcomes = await Promise.all([firstResume, secondResume]);
-
-		assert.equal(invocations, 1, "one approval may dispatch exactly one effect");
-		assert.equal(outcomes.filter((outcome) => outcome.ok).length, 1);
-		assert.equal(outcomes.filter((outcome) => !outcome.ok).length, 1);
-		// The loser is refused either at its claim or, when the winner has already
-		// retired the short ID, at the ID lookup. Both refuse without dispatching.
-		assert.match(
-			outcomes.find((outcome) => !outcome.ok)?.error?.message ?? "",
-			/resume state not found|owned by another executor|not found or expired/i,
-		);
+		assert.equal(invocations, 1);
 	} finally {
-		releaseFirstRename();
-		releaseFirstEffect();
-		restoreWrites();
 		await rm(dir, { recursive: true, force: true });
-	}
-}
-
-test("pipeline approval token and short ID each dispatch an effect at most once", async () => {
-	for (const resumeBy of ["token", "approvalId"] as const) {
-		await assertApprovalResumeIsExclusive({ workflow: false, resumeBy });
 	}
 });
 
@@ -4050,230 +3506,6 @@ test("pipeline approval token and short ID cannot fork a next input gate", async
 test("workflow approval token and short ID cannot fork a next input gate", async () => {
 	for (const resumeBy of ["token", "approvalId"] as const) {
 		await assertApprovalGateHandoffIsExclusive({ workflow: true, resumeBy });
-	}
-});
-
-async function assertCancellationCannotRetireClaimedSuccessor({
-	workflow,
-	rejectApproval,
-}: {
-	workflow: boolean;
-	rejectApproval: boolean;
-}) {
-	const dir = await mkdtemp(join(tmpdir(), "lobster-cancel-claimed-successor-"));
-	let restoreWrites = () => {};
-	let releaseClaim!: () => void;
-	const claimReleased = new Promise<void>((resolve) => {
-		releaseClaim = resolve;
-	});
-	let claimPublished!: () => void;
-	const claimReached = new Promise<void>((resolve) => {
-		claimPublished = resolve;
-	});
-	let claimPaused = false;
-	try {
-		const stateDir = join(dir, "state");
-		const env = { ...process.env, LOBSTER_STATE_DIR: stateDir };
-		let first: any;
-		if (workflow) {
-			const filePath = join(dir, "workflow.lobster");
-			await writeFile(
-				filePath,
-				JSON.stringify({
-					steps: [
-						{ id: "approve", approval: "Continue?" },
-						{ id: "next-input", pipeline: "ask --prompt Next?" },
-					],
-				}),
-				"utf8",
-			);
-			first = await runToolRequest({ filePath, ctx: { cwd: dir, env } });
-		} else {
-			first = await runToolRequest({
-				pipeline: "approve --prompt Continue? | ask --prompt Next?",
-				ctx: { cwd: dir, env },
-			});
-		}
-		assert.equal(first.status, "needs_approval");
-		assert.ok(first.requiresApproval?.resumeToken);
-		const payload = decodeResumeToken(first.requiresApproval.resumeToken!);
-		// Hold the resume right after its claim on the predecessor has committed.
-		restoreWrites = hookStoreWrites(async ({ key, text, phase }) => {
-			if (phase === "after" && key === payload.stateKey && isConsumedMarker(text) && !claimPaused) {
-				claimPaused = true;
-				claimPublished();
-				await claimReleased;
-			}
-		});
-
-		const resumed = resumeToolRequest({
-			token: first.requiresApproval.resumeToken!,
-			approved: true,
-			ctx: { cwd: dir, env },
-		});
-		await claimReached;
-		const cancelled = resumeToolRequest({
-			token: first.requiresApproval.resumeToken!,
-			...(rejectApproval ? { approved: false } : { cancel: true }),
-			ctx: { cwd: dir, env },
-		});
-		releaseClaim();
-
-		const [resumedResult, cancelledResult] = await Promise.all([resumed, cancelled]);
-		assert.equal(resumedResult.ok, true);
-		assert.equal(resumedResult.status, "needs_input");
-		assert.ok(resumedResult.requiresInput?.resumeToken);
-		assert.equal(
-			cancelledResult.ok,
-			false,
-			"cancellation must reject a predecessor already claimed for a successor",
-		);
-		assert.match(
-			cancelledResult.error?.message ?? "",
-			/resume state not found|owned by another executor/i,
-		);
-		const successor = decodeResumeToken(resumedResult.requiresInput.resumeToken!);
-		assert.equal(
-			await storedKeyExists(keyToPath(stateDir, successor.stateKey)),
-			true,
-			"the returned successor must remain live",
-		);
-	} finally {
-		releaseClaim();
-		restoreWrites();
-		await rm(dir, { recursive: true, force: true });
-	}
-}
-
-test("cancellation and rejection cannot retire a claimed pipeline successor", async () => {
-	for (const workflow of [false]) {
-		for (const rejectApproval of [false, true]) {
-			await assertCancellationCannotRetireClaimedSuccessor({ workflow, rejectApproval });
-		}
-	}
-});
-
-test("a cancellation immediately after pipeline resume consumption restores the unstarted approval", async () => {
-	const dir = await mkdtemp(join(tmpdir(), "lobster-consume-rename-abort-"));
-	let restoreWrites = () => {};
-	try {
-		const stateDir = join(dir, "state");
-		const env = { ...process.env, LOBSTER_STATE_DIR: stateDir };
-		const effect = createCountingSideEffect("test.consume-rename-effect");
-		const registry = withCommands(createDefaultRegistry(), effect.command);
-		const first = await runToolRequest({
-			pipeline: "approve --prompt Continue? | test.consume-rename-effect",
-			ctx: { cwd: dir, env, registry },
-		});
-		assert.equal(first.status, "needs_approval");
-		assert.ok(first.requiresApproval?.resumeToken);
-		const payload = decodeResumeToken(first.requiresApproval.resumeToken!);
-		const controller = new AbortController();
-		let abortedAtConsumption = false;
-		restoreWrites = hookStoreWrites(({ key, text, phase }) => {
-			if (
-				phase === "after" &&
-				key === payload.stateKey &&
-				isConsumedMarker(text) &&
-				!abortedAtConsumption
-			) {
-				abortedAtConsumption = true;
-				controller.abort(new Error("abort after consumed resume rename"));
-			}
-		});
-
-		const cancelled = await resumeToolRequest({
-			token: first.requiresApproval.resumeToken,
-			approved: true,
-			ctx: { cwd: dir, env, registry, signal: controller.signal },
-		});
-		assertCancellationEnvelope(cancelled);
-		assert.equal(effect.invocations, 0);
-		assert.equal(abortedAtConsumption, true);
-
-		const retried = await resumeToolRequest({
-			token: first.requiresApproval.resumeToken,
-			approved: true,
-			ctx: { cwd: dir, env, registry },
-		});
-		assert.equal(retried.ok, true);
-		assert.equal(effect.invocations, 1);
-	} finally {
-		restoreWrites();
-		await rm(dir, { recursive: true, force: true });
-	}
-});
-
-test("resumed pipeline approvals retain their short ID until the started invocation settles", async () => {
-	for (const workflow of [false]) {
-		const dir = await mkdtemp(join(tmpdir(), "lobster-approval-index-dispatch-boundary-"));
-		let releaseEffect!: () => void;
-		const effectReleased = new Promise<void>((resolve) => {
-			releaseEffect = resolve;
-		});
-		let effectStarted!: () => void;
-		const effectEntered = new Promise<void>((resolve) => {
-			effectStarted = resolve;
-		});
-		const effect = {
-			name: "test.hold-before-terminal-cleanup",
-			async run() {
-				effectStarted();
-				await effectReleased;
-				return { output: streamOf([{ ok: true }]) };
-			},
-		};
-		try {
-			const stateDir = join(dir, "state");
-			const env = { ...process.env, LOBSTER_STATE_DIR: stateDir };
-			const registry = withCommands(createDefaultRegistry(), effect);
-			let first;
-			let filePath: string | undefined;
-			if (workflow) {
-				filePath = join(dir, "workflow.lobster");
-				await writeFile(
-					filePath,
-					JSON.stringify({
-						steps: [
-							{ id: "confirm", approval: "Continue?" },
-							{ id: "effect", pipeline: "test.hold-before-terminal-cleanup" },
-						],
-					}),
-					"utf8",
-				);
-				first = await runToolRequest({ filePath, ctx: { cwd: dir, env, registry } });
-			} else {
-				first = await runToolRequest({
-					pipeline: "approve --prompt Continue? | test.hold-before-terminal-cleanup",
-					ctx: { cwd: dir, env, registry },
-				});
-			}
-			assert.equal(first.status, "needs_approval");
-			assert.ok(first.requiresApproval?.approvalId);
-			const approvalIndexPath = join(
-				stateDir,
-				`approval_${first.requiresApproval.approvalId}.json`,
-			);
-
-			const resumed = resumeToolRequest({
-				approvalId: first.requiresApproval.approvalId,
-				approved: true,
-				ctx: { cwd: dir, env, registry },
-			});
-			await effectEntered;
-			assert.equal(
-				await storedKeyExists(approvalIndexPath),
-				true,
-				"the short approval ID must survive until the resumed invocation reaches a terminal outcome",
-			);
-			releaseEffect();
-			const settled = await resumed;
-			assert.equal(settled.status, "ok");
-			assert.equal(await storedKeyExists(approvalIndexPath), false);
-		} finally {
-			releaseEffect();
-			await rm(dir, { recursive: true, force: true });
-		}
 	}
 });
 
@@ -4727,7 +3959,7 @@ test("approval resume token cannot replay after a non-abort failure past an unsa
 			ctx: { registry, env },
 		});
 		assert.equal(replay.ok, false);
-		assert.match(replay.error?.message ?? "", /Pipeline resume state not found/);
+		assert.match(replay.error?.message ?? "", /Resume state not found/);
 		assert.equal(attempts, 1);
 	} finally {
 		await rm(dir, { recursive: true, force: true });
@@ -4775,7 +4007,7 @@ test("next-stage input resume cannot replay after a non-abort failure past an un
 			ctx: { registry, env },
 		});
 		assert.equal(replay.ok, false);
-		assert.match(replay.error?.message ?? "", /Pipeline resume state not found/);
+		assert.match(replay.error?.message ?? "", /Resume state not found/);
 		assert.equal(attempts, 1);
 	} finally {
 		await rm(dir, { recursive: true, force: true });
@@ -4831,7 +4063,7 @@ test("workflow resume cannot replay after a non-abort failure past an unsafe bou
 			ctx: { cwd: dir, registry, env },
 		});
 		assert.equal(replay.ok, false);
-		assert.match(replay.error?.message ?? "", /Workflow resume state not found/);
+		assert.match(replay.error?.message ?? "", /Resume state not found/);
 		assert.equal(attempts, 1);
 	} finally {
 		await rm(dir, { recursive: true, force: true });
@@ -4895,7 +4127,7 @@ test("next-stage input resume cannot replay a send after downstream cancellation
 			ctx: { env: { ...env, MOCK_GOG_COMPLETION_DELAY_MS: "0" } },
 		});
 		assert.equal(replay.ok, false);
-		assert.match(replay.error?.message ?? "", /Pipeline resume state not found/);
+		assert.match(replay.error?.message ?? "", /Resume state not found/);
 		invocations = (await readFile(sendInvocations, "utf8")).trim().split(/\r?\n/);
 		assert.equal(invocations.length, 1, "retrying an aborted input token must not resend");
 	} finally {
@@ -4982,7 +4214,7 @@ test("workflow approval resume cannot replay a send after downstream cancellatio
 			ctx: { cwd: dir, env: { ...env, MOCK_GOG_COMPLETION_DELAY_MS: "0" } },
 		});
 		assert.equal(replayByToken.ok, false);
-		assert.match(replayByToken.error?.message ?? "", /Workflow resume state not found/);
+		assert.match(replayByToken.error?.message ?? "", /Resume state not found/);
 		invocations = (await readFile(sendInvocations, "utf8")).trim().split(/\r?\n/);
 		assert.equal(invocations.length, 1, "retrying an aborted workflow approval must not resend");
 	} finally {
@@ -5061,7 +4293,7 @@ test("workflow input resume cannot replay a send after downstream cancellation",
 			ctx: { cwd: dir, env: { ...env, MOCK_GOG_COMPLETION_DELAY_MS: "0" } },
 		});
 		assert.equal(replay.ok, false);
-		assert.match(replay.error?.message ?? "", /Workflow resume state not found/);
+		assert.match(replay.error?.message ?? "", /Resume state not found/);
 		invocations = (await readFile(sendInvocations, "utf8")).trim().split(/\r?\n/);
 		assert.equal(invocations.length, 1, "retrying an aborted workflow input must not resend");
 	} finally {
@@ -5134,25 +4366,36 @@ test(
 			await copyFile(mockGh, ghBin);
 			await chmod(ghBin, 0o755);
 			const controller = new AbortController();
-			const signal = controller.signal;
-			const throwIfAborted = signal.throwIfAborted.bind(signal);
+			const base = createDefaultRegistry();
+			const realRun = base.get("workflows.run")!;
 			let signalChecks = 0;
-			Object.defineProperty(signal, "throwIfAborted", {
-				value() {
-					signalChecks += 1;
-					if (signalChecks === 4) {
-						controller.abort(new Error("abort before monitor state write"));
-					}
-					throwIfAborted();
+			// Cancel at the monitor's second check: after gh returned, before the snapshot is saved.
+			const workflowsRun = {
+				...realRun,
+				name: "workflows.run",
+				run(params: any) {
+					const signal = params.ctx.signal as AbortSignal;
+					const throwIfAborted = signal.throwIfAborted.bind(signal);
+					Object.defineProperty(signal, "throwIfAborted", {
+						configurable: true,
+						value() {
+							signalChecks += 1;
+							if (signalChecks === 2)
+								controller.abort(new Error("abort before monitor state write"));
+							throwIfAborted();
+						},
+					});
+					return realRun.run(params);
 				},
-			});
+			};
 			const key = "github.pr:openclaw/lobster#1";
 
 			const envelope = await runToolRequest({
 				pipeline:
 					'workflows.run --name github.pr.monitor --args-json \'{"repo":"openclaw/lobster","pr":1,"changesOnly":true}\'',
 				ctx: {
-					signal,
+					registry: withCommands(base, workflowsRun),
+					signal: controller.signal,
 					env: {
 						...process.env,
 						PATH: `${dir}:${process.env.PATH ?? ""}`,
@@ -5163,7 +4406,7 @@ test(
 			});
 
 			assertCancellationEnvelope(envelope);
-			assert.equal(signalChecks, 4);
+			assert.equal(signalChecks, 2);
 			assert.equal(
 				await storedKeyExists(keyToPath(stateDir, key)),
 				false,

@@ -1,4 +1,3 @@
-import { legacyCheckpointText, validateCheckpoint } from "./legacy.js";
 import type { ExecutionState } from "../engine/state.js";
 import { assertSqliteNodeSupport } from "./sqlite-support.js";
 import { randomUUID } from "node:crypto";
@@ -18,7 +17,6 @@ import {
 import { sessionFromEnv } from "./context.js";
 import {
 	canRetain,
-	isRetiredCheckpoint,
 	captureRunMetadata,
 	fingerprint,
 	summarize,
@@ -217,62 +215,32 @@ export class StoreSession {
 		return recorder;
 	}
 
+	/** The recorder of the run that owns this continuation key, if a run owns it. */
 	async recorderForState(
 		key: string,
 		signal?: AbortSignal,
 	): Promise<ExecutionRecorder | undefined> {
 		signal?.throwIfAborted();
-		key = normalizeStateKey(key);
-		if (!/^(pipeline_resume_|workflow[-_]resume_|sdk_resume_)[a-z0-9._-]+$/.test(key)) {
-			throw new Error("Invalid checkpoint ID");
-		}
-		if ((await this.read(key)).text === null && /^workflow[-_]resume_/.test(key)) {
-			key = key.includes("workflow-resume_")
-				? key.replace("workflow-resume_", "workflow_resume_")
-				: key.replace("workflow_resume_", "workflow-resume_");
-		}
-		return withFileLock({
-			filePath: path.join(this.directory, `${key}.json`),
-			signal,
-			task: async () => {
-				const record = await this.read(key);
-				if (record.text === null) return undefined;
-				if (record.runId) {
-					const run = await this.getRunState(record.runId);
-					if (!run) return undefined;
-					return new ExecutionRecorder(this, run.id, "", run.historyEnabled !== false);
-				}
-				if (!this.trackRuns || JSON.parse(record.text)?.type === "lobster.consumed-resume-state.v1")
-					return undefined;
-				validateCheckpoint(key, record.text);
-				if (/^workflow[-_]resume_/.test(key)) {
-					const alternate = key.includes("workflow-resume_")
-						? key.replace("workflow-resume_", "workflow_resume_")
-						: key.replace("workflow_resume_", "workflow-resume_");
-					if (!isRetiredCheckpoint((await this.read(alternate)).text))
-						throw new Error("Conflicting workflow checkpoint aliases");
-				}
-				return this.createRecorder({
-					kind: "legacy",
-					partialHistory: true,
-					checkpoint: { key, text: legacyCheckpointText(key, record.text) },
-					signal,
-				});
-			},
-		});
+		const record = await this.read(normalizeStateKey(key));
+		if (!record.runId) return undefined;
+		const run = await this.getRunState(record.runId);
+		if (!run) return undefined;
+		return new ExecutionRecorder(this, run.id, "", run.historyEnabled !== false);
 	}
 
 	/**
-	 * Upgrade only: register a converted workflow pause as a run, with its execution
+	 * Upgrade only: register a converted workflow or pipeline pause as a run, with its execution
 	 * state and continuation, in one transition. The key keeps its old token valid.
 	 */
 	async createWaitingRun({
 		id,
+		kind = "workflow",
 		key,
 		execution,
 		continuation,
 	}: {
 		id: string;
+		kind?: string;
 		key: string;
 		execution: ExecutionState;
 		continuation: (runId: string) => string;
@@ -285,7 +253,7 @@ export class StoreSession {
 				if ((await this.read(key)).runId) throw new Error("Checkpoint already belongs to a run");
 				const recorder = await this.createRecorder({
 					id,
-					kind: "workflow",
+					kind,
 					checkpoint: { key, text: continuation(id) },
 					execution,
 				});
@@ -405,8 +373,7 @@ export class StoreSession {
 				result = await this.backend.transition(request, signal, assertInvocationCurrent);
 			} catch (error) {
 				result = await this.reconcileUnknown(error, async () => {
-					if (request.action.kind !== "handoff" && !request.action.kind.startsWith("execution-"))
-						return;
+					if (!request.action.kind.startsWith("execution-")) return;
 					const run = await this.backend.getRun(request.runId);
 					const receipt = run?.receipts[request.operationId];
 					if (receipt?.fingerprint === fingerprint(request)) {
@@ -451,10 +418,7 @@ export class StoreSession {
 }
 
 export class ExecutionRecorder {
-	ownsExecution = false;
 	pipelineOffset = 0;
-	decision?: unknown;
-	decisionKey?: string;
 
 	constructor(
 		readonly session: StoreSession,

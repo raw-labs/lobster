@@ -1,3 +1,4 @@
+import { isHostless } from "./owner_signal.js";
 import { spawn, type ChildProcess, type SpawnOptionsWithoutStdio } from "node:child_process";
 import { StringDecoder } from "node:string_decoder";
 import { resolveInlineShellCommand } from "./shell.js";
@@ -317,7 +318,7 @@ export function runAbortableProcess(options: RunAbortableProcessOptions): Promis
 			forceTerminationRegistrations.push(listeners);
 		}
 
-		if (spawnOptions.detached && signal === undefined) {
+		if (spawnOptions.detached && isHostless(signal)) {
 			unregisterInterruptTarget = registerInterruptTarget({
 				stop(receivedSignal) {
 					if (terminationError) forceKill();
