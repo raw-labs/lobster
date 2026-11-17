@@ -985,15 +985,26 @@ test("workflow cost tracking bills a projected step that prints the full replay 
 
 // A command that fails the first time it runs and succeeds afterwards, so a step carrying it
 // takes exactly two attempts under `retry`.
-async function failsOnceCommand() {
+// Fails on its first run, succeeds afterwards. These tests need the failure to come after the
+// sibling `llm.invoke` branches stored their answers: a failure that came first would abort
+// them mid-request, and the retry would rightly call the provider again. So the failing run
+// waits for a stored answer in `cacheDir`, then lets concurrent writers of the same key finish.
+async function failsOnceCommand(cacheDir: string) {
 	const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-cost-flaky-"));
 	const marker = JSON.stringify(path.join(dir, "attempted"));
 	const filePath = path.join(dir, "flaky.mjs");
 	await fsp.writeFile(
 		filePath,
 		`import fs from "node:fs";\n` +
-			`if (fs.existsSync(${marker})) process.stdout.write("ok");\n` +
-			`else { fs.writeFileSync(${marker}, "1"); process.exit(1); }\n`,
+			`import path from "node:path";\n` +
+			`if (fs.existsSync(${marker})) { process.stdout.write("ok"); process.exit(0); }\n` +
+			`fs.writeFileSync(${marker}, "1");\n` +
+			`const stored = (dir) => fs.readdirSync(dir, { withFileTypes: true }).some((e) =>\n` +
+			`  e.isDirectory() ? stored(path.join(dir, e.name)) : !e.name.startsWith(".") && e.name.endsWith(".json"));\n` +
+			`const deadline = Date.now() + 10000;\n` +
+			`while (!stored(${JSON.stringify(cacheDir)}) && Date.now() < deadline) await new Promise((r) => setTimeout(r, 10));\n` +
+			`await new Promise((r) => setTimeout(r, 250));\n` +
+			`process.exit(1);\n`,
 		"utf8",
 	);
 	return `node ${filePath}`;
@@ -1006,7 +1017,7 @@ async function failsOnceCommand() {
 test("workflow cost tracking bills a replay standing in for a retried step's live call", async () => {
 	const provider = await startFakeProvider();
 	const cacheDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-cost-cache-"));
-	const flaky = await failsOnceCommand();
+	const flaky = await failsOnceCommand(cacheDir);
 	try {
 		const { result } = await runWorkflow(
 			{
@@ -1044,7 +1055,7 @@ test("workflow cost tracking bills a replay standing in for a retried step's liv
 test("cost_limit stop counts the live call a retried step's replay stands in for", async () => {
 	const provider = await startFakeProvider();
 	const cacheDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-cost-cache-"));
-	const flaky = await failsOnceCommand();
+	const flaky = await failsOnceCommand(cacheDir);
 	try {
 		await assert.rejects(
 			() =>
@@ -1140,7 +1151,7 @@ test("workflow cost tracking does not bill a replay of a call another run paid f
 test("workflow cost tracking bills both live calls a retried step's replays stand in for", async () => {
 	const provider = await startFakeProvider(2);
 	const cacheDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-cost-cache-"));
-	const flaky = await failsOnceCommand();
+	const flaky = await failsOnceCommand(cacheDir);
 	const invoke = "llm.invoke --model gpt-4o --prompt Summarize";
 	try {
 		const { result } = await runWorkflow(
@@ -1648,7 +1659,7 @@ test("workflow cost tracking bills each retried replay at what its own call cost
 		outputTokens: seen === 1 ? 500 : 100,
 	}));
 	const cacheDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-cost-cache-"));
-	const flaky = await failsOnceCommand();
+	const flaky = await failsOnceCommand(cacheDir);
 	const invoke = "llm.invoke --model gpt-4o --prompt Summarize";
 	try {
 		const { result } = await runWorkflow(
@@ -1923,7 +1934,7 @@ test("workflow cost tracking bills a retried live call and the attempt before it
 			: { inputTokens: 3000, outputTokens: 100 },
 	);
 	const cacheDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-cost-cache-"));
-	const flaky = await failsOnceCommand();
+	const flaky = await failsOnceCommand(cacheDir);
 	try {
 		const { result } = await runWorkflow(
 			{
