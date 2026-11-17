@@ -1,5 +1,5 @@
 import type { PersistenceOptions } from "../persistence/context.js";
-import type { LlmSpendLedger } from "../core/llm_accounting.js";
+import type { LlmSpendLedger } from "../llm/accounting.js";
 export type RunContext = PersistenceOptions & {
 	stdin: NodeJS.ReadableStream;
 	stdout: NodeJS.WritableStream;

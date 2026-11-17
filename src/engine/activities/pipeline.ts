@@ -1,20 +1,16 @@
 import { PassThrough } from "node:stream";
 import { isDeepStrictEqual } from "node:util";
-import { parsePipeline } from "../parser.js";
-import { runPipeline } from "../runtime.js";
-import { RequestInputResumeError, type CommandInputState } from "../input_request.js";
-import { recorderFromEnv, bindRecorder } from "../persistence/context.js";
-import { carryLlmProvenance } from "../core/llm_accounting.js";
-import type { LlmSpendLedger } from "../core/llm_accounting.js";
-import { stableStringify } from "../state/store.js";
-import type { WorkflowStepResult } from "../workflows/types.js";
-import type { RunContext } from "../engine/context.js";
-import { stepScopedLedger, attachPipelineSourceItems } from "../engine/accounting.js";
-import {
-	parseJson,
-	serializePipelineItemsToStdout,
-	inputValueToPipelineItems,
-} from "../engine/values.js";
+import { parsePipeline } from "../../pipeline/parser.js";
+import { runPipeline } from "../../pipeline/runtime.js";
+import { RequestInputResumeError, type CommandInputState } from "../../pipeline/input_request.js";
+import { recorderFromEnv, bindRecorder } from "../../persistence/context.js";
+import { carryLlmProvenance } from "../../llm/accounting.js";
+import type { LlmSpendLedger } from "../../llm/accounting.js";
+import { stableStringify } from "../../state/store.js";
+import type { WorkflowStepResult } from "../../workflows/types.js";
+import type { RunContext } from "../context.js";
+import { stepScopedLedger, attachPipelineSourceItems } from "../accounting.js";
+import { parseJson, serializePipelineItemsToStdout, inputValueToPipelineItems } from "../values.js";
 
 export type WorkflowPipelineInputResumeState = {
 	pipeline: Array<{ name: string; args: Record<string, unknown>; raw: string }>;

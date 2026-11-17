@@ -9,7 +9,7 @@ import { promisify } from "node:util";
 import { createDefaultRegistry, resumeToolRequest, runToolRequest } from "../src/core/index.js";
 import { openStoreSession } from "../src/persistence/session.js";
 import { withFileLock } from "../src/state/file_lock.js";
-import { encodeToken } from "../src/token.js";
+import { encodeToken } from "../src/resume/token.js";
 import { pendingUpgrade, savedByOlderVersion, upgradeStore } from "../src/workflows/upgrade.js";
 
 const exec = promisify(execFile);

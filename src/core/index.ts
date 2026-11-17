@@ -1,8 +1,8 @@
 export { createDefaultRegistry } from "../commands/registry.js";
-export { parsePipeline } from "../parser.js";
-export { runPipeline } from "../runtime.js";
+export { parsePipeline } from "../pipeline/parser.js";
+export { runPipeline } from "../pipeline/runtime.js";
 export { runWorkflowFile, advanceWorkflowRun, abandonWorkflowRun } from "../workflows/file.js";
-export { decodeResumeToken } from "../resume.js";
+export { decodeResumeToken } from "../resume/resume.js";
 export { runToolRequest, resumeToolRequest, createToolContext } from "./tool_runtime.js";
 
 export {
@@ -25,7 +25,7 @@ export type { RunStatus, RunSummary } from "../persistence/model.js";
 
 export { upgradeStore, type UpgradeReport } from "../workflows/upgrade.js";
 
-export type { ResumeDecision, WaitResumeOptions, ResumeTarget } from "../resume_options.js";
+export type { ResumeDecision, WaitResumeOptions, ResumeTarget } from "../resume/options.js";
 export type { PersistenceOptions, RunScope } from "../persistence/context.js";
 export type {
 	RunMetadata,

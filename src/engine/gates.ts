@@ -4,7 +4,7 @@ import type {
 	WorkflowStepResult,
 	WorkflowRunResult,
 } from "../workflows/types.js";
-import { compileCached } from "../validation.js";
+import { compileCached } from "../util/validation.js";
 import { serializeValueForStdout } from "./values.js";
 import { resolveInputValue } from "../workflows/values.js";
 

@@ -1,19 +1,19 @@
 import path from "node:path";
 import { listRuns, getRun, getWait } from "./core/runs.js";
-import { forceTerminateAbortableProcesses } from "./abortable_process.js";
+import { forceTerminateAbortableProcesses } from "./process/abortable_process.js";
 import { createDefaultRegistry } from "./commands/registry.js";
 import { resumeToolRequest, createToolContext } from "./core/tool_runtime.js";
-import { parsePipeline } from "./parser.js";
+import { parsePipeline } from "./pipeline/parser.js";
 import { runtimeErrorDetails } from "./persistence/backend.js";
 import { recorderFromEnv } from "./persistence/context.js";
 import { withExecution } from "./persistence/execution.js";
 import { openStoreSession } from "./persistence/session.js";
-import { finalizePipelineToolRun } from "./pipeline_resume_state.js";
-import { parseResumeArgs } from "./resume.js";
-import { readLineFromStream } from "./read_line.js";
+import { finalizePipelineToolRun } from "./pipeline/resume_state.js";
+import { parseResumeArgs } from "./resume/resume.js";
+import { readLineFromStream } from "./io/read_line.js";
 import { defaultStateDir } from "./state/store.js";
 import { pendingUpgrade, upgradeStore, type UpgradeReport } from "./workflows/upgrade.js";
-import { runPipeline } from "./runtime.js";
+import { runPipeline } from "./pipeline/runtime.js";
 import {
 	loadWorkflowFile,
 	resolveWorkflowArgs,

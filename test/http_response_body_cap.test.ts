@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import http from "node:http";
 
 import { createDefaultRegistry } from "../src/commands/registry.js";
-import { readResponseTextCapped } from "../src/read_response_text.js";
+import { readResponseTextCapped } from "../src/io/read_response_text.js";
 
 const HTTP_RESPONSE_MAX_BYTES = 10 * 1024 * 1024;
 const OVER_LIMIT_BYTES = HTTP_RESPONSE_MAX_BYTES + 1;

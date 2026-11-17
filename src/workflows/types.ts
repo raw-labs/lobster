@@ -1,4 +1,4 @@
-import type { CostLimit, CostSummary } from "../core/cost_tracker.js";
+import type { CostLimit, CostSummary } from "../llm/cost_tracker.js";
 
 export type WorkflowFile = {
 	name?: string;

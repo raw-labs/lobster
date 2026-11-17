@@ -1,6 +1,6 @@
 import { defineCommand } from "../define.js";
-import { markLlmItem } from "../../core/llm_accounting.js";
-import type { LlmChargeCost, LlmSpendLedger, LlmProvenance } from "../../core/llm_accounting.js";
+import { markLlmItem } from "../../llm/accounting.js";
+import type { LlmChargeCost, LlmSpendLedger, LlmProvenance } from "../../llm/accounting.js";
 import path from "node:path";
 import { promises as fsp } from "node:fs";
 import { createHash } from "node:crypto";
@@ -17,8 +17,8 @@ import {
 	withFileLock,
 	writeFileAtomic,
 } from "../../state/store.js";
-import { createCompileCached } from "../../validation.js";
-import { httpResponseLimitFromEnv, readResponseTextCapped } from "../../read_response_text.js";
+import { createCompileCached } from "../../util/validation.js";
+import { httpResponseLimitFromEnv, readResponseTextCapped } from "../../io/read_response_text.js";
 
 const ajv = new Ajv({ allErrors: true, strict: false });
 const compileCachedLocal = createCompileCached(ajv);

@@ -8,7 +8,7 @@ import {
 	isInteractive,
 	parseApprovalTimeoutMs,
 } from "../gates.js";
-import { readLineFromStream } from "../../read_line.js";
+import { readLineFromStream } from "../../io/read_line.js";
 
 export async function approval(
 	machine: Machine,

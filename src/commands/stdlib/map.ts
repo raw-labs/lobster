@@ -1,5 +1,5 @@
 import { defineCommand } from "../define.js";
-import { getByPath } from "../../core/value_path.js";
+import { getByPath } from "../../util/value_path.js";
 
 function renderTemplate(tpl: string, ctx: any): string {
 	return tpl.replace(/\{\{\s*([^}]+?)\s*\}\}/g, (_m, expr) => {

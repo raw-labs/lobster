@@ -16,7 +16,7 @@ import {
 } from "../src/core/index.js";
 import { Lobster, approve, openStoreSession as openSdkStore } from "../src/sdk/index.js";
 import { openStoreSession as openCoreStore } from "../src/core/index.js";
-import { parseResumeArgs } from "../src/resume.js";
+import { parseResumeArgs } from "../src/resume/resume.js";
 
 const exec = promisify(execFile);
 const schema = {

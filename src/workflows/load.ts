@@ -1,7 +1,8 @@
+import { closestMatch } from "../util/suggest.js";
 import { promises as fsp } from "node:fs";
 import path from "node:path";
 import { parse as parseYaml } from "yaml";
-import { compileCached } from "../validation.js";
+import { compileCached } from "../util/validation.js";
 import type { WorkflowFile, WorkflowStep, ParallelConfig } from "./types.js";
 
 export async function loadWorkflowFile(filePath: string): Promise<WorkflowFile> {
@@ -565,7 +566,7 @@ function checkKeys(value: unknown, allowed: string[], where: string) {
 	if (!isPlainObject(value)) return;
 	for (const key of Object.keys(value)) {
 		if (allowed.includes(key)) continue;
-		const near = allowed.find((candidate) => editDistance(key, candidate) <= 2);
+		const near = closestMatch(key, allowed);
 		throw new Error(
 			`${where} has unknown key "${key}"${near ? ` (did you mean "${near}"?)` : ""}. Allowed: ${allowed.join(", ")}`,
 		);
@@ -574,20 +575,4 @@ function checkKeys(value: unknown, allowed: string[], where: string) {
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
 	return Boolean(value) && typeof value === "object" && !Array.isArray(value);
-}
-
-function editDistance(a: string, b: string): number {
-	let previous = Array.from({ length: b.length + 1 }, (_, i) => i);
-	for (let i = 1; i <= a.length; i++) {
-		const current = [i];
-		for (let j = 1; j <= b.length; j++) {
-			current[j] = Math.min(
-				previous[j] + 1,
-				current[j - 1] + 1,
-				previous[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1),
-			);
-		}
-		previous = current;
-	}
-	return previous[b.length];
 }

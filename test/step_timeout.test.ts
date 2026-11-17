@@ -8,7 +8,7 @@ import { PassThrough } from "node:stream";
 
 import { loadWorkflowFile, runWorkflowFile } from "../src/workflows/file.js";
 import { createDefaultRegistry } from "../src/commands/registry.js";
-import { decodeResumeToken } from "../src/resume.js";
+import { decodeResumeToken } from "../src/resume/resume.js";
 
 async function runWorkflow(
 	workflow: unknown,

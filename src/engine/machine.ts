@@ -1,19 +1,19 @@
 import { randomUUID } from "node:crypto";
 import type { RunContext } from "./context.js";
 import type { WorkflowStep, WorkflowStepResult, WorkflowRunResult } from "../workflows/types.js";
-import type { LlmSpendLedger } from "../core/llm_accounting.js";
-import { createLlmSpendLedger, restoreLlmProvenance } from "../core/llm_accounting.js";
-import { CostTracker, CostLimitExceededError, type CostLimit } from "../core/cost_tracker.js";
-import { resolveRetryConfig, computeDelay } from "../core/retry.js";
+import type { LlmSpendLedger } from "../llm/accounting.js";
+import { createLlmSpendLedger, restoreLlmProvenance } from "../llm/accounting.js";
+import { CostTracker, CostLimitExceededError, type CostLimit } from "../llm/cost_tracker.js";
+import { resolveRetryConfig, computeDelay } from "./retry.js";
 import { PersistenceError, WaitConflictError } from "../persistence/backend.js";
-import { RequestInputResumeError } from "../input_request.js";
+import { RequestInputResumeError } from "../pipeline/input_request.js";
 import {
 	createApprovalIndex,
 	cleanupApprovalIndexByStateKey,
 	findApprovalIdByStateKey,
 } from "../state/store.js";
 import { resumeGuardFromEnv } from "../persistence/context.js";
-import { encodeToken } from "../token.js";
+import { encodeToken } from "../resume/token.js";
 import { enter } from "./nodes/condition.js";
 import { isApprovalStep } from "../workflows/load.js";
 import {
@@ -32,7 +32,7 @@ import { activity } from "./nodes/activity.js";
 import { forEach } from "./nodes/for-each.js";
 import { parallel } from "./nodes/parallel.js";
 import { childWorkflow } from "./nodes/child-workflow.js";
-import { WorkflowPipelineHaltError } from "../activities/pipeline.js";
+import { WorkflowPipelineHaltError } from "./activities/pipeline.js";
 import { input } from "./nodes/input.js";
 import { approval } from "./nodes/approval.js";
 import { toOutputItems } from "./values.js";

@@ -1,5 +1,5 @@
-import type { WorkflowFile } from "../workflows/types.js";
-import { createRecord } from "../workflows/values.js";
+import type { WorkflowFile } from "./types.js";
+import { createRecord } from "./values.js";
 export function resolveWorkflowArgs(
 	argDefs: WorkflowFile["args"],
 	provided: Record<string, unknown> | undefined,

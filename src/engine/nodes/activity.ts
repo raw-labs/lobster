@@ -1,7 +1,7 @@
 import { activation, InterruptedActivityError } from "../state.js";
 import type { Machine, Scope } from "../machine.js";
 import type { WorkflowStep } from "../../workflows/types.js";
-import { parsePipeline } from "../../parser.js";
+import { parsePipeline } from "../../pipeline/parser.js";
 import { getStepExecution } from "../../workflows/load.js";
 import { resolveTemplate } from "../../workflows/expressions.js";
 import {
@@ -10,8 +10,8 @@ import {
 	resolveInputValue,
 	encodeShellInput,
 } from "../../workflows/values.js";
-import { runShellCommand } from "../../activities/command.js";
-import { runPipelineStep, WorkflowPipelineInputSuspension } from "../../activities/pipeline.js";
+import { runShellCommand } from "../activities/shell.js";
+import { runPipelineStep, WorkflowPipelineInputSuspension } from "../activities/pipeline.js";
 import { parseJson, createSyntheticStepResult } from "../values.js";
 import { bindRecorder, recorderFromEnv } from "../../persistence/context.js";
 import { input } from "./input.js";

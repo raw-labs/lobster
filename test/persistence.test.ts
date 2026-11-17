@@ -13,7 +13,7 @@ import { PersistenceOutcomeUnknown } from "../src/persistence/backend.js";
 import type { Transition } from "../src/persistence/model.js";
 import type { SqliteBackend } from "../src/persistence/sqlite.js";
 import { bindStoreSession, openStoreSession } from "../src/persistence/session.js";
-import { decodeResumeToken } from "../src/resume.js";
+import { decodeResumeToken } from "../src/resume/resume.js";
 import { Lobster } from "../src/sdk/Lobster.js";
 import { diffAndStore, readStateJsonWithLock, writeStateJson } from "../src/state/store.js";
 

@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { mkdtempSync, promises as fsp } from "node:fs";
 import { createDefaultRegistry } from "../src/commands/registry.js";
-import { runPipeline } from "../src/runtime.js";
+import { runPipeline } from "../src/pipeline/runtime.js";
 import { diffLast, diffAndStoreValue } from "../src/sdk/primitives/diff.js";
 import { stateSet, readState, writeState } from "../src/sdk/primitives/state.js";
 import {

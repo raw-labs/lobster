@@ -1,5 +1,5 @@
-import { validateCommandInputState } from "../input_request.js";
-import { compileCached } from "../validation.js";
+import { validateCommandInputState } from "../pipeline/input_request.js";
+import { compileCached } from "../util/validation.js";
 import { fingerprint, isRetiredCheckpoint } from "./model.js";
 
 /** Wrap a stored SDK input frame without changing the legacy token's state key. */

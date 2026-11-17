@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { parsePipeline } from "../src/parser.js";
+import { parsePipeline } from "../src/pipeline/parser.js";
 import { createDefaultRegistry } from "../src/commands/registry.js";
 
 const registry = createDefaultRegistry();

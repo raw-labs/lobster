@@ -1,6 +1,6 @@
 import { tokenizeCommand } from "./command_tokens.js";
-import { booleanFlags } from "./commands/define.js";
-import type { CommandRegistry } from "./commands/types.js";
+import { booleanFlags } from "../commands/define.js";
+import type { CommandRegistry } from "../commands/types.js";
 
 function splitPipes(input) {
 	const parts = [];

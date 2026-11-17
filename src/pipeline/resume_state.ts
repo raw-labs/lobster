@@ -1,8 +1,8 @@
-import type { WaitRequest } from "./persistence/waits.js";
-import { publishTrackedCheckpoint } from "./persistence/continuations.js";
+import type { WaitRequest } from "../persistence/waits.js";
+import { publishTrackedCheckpoint } from "../persistence/continuations.js";
 import { randomUUID } from "node:crypto";
 import { validateCommandInputState, type CommandInputState } from "./input_request.js";
-import { recorderFromEnv } from "./persistence/context.js";
+import { recorderFromEnv } from "../persistence/context.js";
 import {
 	cleanupApprovalIndexByStateKey,
 	consumeResumeState,
@@ -14,9 +14,9 @@ import {
 	readStateJsonWithLock,
 	restoreConsumedResumeState,
 	writeStateJson,
-} from "./state/store.js";
-import { encodeToken } from "./token.js";
-import { compileCached } from "./validation.js";
+} from "../state/store.js";
+import { encodeToken } from "../resume/token.js";
+import { compileCached } from "../util/validation.js";
 
 export type PipelineResumeState = {
 	wait?: WaitRequest;

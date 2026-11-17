@@ -6,8 +6,8 @@ import os from "node:os";
 import path from "node:path";
 
 import { resumeToolRequest, runToolRequest } from "../src/core/tool_runtime.js";
-import { runPipeline } from "../src/runtime.js";
-import { decodeResumeToken } from "../src/resume.js";
+import { runPipeline } from "../src/pipeline/runtime.js";
+import { decodeResumeToken } from "../src/resume/resume.js";
 import { readStateJsonWithLock as readStateJson, writeStateJson } from "../src/state/store.js";
 
 const responseSchema = {

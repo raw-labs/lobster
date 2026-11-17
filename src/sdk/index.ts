@@ -42,7 +42,7 @@ export type { RunStatus, RunSummary } from "../persistence/model.js";
 
 export { upgradeStore, type UpgradeReport } from "../workflows/upgrade.js";
 
-export type { ResumeDecision, WaitResumeOptions, ResumeTarget } from "../resume_options.js";
+export type { ResumeDecision, WaitResumeOptions, ResumeTarget } from "../resume/options.js";
 export type { PersistenceOptions, RunScope } from "../persistence/context.js";
 export type {
 	RunMetadata,

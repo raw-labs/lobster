@@ -9,8 +9,8 @@ import {
 	mergeEnv,
 	resolveCwd,
 } from "../../workflows/values.js";
-import { resolveWorkflowArgs } from "../../definition/args.js";
-import { snapshotDefinition } from "../../definition/normalize.js";
+import { resolveWorkflowArgs } from "../../workflows/args.js";
+import { snapshotDefinition } from "../../workflows/definition.js";
 import { sequence } from "./sequence.js";
 import { toOutputItems, createSyntheticStepResult } from "../values.js";
 import { pipelineSourceItems, attachPipelineSourceItems } from "../accounting.js";

@@ -8,7 +8,7 @@ import os from "node:os";
 import { createDefaultRegistry } from "../src/commands/registry.js";
 import { runWorkflowFile, advanceWorkflowRun } from "../src/workflows/file.js";
 import { openStoreSession } from "../src/persistence/session.js";
-import { decodeResumeToken } from "../src/resume.js";
+import { decodeResumeToken } from "../src/resume/resume.js";
 import { keyToPath, readStateJsonWithLock as readStateJson } from "../src/state/store.js";
 
 async function savedPipelineInput(env: Record<string, string | undefined>, key: string) {
