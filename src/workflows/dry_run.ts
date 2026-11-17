@@ -82,11 +82,31 @@ export function dryRunWorkflow({
 	startIndex: number;
 	ctx: { stderr: NodeJS.WritableStream; registry?: { get: (name: string) => unknown } };
 }): WorkflowRunResult {
-	const lines: string[] = [];
-	const undecided = new Set<string>();
 	const totalSteps = steps.length - startIndex;
-	lines.push(`[DRY RUN] Would execute ${totalSteps} step${totalSteps !== 1 ? "s" : ""}:\n`);
+	const lines = [
+		`[DRY RUN] Would execute ${totalSteps} step${totalSteps !== 1 ? "s" : ""}:\n`,
+		...planSteps(steps, resolvedArgs, results, startIndex, ctx, new Set<string>()),
+		"",
+	];
+	ctx.stderr.write(lines.join("\n"));
+	return { status: "ok", output: [] };
+}
 
+type PlanContext = Parameters<typeof dryRunWorkflow>[0]["ctx"];
+
+/**
+ * The plan of `steps`, one numbered entry each. `undecided` holds the steps whose outcome
+ * depends on output the plan does not have; it grows as steps are planned.
+ */
+function planSteps(
+	steps: WorkflowStep[],
+	resolvedArgs: Record<string, unknown>,
+	results: Record<string, WorkflowStepResult>,
+	startIndex: number,
+	ctx: PlanContext,
+	undecided: Set<string>,
+): string[] {
+	const lines: string[] = [];
 	for (let idx = startIndex; idx < steps.length; idx++) {
 		const step = steps[idx];
 		const num = idx - startIndex + 1;
@@ -135,6 +155,15 @@ export function dryRunWorkflow({
 			lines.push(`     prompt: ${step.input.prompt}`);
 			lines.push(`     [input required]`);
 			results[step.id] = { id: step.id, response: { pending: true } };
+			noteCondition();
+			continue;
+		}
+
+		if (step.switch) {
+			lines.push(`  ${num}. ${step.id}  [switch]`);
+			planSwitch(step, resolvedArgs, results, ctx, undecided, lines);
+			if (step.timeout_ms) lines.push(`     timeout: ${step.timeout_ms}ms`);
+			if (step.on_error && step.on_error !== "stop") lines.push(`     on_error: ${step.on_error}`);
 			noteCondition();
 			continue;
 		}
@@ -358,8 +387,70 @@ export function dryRunWorkflow({
 			? { id: step.id, approved: true }
 			: { id: step.id };
 	}
+	return lines;
+}
 
-	lines.push("");
-	ctx.stderr.write(lines.join("\n"));
-	return { status: "ok", output: [] };
+/**
+ * A switch's cases, in order. A case decided from what the plan knows either runs (and the
+ * plan follows it) or does not; once a case depends on step output, every case from there
+ * may run, so each is planned and its steps count as undecided.
+ */
+function planSwitch(
+	step: WorkflowStep,
+	resolvedArgs: Record<string, unknown>,
+	results: Record<string, WorkflowStepResult>,
+	ctx: PlanContext,
+	undecided: Set<string>,
+	lines: string[],
+) {
+	const config = step.switch!;
+	let chosen = false;
+	let open = false;
+	const MAY_RUN = "may run — depends on step output";
+	const branch = (label: string, steps: WorkflowStep[], state: string) => {
+		lines.push(`     ${label}  [${state}]`);
+		if (state !== "runs" && state !== MAY_RUN) {
+			for (const id of stepIds(steps)) results[id] ??= { id, skipped: true };
+			return;
+		}
+		for (const line of planSteps(steps, resolvedArgs, results, 0, ctx, undecided))
+			lines.push(`     ${line}`);
+		// Whether these steps run is not known, so neither is anything that reads them.
+		if (state === MAY_RUN) for (const id of stepIds(steps)) undecided.add(id);
+	};
+	config.cases.forEach((entry, index) => {
+		const label = `case ${index + 1}: when ${String(entry.when).replace(/\s+/g, " ").trim()}`;
+		if (chosen) return branch(label, entry.steps, "not reached");
+		if (open || dependsOnStepOutput(entry.when, undecided)) {
+			checkConditionSyntax(entry.when);
+			open = true;
+			return branch(label, entry.steps, MAY_RUN);
+		}
+		if (evaluateCondition(entry.when, results)) {
+			chosen = true;
+			return branch(label, entry.steps, "runs");
+		}
+		branch(label, entry.steps, "condition: false");
+	});
+	if (config.else) {
+		branch("else", config.else, chosen ? "not reached" : open ? MAY_RUN : "runs");
+	} else if (!chosen && !open) {
+		throw new Error(`Workflow step ${step.id} switch: no case matched and there is no else`);
+	}
+	if (open) undecided.add(step.id);
+	results[step.id] = { id: step.id };
+}
+
+/** Every step id a list of steps can produce, nested switches included. */
+function stepIds(steps: WorkflowStep[]): string[] {
+	return steps.flatMap((step) => [
+		step.id,
+		...(step.parallel?.branches ?? []).map((branch) => branch.id),
+		...(step.switch
+			? [
+					...step.switch.cases.flatMap((entry) => stepIds(entry.steps)),
+					...stepIds(step.switch.else ?? []),
+				]
+			: []),
+	]);
 }

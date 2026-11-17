@@ -44,6 +44,8 @@ export type Activation = {
 	retryAt?: number;
 	cursor?: number;
 	lastStepId?: string;
+	/** A switch's chosen case: its number from 1, or "else". */
+	case?: number | "else";
 	dispatchAttempts?: number;
 	items?: unknown[];
 	iterations?: unknown[];
@@ -119,6 +121,7 @@ export function nodeKind(step: WorkflowStep) {
 	if (step.for_each !== undefined) return "for-each";
 	if (step.parallel) return "parallel";
 	if (step.workflow) return "child-workflow";
+	if (step.switch) return "switch";
 	if (step.input) return "input";
 	if (step.sleep !== undefined) return "sleep";
 	if (step.wait) return "event";

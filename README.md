@@ -650,6 +650,7 @@ Lobster workflow files are meant to read like small scripts:
 - `run:` or `command:` for deterministic shell/CLI steps
 - `pipeline:` for native Lobster stages like `llm.invoke`
 - `approval:` for hard workflow gates between steps
+- `when:` and `switch:` for branching (see [Conditions](#conditions) and [Switch](#switch))
 - `stdin: $step.stdout` or `stdin: $step.json` to pass data forward
 
 ```
@@ -698,6 +699,55 @@ Notes:
   - `approval.initiated_by` (or `initiatedBy`) sets the initiator id for comparison.
   - `LOBSTER_APPROVAL_INITIATED_BY` can provide a default initiator id at run time.
   - `LOBSTER_APPROVAL_APPROVED_BY` is used at resume/approval time for identity checks.
+
+### Conditions
+
+`when:`, `condition:` and switch cases take a condition:
+
+- **Values:** step fields (`$classify.json.label`, `$confirm.approved`, `$route.case`), strings in quotes, numbers, `true`, `false`, `null`, and lists (`[refund, spam]`). On the right of an operator, a bare word is a string: `$review.response.decision == approve`.
+- **Operators:** `==`, `!=`, `<`, `<=`, `>`, `>=`, `in`, `contains`, `matches`, then `!`, `&&`, `||` and parentheses. A comparison does not chain.
+- **`in` / `contains`:** `$c.json.label in [refund, spam]` and `$c.json.tags contains urgent` test list membership (by value, without converting types); with two strings they test for a substring. Anything else fails the step.
+- **`matches`:** `$c.json.label matches "^urgent-"` tests a regular expression, which must be a quoted string in the file. Only a string can be matched.
+- **Checked when the file loads:** syntax (errors give the character position), that every step a condition reads runs before it, and literal operands that would fail on every run (`$n.json.count > "high"`, `5 matches "x"`).
+
+### Switch
+
+A `switch` step runs the steps of its first case whose `when` holds, or its `else`:
+
+```yaml
+steps:
+  - id: classify
+    pipeline: llm.invoke --prompt "Classify this email" --output-schema '{"type":"object"}'
+
+  - id: route
+    switch:
+      cases:
+        - when: $classify.json.label == refund && $classify.json.score >= 0.8
+          steps:
+            - id: confirm
+              approval: Issue the refund?
+            - id: refund
+              run: billing refund --order ${order}
+              when: $confirm.approved
+        - when: $classify.json.label in [spam, junk]
+          steps:
+            - id: drop
+              run: mail archive ${message}
+      else:
+        - id: triage
+          run: tickets create --queue support
+
+  - id: notify
+    run: notify --summary
+    stdin: $route.json
+```
+
+- The choice is made once from saved results and kept, so a resumed or recovered run continues the same case.
+- A case's steps are full steps: approvals, inputs, waits, child workflows, nested switches.
+- `$route.json` is the output of the last step that ran in the chosen case ("whichever branch ran"), and `$route.case` is the case's number from 1, or `"else"`.
+- Steps of the cases that did not run count as skipped (`$drop.skipped`), so later steps can read any of them. A case cannot read the steps of another case.
+- With no matching case and no `else`, the step fails; `else: []` means "nothing".
+- A switch takes `when`, `timeout_ms`, `on_error` and `retry` like any step; a retry runs the chosen case again, so only retry work that is safe to repeat. A switch cannot be a `for_each` sub-step.
 
 ### Retries after external dispatch
 

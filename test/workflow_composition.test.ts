@@ -122,7 +122,7 @@ test("workflow validation rejects workflow combined with run", async () => {
 	);
 	await assert.rejects(
 		() => loadWorkflowFile(filePath),
-		/can only define one of run, command, pipeline, workflow, parallel, for_each, sleep, or wait/,
+		/can only define one of run, command, pipeline, workflow, parallel, for_each, switch, sleep, or wait/,
 	);
 });
 
@@ -138,7 +138,7 @@ test("workflow validation rejects workflow combined with pipeline", async () => 
 	);
 	await assert.rejects(
 		() => loadWorkflowFile(filePath),
-		/can only define one of run, command, pipeline, workflow, parallel, for_each, sleep, or wait/,
+		/can only define one of run, command, pipeline, workflow, parallel, for_each, switch, sleep, or wait/,
 	);
 });
 

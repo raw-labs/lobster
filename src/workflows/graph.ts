@@ -36,6 +36,7 @@ function isInputStep(step: WorkflowStep) {
 
 function stepType(step: WorkflowStep) {
 	if (step.parallel) return "parallel";
+	if (step.switch) return "switch";
 	if (typeof step.for_each === "string") return "for_each";
 	if (typeof step.workflow === "string" && step.workflow.trim()) return "workflow";
 	if (typeof step.pipeline === "string" && step.pipeline.trim()) return "pipeline";
@@ -48,6 +49,10 @@ function stepType(step: WorkflowStep) {
 }
 
 function stepDetails(step: WorkflowStep, args: Record<string, unknown>) {
+	if (step.switch) {
+		const cases = step.switch.cases.length;
+		return `switch (${cases} case${cases === 1 ? "" : "s"}${step.switch.else ? " + else" : ""})`;
+	}
 	if (step.parallel) {
 		return `parallel (${step.parallel.wait ?? "all"})`;
 	}
@@ -107,8 +112,15 @@ function truncate(value: string, max = 80) {
 function collectGraph(workflow: WorkflowFile, args: Record<string, unknown>) {
 	const nodes: GraphNode[] = [];
 	const edges: GraphEdge[] = [];
-	const knownStepIds = new Set(workflow.steps.map((s) => s.id));
-	let prevStepId: string | null = null;
+	const knownStepIds = new Set<string>();
+	const collectIds = (steps: WorkflowStep[]) => {
+		for (const step of steps) {
+			knownStepIds.add(step.id);
+			for (const entry of step.switch?.cases ?? []) collectIds(entry.steps);
+			collectIds(step.switch?.else ?? []);
+		}
+	};
+	collectIds(workflow.steps);
 
 	const seenEdgeKeys = new Set<string>();
 	const addEdge = (edge: GraphEdge) => {
@@ -117,41 +129,60 @@ function collectGraph(workflow: WorkflowFile, args: Record<string, unknown>) {
 		seenEdgeKeys.add(key);
 		edges.push(edge);
 	};
-
-	for (const step of workflow.steps) {
-		const type = stepType(step);
-		const details = stepDetails(step, args);
-		const label = details ? `${step.id}\\n${truncate(details)}` : step.id;
-		nodes.push({
-			id: step.id,
-			type,
-			label,
-			shape: isApprovalStep(step) ? "diamond" : "box",
-		});
-
-		if (prevStepId) {
-			addEdge({ from: prevStepId, to: step.id, label: "next" });
+	const conditionEdges = (condition: unknown, to: string, label: string) => {
+		if (typeof condition !== "string" || !condition.trim()) return;
+		for (const ref of extractStepRefs(condition)) {
+			if (knownStepIds.has(ref)) addEdge({ from: ref, to, label });
 		}
-		prevStepId = step.id;
+	};
 
-		for (const ref of extractStepRefs(step.stdin)) {
-			if (knownStepIds.has(ref)) addEdge({ from: ref, to: step.id, label: "stdin" });
-		}
+	/**
+	 * Adds `steps` in order, each entered by `incoming` (edges still waiting for a target),
+	 * and returns the edges that leave the last of them. A switch enters each case's first
+	 * step, and every case leaves to whatever follows the switch.
+	 */
+	const visit = (steps: WorkflowStep[], incoming: Omit<GraphEdge, "to">[]) => {
+		for (const step of steps) {
+			const type = stepType(step);
+			const details = stepDetails(step, args);
+			const label = details ? `${step.id}\\n${truncate(details)}` : step.id;
+			nodes.push({
+				id: step.id,
+				type,
+				label,
+				shape: isApprovalStep(step) || step.switch ? "diamond" : "box",
+			});
+			for (const edge of incoming) addEdge({ ...edge, to: step.id });
 
-		if (typeof step.for_each === "string") {
-			for (const ref of extractStepRefs(step.for_each)) {
-				if (knownStepIds.has(ref)) addEdge({ from: ref, to: step.id, label: "for_each" });
+			for (const ref of extractStepRefs(step.stdin)) {
+				if (knownStepIds.has(ref)) addEdge({ from: ref, to: step.id, label: "stdin" });
 			}
-		}
-
-		const condition = step.when ?? step.condition;
-		if (typeof condition === "string" && condition.trim()) {
-			const labelValue = truncate(`when: ${condition.trim()}`, 70);
-			for (const ref of extractStepRefs(condition)) {
-				if (knownStepIds.has(ref)) addEdge({ from: ref, to: step.id, label: labelValue });
+			if (typeof step.for_each === "string") {
+				for (const ref of extractStepRefs(step.for_each)) {
+					if (knownStepIds.has(ref)) addEdge({ from: ref, to: step.id, label: "for_each" });
+				}
 			}
+			const condition = step.when ?? step.condition;
+			if (typeof condition === "string")
+				conditionEdges(condition, step.id, truncate(`when: ${condition.trim()}`, 70));
+
+			if (!step.switch) {
+				incoming = [{ from: step.id, label: "next" }];
+				continue;
+			}
+			const leaving: Omit<GraphEdge, "to">[] = [];
+			step.switch.cases.forEach((entry, index) => {
+				const caseLabel = truncate(`case ${index + 1}: when ${String(entry.when).trim()}`, 70);
+				conditionEdges(entry.when, step.id, caseLabel);
+				leaving.push(...visit(entry.steps, [{ from: step.id, label: caseLabel }]));
+			});
+			if (step.switch.else)
+				leaving.push(...visit(step.switch.else, [{ from: step.id, label: "else" }]));
+			incoming = leaving;
 		}
-	}
+		return incoming;
+	};
+	visit(workflow.steps, []);
 
 	return { nodes, edges };
 }

@@ -153,7 +153,7 @@ test("for_each validation rejects run/command/pipeline/workflow/parallel on loop
 	);
 	await assert.rejects(
 		() => loadWorkflowFile(filePath),
-		/for_each cannot also define run, command, pipeline, workflow, or parallel/,
+		/for_each cannot also define run, command, pipeline, workflow, parallel, or switch/,
 	);
 });
 

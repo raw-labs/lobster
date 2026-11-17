@@ -82,7 +82,8 @@ type NodeExample = {
 	/** A `when` that makes the node skip (default: false). */
 	skipWhen?: unknown;
 	dryRun: RegExp[];
-	graph: { type: string; diamond?: boolean };
+	/** `leaves` are the nodes that lead to the next step (default: the node itself). */
+	graph: { type: string; diamond?: boolean; leaves?: string[] };
 	/** Node-specific edits that validation must reject (shared ones are in SHARED_INVALID). */
 	invalid: Array<[string, (step: any) => any]>;
 	/** Extra condition (on the last saved checkpoint) before a crash test may kill. */
@@ -283,7 +284,7 @@ const NODES: NodeExample[] = [
 			["empty steps", (step) => ({ ...step, steps: [] })],
 			["unknown sub-step key", (step) => ({ ...step, steps: [{ ...step.steps[0], wehn: true }] })],
 		],
-		rejectedIn: { forEach: /cannot define workflow, parallel, or for_each/ },
+		rejectedIn: { forEach: /cannot define workflow, parallel, for_each, or switch/ },
 		cells: all("generic"),
 	},
 	...(["all", "any"] as const).map((wait): NodeExample => ({
@@ -342,7 +343,7 @@ const NODES: NodeExample[] = [
 		],
 		// The completed branch must be saved before the crash, or recovery would rightly repeat it.
 		crashReady: wait === "all" ? (saved) => saved.includes("result-of-other") : undefined,
-		rejectedIn: { forEach: /cannot define workflow, parallel, or for_each/ },
+		rejectedIn: { forEach: /cannot define workflow, parallel, for_each, or switch/ },
 		cells: all("generic"),
 	})),
 	{
@@ -362,7 +363,7 @@ const NODES: NodeExample[] = [
 			["workflow_args as a list", (step) => ({ ...step, workflow_args: ["x"] })],
 			["missing child file", (step) => ({ ...step, workflow: "missing.lobster" })],
 		],
-		rejectedIn: { forEach: /cannot define workflow, parallel, or for_each/ },
+		rejectedIn: { forEach: /cannot define workflow, parallel, for_each, or switch/ },
 		cells: {
 			...all("generic"),
 			validation: async (t, fx, node) => {
@@ -379,6 +380,59 @@ const NODES: NodeExample[] = [
 				assert.deepEqual(accepted, [], "a child with these invalid edits must be rejected");
 			},
 		},
+	},
+	{
+		name: "switch",
+		engine: ["switch", "activity", "condition", "sequence"],
+		build: async (_fx, o = {}) => ({
+			id: "n",
+			switch: {
+				cases: [
+					{ when: false, steps: [{ id: "unused", pipeline: "fake --name unused" }] },
+					{ when: true, steps: [{ id: "w", pipeline: "fake --name w", ...rec(o.recovery) }] },
+				],
+				else: [{ id: "fallback", pipeline: "fake --name fallback" }],
+			},
+		}),
+		workCalls: 1,
+		reference: { expr: "$n.json", expected: fakeResult("w", 1) },
+		dryRun: [
+			/\d\. n {2}\[switch\]/,
+			/case 1: when false {2}\[condition: false\]/,
+			/case 2: when true {2}\[runs\]/,
+			/1\. w {2}\[pipeline\]/,
+			/else {2}\[not reached\]/,
+		],
+		graph: { type: "switch", diamond: true, leaves: ["unused", "w", "fallback"] },
+		invalid: [
+			["switch as a list", (step) => ({ ...step, switch: [] })],
+			["no cases", (step) => ({ ...step, switch: { cases: [] } })],
+			[
+				"a case without steps",
+				(step) => ({ ...step, switch: { cases: [{ when: true, steps: [] }] } }),
+			],
+			[
+				"a case when as a number",
+				(step) => ({
+					...step,
+					switch: { cases: [{ when: 1, steps: step.switch.cases[1].steps }] },
+				}),
+			],
+			[
+				"an unknown case key",
+				(step) => ({ ...step, switch: { cases: [{ ...step.switch.cases[1], wehn: true }] } }),
+			],
+			["an unknown switch key", (step) => ({ ...step, switch: { ...step.switch, default: [] } })],
+			["else as an object", (step) => ({ ...step, switch: { ...step.switch, else: {} } })],
+			[
+				"a case step id used twice",
+				(step) => ({ ...step, switch: { cases: [step.switch.cases[1], step.switch.cases[1]] } }),
+			],
+			["switch with run", (step) => ({ ...step, run: "echo x" })],
+			["switch with approval", (step) => ({ ...step, approval: true })],
+		],
+		rejectedIn: { forEach: /cannot define workflow, parallel, for_each, or switch/ },
+		cells: all("generic"),
 	},
 	{
 		name: "sleep",
@@ -521,7 +575,8 @@ const GENERIC: Record<Concern, Custom> = {
 		);
 		const ascii = renderWorkflowGraph({ workflow, format: "ascii" });
 		assert.match(ascii, new RegExp(`^- n \\[${node.graph.type}\\]`, "m"));
-		assert.match(ascii, /^- n -> next \(next\)$/m);
+		for (const leaf of node.graph.leaves ?? ["n"])
+			assert.match(ascii, new RegExp(`^- ${leaf} -> next \\(next\\)$`, "m"));
 		const mermaid = renderWorkflowGraph({ workflow, format: "mermaid" });
 		assert.match(mermaid, node.graph.diamond ? /^ {2}n\{"n/m : /^ {2}n\["n/m);
 		const dot = renderWorkflowGraph({ workflow, format: "dot" });

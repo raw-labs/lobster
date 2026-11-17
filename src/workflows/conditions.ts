@@ -1,31 +1,51 @@
 /**
- * The condition language of `when:` and `condition:`.
+ * The condition language of `when:`, `condition:` and `switch` cases.
  *
  * A condition is parsed once into a syntax tree, then evaluated against step results.
- * Parsing alone checks syntax: when a workflow loads, and in dry-run for conditions on
- * output a plan does not have.
+ * Parsing checks syntax; `checkCondition` also checks what can be known before a run
+ * (step references, literal operands), and runs when a workflow loads.
  *
  *   or      := and ("||" and)*
  *   and     := compare ("&&" compare)*
- *   compare := unary [("==" | "!=" | "<" | "<=" | ">" | ">=") unary']
+ *   compare := unary [operator unary']
+ *   operator:= "==" | "!=" | "<" | "<=" | ">" | ">=" | "in" | "contains" | "matches"
  *   unary   := "!" unary | primary
- *   primary := "(" or ")" | $step.path | "string" | 'string' | number | true | false | null
+ *   primary := "(" or ")" | "[" [primary ("," primary)*] "]" | $step.path
+ *            | "string" | 'string' | number | true | false | null
  *
- * `unary'` on the right of a comparison may also be a bare word, read as a string:
- * `$review.response.decision == approve`. A comparison does not chain.
+ * On the right of an operator (and inside a list there) a bare word is a string:
+ * `$review.response.decision == approve`, `$c.json.label in [refund, spam]`.
+ * A comparison does not chain. `matches` takes a regular expression as a quoted string.
  */
 import { isDeepStrictEqual } from "node:util";
 import { getStepRefValue } from "./expressions.js";
 import type { WorkflowStepResult } from "./types.js";
 
-export type ComparisonOperator = "==" | "!=" | "<" | "<=" | ">" | ">=";
+export type ComparisonOperator =
+	| "=="
+	| "!="
+	| "<"
+	| "<="
+	| ">"
+	| ">="
+	| "in"
+	| "contains"
+	| "matches";
 
+/** `at` is where the node starts in the condition text, from 0. */
 export type ConditionNode =
-	| { kind: "literal"; value: string | number | boolean | null }
-	| { kind: "ref"; id: string; path: string }
-	| { kind: "not"; operand: ConditionNode }
-	| { kind: "and" | "or"; left: ConditionNode; right: ConditionNode }
-	| { kind: "compare"; operator: ComparisonOperator; left: ConditionNode; right: ConditionNode };
+	| { kind: "literal"; at: number; value: string | number | boolean | null }
+	| { kind: "list"; at: number; items: ConditionNode[] }
+	| { kind: "ref"; at: number; id: string; path: string }
+	| { kind: "not"; at: number; operand: ConditionNode }
+	| { kind: "and" | "or"; at: number; left: ConditionNode; right: ConditionNode }
+	| {
+			kind: "compare";
+			at: number;
+			operator: ComparisonOperator;
+			left: ConditionNode;
+			right: ConditionNode;
+	  };
 
 export type Condition = { source: string; root: ConditionNode };
 
@@ -46,20 +66,72 @@ export function checkConditionSyntax(condition: unknown) {
 	if (typeof condition === "string") parseCondition(condition);
 }
 
+/**
+ * Check a condition before any step runs: its syntax, that every step it reads is one of
+ * `known` (the steps that run before it), and that no literal operand makes it fail on
+ * every run (`$a.json.n > "high"`, `$a.json.tags contains 3`, `5 matches "x"`).
+ */
+export function checkCondition(condition: unknown, known?: ReadonlySet<string>) {
+	if (typeof condition !== "string") return;
+	const { source, root } = parseCondition(condition);
+	const fail = (reason: string, at: number): never => {
+		throw new Error(`Condition "${source}" ${reason} (at character ${at + 1})`);
+	};
+	walk(root, (node) => {
+		if (node.kind === "ref" && known && !known.has(node.id))
+			fail(`reads $${node.id}.${node.path}, but no step "${node.id}" runs before it`, node.at);
+		if (node.kind !== "compare") return;
+		const { operator, left, right } = node;
+		if (["<", "<=", ">", ">="].includes(operator)) {
+			for (const side of [left, right])
+				if (isLiteralKind(side) && !isStrictlyNumeric(literalValue(side)))
+					fail(`cannot order ${describeNode(side)}: only numbers can be ordered`, side.at);
+		}
+		const container = operator === "in" ? right : operator === "contains" ? left : undefined;
+		if (container && isLiteralKind(container)) {
+			const value = literalValue(container);
+			if (!Array.isArray(value) && typeof value !== "string")
+				fail(
+					`cannot look inside ${describeNode(container)}: only lists and strings can be`,
+					container.at,
+				);
+		}
+		if (operator === "matches" && isLiteralKind(left) && typeof literalValue(left) !== "string")
+			fail(`cannot match ${describeNode(left)}: only strings can be matched`, left.at);
+	});
+}
+
 /** The step fields a condition reads, in order of appearance; none for a non-string. */
 export function conditionRefs(condition: unknown): { id: string; path: string }[] {
 	if (typeof condition !== "string") return [];
 	const refs: { id: string; path: string }[] = [];
-	const visit = (node: ConditionNode) => {
+	walk(parseCondition(condition).root, (node) => {
 		if (node.kind === "ref") refs.push({ id: node.id, path: node.path });
-		else if (node.kind === "not") visit(node.operand);
-		else if (node.kind !== "literal") {
-			visit(node.left);
-			visit(node.right);
-		}
-	};
-	visit(parseCondition(condition).root);
+	});
 	return refs;
+}
+
+function walk(node: ConditionNode, visit: (node: ConditionNode) => void) {
+	visit(node);
+	if (node.kind === "not") walk(node.operand, visit);
+	else if (node.kind === "list") node.items.forEach((item) => walk(item, visit));
+	else if (node.kind !== "literal" && node.kind !== "ref") {
+		walk(node.left, visit);
+		walk(node.right, visit);
+	}
+}
+
+/** A literal or a list of literals: its value is known before the run. */
+function isLiteralKind(node: ConditionNode): boolean {
+	return node.kind === "literal" || (node.kind === "list" && node.items.every(isLiteralKind));
+}
+
+function literalValue(node: ConditionNode): unknown {
+	return node.kind === "list" ? node.items.map(literalValue) : (node as { value: unknown }).value;
+}
+
+function describeNode(node: ConditionNode) {
+	return describeOperand(literalValue(node));
 }
 
 // ------------------------------------------------------------------
@@ -81,14 +153,16 @@ export function parseCondition(text: string): Condition {
 	return condition;
 }
 
+type Symbol = "(" | ")" | "[" | "]" | "," | "&&" | "||" | "!" | ComparisonOperator;
 type Token =
-	| { type: "(" | ")" | "&&" | "||" | "!" | ComparisonOperator; at: number }
+	| { type: Symbol; at: number }
 	| { type: "ref"; at: number; id: string; path: string }
 	| { type: "literal"; at: number; value: string | number | boolean | null }
 	| { type: "word"; at: number; value: string };
 
 const COMPARISONS: ComparisonOperator[] = ["==", "!=", "<=", ">=", "<", ">"];
-const SYMBOLS = ["&&", "||", ...COMPARISONS, "!", "(", ")"] as const;
+const WORD_OPERATORS: ComparisonOperator[] = ["in", "contains", "matches"];
+const SYMBOLS: Symbol[] = ["&&", "||", ...COMPARISONS, "!", "(", ")", "[", "]", ","];
 
 class Parser {
 	#tokens: Token[];
@@ -104,8 +178,8 @@ class Parser {
 		const extra = this.#tokens[this.#index];
 		if (extra) {
 			this.#fail(
-				COMPARISONS.includes(extra.type as ComparisonOperator) && this.#index > 0
-					? `comparisons do not chain: group them with && or parentheses`
+				this.#operatorAt(this.#index)
+					? `comparisons do not chain: group them with && or parentheses (at character ${extra.at + 1})`
 					: `unexpected ${describe(extra)} at character ${extra.at + 1}`,
 			);
 		}
@@ -114,63 +188,97 @@ class Parser {
 
 	#or(): ConditionNode {
 		let left = this.#and();
-		while (this.#take("||")) left = { kind: "or", left, right: this.#and() };
+		while (this.#take("||")) left = { kind: "or", at: left.at, left, right: this.#and() };
 		return left;
 	}
 
 	#and(): ConditionNode {
 		let left = this.#compare();
-		while (this.#take("&&")) left = { kind: "and", left, right: this.#compare() };
+		while (this.#take("&&")) left = { kind: "and", at: left.at, left, right: this.#compare() };
 		return left;
 	}
 
 	#compare(): ConditionNode {
 		const left = this.#unary(false);
-		const operator = this.#tokens[this.#index]?.type;
-		if (!COMPARISONS.includes(operator as ComparisonOperator)) return left;
+		const operator = this.#operatorAt(this.#index);
+		if (!operator) return left;
 		this.#index += 1;
-		return {
-			kind: "compare",
-			operator: operator as ComparisonOperator,
-			left,
-			right: this.#unary(true),
-		};
+		const right = this.#unary(true);
+		if (operator === "matches") {
+			if (right.kind !== "literal" || typeof right.value !== "string")
+				this.#fail(
+					`matches takes a regular expression in quotes, as in matches "^re-" (at character ${right.at + 1})`,
+				);
+			try {
+				pattern(right.value);
+			} catch (error) {
+				this.#fail(
+					`${(error as Error).message.replace(/^Invalid regular expression: /, "invalid regular expression ")} (at character ${right.at + 1})`,
+				);
+			}
+		}
+		return { kind: "compare", at: left.at, operator, left, right };
+	}
+
+	/** The operator at `index`: a symbol, or `in`/`contains`/`matches` after a value. */
+	#operatorAt(index: number): ComparisonOperator | undefined {
+		const token = this.#tokens[index];
+		if (!token) return undefined;
+		if (COMPARISONS.includes(token.type as ComparisonOperator))
+			return token.type as ComparisonOperator;
+		if (token.type === "word" && WORD_OPERATORS.includes(token.value as ComparisonOperator))
+			return token.value as ComparisonOperator;
+		return undefined;
 	}
 
 	#unary(wordAllowed: boolean): ConditionNode {
-		if (this.#take("!")) return { kind: "not", operand: this.#unary(wordAllowed) };
+		const at = this.#tokens[this.#index]?.at;
+		if (this.#take("!")) return { kind: "not", at: at!, operand: this.#unary(wordAllowed) };
 		return this.#primary(wordAllowed);
 	}
 
 	#primary(wordAllowed: boolean): ConditionNode {
 		const token = this.#tokens[this.#index];
-		if (!token) this.#fail("it ends where a value is expected");
+		if (!token)
+			this.#fail(`it ends at character ${this.source.length + 1}, where a value is expected`);
 		this.#index += 1;
 		switch (token.type) {
 			case "(": {
 				const inner = this.#or();
-				if (!this.#take(")")) {
-					const next = this.#tokens[this.#index];
-					this.#fail(
-						next
-							? `expected ) at character ${next.at + 1}, found ${describe(next)}`
-							: "a ( is not closed",
-					);
-				}
+				this.#close(")", token);
 				return inner;
 			}
+			case "[": {
+				const items: ConditionNode[] = [];
+				if (!this.#take("]")) {
+					do items.push(this.#primary(wordAllowed));
+					while (this.#take(","));
+					this.#close("]", token);
+				}
+				return { kind: "list", at: token.at, items };
+			}
 			case "ref":
-				return { kind: "ref", id: token.id, path: token.path };
+				return { kind: "ref", at: token.at, id: token.id, path: token.path };
 			case "literal":
-				return { kind: "literal", value: token.value };
+				return { kind: "literal", at: token.at, value: token.value };
 			case "word":
-				if (wordAllowed) return { kind: "literal", value: token.value };
+				if (wordAllowed) return { kind: "literal", at: token.at, value: token.value };
 				this.#fail(
-					`${token.value} is not a value: quote it, or compare a step field with it ($step.json.field == ${token.value})`,
+					`${token.value} at character ${token.at + 1} is not a value: quote it, or compare a step field with it ($step.json.field == ${token.value})`,
 				);
 			default:
 				this.#fail(`unexpected ${describe(token)} at character ${token.at + 1}`);
 		}
+	}
+
+	#close(type: ")" | "]", open: Token) {
+		if (this.#take(type)) return;
+		const next = this.#tokens[this.#index];
+		this.#fail(
+			next
+				? `expected ${type} at character ${next.at + 1}, found ${describe(next)}`
+				: `the ${open.type} at character ${open.at + 1} is not closed`,
+		);
 	}
 
 	#take(type: Token["type"]) {
@@ -254,6 +362,19 @@ function tokenize(source: string, fail: (reason: string) => never): Token[] {
 	return tokens;
 }
 
+const patterns = new Map<string, RegExp>();
+
+/** The compiled `matches` pattern; patterns come from workflow files only, never from data. */
+function pattern(source: string): RegExp {
+	let compiled = patterns.get(source);
+	if (!compiled) {
+		compiled = new RegExp(source, "u");
+		if (patterns.size >= PARSED_LIMIT) patterns.delete(patterns.keys().next().value!);
+		patterns.set(source, compiled);
+	}
+	return compiled;
+}
+
 // ------------------------------------------------------------------
 // Evaluation
 // ------------------------------------------------------------------
@@ -271,6 +392,8 @@ function evaluate(
 	switch (node.kind) {
 		case "literal":
 			return node.value;
+		case "list":
+			return node.items.map((item) => evaluate(item, source, results));
 		case "ref":
 			return getStepRefValue(node, results, true);
 		case "not":
@@ -285,18 +408,48 @@ function evaluate(
 				Boolean(evaluate(node.left, source, results)) ||
 				Boolean(evaluate(node.right, source, results))
 			);
-		case "compare": {
-			const left = evaluate(node.left, source, results);
-			const right = evaluate(node.right, source, results);
-			if (node.operator === "==" || node.operator === "!=") {
-				const equal = equals(left, right, isNull(node.left) || isNull(node.right));
-				return node.operator === "==" ? equal : !equal;
-			}
-			if (!isStrictlyNumeric(left) || !isStrictlyNumeric(right)) {
-				throw new Error(
-					`Condition "${source}" cannot compare ${describeOperand(left)} ${node.operator} ${describeOperand(right)}: only numbers can be ordered`,
+		case "compare":
+			return compare(node, source, results);
+	}
+}
+
+function compare(
+	node: Extract<ConditionNode, { kind: "compare" }>,
+	source: string,
+	results: Record<string, WorkflowStepResult>,
+) {
+	const left = evaluate(node.left, source, results);
+	const right = evaluate(node.right, source, results);
+	const refuse = (reason: string): never => {
+		throw new Error(`Condition "${source}" ${reason}`);
+	};
+	switch (node.operator) {
+		case "==":
+		case "!=": {
+			const equal = equals(left, right, isNull(node.left) || isNull(node.right));
+			return node.operator === "==" ? equal : !equal;
+		}
+		case "in":
+		case "contains": {
+			const [item, container] = node.operator === "in" ? [left, right] : [right, left];
+			if (Array.isArray(container)) return container.some((entry) => equals(item, entry, false));
+			if (typeof container === "string" && typeof item === "string")
+				return container.includes(item);
+			return refuse(
+				typeof container === "string"
+					? `cannot look for ${describeOperand(item)} in a string: only a string can be found in one`
+					: `cannot look inside ${describeOperand(container)}: only lists and strings can be`,
+			);
+		}
+		case "matches":
+			if (typeof left !== "string")
+				refuse(`cannot match ${describeOperand(left)}: only strings can be matched`);
+			return pattern(right as string).test(left as string);
+		default: {
+			if (!isStrictlyNumeric(left) || !isStrictlyNumeric(right))
+				refuse(
+					`cannot compare ${describeOperand(left)} ${node.operator} ${describeOperand(right)}: only numbers can be ordered`,
 				);
-			}
 			const [a, b] = [Number(left), Number(right)];
 			if (node.operator === "<") return a < b;
 			if (node.operator === "<=") return a <= b;

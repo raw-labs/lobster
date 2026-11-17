@@ -33,6 +33,8 @@ export async function snapshotDefinition(
 				}
 			}
 			if (step.steps) await collect(step.steps, key);
+			for (const entry of step.switch?.cases ?? []) await collect(entry.steps, key);
+			if (step.switch?.else) await collect(step.switch.else, key);
 		}
 	};
 	await collect(workflow.steps, "");

@@ -1,11 +1,11 @@
-import { checkConditionSyntax } from "./conditions.js";
+import { checkCondition } from "./conditions.js";
 import { parseDuration } from "../util/duration.js";
 import { closestMatch } from "../util/suggest.js";
 import { promises as fsp } from "node:fs";
 import path from "node:path";
 import { parse as parseYaml } from "yaml";
 import { prepareSchema } from "../util/validation.js";
-import type { WorkflowFile, WorkflowStep, ParallelConfig } from "./types.js";
+import type { WorkflowFile, WorkflowStep, ParallelConfig, SwitchConfig } from "./types.js";
 
 export async function loadWorkflowFile(filePath: string): Promise<WorkflowFile> {
 	const text = await fsp.readFile(filePath, "utf8");
@@ -39,7 +39,16 @@ export async function loadWorkflowFile(filePath: string): Promise<WorkflowFile> 
 		}
 	}
 
-	const seen = new Set<string>();
+	validateSteps(steps, new Set<string>(), new Set<string>());
+	return parsed as WorkflowFile;
+}
+
+/**
+ * Validates steps that run in order. `seen` holds every step id so far, which must be unique;
+ * `known` holds the steps whose results exist when these start, and gains each step as it is
+ * validated, so a condition can only read a step that runs before it.
+ */
+function validateSteps(steps: WorkflowStep[], seen: Set<string>, known: Set<string>) {
 	for (const step of steps) {
 		if (!step || typeof step !== "object") {
 			throw new Error("Workflow step must be an object");
@@ -183,9 +192,15 @@ export async function loadWorkflowFile(filePath: string): Promise<WorkflowFile> 
 			}
 			const loopShell = typeof step.run === "string" ? step.run : step.command;
 			const loopPipeline = typeof step.pipeline === "string" ? step.pipeline : undefined;
-			if (loopShell || loopPipeline || step.workflow || step.parallel) {
+			if (
+				loopShell ||
+				loopPipeline ||
+				step.workflow ||
+				step.parallel ||
+				step.switch !== undefined
+			) {
 				throw new Error(
-					`Workflow step ${step.id} for_each cannot also define run, command, pipeline, workflow, or parallel`,
+					`Workflow step ${step.id} for_each cannot also define run, command, pipeline, workflow, parallel, or switch`,
 				);
 			}
 			if (step.item_var !== undefined && typeof step.item_var !== "string") {
@@ -205,7 +220,11 @@ export async function loadWorkflowFile(filePath: string): Promise<WorkflowFile> 
 					throw new Error(`Workflow step ${step.id} for_each sub-step requires an id`);
 				}
 				validateRecovery(sub);
-				validateStepOptions(sub, `Workflow step ${step.id} for_each sub-step ${sub.id}`);
+				validateStepOptions(
+					sub,
+					`Workflow step ${step.id} for_each sub-step ${sub.id}`,
+					new Set([...known, loopItemVar, loopIndexVar, ...subStepIds]),
+				);
 				if (sub.id === loopItemVar || sub.id === loopIndexVar) {
 					throw new Error(
 						`Workflow step ${step.id} for_each sub-step id '${sub.id}' conflicts with loop variable`,
@@ -241,9 +260,9 @@ export async function loadWorkflowFile(filePath: string): Promise<WorkflowFile> 
 						`Workflow step ${step.id} for_each sub-step ${sub.id} pipeline must be a string`,
 					);
 				}
-				if (sub.workflow || sub.parallel || sub.for_each) {
+				if (sub.workflow || sub.parallel || sub.for_each || sub.switch !== undefined) {
 					throw new Error(
-						`Workflow step ${step.id} for_each sub-step ${sub.id} cannot define workflow, parallel, or for_each`,
+						`Workflow step ${step.id} for_each sub-step ${sub.id} cannot define workflow, parallel, for_each, or switch`,
 					);
 				}
 				const subShell =
@@ -272,27 +291,39 @@ export async function loadWorkflowFile(filePath: string): Promise<WorkflowFile> 
 			typeof step.workflow === "string" && step.workflow.trim() ? step.workflow : undefined;
 		const isSleep = step.sleep !== undefined;
 		const isWait = step.wait !== undefined;
+		const isSwitch = step.switch !== undefined;
 		const executionCount =
 			Number(Boolean(shellCommand)) +
 			Number(Boolean(pipeline)) +
 			Number(Boolean(workflowRef)) +
 			Number(isParallel) +
 			Number(isForEach) +
+			Number(isSwitch) +
 			Number(isSleep) +
 			Number(isWait);
 		if (executionCount === 0 && !isApprovalStep(step.approval) && !isInputStep(step.input)) {
 			throw new Error(
-				`Workflow step ${step.id} requires run, command, pipeline, workflow, parallel, for_each, sleep, wait, approval, or input`,
+				`Workflow step ${step.id} requires run, command, pipeline, workflow, parallel, for_each, switch, sleep, wait, approval, or input`,
 			);
 		}
 		if (executionCount > 1) {
 			throw new Error(
-				`Workflow step ${step.id} can only define one of run, command, pipeline, workflow, parallel, for_each, sleep, or wait`,
+				`Workflow step ${step.id} can only define one of run, command, pipeline, workflow, parallel, for_each, switch, sleep, or wait`,
 			);
 		}
 		if (executionCount > 0 && isInputStep(step.input)) {
 			throw new Error(
-				`Workflow step ${step.id} input steps cannot define run, command, pipeline, workflow, parallel, for_each, sleep, or wait`,
+				`Workflow step ${step.id} input steps cannot define run, command, pipeline, workflow, parallel, for_each, switch, sleep, or wait`,
+			);
+		}
+		if (isSwitch && isApprovalStep(step.approval)) {
+			throw new Error(
+				`Workflow step ${step.id} switch steps cannot define approval (put it on a step in a case)`,
+			);
+		}
+		if (isSwitch && step.stdin !== undefined && step.stdin !== null) {
+			throw new Error(
+				`Workflow step ${step.id} switch steps cannot define stdin (give it to the steps in the cases)`,
 			);
 		}
 		if ((isSleep || isWait) && isApprovalStep(step.approval)) {
@@ -398,20 +429,57 @@ export async function loadWorkflowFile(filePath: string): Promise<WorkflowFile> 
 				);
 			}
 		}
-		validateStepOptions(step, `Workflow step ${step.id}`);
+		validateStepOptions(step, `Workflow step ${step.id}`, known);
 		if (seen.has(step.id)) {
 			throw new Error(`Duplicate workflow step id: ${step.id}`);
+		}
+		if (isSwitch) {
+			// Validated after the switch's own condition: its cases run after that.
+			const before = new Set(seen);
+			validateSwitch(step, seen, known);
+			for (const id of seen) if (!before.has(id)) known.add(id);
 		}
 		if (isParallel) {
 			const parallel = step.parallel as ParallelConfig;
 			for (const branch of parallel.branches) {
 				seen.add(branch.id);
+				known.add(branch.id);
 			}
 		}
 		seen.add(step.id);
+		known.add(step.id);
 	}
+}
 
-	return parsed as WorkflowFile;
+/**
+ * A switch runs the steps of its first case whose `when` holds, or its `else`. Every case's
+ * steps are known after it: those of the cases that did not run count as skipped.
+ */
+function validateSwitch(step: WorkflowStep, seen: Set<string>, known: Set<string>) {
+	const name = `Workflow step ${step.id} switch`;
+	const config = step.switch as SwitchConfig;
+	if (!isPlainObject(config)) throw new Error(`${name} must be an object with cases`);
+	if (!Array.isArray(config.cases) || config.cases.length === 0)
+		throw new Error(`${name} requires a non-empty cases array`);
+	config.cases.forEach((entry, index) => {
+		const where = `${name} case ${index + 1}`;
+		if (!isPlainObject(entry)) throw new Error(`${where} must be an object with when and steps`);
+		if (typeof entry.when !== "string" && typeof entry.when !== "boolean")
+			throw new Error(`${where} requires when: a condition, or true`);
+		try {
+			checkCondition(entry.when, known);
+		} catch (error: any) {
+			throw new Error(`${where} when is not a valid condition: ${error?.message ?? error}`);
+		}
+		if (!Array.isArray(entry.steps) || entry.steps.length === 0)
+			throw new Error(`${where} requires a non-empty steps array`);
+		validateSteps(entry.steps, seen, new Set(known));
+	});
+	if (config.else !== undefined) {
+		if (!Array.isArray(config.else))
+			throw new Error(`${name} else must be a list of steps (empty for none)`);
+		validateSteps(config.else, seen, new Set(known));
+	}
 }
 
 export function isApprovalStep(approval: WorkflowStep["approval"]) {
@@ -447,7 +515,7 @@ export function getStepExecution(step: WorkflowStep) {
 }
 
 // Options every step accepts, wherever it is nested.
-function validateStepOptions(step: WorkflowStep, name: string) {
+function validateStepOptions(step: WorkflowStep, name: string, known: ReadonlySet<string>) {
 	if (
 		step.timeout_ms !== undefined &&
 		(typeof step.timeout_ms !== "number" ||
@@ -507,7 +575,7 @@ function validateStepOptions(step: WorkflowStep, name: string) {
 			`${name} heartbeat_timeout_ms must be a positive integer between 1 and 2147483647`,
 		);
 	}
-	validateCondition(step, name);
+	validateCondition(step, name, known);
 }
 
 function validateWaitTimeout(config: Record<string, unknown>, name: string) {
@@ -533,7 +601,7 @@ function validateEventWait(step: WorkflowStep, name: string) {
 }
 
 // Checked here, not when the step is reached: by then earlier steps have had their effects.
-function validateCondition(step: WorkflowStep, name: string) {
+function validateCondition(step: WorkflowStep, name: string, known: ReadonlySet<string>) {
 	for (const key of ["when", "condition"] as const) {
 		const value = step[key];
 		if (
@@ -545,7 +613,7 @@ function validateCondition(step: WorkflowStep, name: string) {
 			throw new Error(`${name} ${key} must be a boolean or an expression string`);
 		if (typeof value === "string") {
 			try {
-				checkConditionSyntax(value);
+				checkCondition(value, known);
 			} catch (error: any) {
 				throw new Error(`${name} ${key} is not a valid condition: ${error?.message ?? error}`);
 			}
@@ -577,6 +645,7 @@ const STEP_KEYS = [
 	"when",
 	"parallel",
 	"for_each",
+	"switch",
 	"item_var",
 	"index_var",
 	"batch_size",
@@ -592,6 +661,8 @@ const STEP_KEYS = [
 const WAIT_KEYS = ["event", "match", "timeout", "on_timeout"];
 const BRANCH_KEYS = ["id", "recovery", "run", "command", "pipeline", "env", "cwd", "stdin"];
 const PARALLEL_KEYS = ["wait", "timeout_ms", "branches"];
+const SWITCH_KEYS = ["cases", "else"];
+const CASE_KEYS = ["when", "steps"];
 const RETRY_KEYS = ["max", "backoff", "delay_ms", "max_delay_ms", "jitter"];
 const COST_LIMIT_KEYS = ["max_usd", "action"];
 const INPUT_KEYS = ["prompt", "responseSchema", "defaults", "timeout", "on_timeout"];
@@ -630,6 +701,18 @@ function rejectUnknownKeys(workflow: Record<string, unknown>) {
 			}
 		}
 		if (Array.isArray(step.steps)) for (const sub of step.steps) visit(sub, `${name} sub-step`);
+		if (isPlainObject(step.switch)) {
+			checkKeys(step.switch, SWITCH_KEYS, `${name} switch`);
+			const cases = Array.isArray(step.switch.cases) ? step.switch.cases : [];
+			cases.forEach((entry, index) => {
+				const where = `${name} switch case ${index + 1}`;
+				checkKeys(entry, CASE_KEYS, where);
+				if (isPlainObject(entry) && Array.isArray(entry.steps))
+					for (const sub of entry.steps) visit(sub, `${where} step`);
+			});
+			if (Array.isArray(step.switch.else))
+				for (const sub of step.switch.else) visit(sub, `${name} switch else step`);
+		}
 	};
 	for (const step of workflow.steps as unknown[]) visit(step, "Workflow step");
 }

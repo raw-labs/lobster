@@ -20,6 +20,10 @@ export type ParallelBranch = {
 	stdin?: unknown;
 };
 
+export type SwitchCase = { when: string | boolean; steps: WorkflowStep[] };
+
+export type SwitchConfig = { cases: SwitchCase[]; else?: WorkflowStep[] };
+
 export type ParallelConfig = {
 	wait?: "all" | "any";
 	timeout_ms?: number;
@@ -43,6 +47,8 @@ export type WorkflowStep = {
 	when?: unknown;
 	parallel?: ParallelConfig;
 	for_each?: string;
+	/** Run the steps of the first case whose `when` holds, or `else`. */
+	switch?: SwitchConfig;
 	item_var?: string;
 	index_var?: string;
 	batch_size?: number;
@@ -115,6 +121,8 @@ export type WorkflowStepResult = {
 	subject?: unknown;
 	response?: unknown;
 	skipped?: boolean;
+	/** For a switch: the case that ran, from 1, or "else". */
+	case?: number | "else";
 	/** A question or event wait reached its timeout with `on_timeout: continue`. */
 	timedOut?: boolean;
 	/** A standalone pipeline's items as they are, and whether a renderer already showed them. */

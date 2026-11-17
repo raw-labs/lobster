@@ -96,7 +96,7 @@ for (const [name, data, when] of [
 	["a boolean", { val: true }, "$data.json.val > 0"],
 	["null", { val: null }, "$data.json.val >= 0"],
 	["a missing value", { val: 1 }, "$data.json.nope < 2"],
-	["two strings", { val: "b" }, '$data.json.val > "a"'],
+	["two strings", { val: "b", other: "a" }, "$data.json.val > $data.json.other"],
 ] as const) {
 	test(`ordering ${name} is an error, not a silent false`, async () => {
 		await assert.rejects(

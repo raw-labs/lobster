@@ -19,6 +19,7 @@ import { resumeGuardFromEnv } from "../persistence/context.js";
 import { combineSignals } from "../process/owner_signal.js";
 import { encodeToken } from "../resume/token.js";
 import { enter } from "./nodes/condition.js";
+import { switchStep } from "./nodes/switch.js";
 import { isApprovalStep } from "../workflows/load.js";
 import {
 	activation,
@@ -345,7 +346,8 @@ export class Machine {
 				},
 			};
 			// Control nodes are timed as a whole. Gates wait for people, time or events, not work.
-			if (["for-each", "parallel", "child-workflow"].includes(nodeKind(step))) startTimeout();
+			if (["for-each", "parallel", "child-workflow", "switch"].includes(nodeKind(step)))
+				startTimeout();
 			let decidingApproval = false;
 			try {
 				let result: WorkflowStepResult;
@@ -372,6 +374,11 @@ export class Machine {
 					case "child-workflow":
 						result = await childWorkflow(this, step, attemptKey, local);
 						break;
+					case "switch":
+						result = await switchStep(this, step, attemptKey, local);
+						// Its case's steps, and those that did not run as skipped, for later steps.
+						frame.results = activation(this.state, attemptKey).results;
+						break;
 					case "input":
 						result = await input(this, step, attemptKey, local);
 						break;
@@ -384,7 +391,13 @@ export class Machine {
 					default:
 						result = await activity(this, step, attemptKey, local);
 				}
-				if (account && !frame.accounted && nodeKind(step) !== "child-workflow") {
+				// A child workflow's and a switch's steps were charged as they ran.
+				if (
+					account &&
+					!frame.accounted &&
+					nodeKind(step) !== "child-workflow" &&
+					nodeKind(step) !== "switch"
+				) {
 					const deferred: DeferredCharge[] = [];
 					if (frame.results)
 						for (const [id, branch] of Object.entries(frame.results))

@@ -2016,7 +2016,7 @@ test("workflow conditions reject unknown step refs even under negation", async (
 					mode: "tool",
 				},
 			}),
-		/Unknown step reference: aprove\.approved/,
+		/reads \$aprove\.approved, but no step "aprove" runs before it/,
 	);
 });
 
