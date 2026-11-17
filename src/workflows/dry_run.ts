@@ -47,6 +47,20 @@ function resolveDryRunTemplate(
 	});
 }
 
+// A plan has no step outputs: a condition that reads one is neither true nor false yet.
+// Only `approved` (gates are assumed granted) and `skipped` are modelled by the plan.
+function dependsOnStepOutput(condition: unknown) {
+	if (typeof condition !== "string") return false;
+	for (const [, field] of condition.matchAll(/\$[A-Za-z0-9_-]+\.([A-Za-z0-9_]+)/g))
+		if (field !== "approved" && field !== "skipped") return true;
+	return false;
+}
+
+function conditionNote(condition: unknown) {
+	const text = String(condition).replace(/\s+/g, " ").trim();
+	return `when: ${text}  [depends on step output — unknown at plan time]`;
+}
+
 export function dryRunWorkflow({
 	steps,
 	resolvedArgs,
@@ -68,17 +82,27 @@ export function dryRunWorkflow({
 		const step = steps[idx];
 		const num = idx - startIndex + 1;
 
-		if (!evaluateCondition(step.when ?? step.condition, results)) {
+		const condition = step.when ?? step.condition;
+		// Evaluated even when its value is unknown, so a malformed condition still fails the plan.
+		const holds = evaluateCondition(condition, results);
+		const unknownCondition = dependsOnStepOutput(condition);
+		if (!unknownCondition && !holds) {
 			results[step.id] = { id: step.id, skipped: true };
 			lines.push(`  ${num}. ${step.id}  [skipped — condition: false]`);
 			continue;
 		}
+		// Shown under the step's first line, whichever kind of step it is.
+		const header = lines.length + 1;
+		const noteCondition = () => {
+			if (unknownCondition) lines.splice(header, 0, `     ${conditionNote(condition)}`);
+		};
 
 		if (isInputStep(step.input)) {
 			lines.push(`  ${num}. ${step.id}  [input]`);
 			lines.push(`     prompt: ${step.input.prompt}`);
 			lines.push(`     [input required]`);
 			results[step.id] = { id: step.id, response: { pending: true } };
+			noteCondition();
 			continue;
 		}
 
@@ -106,7 +130,10 @@ export function dryRunWorkflow({
 			loopScopedResults[dryIndexVar] = { id: dryIndexVar, json: 0 };
 			for (let subIdx = 0; subIdx < step.steps.length; subIdx++) {
 				const sub = step.steps[subIdx];
-				if (!evaluateCondition(sub.when ?? sub.condition, loopScopedResults)) {
+				const subCondition = sub.when ?? sub.condition;
+				const subHolds = evaluateCondition(subCondition, loopScopedResults);
+				const unknownSubCondition = dependsOnStepOutput(subCondition);
+				if (!unknownSubCondition && !subHolds) {
 					lines.push(`       ${subIdx + 1}. ${sub.id}  [skipped — condition: false]`);
 					loopScopedResults[sub.id] = { id: sub.id, skipped: true };
 					continue;
@@ -148,6 +175,7 @@ export function dryRunWorkflow({
 				} else {
 					lines.push(`       ${subIdx + 1}. ${sub.id}  [no-op]`);
 				}
+				if (unknownSubCondition) lines.push(`          ${conditionNote(subCondition)}`);
 				loopScopedResults[sub.id] = { id: sub.id };
 			}
 			if (step.timeout_ms) lines.push(`     timeout: ${step.timeout_ms}ms`);
@@ -161,6 +189,7 @@ export function dryRunWorkflow({
 				}
 			}
 			results[step.id] = { id: step.id };
+			noteCondition();
 			continue;
 		}
 
@@ -282,6 +311,8 @@ export function dryRunWorkflow({
 		if (isApprovalStep(step.approval)) {
 			lines.push(`     [approval required]`);
 		}
+
+		noteCondition();
 
 		// Record a placeholder result so later steps can reference this step in conditions.
 		// For approval steps, model approval as granted so downstream conditions like

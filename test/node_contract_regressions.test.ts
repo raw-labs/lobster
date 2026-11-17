@@ -73,3 +73,64 @@ test("an approval of the wrong type is rejected, not dropped", async (t) => {
 		assert.equal((await fx.run(gated(approval))).status, "needs_approval");
 	assert.equal((await fx.run(gated(false))).status, "ok");
 });
+
+test("dry-run does not claim a step is skipped when its condition reads a step output", async (t) => {
+	const fx = await workflowFixture(t);
+	fx.fake.script({ items: [{ output: [1] }] });
+	await fx.run(
+		{
+			steps: [
+				{ id: "seed", pipeline: "fake --name seed" },
+				{ id: "n", pipeline: "fake --name n", when: "$seed.json.call == 1" },
+				{ id: "ask", input: { prompt: "Go?", responseSchema: {} }, when: "$seed.stdout != ''" },
+				{
+					id: "loop",
+					for_each: "$seed.json",
+					when: "$ask.response.go == true",
+					steps: [{ id: "sub", pipeline: "fake --name sub", when: "$item.json.ok == true" }],
+				},
+				{ id: "never", pipeline: "fake --name never", when: false },
+				{ id: "gated", pipeline: "fake --name gated", approval: true },
+				{ id: "ifApproved", pipeline: "fake --name a", when: "$gated.approved == true" },
+				{ id: "ifFailed", pipeline: "fake --name f", when: "$seed.error ==\n true" },
+			],
+		},
+		{ dryRun: true },
+	);
+	const plan = fx.stderr();
+	// The plan used to say "[skipped — condition: false]" for all of these, which a run would execute.
+	assert.match(
+		plan,
+		/2\. n {2}\[pipeline\]\n {5}when: \$seed\.json\.call == 1 {2}\[depends on step output — unknown at plan time\]/,
+	);
+	assert.match(
+		plan,
+		/3\. ask {2}\[input\]\n {5}when: \$seed\.stdout != '' {2}\[depends on step output/,
+	);
+	assert.match(
+		plan,
+		/4\. loop {2}\[for_each\]\n {5}when: \$ask\.response\.go == true {2}\[depends/,
+	);
+	assert.match(
+		plan,
+		/1\. sub {2}\[pipeline\] pipeline: fake --name sub\n {10}when: \$item\.json\.ok == true/,
+	);
+	// Gates are planned as granted, so a condition on `approved` is decided; one on any
+	// other field is not, and is shown on one line.
+	assert.match(plan, /7\. ifApproved {2}\[pipeline\]\n {5}pipeline: fake --name a\n/);
+	assert.match(plan, /8\. ifFailed {2}\[pipeline\]\n {5}when: \$seed\.error == true {2}\[depends/);
+	await assert.rejects(
+		fx.run(
+			{
+				steps: [
+					{ id: "a", run: "true" },
+					{ id: "x", run: "true", when: "$a.json == == 1" },
+				],
+			},
+			{ dryRun: true },
+		),
+		/condition|expected|unexpected/i,
+	);
+	assert.match(plan, /5\. never {2}\[skipped — condition: false\]/);
+	assert.equal(fx.fake.calls("seed"), 0);
+});
