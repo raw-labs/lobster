@@ -1,6 +1,6 @@
 {
 	"name": "@clawdbot/lobster",
-	"version": "2026.10.1",
+	"version": "2026.11.2",
 	"description": "Workflow runtime for AI agents - deterministic pipelines with approval gates",
 	"keywords": [
 		"ai-agent",
@@ -76,12 +76,12 @@
 	},
 	"devDependencies": {
 		"@types/node": "^24.19.2",
-		"oxfmt": "^0.73.0",
-		"oxlint": "^1.88.0",
+		"oxfmt": "^0.78.0",
+		"oxlint": "^1.93.0",
 		"typescript": "^7.0.2"
 	},
 	"engines": {
 		"node": ">=24.16.0 <25 || >=26.1.0"
 	},
-	"packageManager": "pnpm@12.14.0"
+	"packageManager": "pnpm@12.18.0"
 }

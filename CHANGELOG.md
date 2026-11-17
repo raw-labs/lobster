@@ -17,6 +17,23 @@ All notable changes to Lobster will be documented in this file.
 - Refuse an approval or input gate inside a sub-workflow before its command runs; the command used to run and only then fail the run.
 - Dry-run no longer lists a step as skipped when its condition reads an earlier step's output; the step is planned with its condition marked as unknown at plan time.
 
+## 2026.11.2 - 2026-11-15
+
+**Highlights:** Show usage for built-in help topics and reject malformed workflow arguments cleanly.
+
+- Show the usage for `lobster help run`, `help resume`, `help doctor`, `help version` and `help help`, the same text `lobster run --help` prints, instead of failing with `Unknown command: run` (exit code 2); thanks @KrasimirKralev.
+- Reject a non-object or empty `--args-json` on `lobster run`, `lobster graph`, and `workflows.run` instead of running the workflow on its default args or failing with a raw `TypeError`; thanks @KrasimirKralev.
+- Update Oxfmt to 0.78.0, Oxlint to 1.93.0, and pnpm to 12.18.0 across development and release tooling while retaining the two-day dependency cooldown and Node.js 22 runtime floor.
+
+## 2026.11.1 - 2026-11-05
+
+**Highlights:** Show graph-specific help for `lobster help graph` and patch URI parsing vulnerabilities in `fast-uri`.
+
+- Show the graph help for `lobster help graph`, which `lobster --help` lists under Commands, instead of failing with `Unknown command: graph` (exit code 2); thanks @KrasimirKralev.
+- Update the `fast-uri` override to 4.2.3 to fix URI scheme spoofing, scheme injection, host confusion, and path normalization vulnerabilities.
+- Refresh Oxfmt to 0.75.0 and Oxlint to 1.90.0 while preserving the two-day dependency cooldown and Node.js 22 runtime floor.
+- Remove the unused internal `getFilter` helper from the template filters; `applyFilters` keeps reading the filter table directly and template output is unchanged; thanks @KrasimirKralev.
+
 ## 2026.10.1 - 2026-10-20
 
 **Highlights:** Honor host invocation authority before effects, prevent unsafe resume replay, and report invalid workflow paths consistently.

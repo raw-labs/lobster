@@ -22,7 +22,10 @@ import {
 	abandonWorkflowRun,
 } from "./workflows/file.js";
 import { renderWorkflowGraph } from "./workflows/graph.js";
+import { parseWorkflowArgsJson } from "./workflows/values.js";
 import type { WorkflowGraphFormat } from "./workflows/graph.js";
+
+const USAGE_TOPICS = new Set(["run", "resume", "doctor", "version", "help"]);
 
 export async function runCli(argv) {
 	const cancellation = createCliCancellation();
@@ -56,6 +59,15 @@ async function runCliWithSignal(
 	if (argv[0] === "help") {
 		const topic = argv[1];
 		if (!topic) {
+			process.stdout.write(helpText());
+			return;
+		}
+		if (topic === "graph") {
+			process.stdout.write(graphHelpText());
+			return;
+		}
+		// These built-ins are documented in the top-level usage, which `<topic> --help` prints too.
+		if (USAGE_TOPICS.has(topic)) {
 			process.stdout.write(helpText());
 			return;
 		}
@@ -220,17 +232,11 @@ async function handleGraph({ argv }) {
 	}
 
 	let argsJson: Record<string, unknown> = {};
-	if (parsed.argsJson) {
+	if (parsed.argsJson !== null) {
 		try {
-			const value = JSON.parse(parsed.argsJson);
-			if (!value || typeof value !== "object" || Array.isArray(value)) {
-				process.stderr.write("graph --args-json must be a JSON object\n");
-				process.exitCode = 2;
-				return;
-			}
-			argsJson = value as Record<string, unknown>;
-		} catch {
-			process.stderr.write("graph --args-json must be valid JSON\n");
+			argsJson = parseWorkflowArgsJson(parsed.argsJson, "graph");
+		} catch (err) {
+			process.stderr.write(`${err.message}\n`);
 			process.exitCode = 2;
 			return;
 		}
@@ -335,17 +341,11 @@ async function handleRunInternal({
 	const { rest, workflowFile, dryRun } = target;
 	if (workflowFile) {
 		let parsedArgs = {};
-		if (argsJson) {
+		if (argsJson !== null) {
 			try {
-				parsedArgs = JSON.parse(argsJson);
-			} catch {
-				reportRunError(
-					normalizedMode,
-					"parse_error",
-					new Error("run --args-json must be valid JSON"),
-					"",
-					emit,
-				);
+				parsedArgs = parseWorkflowArgsJson(argsJson, "run");
+			} catch (err) {
+				reportRunError(normalizedMode, "parse_error", err, "", emit);
 				return { ok: false };
 			}
 		}
@@ -566,11 +566,9 @@ function parseRunArgs(argv) {
 		}
 
 		if (tok === "--args-json") {
-			const value = argv[i + 1];
-			if (value) {
-				argsJson = value;
-				i++;
-			}
+			// An empty or missing value is rejected later instead of falling back to defaults.
+			argsJson = argv[i + 1] ?? "";
+			i++;
 			continue;
 		}
 
@@ -629,11 +627,9 @@ function parseGraphArgs(argv: string[]) {
 		}
 
 		if (tok === "--args-json") {
-			const value = argv[i + 1];
-			if (value) {
-				argsJson = value;
-				i++;
-			}
+			// An empty or missing value is rejected later instead of falling back to defaults.
+			argsJson = argv[i + 1] ?? "";
+			i++;
 			continue;
 		}
 
