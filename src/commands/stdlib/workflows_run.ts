@@ -1,16 +1,8 @@
-import { workflowRegistry } from "../../workflows/registry.js";
-import {
-	runGithubPrMonitorWorkflow,
-	runGithubPrMonitorNotifyWorkflow,
-} from "../../workflows/github_pr_monitor.js";
 import { parseWorkflowArgsJson } from "../../workflows/values.js";
+import { defineCommand } from "../define.js";
+import { registryWorkflows } from "../registry.js";
 
-const runners = {
-	"github.pr.monitor": runGithubPrMonitorWorkflow,
-	"github.pr.monitor.notify": runGithubPrMonitorNotifyWorkflow,
-};
-
-export const workflowsRunCommand = {
+export const workflowsRunCommand = defineCommand({
 	name: "workflows.run",
 	meta: {
 		description: "Run a named Lobster workflow",
@@ -24,6 +16,8 @@ export const workflowsRunCommand = {
 			required: ["name"],
 		},
 		sideEffects: [],
+		// Named workflows must be safe to repeat (see NamedWorkflow.repeatable).
+		repeatable: true,
 	},
 	help() {
 		return `workflows.run — run a named Lobster workflow\n\nUsage:\n  workflows.run --name <workflow> [--args-json '{...}']\n\nExample:\n  workflows.run --name github.pr.monitor.notify --args-json '{"repo":"openclaw/openclaw","pr":1152}'\n`;
@@ -37,21 +31,18 @@ export const workflowsRunCommand = {
 		const name = args.name ?? args._[0];
 		if (!name) throw new Error("workflows.run requires --name");
 
-		const meta = workflowRegistry[name];
-		if (!meta) throw new Error(`Unknown workflow: ${name}`);
-
-		const runner = runners[name];
-		if (!runner) throw new Error(`Workflow runner not implemented: ${name}`);
+		const workflow = registryWorkflows(ctx?.registry).find((w) => w.name === name);
+		if (!workflow) throw new Error(`Unknown workflow: ${name}`);
 
 		let workflowArgs = {};
 		if (args["args-json"] !== undefined) {
 			workflowArgs = parseWorkflowArgsJson(String(args["args-json"]), "workflows.run");
 		}
 
-		const result = await runner({ args: workflowArgs, ctx });
+		const result = await workflow.run({ args: workflowArgs, ctx });
 		return { output: asStream([result]) };
 	},
-};
+});
 
 async function* asStream(items) {
 	for (const item of items) yield item;

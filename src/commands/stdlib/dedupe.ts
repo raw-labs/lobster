@@ -1,6 +1,7 @@
+import { defineCommand } from "../define.js";
 import { getByPath } from "../../core/value_path.js";
 
-export const dedupeCommand = {
+export const dedupeCommand = defineCommand({
 	name: "dedupe",
 	meta: {
 		description: "Remove duplicate items, keeping first occurrence (stable)",
@@ -16,6 +17,7 @@ export const dedupeCommand = {
 			required: [],
 		},
 		sideEffects: [],
+		repeatable: true,
 	},
 	help() {
 		return (
@@ -43,4 +45,4 @@ export const dedupeCommand = {
 			})(),
 		};
 	},
-};
+});

@@ -1,10 +1,11 @@
+import { defineCommand } from "../define.js";
 import { readLineFromStream } from "../../read_line.js";
 
 function isInteractive(stdin) {
 	return Boolean(stdin.isTTY);
 }
 
-export const approveCommand = {
+export const approveCommand = defineCommand({
 	name: "approve",
 	meta: {
 		description: "Require confirmation to continue",
@@ -13,11 +14,20 @@ export const approveCommand = {
 			properties: {
 				prompt: { type: "string", description: "Approval prompt text", default: "Approve?" },
 				emit: { type: "boolean", description: "Force emit approval request + halt" },
+				"preview-from-stdin": {
+					type: "boolean",
+					description: "Include a preview of the input items in the request",
+				},
+				previewFromStdin: { type: "boolean", description: "Alias for preview-from-stdin" },
+				limit: { type: "number", description: "Items in the preview (default 5)" },
+				"preview-limit": { type: "number", description: "Alias for limit" },
+				previewLimit: { type: "number", description: "Alias for limit" },
 				_: { type: "array", items: { type: "string" } },
 			},
 			required: [],
 		},
 		sideEffects: [],
+		repeatable: true,
 		resumeSafeBeforeInput: true,
 	},
 	help() {
@@ -63,7 +73,7 @@ export const approveCommand = {
 
 		return { output: asStream(items) };
 	},
-};
+});
 
 function buildPreview(items) {
 	if (!items.length) return "";

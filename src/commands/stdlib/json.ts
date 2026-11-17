@@ -1,9 +1,11 @@
-export const jsonCommand = {
+import { defineCommand } from "../define.js";
+export const jsonCommand = defineCommand({
 	name: "json",
 	meta: {
 		description: "Render pipeline output as JSON",
 		argsSchema: { type: "object", properties: {}, required: [] },
 		sideEffects: [],
+		repeatable: true,
 	},
 	help() {
 		return `json — render pipeline output as JSON\n\nUsage:\n  ... | json\n`;
@@ -15,6 +17,6 @@ export const jsonCommand = {
 		ctx.render.json(items);
 		return { output: emptyStream(), rendered: true };
 	},
-};
+});
 
 async function* emptyStream() {}

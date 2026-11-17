@@ -1,3 +1,4 @@
+import { defineCommand } from "../define.js";
 function stringifyCell(v) {
 	if (v === null || v === undefined) return "";
 	if (typeof v === "string") return v;
@@ -5,12 +6,13 @@ function stringifyCell(v) {
 	return JSON.stringify(v);
 }
 
-export const tableCommand = {
+export const tableCommand = defineCommand({
 	name: "table",
 	meta: {
 		description: "Render items as a simple table",
 		argsSchema: { type: "object", properties: {}, required: [] },
 		sideEffects: [],
+		repeatable: true,
 	},
 	help() {
 		return `table — render items as a simple table\n\nUsage:\n  ... | table\n\nNotes:\n  - If items are objects, columns are union of keys (first 20 items).\n`;
@@ -57,6 +59,6 @@ export const tableCommand = {
 		for (const item of items) ctx.stdout.write(stringifyCell(item) + "\n");
 		return { output: emptyStream(), rendered: true };
 	},
-};
+});
 
 async function* emptyStream() {}

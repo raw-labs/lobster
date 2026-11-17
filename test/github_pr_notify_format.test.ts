@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { buildPrChangeSummary } from "../src/workflows/github_pr_monitor.js";
+import { buildPrChangeSummary } from "../src/packs/github/workflows.js";
 
 function formatLikeWorkflow({ repo, pr, after, before }) {
 	const summary = buildPrChangeSummary(before, after);

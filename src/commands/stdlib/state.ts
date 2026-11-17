@@ -1,3 +1,4 @@
+import { defineCommand } from "../define.js";
 import { carryLlmProvenance } from "../../core/llm_accounting.js";
 import {
 	defaultStateDir,
@@ -49,7 +50,7 @@ async function readRememberedState({ env, key, signal }) {
 	}
 }
 
-export const stateGetCommand = {
+export const stateGetCommand = defineCommand({
 	name: "state.get",
 	meta: {
 		description: "Read a JSON value from Lobster state",
@@ -61,6 +62,7 @@ export const stateGetCommand = {
 			required: ["_"],
 		},
 		sideEffects: ["reads_state"],
+		repeatable: true,
 	},
 	help() {
 		return `state.get — read a JSON value from Lobster state\n\nUsage:\n  state.get <key>\n\nEnv:\n  LOBSTER_STATE_DIR overrides storage directory\n`;
@@ -73,9 +75,9 @@ export const stateGetCommand = {
 
 		return { output: asStream([value]) };
 	},
-};
+});
 
-export const stateSetCommand = {
+export const stateSetCommand = defineCommand({
 	name: "state.set",
 	meta: {
 		description: "Write a JSON value to Lobster state",
@@ -87,6 +89,7 @@ export const stateSetCommand = {
 			required: ["_"],
 		},
 		sideEffects: ["writes_state"],
+		repeatable: true,
 	},
 	help() {
 		return `state.set — write a JSON value to Lobster state\n\nUsage:\n  <value> | state.set <key>\n\nNotes:\n  - Consumes the entire input stream; stores a single JSON value.\n`;
@@ -113,7 +116,7 @@ export const stateSetCommand = {
 
 		return { output: asStream([value]) };
 	},
-};
+});
 
 async function* asStream(items) {
 	for (const item of items) yield item;

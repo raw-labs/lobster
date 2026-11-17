@@ -1,3 +1,4 @@
+import { defineCommand } from "../../commands/define.js";
 import { runAbortableProcess } from "../../abortable_process.js";
 
 type Draft = {
@@ -17,7 +18,7 @@ function parseDraft(item: any): Draft {
 	return { to, subject, body };
 }
 
-export const gogGmailSendCommand = {
+export const gogGmailSendCommand = defineCommand({
 	name: "gog.gmail.send",
 	meta: {
 		description: "Send Gmail messages via gog",
@@ -31,6 +32,7 @@ export const gogGmailSendCommand = {
 			required: [],
 		},
 		sideEffects: ["sends_email"],
+		repeatable: false,
 	},
 	help() {
 		return (
@@ -109,4 +111,4 @@ export const gogGmailSendCommand = {
 			})(),
 		};
 	},
-};
+});

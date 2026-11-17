@@ -1,6 +1,7 @@
+import { defineCommand } from "../define.js";
 import { runAbortableProcess } from "../../abortable_process.js";
 
-export const execCommand = {
+export const execCommand = defineCommand({
 	name: "exec",
 	meta: {
 		description: "Run an OS command",
@@ -9,11 +10,17 @@ export const execCommand = {
 			properties: {
 				json: { type: "boolean", description: "Parse stdout as JSON (single value)." },
 				shell: { type: "string", description: "Run via the system shell with this command line." },
+				stdin: {
+					type: "string",
+					enum: ["raw", "json", "jsonl"],
+					description: "Write pipeline input to the command's stdin in this format.",
+				},
 				_: { type: "array", items: { type: "string" }, description: "Command + args." },
 			},
 			required: ["_"],
 		},
 		sideEffects: ["local_exec"],
+		repeatable: true,
 	},
 	help() {
 		return (
@@ -87,7 +94,7 @@ export const execCommand = {
 		const lines = result.stdout.split(/\r?\n/).filter(Boolean);
 		return { output: asStream(lines) };
 	},
-};
+});
 
 async function runProcess(
 	command,

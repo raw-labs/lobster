@@ -162,7 +162,7 @@ export function dryRunWorkflow({
 						resolvedArgs,
 						loopScopedResults,
 					);
-					const stages = parsePipeline(pipelineText);
+					const stages = parsePipeline(pipelineText, ctx.registry as any);
 					for (const stage of stages) {
 						if (hasDeferredDryRunStageName(stage.name)) continue;
 						if (!ctx.registry.get(stage.name)) {
@@ -228,7 +228,7 @@ export function dryRunWorkflow({
 							`Parallel branch ${branch.id} requires a command registry for pipeline execution`,
 						);
 					}
-					const stages = parsePipeline(pipelineText);
+					const stages = parsePipeline(pipelineText, ctx.registry as any);
 					for (const stage of stages) {
 						if (hasDeferredDryRunStageName(stage.name)) continue;
 						if (!ctx.registry.get(stage.name)) {
@@ -277,7 +277,7 @@ export function dryRunWorkflow({
 				);
 			}
 			// Validate that every stage name is a known command.
-			const stages = parsePipeline(pipelineText);
+			const stages = parsePipeline(pipelineText, ctx.registry as any);
 			for (const stage of stages) {
 				if (hasDeferredDryRunStageName(stage.name)) {
 					continue;

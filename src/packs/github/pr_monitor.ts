@@ -14,7 +14,7 @@ import { buildPrChangeSummary, formatPrChangeMessage } from "./snapshot.js";
 
 import { Lobster } from "../../sdk/index.js";
 import { diffLast } from "../../sdk/primitives/diff.js";
-import { ghPrView } from "./stages/pr-view.js";
+import { ghPrView } from "./pr_view.js";
 
 /**
  * Create a PR monitor workflow

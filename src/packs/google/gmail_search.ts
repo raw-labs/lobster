@@ -1,6 +1,7 @@
+import { defineCommand } from "../../commands/define.js";
 import { runAbortableProcess } from "../../abortable_process.js";
 
-export const gogGmailSearchCommand = {
+export const gogGmailSearchCommand = defineCommand({
 	name: "gog.gmail.search",
 	meta: {
 		description: "Fetch Gmail threads via gog (JSON)",
@@ -15,6 +16,7 @@ export const gogGmailSearchCommand = {
 			required: [],
 		},
 		sideEffects: ["reads_email"],
+		repeatable: true,
 	},
 	help() {
 		return (
@@ -87,4 +89,4 @@ export const gogGmailSearchCommand = {
 			})(),
 		};
 	},
-};
+});

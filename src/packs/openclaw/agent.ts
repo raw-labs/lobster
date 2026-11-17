@@ -1,5 +1,5 @@
 import { runAbortableProcess } from "../../abortable_process.js";
-import type { LobsterCommand } from "../types.js";
+import { defineCommand } from "../../commands/define.js";
 
 const OPENCLAW_AGENT_MAX_OUTPUT_BYTES = 10 * 1024 * 1024;
 
@@ -15,10 +15,8 @@ type AgentCliRunner = (params: {
 
 export const openclawAgentCommand = createOpenClawAgentCommand();
 
-export function createOpenClawAgentCommand(
-	runCli: AgentCliRunner = runOpenClawAgentCli,
-): LobsterCommand {
-	return {
+export function createOpenClawAgentCommand(runCli: AgentCliRunner = runOpenClawAgentCli) {
+	return defineCommand({
 		name: "openclaw.agent",
 		meta: {
 			description: "Run a configured OpenClaw agent turn",
@@ -41,6 +39,8 @@ export function createOpenClawAgentCommand(
 				required: [],
 			},
 			sideEffects: ["calls_openclaw_agent"],
+			// An agent turn acts on its own; it is never repeated automatically.
+			repeatable: false,
 		},
 		help() {
 			return (
@@ -103,7 +103,7 @@ export function createOpenClawAgentCommand(
 			});
 			return { output: streamOf([response]) };
 		},
-	};
+	});
 }
 
 export function runOpenClawAgentCli(params: {

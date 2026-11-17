@@ -1,4 +1,5 @@
-import type { CommandMeta, LobsterCommand } from "./types.js";
+import { defineCommand } from "../define.js";
+import type { LobsterCommand } from "../types.js";
 
 function parseDescriptionFromHelp(helpText: string): string {
 	const firstLine = helpText.split("\n").find((l) => l.trim().length > 0) ?? "";
@@ -8,7 +9,7 @@ function parseDescriptionFromHelp(helpText: string): string {
 		: firstLine.trim();
 }
 
-export const commandsListCommand: LobsterCommand = {
+export const commandsListCommand = defineCommand({
 	name: "commands.list",
 	help() {
 		return (
@@ -24,7 +25,8 @@ export const commandsListCommand: LobsterCommand = {
 		description: "List available Lobster pipeline commands",
 		argsSchema: { type: "object", properties: {}, required: [] },
 		sideEffects: [],
-	} satisfies CommandMeta,
+		repeatable: true,
+	},
 	async run({ input, ctx }) {
 		// Drain input
 		for await (const _ of input) {
@@ -34,7 +36,7 @@ export const commandsListCommand: LobsterCommand = {
 		const names = ctx.registry.list();
 		const output = names.map((name) => {
 			const cmd = ctx.registry.get(name) as LobsterCommand | undefined;
-			const help = typeof cmd?.help === "function" ? String(cmd.help()) : "";
+			const help = typeof cmd?.help === "function" ? String(cmd.help(name)) : "";
 			const description = cmd?.meta?.description ?? parseDescriptionFromHelp(help);
 
 			return {
@@ -43,6 +45,8 @@ export const commandsListCommand: LobsterCommand = {
 				argsSchema: cmd?.meta?.argsSchema ?? null,
 				examples: cmd?.meta?.examples ?? null,
 				sideEffects: cmd?.meta?.sideEffects ?? null,
+				repeatable: cmd?.meta?.repeatable ?? null,
+				...(cmd && cmd.name !== name ? { aliasOf: cmd.name } : {}),
 			};
 		});
 
@@ -52,4 +56,4 @@ export const commandsListCommand: LobsterCommand = {
 			})(),
 		};
 	},
-};
+});

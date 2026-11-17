@@ -145,7 +145,7 @@ async function runToolRequestInternal({
 
 	let parsed;
 	try {
-		parsed = parsePipeline(String(pipeline));
+		parsed = parsePipeline(String(pipeline), runtime.registry);
 	} catch (err: any) {
 		return errorEnvelope("parse_error", err?.message ?? String(err));
 	}
