@@ -409,6 +409,7 @@ export async function loadWorkflowFile(filePath: string): Promise<WorkflowFile> 
 				throw new Error(`Workflow step ${step.id} retry.jitter must be a boolean`);
 			}
 		}
+		validateCondition(step, `Workflow step ${step.id}`);
 		if (seen.has(step.id)) {
 			throw new Error(`Duplicate workflow step id: ${step.id}`);
 		}
@@ -454,6 +455,20 @@ export function getStepExecution(step: WorkflowStep) {
 	}
 
 	return { kind: "none" as const };
+}
+
+// Checked here, not when the step is reached: by then earlier steps have had their effects.
+function validateCondition(step: WorkflowStep, name: string) {
+	for (const key of ["when", "condition"] as const) {
+		const value = step[key];
+		if (
+			value !== undefined &&
+			value !== null &&
+			typeof value !== "boolean" &&
+			typeof value !== "string"
+		)
+			throw new Error(`${name} ${key} must be a boolean or an expression string`);
+	}
 }
 
 function validateRecovery(step: WorkflowStep) {
