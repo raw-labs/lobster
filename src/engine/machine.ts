@@ -211,6 +211,9 @@ export class Machine {
 		if (frame.phase === "completed") return frame.result!;
 		if (frame.phase === "failed") throw new Error(frame.error);
 		if (await enter(this, step, frame, scope)) return frame.result!;
+		// Refused before dispatch: the command of a gated step must not run when nobody can be asked.
+		if (scope.nested && (isApprovalStep(step.approval) || nodeKind(step) === "input"))
+			throw new Error("Sub-workflow approval/input gates are not supported in composition.");
 		const config = resolveRetryConfig(step.retry);
 		while (true) {
 			if (frame.retryAt) {
@@ -273,10 +276,6 @@ export class Machine {
 						result = await childWorkflow(this, step, attemptKey, local);
 						break;
 					case "input":
-						if (scope.nested)
-							throw new Error(
-								"Sub-workflow approval/input gates are not supported in composition.",
-							);
 						result = await input(this, step, attemptKey, local);
 						break;
 					default:
@@ -306,8 +305,6 @@ export class Machine {
 				if (account) this.checkCost(scope);
 				frame.accounted = account || frame.accounted;
 				// An approval is a separate activation: the preceding command is never rerun to ask again.
-				if (isApprovalStep(step.approval) && scope.nested)
-					throw new Error("Sub-workflow approval/input gates are not supported in composition.");
 				if (isApprovalStep(step.approval)) {
 					// A completed activity must not be retried for a failed human decision/read.
 					decidingApproval = true;

@@ -134,3 +134,22 @@ test("dry-run does not claim a step is skipped when its condition reads a step o
 	assert.match(plan, /5\. never {2}\[skipped — condition: false\]/);
 	assert.equal(fx.fake.calls("seed"), 0);
 });
+
+test("an approval gate in a child workflow is refused before its command runs", async (t) => {
+	const fx = await workflowFixture(t);
+	await fx.write("child.lobster", {
+		steps: [
+			{ id: "skipped", pipeline: "fake --name skipped", approval: true, when: false },
+			{ id: "deploy", pipeline: "fake --name deploy", approval: true },
+		],
+	});
+	await assert.rejects(
+		fx.run({ steps: [{ id: "child", workflow: "child.lobster" }] }),
+		/Sub-workflow approval\/input gates are not supported in composition/,
+	);
+	// The command used to run, and only then was the step refused.
+	assert.equal(fx.fake.calls("deploy"), 0);
+	// A gate that its condition skips is still allowed.
+	assert.equal(fx.fake.calls("skipped"), 0);
+	assert.equal((await fx.execution()).status, "failed");
+});
