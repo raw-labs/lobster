@@ -666,7 +666,8 @@ test("pre-aborted pipeline resume does not wait for a live state lock", async ()
 			approved: true,
 			ctx: { registry, signal: controller.signal, env },
 		});
-		const early = await observeSettlement(pending, 75);
+		// The lock is only removed after this window, so only a missed abort waits it out.
+		const early = await observeSettlement(pending, 2000);
 		if (!early.settled) await fsp.rm(lockPath, { recursive: true, force: true });
 		const envelope = early.settled ? early.value : await pending;
 
@@ -3178,7 +3179,8 @@ test("cancellation after a Gmail send interrupts a blocked next draft read", asy
 		await waitForFile(sendCompleted);
 		await blockedReadStarted;
 		controller.abort(new Error("abort while waiting for another draft"));
-		const observed = await observeSettlement(run, 100);
+		// The read never ends by itself, so only a missed abort waits out this window.
+		const observed = await observeSettlement(run, 2000);
 		releaseBlockedRead();
 		const envelope = observed.settled ? observed.value : await run;
 

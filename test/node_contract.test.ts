@@ -680,8 +680,18 @@ async function cancelWhileAsking(t: TestContext, node: NodeExample) {
 	const controller = new AbortController();
 	const stdin = interactiveStdin();
 	const running = fx.run(workflow, { signal: controller.signal, mode: "human", stdin });
-	// The prompt is shown once the work before it has finished.
+	// The prompt is shown once the work before it has finished and the run is saved.
 	if (node.workCalls) await fx.fake.waitForCalls("w", node.workCalls);
+	for (const deadline = Date.now() + 10000; ; await sleep(10)) {
+		if (
+			await fx.runId().then(
+				() => true,
+				() => false,
+			)
+		)
+			break;
+		if (Date.now() > deadline) throw new Error("the run was never saved");
+	}
 	await sleep(200);
 	controller.abort(new Error("stopped by host"));
 	await assert.rejects(running, /stopped by host/);

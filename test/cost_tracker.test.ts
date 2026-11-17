@@ -1087,11 +1087,25 @@ test("cost_limit stop counts the live call a retried step's replay stands in for
 	}
 });
 
-// A command that always fails, so a step carrying it never succeeds.
-async function alwaysFailsCommand() {
+// A command that always fails, so a step carrying it never succeeds. With `cacheDir`, it fails
+// only once a sibling `llm.invoke` branch has stored its answer there (see failsOnceCommand).
+async function alwaysFailsCommand(cacheDir?: string) {
 	const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-cost-fail-"));
 	const filePath = path.join(dir, "fail.mjs");
-	await fsp.writeFile(filePath, "process.exit(1);\n", "utf8");
+	await fsp.writeFile(
+		filePath,
+		cacheDir === undefined
+			? "process.exit(1);\n"
+			: `import fs from "node:fs";\n` +
+					`import path from "node:path";\n` +
+					`const stored = (dir) => fs.existsSync(dir) && fs.readdirSync(dir, { withFileTypes: true }).some((e) =>\n` +
+					`  e.isDirectory() ? stored(path.join(dir, e.name)) : !e.name.startsWith(".") && e.name.endsWith(".json"));\n` +
+					`const deadline = Date.now() + 10000;\n` +
+					`while (!stored(${JSON.stringify(cacheDir)}) && Date.now() < deadline) await new Promise((r) => setTimeout(r, 10));\n` +
+					`await new Promise((r) => setTimeout(r, 250));\n` +
+					`process.exit(1);\n`,
+		"utf8",
+	);
 	return `node ${filePath}`;
 }
 
@@ -1103,7 +1117,7 @@ async function alwaysFailsCommand() {
 test("workflow cost tracking does not bill a replay of a call another run paid for", async () => {
 	const provider = await startFakeProvider();
 	const cacheDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-cost-cache-"));
-	const failing = await alwaysFailsCommand();
+	const failing = await alwaysFailsCommand(cacheDir);
 	const invoke = "llm.invoke --model gpt-4o --prompt Summarize";
 	const env = { LOBSTER_LLM_ADAPTER_URL: provider.url, LOBSTER_CACHE_DIR: cacheDir };
 	try {
@@ -1750,7 +1764,7 @@ fs.writeFileSync("${marker}", "ran");
 `,
 		"utf8",
 	);
-	const failing = await alwaysFailsCommand();
+	const failing = await alwaysFailsCommand(path.join(tmpDir, "cache"));
 
 	try {
 		// One branch pays a provider, another fails, and `on_error: continue` advances the run.
