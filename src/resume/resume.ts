@@ -20,25 +20,39 @@ export type PipelineResumePayload = {
 	stateKey: string;
 };
 
+const APPROVAL_ID = /^[0-9a-f]{8}$/;
+const WAIT_ID = /^[0-9a-f-]{36}\.[0-9a-f]{64}$/;
+
+/**
+ * What a resume reference names. The three forms cannot be confused: a short approval ID is
+ * 8 hex characters, a wait ID is `<run id>.<64 hex>`, and a token is base64url JSON.
+ */
+export function classifyResumeRef(
+	ref: string,
+): { approvalId: string } | { waitId: string } | { token: string } {
+	if (APPROVAL_ID.test(ref)) return { approvalId: ref };
+	if (WAIT_ID.test(ref)) return { waitId: ref };
+	return { token: ref };
+}
+
+/**
+ * `lobster resume <ref> --approve yes|no | --response-json '{...}' | --cancel`.
+ * `<ref>` is a resume token, a short approval ID or a wait ID. The released spellings
+ * `--token <t>`, `--id <approvalId>` and `--decision` keep working.
+ */
 export function parseResumeArgs(argv) {
 	const args = {
 		decision: null,
+		ref: null as string | null,
 		token: null,
 		approvalId: null,
 		responseJson: null,
 		cancel: false,
-		waitId: null,
-		expectedRevision: null,
+		expectedRevision: null as number | null,
 	};
 
 	for (let i = 0; i < argv.length; i++) {
 		const tok = argv[i];
-		if (tok === "--wait" || tok.startsWith("--wait=")) {
-			args.waitId = tok === "--wait" ? argv[++i] : tok.slice("--wait=".length);
-			if (!args.waitId || args.waitId.startsWith("--"))
-				throw new Error("resume --wait requires a wait ID");
-			continue;
-		}
 		if (tok === "--expected-revision" || tok.startsWith("--expected-revision=")) {
 			const value =
 				tok === "--expected-revision" ? argv[++i] : tok.slice("--expected-revision=".length);
@@ -80,12 +94,11 @@ export function parseResumeArgs(argv) {
 			const next = argv[i + 1];
 			if (typeof next === "string" && !next.startsWith("--")) {
 				const parsed = parseBooleanArg(next);
-				if (parsed === null) {
-					throw new Error("resume --cancel must be true or false");
+				if (parsed !== null) {
+					args.cancel = parsed;
+					i++;
+					continue;
 				}
-				args.cancel = parsed;
-				i++;
-				continue;
 			}
 			args.cancel = true;
 			continue;
@@ -109,22 +122,32 @@ export function parseResumeArgs(argv) {
 			args.decision = tok.slice("--decision=".length);
 			continue;
 		}
+		if (tok.startsWith("--")) throw new Error(`resume has no flag ${tok.split("=")[0]}`);
+		if (args.ref !== null) throw new Error("resume takes one reference");
+		args.ref = String(tok);
 	}
 
-	if (args.waitId) {
-		if (args.token || args.approvalId || args.expectedRevision === null) {
-			throw new Error(
-				"resume --wait requires --expected-revision and cannot be combined with --token or --id",
-			);
-		}
-	} else {
-		if (args.expectedRevision !== null)
-			throw new Error("resume --expected-revision requires --wait");
-		if (!args.token && !args.approvalId) throw new Error("resume requires --token or --id");
-	}
-	const wait = args.waitId
-		? { waitId: String(args.waitId), expectedRevision: args.expectedRevision as number }
-		: {};
+	const named = [args.ref, args.token, args.approvalId].filter((value) => value);
+	if (named.length !== 1)
+		throw new Error(
+			named.length === 0
+				? "resume requires a token, approval ID or wait ID"
+				: "resume takes one reference",
+		);
+	const target = args.ref
+		? classifyResumeRef(args.ref)
+		: args.token
+			? { token: String(args.token) }
+			: { approvalId: String(args.approvalId) };
+	if (args.expectedRevision !== null && !("waitId" in target))
+		throw new Error("resume --expected-revision applies only to a wait ID");
+	const base = {
+		token: "token" in target ? target.token : null,
+		approvalId: "approvalId" in target ? target.approvalId : null,
+		...("waitId" in target
+			? { waitId: target.waitId, expectedRevision: args.expectedRevision }
+			: {}),
+	};
 	const intentCount =
 		Number(Boolean(args.decision)) + Number(args.responseJson !== null) + Number(args.cancel);
 	if (intentCount > 1) {
@@ -134,23 +157,11 @@ export function parseResumeArgs(argv) {
 		throw new Error("resume requires --approve yes|no, --response-json, or --cancel");
 	}
 
-	if (args.cancel) {
-		return {
-			token: args.token ? String(args.token) : null,
-			approvalId: args.approvalId ? String(args.approvalId) : null,
-			...wait,
-			cancel: true,
-		};
-	}
+	if (args.cancel) return { ...base, cancel: true };
 
 	if (args.responseJson !== null) {
 		try {
-			return {
-				token: args.token ? String(args.token) : null,
-				approvalId: args.approvalId ? String(args.approvalId) : null,
-				...wait,
-				response: JSON.parse(String(args.responseJson)),
-			};
+			return { ...base, response: JSON.parse(String(args.responseJson)) };
 		} catch {
 			throw new Error("resume --response-json must be valid JSON");
 		}
@@ -159,12 +170,7 @@ export function parseResumeArgs(argv) {
 	const decision = String(args.decision).toLowerCase();
 	if (!["yes", "y", "no", "n"].includes(decision))
 		throw new Error("resume --approve must be yes or no");
-	return {
-		token: args.token ? String(args.token) : null,
-		approvalId: args.approvalId ? String(args.approvalId) : null,
-		...wait,
-		approved: decision === "yes" || decision === "y",
-	};
+	return { ...base, approved: decision === "yes" || decision === "y" };
 }
 
 function parseBooleanArg(value: string): boolean | null {

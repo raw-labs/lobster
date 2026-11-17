@@ -583,7 +583,6 @@ for (const backend of ["sqlite"] as const) {
 		assert.equal(wait.request.prompt, "CLI question");
 		const done = await cli(
 			"resume",
-			"--wait",
 			wait.id,
 			"--expected-revision",
 			String(wait.revision),
@@ -596,32 +595,56 @@ for (const backend of ["sqlite"] as const) {
 	});
 }
 
-test("wait resume flags require a revision and preserve legacy argument parsing", () => {
-	assert.deepEqual(parseResumeArgs(["--token", "fixture", "--approve", "yes"]), {
+test("resume takes one reference of any kind and keeps the released flags", () => {
+	const waitId = `${"0".repeat(8)}-0000-4000-8000-${"0".repeat(12)}.${"a".repeat(64)}`;
+	const token = Buffer.from('{"protocolVersion":1}').toString("base64url");
+	assert.deepEqual(parseResumeArgs([token, "--approve", "yes"]), {
+		token,
+		approvalId: null,
+		approved: true,
+	});
+	assert.deepEqual(parseResumeArgs(["a9d03673", "--approve", "no"]), {
+		token: null,
+		approvalId: "a9d03673",
+		approved: false,
+	});
+	assert.deepEqual(parseResumeArgs([waitId, "--expected-revision=3", "--response-json", "42"]), {
+		token: null,
+		approvalId: null,
+		waitId,
+		expectedRevision: 3,
+		response: 42,
+	});
+	assert.deepEqual(parseResumeArgs(["--cancel", waitId]), {
+		token: null,
+		approvalId: null,
+		waitId,
+		expectedRevision: null,
+		cancel: true,
+	});
+	// Released spellings.
+	assert.deepEqual(parseResumeArgs(["--token", "fixture", "--decision", "yes"]), {
 		token: "fixture",
 		approvalId: null,
 		approved: true,
 	});
-	assert.deepEqual(
-		parseResumeArgs(["--wait=fixture", "--expected-revision=3", "--response-json", "42"]),
-		{ token: null, approvalId: null, waitId: "fixture", expectedRevision: 3, response: 42 },
-	);
-	assert.throws(() => parseResumeArgs(["--wait", "fixture", "--cancel"]), /expected-revision/);
+	assert.deepEqual(parseResumeArgs(["--id=a9d03673", "--cancel"]), {
+		token: null,
+		approvalId: "a9d03673",
+		cancel: true,
+	});
 	assert.throws(
-		() => parseResumeArgs(["--wait", "fixture", "--expected-revision", "-1", "--cancel"]),
+		() => parseResumeArgs(["--approve", "yes"]),
+		/requires a token, approval ID or wait ID/,
+	);
+	assert.throws(() => parseResumeArgs([token, "--token", token, "--cancel"]), /one reference/);
+	assert.throws(
+		() => parseResumeArgs(["a9d03673", "--expected-revision", "1", "--cancel"]),
+		/applies only to a wait ID/,
+	);
+	assert.throws(
+		() => parseResumeArgs([waitId, "--expected-revision", "-1", "--cancel"]),
 		/non-negative/,
 	);
-	assert.throws(
-		() =>
-			parseResumeArgs([
-				"--wait",
-				"fixture",
-				"--expected-revision",
-				"3",
-				"--token",
-				"old",
-				"--cancel",
-			]),
-		/cannot be combined/,
-	);
+	assert.throws(() => parseResumeArgs([token, "--wait", waitId, "--cancel"]), /no flag --wait/);
 });

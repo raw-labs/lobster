@@ -21,7 +21,7 @@ Guidance for coding assistants operating in this repository.
 - Treat `status: "needs_approval"` as a hard stop.
 - Never auto-approve on behalf of a user.
 - Resume only after explicit user decision:
-  - `lobster resume --token <resumeToken> --approve yes|no`
+  - `lobster resume <resumeToken or approvalId> --approve yes|no`
 
 ## Output Handling
 

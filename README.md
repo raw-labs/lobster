@@ -174,8 +174,10 @@ lobster run --mode tool --file review.lobster
 lobster runs list --status waiting
 lobster runs show <runId>
 lobster waits show <waitId>
-lobster resume --wait <waitId> --expected-revision <revision> --response-json '{...}'
+lobster resume <waitId> --response-json '{...}'
 # Or use --approve yes|no or --cancel for the appropriate decision.
+# <waitId> may also be the run's resume token or short approval ID. With a wait ID,
+# --expected-revision <revision> refuses the answer if the question changed meanwhile.
 ```
 
 Full wait inspection is an explicit read of private review material; callers must

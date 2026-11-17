@@ -732,11 +732,16 @@ async function handleResume({
 
 	let envelope;
 	try {
+		// A wait ID without --expected-revision answers the question as it stands now.
+		const expectedRevision =
+			parsed.waitId && parsed.expectedRevision === null
+				? (await getWait({ waitId: parsed.waitId, ctx: { env: process.env } }))?.revision
+				: parsed.expectedRevision;
 		envelope = await resumeToolRequest({
 			token: parsed.token ?? undefined,
 			approvalId: parsed.approvalId ?? undefined,
 			waitId: parsed.waitId,
-			expectedRevision: parsed.expectedRevision,
+			expectedRevision: parsed.waitId ? (expectedRevision ?? 0) : undefined,
 			approved: parsed.approved,
 			response: parsed.response,
 			cancel: parsed.cancel,
@@ -846,29 +851,29 @@ function writeToolEnvelope(payload) {
 function helpText(registry: CommandRegistry) {
 	return (
 		`lobster — OpenClaw-native typed shell\n\n` +
-		`Usage:\n` +
-		`  lobster '<pipeline>'\n` +
-		`  lobster run --mode tool '<pipeline>'\n` +
-		`  lobster run path/to/workflow.lobster\n` +
-		`  lobster run --file path/to/workflow.lobster --args-json '{...}'\n` +
-		`  lobster run --dry-run --file path/to/workflow.lobster\n` +
-		`  lobster run --dry-run '<pipeline>'\n` +
-		`  lobster graph --file path/to/workflow.lobster --format mermaid\n` +
-		`  lobster graph --file path/to/workflow.lobster --format dot\n` +
-		`  lobster graph --file path/to/workflow.lobster --format ascii\n` +
-		`  lobster resume --token <token> --approve yes|no\n` +
-		`  lobster resume --token <token> --response-json '{...}'\n` +
-		`  lobster resume --token <token> --cancel\n` +
+		`Usage:\n\n` +
+		`Start and answer:\n` +
+		`  lobster '<pipeline>'                                run a pipeline\n` +
+		`  lobster run [--mode tool] '<pipeline>'\n` +
+		`  lobster run <workflow.lobster> [--args-json '{...}']  start a workflow run\n` +
+		`  lobster run --dry-run <workflow.lobster | pipeline>  show the plan only\n` +
+		`  lobster resume <ref> --approve yes|no               answer a question\n` +
+		`  lobster resume <ref> --response-json '{...}'\n` +
+		`  lobster resume <ref> --cancel\n` +
+		`      <ref> is a resume token, a short approval ID or a wait ID.\n\n` +
+		`Manage runs:\n` +
 		`  lobster runs list [--status waiting] [--limit 20] [--after <cursor>]\n` +
-		`  lobster runs show <runId>\n  lobster runs advance <runId>\n  lobster runs abandon <runId>\n` +
-		`  lobster waits show <waitId>\n` +
-		`  lobster resume --wait <waitId> --expected-revision <revision> --response-json '{...}'\n` +
-		`  lobster history list\n` +
-		`  lobster history show <runId> [afterSequence]\n` +
-		`  lobster history prune <before> [--apply]\n` +
+		`  lobster runs show <runId>\n` +
+		`  lobster runs advance <runId>                       continue after a crash\n` +
+		`  lobster runs abandon <runId>                       stop a run for good\n` +
+		`  lobster waits show <waitId>\n\n` +
+		`Diagnostics:\n` +
+		`  lobster graph <workflow.lobster> [--format mermaid|dot|ascii]\n` +
+		`  lobster history list | show <runId> [afterSequence] | prune <before> [--apply]\n` +
 		`  lobster storage export\n` +
-		`  lobster upgrade [--dry-run] [--json]\n` +
-		`  lobster doctor\n` +
+		`  lobster doctor\n\n` +
+		`Setup:\n` +
+		`  lobster upgrade [--dry-run] [--json]                import state from older versions\n` +
 		`  lobster version\n` +
 		`  lobster help <command>\n\n` +
 		`Flags:\n` +
