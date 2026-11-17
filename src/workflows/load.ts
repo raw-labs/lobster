@@ -202,6 +202,7 @@ export async function loadWorkflowFile(filePath: string): Promise<WorkflowFile> 
 					throw new Error(`Workflow step ${step.id} for_each sub-step requires an id`);
 				}
 				validateRecovery(sub);
+				validateStepOptions(sub, `Workflow step ${step.id} for_each sub-step ${sub.id}`);
 				if (sub.id === loopItemVar || sub.id === loopIndexVar) {
 					throw new Error(
 						`Workflow step ${step.id} for_each sub-step id '${sub.id}' conflicts with loop variable`,
@@ -351,65 +352,7 @@ export async function loadWorkflowFile(filePath: string): Promise<WorkflowFile> 
 				);
 			}
 		}
-		if (
-			step.timeout_ms !== undefined &&
-			(typeof step.timeout_ms !== "number" ||
-				!Number.isFinite(step.timeout_ms) ||
-				!Number.isInteger(step.timeout_ms) ||
-				step.timeout_ms < 1 ||
-				step.timeout_ms > 2_147_483_647)
-		) {
-			throw new Error(
-				`Workflow step ${step.id} timeout_ms must be a positive integer between 1 and 2147483647`,
-			);
-		}
-		if (
-			step.on_error !== undefined &&
-			step.on_error !== "stop" &&
-			step.on_error !== "continue" &&
-			step.on_error !== "skip_rest"
-		) {
-			throw new Error(
-				`Workflow step ${step.id} on_error must be "stop", "continue", or "skip_rest"`,
-			);
-		}
-		if (step.retry !== undefined) {
-			if (!step.retry || typeof step.retry !== "object" || Array.isArray(step.retry)) {
-				throw new Error(`Workflow step ${step.id} retry must be an object`);
-			}
-			const r = step.retry;
-			if (
-				r.max !== undefined &&
-				(typeof r.max !== "number" || !Number.isInteger(r.max) || r.max < 1)
-			) {
-				throw new Error(`Workflow step ${step.id} retry.max must be a positive integer`);
-			}
-			if (r.backoff !== undefined && r.backoff !== "fixed" && r.backoff !== "exponential") {
-				throw new Error(`Workflow step ${step.id} retry.backoff must be "fixed" or "exponential"`);
-			}
-			if (
-				r.delay_ms !== undefined &&
-				(typeof r.delay_ms !== "number" || !Number.isFinite(r.delay_ms) || r.delay_ms < 0)
-			) {
-				throw new Error(
-					`Workflow step ${step.id} retry.delay_ms must be a finite non-negative number`,
-				);
-			}
-			if (
-				r.max_delay_ms !== undefined &&
-				(typeof r.max_delay_ms !== "number" ||
-					!Number.isFinite(r.max_delay_ms) ||
-					r.max_delay_ms < 0)
-			) {
-				throw new Error(
-					`Workflow step ${step.id} retry.max_delay_ms must be a finite non-negative number`,
-				);
-			}
-			if (r.jitter !== undefined && typeof r.jitter !== "boolean") {
-				throw new Error(`Workflow step ${step.id} retry.jitter must be a boolean`);
-			}
-		}
-		validateCondition(step, `Workflow step ${step.id}`);
+		validateStepOptions(step, `Workflow step ${step.id}`);
 		if (seen.has(step.id)) {
 			throw new Error(`Duplicate workflow step id: ${step.id}`);
 		}
@@ -455,6 +398,59 @@ export function getStepExecution(step: WorkflowStep) {
 	}
 
 	return { kind: "none" as const };
+}
+
+// Options every step accepts, wherever it is nested.
+function validateStepOptions(step: WorkflowStep, name: string) {
+	if (
+		step.timeout_ms !== undefined &&
+		(typeof step.timeout_ms !== "number" ||
+			!Number.isFinite(step.timeout_ms) ||
+			!Number.isInteger(step.timeout_ms) ||
+			step.timeout_ms < 1 ||
+			step.timeout_ms > 2_147_483_647)
+	) {
+		throw new Error(`${name} timeout_ms must be a positive integer between 1 and 2147483647`);
+	}
+	if (
+		step.on_error !== undefined &&
+		step.on_error !== "stop" &&
+		step.on_error !== "continue" &&
+		step.on_error !== "skip_rest"
+	) {
+		throw new Error(`${name} on_error must be "stop", "continue", or "skip_rest"`);
+	}
+	if (step.retry !== undefined) {
+		if (!step.retry || typeof step.retry !== "object" || Array.isArray(step.retry)) {
+			throw new Error(`${name} retry must be an object`);
+		}
+		const r = step.retry;
+		if (
+			r.max !== undefined &&
+			(typeof r.max !== "number" || !Number.isInteger(r.max) || r.max < 1)
+		) {
+			throw new Error(`${name} retry.max must be a positive integer`);
+		}
+		if (r.backoff !== undefined && r.backoff !== "fixed" && r.backoff !== "exponential") {
+			throw new Error(`${name} retry.backoff must be "fixed" or "exponential"`);
+		}
+		if (
+			r.delay_ms !== undefined &&
+			(typeof r.delay_ms !== "number" || !Number.isFinite(r.delay_ms) || r.delay_ms < 0)
+		) {
+			throw new Error(`${name} retry.delay_ms must be a finite non-negative number`);
+		}
+		if (
+			r.max_delay_ms !== undefined &&
+			(typeof r.max_delay_ms !== "number" || !Number.isFinite(r.max_delay_ms) || r.max_delay_ms < 0)
+		) {
+			throw new Error(`${name} retry.max_delay_ms must be a finite non-negative number`);
+		}
+		if (r.jitter !== undefined && typeof r.jitter !== "boolean") {
+			throw new Error(`${name} retry.jitter must be a boolean`);
+		}
+	}
+	validateCondition(step, name);
 }
 
 // Checked here, not when the step is reached: by then earlier steps have had their effects.
