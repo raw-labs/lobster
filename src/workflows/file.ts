@@ -419,8 +419,16 @@ function assertSdkPipeline(state: ExecutionState, sdk: { pipeline: string }) {
 }
 
 /** Name the run an error stopped, so a host can inspect or retry it. */
+/** The run each failure belongs to, set only here so a command cannot claim another run. */
+const failedRuns = new WeakMap<object, string>();
+
 function withRunId(error: unknown, runId: string) {
-	if (error && typeof error === "object" && !("runId" in error) && Object.isExtensible(error))
-		Object.defineProperty(error, "runId", { value: runId, configurable: true });
+	// The innermost run keeps the error: a later, outer frame does not relabel it.
+	if (error && typeof error === "object" && !failedRuns.has(error)) failedRuns.set(error, runId);
 	return error;
+}
+
+/** The run a failure from `runWorkflowFile` or `advanceWorkflowRun` belongs to. */
+export function runIdOf(error: unknown): string | undefined {
+	return error && typeof error === "object" ? failedRuns.get(error) : undefined;
 }

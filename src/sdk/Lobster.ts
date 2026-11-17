@@ -17,6 +17,7 @@ import {
 	runWorkflowFile,
 	ResumeRefusedError,
 	WorkflowResumeArgumentError,
+	runIdOf,
 	type WorkflowRunResult,
 } from "../workflows/file.js";
 import { waitingPipelineRun, type PausedPipeline } from "../workflows/upgrade.js";
@@ -385,7 +386,7 @@ function finished(output: Partial<WorkflowRunResult> & { runId?: string }): SdkR
 	};
 }
 
-function failed(err: unknown, runId = (err as { runId?: string })?.runId): SdkResult {
+function failed(err: unknown, runId = runIdOf(err)): SdkResult {
 	const error = runtimeErrorDetails(err);
 	return {
 		ok: false,

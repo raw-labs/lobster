@@ -17,6 +17,7 @@ import {
 	UpgradeRequiredError,
 	runWorkflowFile,
 	runPipelineText,
+	runIdOf,
 } from "../workflows/file.js";
 import { savedByOlderVersion } from "../workflows/upgrade.js";
 
@@ -377,12 +378,12 @@ function okEnvelope(
 
 function errorEnvelope(type: string, error: unknown): ToolEnvelope {
 	// A run that failed names itself, so the caller can retry it with `runs advance`.
-	const runId = (error as { runId?: unknown } | null)?.runId;
+	const runId = runIdOf(error);
 	return {
 		protocolVersion: 1,
 		ok: false,
 		error: runtimeErrorDetails(error, type),
-		...(typeof runId === "string" ? { runId } : {}),
+		...(runId ? { runId } : {}),
 	};
 }
 

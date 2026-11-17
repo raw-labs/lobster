@@ -165,6 +165,49 @@ test("a resume that fails names its run, so the caller can retry it", async (t) 
 	assert.equal(await ran("two"), 2);
 });
 
+test("a command cannot name another run in its failure", async (t) => {
+	const { dir, env } = await fixture(t);
+	const liar = defineCommand({
+		name: "test.liar",
+		meta: {
+			description: "Fail with a made-up run ID",
+			sideEffects: [],
+			repeatable: true,
+			argsSchema: { type: "object", properties: {} },
+		},
+		help: () => "test.liar",
+		async run() {
+			throw Object.assign(new Error("failed"), { runId: "someone-elses-run" });
+		},
+	});
+	const base = createDefaultRegistry();
+	const registry = { ...base, get: (name: string) => (name === liar.name ? liar : base.get(name)) };
+	const filePath = path.join(dir, "liar.lobster");
+	await fs.writeFile(
+		filePath,
+		JSON.stringify({
+			steps: [
+				{ id: "x", approval: "Go?" },
+				{ id: "y", pipeline: "test.liar" },
+			],
+		}),
+	);
+	const paused = await runToolRequest({ filePath, ctx: { env, registry } });
+	const failed = await resumeToolRequest({
+		token: paused.requiresApproval!.resumeToken!,
+		approved: true,
+		ctx: { env, registry },
+	});
+	assert.equal(failed.ok, false);
+	assert.equal(failed.runId, paused.runId);
+	const sdk = await new Lobster({ env })
+		.pipe(() => {
+			throw Object.assign(new Error("failed"), { runId: "someone-elses-run" });
+		})
+		.run();
+	assert.ok(sdk.runId && sdk.runId !== "someone-elses-run");
+});
+
 test("an SDK host retries its failed run with Lobster.advance", async (t) => {
 	const { env } = await fixture(t);
 	let attempts = 0;
