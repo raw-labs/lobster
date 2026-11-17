@@ -256,3 +256,14 @@ test("two missing values are not equal to each other", async () => {
 	});
 	assert.deepEqual(result.output, ["end\n"]);
 });
+
+test("a parenthesised null guards a missing field too", async () => {
+	const result = await runWorkflow({
+		steps: [
+			{ id: "data", command: `echo '{}'` },
+			{ id: "a", command: 'echo "a"', when: "$data.json.val != (null) && $data.json.val > 1" },
+			{ id: "b", command: 'echo "b"', when: "($data.json.val) == (null)" },
+		],
+	});
+	assert.deepEqual(result.output, ["b\n"]);
+});
