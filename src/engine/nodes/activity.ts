@@ -15,19 +15,32 @@ import { runPipelineStep, WorkflowPipelineInputSuspension } from "../activities/
 import { parseJson, createSyntheticStepResult } from "../values.js";
 import { bindRecorder, recorderFromEnv } from "../../persistence/context.js";
 import { input } from "./input.js";
+import { pipelineApproval } from "./approval.js";
 
 export async function activity(machine: Machine, step: WorkflowStep, key: string, scope: Scope) {
 	const record = activation(machine.state, key + "/activity");
 	if (record.phase === "completed") return record.result!;
 	if (record.phase === "waiting") {
-		const gateKey =
-			key +
-			"/pipeline-input-" +
-			record.pipelineInput!.resumeAtIndex +
-			"-" +
-			record.pipelineInput!.commandInput.pending.requestIndex;
-		await input(machine, step, gateKey, scope, record.wait);
-		record.response = activation(machine.state, gateKey).result!.response;
+		const paused = record.pipelineInput!;
+		if (paused.mode === "next_stage") {
+			// The pipeline halted after a stage to ask; it continues with the next one.
+			const gateKey = key + "/pipeline-gate-" + paused.resumeAtIndex;
+			if (paused.gate === "approval" && record.wait?.kind === "approval")
+				await pipelineApproval(machine, step, gateKey, scope, record.wait);
+			else {
+				await input(machine, step, gateKey, scope, record.wait);
+				record.response = activation(machine.state, gateKey).result!.response;
+			}
+		} else {
+			const gateKey =
+				key +
+				"/pipeline-input-" +
+				paused.resumeAtIndex +
+				"-" +
+				paused.commandInput!.pending.requestIndex;
+			await input(machine, step, gateKey, scope, record.wait);
+			record.response = activation(machine.state, gateKey).result!.response;
+		}
 	} else if (record.phase === "started") {
 		if (
 			record.input?.kind !== "none" &&
@@ -135,7 +148,7 @@ export async function activity(machine: Machine, step: WorkflowStep, key: string
 		if (error instanceof WorkflowPipelineInputSuspension) {
 			if (historyId) await history!.finish(historyId, "waiting");
 			record.pipelineInput = error.pipelineInput;
-			record.wait = { kind: "input", ...error.request };
+			record.wait = error.request;
 			record.phase = "waiting";
 			await machine.save();
 			return activity(machine, step, key, scope);

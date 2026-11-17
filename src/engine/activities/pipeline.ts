@@ -12,21 +12,34 @@ import type { RunContext } from "../context.js";
 import { stepScopedLedger, attachPipelineSourceItems } from "../accounting.js";
 import { parseJson, serializePipelineItemsToStdout, inputValueToPipelineItems } from "../values.js";
 
+/**
+ * Where a paused pipeline continues. `same_stage` (a command asked mid-run, `ctx.requestInput`)
+ * re-runs that stage with `commandInput`; `next_stage` (it halted for `approve` or `ask --emit`)
+ * continues with the next stage, fed `items` after an approval or `[response]` after an input.
+ */
 export type WorkflowPipelineInputResumeState = {
 	pipeline: Array<{ name: string; args: Record<string, unknown>; raw: string }>;
 	resumeAtIndex: number;
 	items: unknown[];
-	commandInput: CommandInputState;
+	commandInput?: CommandInputState;
+	mode?: "same_stage" | "next_stage";
+	gate?: "approval" | "input";
 };
+
+/** A question a pipeline asked: the step pauses on it, and the pipeline resumes afterwards. */
+export type PipelineGateRequest =
+	| { kind: "approval"; prompt: string; items: unknown[]; preview?: string }
+	| {
+			kind: "input";
+			prompt: string;
+			responseSchema: unknown;
+			defaults?: unknown;
+			subject?: unknown;
+	  };
 
 export class WorkflowPipelineInputSuspension extends Error {
 	stepId: string;
-	request: {
-		prompt: string;
-		responseSchema: unknown;
-		defaults?: unknown;
-		subject?: unknown;
-	};
+	request: PipelineGateRequest;
 	pipelineInput: WorkflowPipelineInputResumeState;
 
 	constructor({
@@ -35,10 +48,10 @@ export class WorkflowPipelineInputSuspension extends Error {
 		pipelineInput,
 	}: {
 		stepId: string;
-		request: WorkflowPipelineInputSuspension["request"];
+		request: PipelineGateRequest;
 		pipelineInput: WorkflowPipelineInputResumeState;
 	}) {
-		super(`Workflow step ${stepId} pipeline requested input`);
+		super(`Workflow step ${stepId} pipeline asked: ${request.prompt}`);
 		this.name = "WorkflowPipelineInputSuspension";
 		this.stepId = stepId;
 		this.request = request;
@@ -121,15 +134,20 @@ export async function runPipelineStep({
 		llmAdapters: ctx.llmAdapters,
 		// Scoped so a charge nothing bills can still name the step that opened it.
 		llmSpendLedger: llmSpendLedger ? stepScopedLedger(llmSpendLedger, stepId) : undefined,
-		input: resume ? resume.pipelineInput.items : inputValueToPipelineItems(inputValue),
+		input: resume
+			? resume.pipelineInput.mode === "next_stage" && resume.pipelineInput.gate === "input"
+				? [resume.response]
+				: resume.pipelineInput.items
+			: inputValueToPipelineItems(inputValue),
 		requestInputEnabled,
-		requestInputResume: resume
-			? {
-					state: resume.pipelineInput.commandInput,
-					response: resume.response,
-					onConsumed: resume.onConsumed,
-				}
-			: undefined,
+		requestInputResume:
+			resume && resume.pipelineInput.mode !== "next_stage"
+				? {
+						state: resume.pipelineInput.commandInput!,
+						response: resume.response,
+						onConsumed: resume.onConsumed,
+					}
+				: undefined,
 		onExecutionStart,
 		onNonRetryableSideEffect: ctx._onNonRetryableSideEffect,
 		heartbeat: ctx._heartbeat,
@@ -139,30 +157,57 @@ export async function runPipelineStep({
 
 	if (result.halted) {
 		const haltedName = result.haltedAt?.stage?.name ?? "unknown";
-		if (result.items.length === 1 && result.items[0]?.type === "approval_request") {
-			throw new WorkflowPipelineHaltError(
-				`Workflow step ${stepId} halted for approval inside pipeline stage ${haltedName}. Use a separate approval step in the workflow file.`,
-			);
-		}
-		const request =
-			result.items.length === 1 && result.items[0]?.type === "input_request"
+		const haltedAt = pipelineStartIndex + (result.haltedAt?.index ?? 0);
+		const item =
+			result.items.length === 1 && result.items[0] && typeof result.items[0] === "object"
 				? (result.items[0] as Record<string, any>)
 				: null;
-		if (request?.commandInput) {
+		// A pipeline that halts to ask pauses the step; the run resumes it after the answer.
+		// Gates are not supported in child workflows, so there the halt stays an error.
+		if (item?.type === "approval_request" && requestInputEnabled) {
 			throw new WorkflowPipelineInputSuspension({
 				stepId,
 				request: {
-					prompt: String(request.prompt),
-					responseSchema: request.responseSchema,
-					...(request.defaults !== undefined ? { defaults: request.defaults } : null),
-					...(request.subject !== undefined ? { subject: request.subject } : null),
+					kind: "approval",
+					prompt: String(item.prompt ?? "Approve?"),
+					items: Array.isArray(item.items) ? item.items : [],
+					...(typeof item.preview === "string" ? { preview: item.preview } : null),
 				},
 				pipelineInput: {
 					pipeline,
-					resumeAtIndex: pipelineStartIndex + (result.haltedAt?.index ?? 0),
-					items: Array.isArray(request.items) ? request.items : [],
-					commandInput: request.commandInput,
+					resumeAtIndex: haltedAt + 1,
+					items: Array.isArray(item.items) ? item.items : [],
+					mode: "next_stage",
+					gate: "approval",
 				},
+			});
+		}
+		if (item?.type === "approval_request") {
+			throw new WorkflowPipelineHaltError(
+				`Workflow step ${stepId} halted for approval inside pipeline stage ${haltedName}; approvals are not supported in child workflows.`,
+			);
+		}
+		const request = item?.type === "input_request" ? item : null;
+		if (request && (request.commandInput || requestInputEnabled)) {
+			const question = {
+				kind: "input" as const,
+				prompt: String(request.prompt),
+				responseSchema: request.responseSchema,
+				...(request.defaults !== undefined ? { defaults: request.defaults } : null),
+				...(request.subject !== undefined ? { subject: request.subject } : null),
+			};
+			throw new WorkflowPipelineInputSuspension({
+				stepId,
+				request: question,
+				pipelineInput: request.commandInput
+					? {
+							pipeline,
+							resumeAtIndex: haltedAt,
+							items: Array.isArray(request.items) ? request.items : [],
+							commandInput: request.commandInput,
+							mode: "same_stage",
+						}
+					: { pipeline, resumeAtIndex: haltedAt + 1, items: [], mode: "next_stage", gate: "input" },
 			});
 		}
 		throw new WorkflowPipelineHaltError(

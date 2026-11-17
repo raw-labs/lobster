@@ -13,7 +13,7 @@ async function runWorkflow(workflow: unknown) {
 	const filePath = path.join(tmpDir, "workflow.lobster");
 	await fsp.writeFile(filePath, JSON.stringify(workflow, null, 2), "utf8");
 
-	return runWorkflowFile({
+	const result = await runWorkflowFile({
 		filePath,
 		ctx: {
 			stdin: process.stdin,
@@ -24,6 +24,7 @@ async function runWorkflow(workflow: unknown) {
 			registry: createDefaultRegistry(),
 		},
 	});
+	return { ...result, stateDir };
 }
 
 test("on_error defaults to stop and propagates errors", async () => {
@@ -146,17 +147,28 @@ test("on_error: continue preserves output when final step fails", async () => {
 	assert.deepEqual(result.output, [{ ok: true }]);
 });
 
-test("pipeline approval halts bypass on_error handling", async () => {
-	await assert.rejects(
-		() =>
-			runWorkflow({
-				steps: [
-					{ id: "gate", pipeline: "approve --prompt 'Proceed?'", on_error: "continue" },
-					{ id: "after", command: "echo should-not-run" },
-				],
-			}),
-		/halted for approval inside pipeline/,
+test("an approval inside a pipeline step pauses the run; on_error does not answer it", async () => {
+	const steps = [
+		{ id: "gate", pipeline: "approve --prompt 'Proceed?'", on_error: "continue" },
+		{ id: "after", command: "echo after" },
+	];
+	const asked = await runWorkflow({ steps });
+	assert.equal(asked.status, "needs_approval");
+	assert.equal(asked.requiresApproval?.prompt, "Proceed?");
+	assert.deepEqual(asked.output, [], "nothing after the gate ran");
+	const ctx = {
+		stdin: process.stdin,
+		stdout: process.stdout,
+		stderr: process.stderr,
+		env: { ...process.env, LOBSTER_STATE_DIR: asked.stateDir },
+		mode: "tool" as const,
+		registry: createDefaultRegistry(),
+	};
+	const token = JSON.parse(
+		Buffer.from(asked.requiresApproval!.resumeToken!, "base64url").toString("utf8"),
 	);
+	const rejected = await runWorkflowFile({ resume: token, approved: false, ctx } as any);
+	assert.equal(rejected.status, "cancelled", "a rejection cancels the run, it is not an error");
 });
 
 test("external abort propagates even with on_error: continue", async () => {

@@ -1,4 +1,4 @@
-import { activation } from "../state.js";
+import { activation, type Activation } from "../state.js";
 import type { Machine, Scope } from "../machine.js";
 import type { WorkflowStep, WorkflowStepResult } from "../../workflows/types.js";
 import {
@@ -32,22 +32,53 @@ export async function approval(
 			`Step ${step.id} approval`,
 		),
 	};
-	const deadline = frame.wait.kind === "approval" ? frame.wait.deadline : undefined;
-	if (machine.expired(frame)) return machine.timeOut(key + "/approval", frame, frame.result);
+	return ask(machine, step.id, key + "/approval", frame, scope);
+}
+
+/**
+ * An `approve` inside a pipeline step: the pipeline halted with this request, and continues
+ * with the next stage once it is approved. A rejection cancels the run, as for a step approval.
+ */
+export async function pipelineApproval(
+	machine: Machine,
+	step: WorkflowStep,
+	key: string,
+	scope: Scope,
+	request: { prompt: string; items: unknown[]; preview?: string },
+) {
+	const frame = activation(machine.state, key);
+	if (frame.phase === "completed") return frame.result!;
+	frame.approval ??= {
+		type: "approval_request",
+		prompt: request.prompt,
+		items: request.items,
+		...(request.preview ? { preview: request.preview } : {}),
+	};
+	frame.result ??= { id: step.id };
+	frame.stepId = step.id;
+	frame.wait ??= { kind: "approval", ...request };
+	return ask(machine, step.id, key, frame, scope);
+}
+
+/** Ask a person, or pause the run when nobody can be asked here. */
+async function ask(machine: Machine, stepId: string, key: string, frame: Activation, scope: Scope) {
+	const approval = frame.approval!;
+	const deadline = frame.wait?.kind === "approval" ? frame.wait.deadline : undefined;
+	if (machine.expired(frame)) return machine.timeOut(key, frame, frame.result!);
 	if (scope.ctx.mode === "tool" || !isInteractive(scope.ctx.stdin))
-		await machine.suspend(key + "/approval", frame);
-	scope.ctx.stdout.write(frame.approval.prompt + " [y/N] ");
+		await machine.suspend(key, frame);
+	scope.ctx.stdout.write(approval.prompt + " [y/N] ");
 	const read = await readAnswer(scope, deadline);
-	if ("expired" in read) return machine.timeOut(key + "/approval", frame, frame.result);
+	if ("expired" in read) return machine.timeOut(key, frame, frame.result!);
 	if (!/^y(es)?$/i.test(String(read.answer).trim())) throw new Error("Not approved");
 	const approvedBy = String(scope.ctx.env.LOBSTER_APPROVAL_APPROVED_BY ?? "").trim() || undefined;
 	enforceApprovalIdentity({
-		stepId: step.id,
-		identity: approvalIdentityFromRequest(frame.approval),
+		stepId,
+		identity: approvalIdentityFromRequest(approval),
 		approvedBy,
 	});
 	// Through resolveWait: a question published earlier (in tool mode) is consumed with it.
-	return machine.resolveWait(key + "/approval", frame, {
+	return machine.resolveWait(key, frame, {
 		...frame.result,
 		approved: true,
 		...(approvedBy ? { approvedBy } : {}),
