@@ -712,6 +712,8 @@ Within a run, these commands suppress automatic workflow-step retries once dispa
 
 Pipeline commands can call `ctx.requestInput({ prompt, responseSchema, defaults, subject, suspendedState })` to pause in tool mode, workflows, or the SDK and resume the same command after a structured response. Resume tokens store only a state key; the run saves the suspended command's frame and validates the suspended request metadata before returning the submitted response to the command. This is the same for the CLI, tool mode and the SDK.
 
+Every schema Lobster checks (`ask --schema`, `responseSchema`, workflow `input.responseSchema`, `llm.invoke --output-schema`) is JSON Schema draft-07. `format` is not checked, keywords from later drafts are ignored, `nullable: true` also allows null, and each schema stands alone, so separate schemas may share an `$id`. Lobster validates without generating code, so it also runs where code generation from strings is disabled. A host with its own validator can run requests inside `withSchemaCompiler(compiler, callback)` from `@clawdbot/lobster/core` to use it instead.
+
 Commands are re-run on resume, so they must be idempotent until `requestInput` returns. Array-backed command input is snapshotted with bounds for replay; lazy stream input is not buffered and requires a compact JSON `suspendedState` supplied by the command. On resume, call `ctx.requestInput.getSuspendedState()` before reading lazy input to restore that command-owned continuation state.
 
 ## Visualizing workflows

@@ -7,7 +7,7 @@ import type {
 	WorkflowStepResult,
 	WorkflowRunResult,
 } from "../workflows/types.js";
-import { compileCached } from "../util/validation.js";
+import { prepareSchema, schemaValidationMessage } from "../util/validation.js";
 import { serializeValueForStdout } from "./values.js";
 import { resolveInputValue } from "../workflows/values.js";
 
@@ -221,14 +221,10 @@ export function validateInputResponse(params: {
 	/** The step that asked; none for a standalone pipeline, which has only the one. */
 	stepId?: string;
 }) {
-	const validator = compileCached(params.schema as object);
-	const ok = validator(params.response);
-	if (ok) return;
-	const first = validator.errors?.[0];
-	const pathValue = first?.instancePath || "/";
-	const reason = first?.message ? ` ${first.message}` : "";
+	const result = prepareSchema(params.schema).validate(params.response);
+	if (result.ok) return;
 	const asker = params.stepId === undefined ? "Input" : `Workflow input step ${params.stepId}`;
-	throw new Error(`${asker} response failed schema validation at ${pathValue}:${reason}`);
+	throw new Error(schemaValidationMessage(`${asker} response`, result.errors));
 }
 
 export function resolveInputSubject(params: {

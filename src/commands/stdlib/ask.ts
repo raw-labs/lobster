@@ -1,5 +1,5 @@
 import { defineCommand } from "../define.js";
-import { compileCached } from "../../util/validation.js";
+import { prepareSchema, schemaValidationMessage } from "../../util/validation.js";
 
 function isInteractive(stdin) {
 	return Boolean(stdin.isTTY);
@@ -7,19 +7,15 @@ function isInteractive(stdin) {
 
 function compileAskValidator(schema) {
 	try {
-		return compileCached(schema);
+		return prepareSchema(schema);
 	} catch {
 		throw new Error("ask response schema is invalid");
 	}
 }
 
 function validateAskResponse(validator, response) {
-	const ok = validator(response);
-	if (ok) return;
-	const first = validator.errors?.[0];
-	const pathValue = first?.instancePath || "/";
-	const reason = first?.message ? ` ${first.message}` : "";
-	throw new Error(`ask response failed schema validation at ${pathValue}:${reason}`);
+	const result = validator.validate(response);
+	if (!result.ok) throw new Error(schemaValidationMessage("ask response", result.errors));
 }
 
 function parseInteractiveCandidates(text) {

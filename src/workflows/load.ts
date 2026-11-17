@@ -4,7 +4,7 @@ import { closestMatch } from "../util/suggest.js";
 import { promises as fsp } from "node:fs";
 import path from "node:path";
 import { parse as parseYaml } from "yaml";
-import { compileCached } from "../util/validation.js";
+import { prepareSchema } from "../util/validation.js";
 import type { WorkflowFile, WorkflowStep, ParallelConfig } from "./types.js";
 
 export async function loadWorkflowFile(filePath: string): Promise<WorkflowFile> {
@@ -334,7 +334,7 @@ export async function loadWorkflowFile(filePath: string): Promise<WorkflowFile> 
 		}
 		if (step.input) {
 			try {
-				compileCached(step.input.responseSchema as any);
+				prepareSchema(step.input.responseSchema);
 			} catch (err: any) {
 				throw new Error(
 					`Workflow step ${step.id} input.responseSchema is invalid: ${err?.message ?? String(err)}`,

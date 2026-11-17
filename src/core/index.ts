@@ -19,6 +19,8 @@ export {
 } from "../workflows/file.js";
 export { decodeResumeToken } from "../resume/resume.js";
 export { runToolRequest, resumeToolRequest, createToolContext } from "./tool_runtime.js";
+// Hosts that bring their own JSON Schema validator (OpenClaw's Lobster plugin) keep it.
+export { withSchemaCompiler, type HostSchemaCompiler } from "../util/validation.js";
 
 export {
 	openStoreSession,

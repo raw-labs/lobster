@@ -1,5 +1,5 @@
 import { stableStringify } from "../state/serialization.js";
-import { compileCached } from "../util/validation.js";
+import { prepareSchema, schemaValidationMessage } from "../util/validation.js";
 
 export type RequestInputParams = {
 	prompt: string;
@@ -327,15 +327,12 @@ export function validateCommandInputState(value: unknown): CommandInputState {
 export function validateRequestInputResponse(schema: unknown, response: unknown, label: string) {
 	let validator;
 	try {
-		validator = compileCached(schema as any);
+		validator = prepareSchema(schema);
 	} catch {
 		throw new Error(`${label} response schema is invalid`);
 	}
-	if (validator(response)) return;
-	const first = validator.errors?.[0];
-	const pathValue = first?.instancePath || "/";
-	const reason = first?.message ? ` ${first.message}` : "";
-	throw new Error(`${label} response failed schema validation at ${pathValue}:${reason}`);
+	const result = validator.validate(response);
+	if (!result.ok) throw new Error(schemaValidationMessage(`${label} response`, result.errors));
 }
 
 function validateRequestInputParams(params: RequestInputParams) {
@@ -349,7 +346,7 @@ function validateRequestInputParams(params: RequestInputParams) {
 		throw new Error("requestInput responseSchema is required");
 	}
 	try {
-		compileCached(params.responseSchema as any);
+		prepareSchema(params.responseSchema);
 	} catch {
 		throw new Error("requestInput response schema is invalid");
 	}

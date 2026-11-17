@@ -4,8 +4,6 @@ import type { LlmChargeCost, LlmSpendLedger, LlmProvenance } from "../../llm/acc
 import path from "node:path";
 import { promises as fsp } from "node:fs";
 import { createHash } from "node:crypto";
-import { Ajv } from "ajv";
-import type { ErrorObject } from "ajv";
 
 import {
 	diffAndStore,
@@ -17,11 +15,13 @@ import {
 	withFileLock,
 	writeFileAtomic,
 } from "../../state/store.js";
-import { createCompileCached } from "../../util/validation.js";
+import {
+	formatSchemaError,
+	prepareSchema,
+	type SchemaError,
+	type SchemaValidator,
+} from "../../util/validation.js";
 import { httpResponseLimitFromEnv, readResponseTextCapped } from "../../io/read_response_text.js";
-
-const ajv = new Ajv({ allErrors: true, strict: false });
-const compileCachedLocal = createCompileCached(ajv);
 
 const artifactSchema = {
 	type: "object",
@@ -105,8 +105,8 @@ const responseSchema = {
 	additionalProperties: true,
 };
 
-const validatePayload = ajv.compile(payloadSchema);
-const validateResponseEnvelope = ajv.compile(responseSchema);
+const payloadValidator = prepareSchema(payloadSchema);
+const responseEnvelopeValidator = prepareSchema(responseSchema);
 
 const DEFAULT_MAX_VALIDATION_RETRIES = 1;
 const STATE_VERSION = 1;
@@ -460,11 +460,19 @@ async function runLlmInvoke({
 	if (Number.isFinite(maxOutputTokens ?? NaN)) payload.maxOutputTokens = Number(maxOutputTokens);
 	if (Number.isFinite(temperature ?? NaN)) payload.temperature = Number(temperature);
 
-	if (!validatePayload(payload)) {
-		throw new Error(`${config.name} payload invalid: ${ajv.errorsText(validatePayload.errors)}`);
+	const payloadCheck = payloadValidator.validate(payload, { allErrors: true });
+	if (!payloadCheck.ok) {
+		throw new Error(`${config.name} payload invalid: ${formatSchemaErrors(payloadCheck.errors)}`);
 	}
 
-	const validator = userOutputSchema ? compileCachedLocal(userOutputSchema) : null;
+	let validator: SchemaValidator | null = null;
+	if (userOutputSchema) {
+		try {
+			validator = prepareSchema(userOutputSchema);
+		} catch (err: any) {
+			throw new Error(`${config.name} output schema is invalid: ${err?.message ?? String(err)}`);
+		}
+	}
 	let attempt = 0;
 	let lastValidationErrors: string[] = [];
 
@@ -503,7 +511,7 @@ async function runLlmInvoke({
 			throw new Error(`${config.name} request failed: ${err?.message ?? String(err)}`);
 		}
 
-		if (!validateResponseEnvelope(responseEnvelope)) {
+		if (!responseEnvelopeValidator.validate(responseEnvelope).ok) {
 			throw new Error(`${config.name} received invalid response envelope`);
 		}
 
@@ -557,7 +565,8 @@ async function runLlmInvoke({
 		}
 
 		const structured = normalized[0]?.output?.data ?? null;
-		if (validator(structured)) {
+		const outputCheck = validator.validate(structured, { allErrors: true });
+		if (outputCheck.ok) {
 			ctx.signal?.throwIfAborted();
 			await persistOutputs({
 				env,
@@ -582,7 +591,7 @@ async function runLlmInvoke({
 			return { output: streamOf(normalized) };
 		}
 
-		lastValidationErrors = collectAjvErrors(validator.errors);
+		lastValidationErrors = outputCheck.errors.map(formatSchemaError);
 		if (attempt > maxValidationRetries) {
 			throw new Error(
 				`${config.name} output failed schema validation: ${lastValidationErrors.join("; ")}`,
@@ -1160,9 +1169,8 @@ function pickReusableState(stored: any, cacheKey: string, stateType: string) {
 	return { items: stored.items as NormalizedInvocationItem[] };
 }
 
-function collectAjvErrors(errors: ErrorObject[] | null | undefined) {
-	if (!errors?.length) return [];
-	return errors.map((err) => `${err.instancePath || "/"} ${err.message ?? ""}`.trim());
+function formatSchemaErrors(errors: SchemaError[]) {
+	return errors.map(formatSchemaError).join(", ");
 }
 
 async function readCacheEntry(

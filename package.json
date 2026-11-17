@@ -71,7 +71,7 @@
 		"crabbox:warmup": "crabbox warmup"
 	},
 	"dependencies": {
-		"ajv": "^8.20.0",
+		"typebox": "^1.4.7",
 		"yaml": "^2.9.1"
 	},
 	"devDependencies": {
