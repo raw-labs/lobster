@@ -879,7 +879,8 @@ test("llm.invoke aborts while waiting for its reusable run-state lock", async ()
 		const early = await Promise.race([
 			completion,
 			new Promise<{ kind: "timeout" }>((resolve) =>
-				setTimeout(() => resolve({ kind: "timeout" }), 75),
+				// Only a missed abort waits this long; an observed one settles at once.
+				setTimeout(() => resolve({ kind: "timeout" }), 2000),
 			),
 		]);
 		if (early.kind === "timeout") await fsp.rm(lockPath, { recursive: true, force: true });

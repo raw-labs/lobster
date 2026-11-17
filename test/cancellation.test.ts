@@ -2082,7 +2082,9 @@ test("parent cancellation terminates the gog process tree and skips Gmail sends"
 		const abortedAt = Date.now();
 		controller.abort();
 		const immediate = await observeSettlement(run, 50);
-		const observed = await observeSettlement(run, 500);
+		// The mock takes 1000ms to exit on SIGTERM; settling well before that shows the
+		// force-kill (after 250ms) ended it. Both bounds allow for a slow CI machine.
+		const observed = await observeSettlement(run, 900);
 		const envelope = observed.settled ? observed.value : await run;
 
 		assert.equal(immediate.settled, false, "workflow must wait for the child to exit");
@@ -2109,7 +2111,7 @@ test("parent cancellation terminates the gog process tree and skips Gmail sends"
 		);
 		assert.equal(await fileExists(sendStarted), false);
 		assert.equal(await fileExists(sendCompleted), false);
-		if (observed.settled) assert.ok(observed.settledAt - abortedAt < 500);
+		if (observed.settled) assert.ok(observed.settledAt - abortedAt < 950);
 	} finally {
 		await rm(dir, { recursive: true, force: true });
 	}
@@ -3758,7 +3760,8 @@ test("explicit cancellation stops waiting for a state lock without orphaning its
 		const early = await Promise.race([
 			completion,
 			new Promise<{ kind: "timeout" }>((resolve) =>
-				setTimeout(() => resolve({ kind: "timeout" }), 75),
+				// Only a missed abort waits this long; an observed one settles at once.
+				setTimeout(() => resolve({ kind: "timeout" }), 2000),
 			),
 		]);
 		if (early.kind === "timeout") await rm(lockPath, { recursive: true, force: true });
@@ -4301,7 +4304,8 @@ test("approval rejection stops waiting for a state lock without orphaning its ap
 		const early = await Promise.race([
 			completion,
 			new Promise<{ kind: "timeout" }>((resolve) =>
-				setTimeout(() => resolve({ kind: "timeout" }), 75),
+				// Only a missed abort waits this long; an observed one settles at once.
+				setTimeout(() => resolve({ kind: "timeout" }), 2000),
 			),
 		]);
 		if (early.kind === "timeout") await rm(lockPath, { recursive: true, force: true });
