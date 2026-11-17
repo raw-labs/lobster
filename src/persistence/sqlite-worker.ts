@@ -504,7 +504,14 @@ function handle(request: WorkerRequest): WorkerResult<WorkerMethod> {
 				.filter((row) => transaction(() => removeRun(row.id, args.before)))
 				.map((row) => row.id);
 			if (ids.length < PRUNE_BATCH) {
-				prepare("DELETE FROM event_inbox WHERE at < ?").run(Date.parse(args.before));
+				// Keep events an unfinished run may still wait for: those since the oldest one started.
+				const oldest = prepare(`SELECT MIN(json_extract(record, '$.execution.startedAt')) AS at
+					FROM runs WHERE json_extract(record, '$.status') IN ('running', 'waiting', 'blocked')`).get() as
+					| { at: number | null }
+					| undefined;
+				prepare("DELETE FROM event_inbox WHERE at < ?").run(
+					Math.min(Date.parse(args.before), oldest?.at ?? Number.POSITIVE_INFINITY),
+				);
 				setMeta("pruneCursor", "");
 				setMeta("lastPrune", args.now);
 			} else {

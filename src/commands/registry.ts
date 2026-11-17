@@ -43,7 +43,11 @@ export function createDefaultRegistry(): CommandRegistry {
 	return createRegistry({ packs: builtinPacks });
 }
 
-/** Named workflows of a registry. A registry that does not list any has none. */
+/**
+ * Named workflows of a registry. One that cannot list them (a host's `{ get, list }` wrapper,
+ * the shape registries had before packs) sees the built-in ones, as `workflows.run` always did;
+ * a host that must not run them leaves `workflows.run` out of its registry.
+ */
 export function registryWorkflows(registry: CommandRegistry | undefined): NamedWorkflow[] {
-	return registry?.workflows?.() ?? [];
+	return registry?.workflows?.() ?? builtinPacks.flatMap((pack) => pack.workflows ?? []);
 }

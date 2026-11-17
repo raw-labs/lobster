@@ -49,8 +49,6 @@ export async function input(
 	if ("expired" in read) return machine.timeOut(key, frame, { id: step.id, subject: wait.subject });
 	const response = parseResponseJson(String(read.answer ?? "").trim());
 	validateInputResponse({ schema: wait.responseSchema, response, stepId: step.id });
-	frame.result = { id: step.id, subject: wait.subject, response };
-	frame.phase = "completed";
-	await machine.save();
-	return frame.result;
+	// Through resolveWait: a question published earlier (in tool mode) is consumed with it.
+	return machine.resolveWait(key, frame, { id: step.id, subject: wait.subject, response });
 }

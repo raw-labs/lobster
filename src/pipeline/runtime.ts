@@ -104,6 +104,14 @@ export async function runPipeline({
 		heartbeat: heartbeat ?? (() => {}),
 	};
 
+	// Every stage is checked before the first runs: a typo in a later stage must not fail
+	// the pipeline after an earlier one has already acted (sent a message, called a tool).
+	for (const stage of pipeline) {
+		const command = registry.get(stage.name);
+		if (!command) throw new Error(`Unknown command: ${stage.name}`);
+		assertKnownFlags(command, stage.name, stage.args ?? {});
+	}
+
 	const unfinishedStages = new Set<() => Promise<void>>();
 	try {
 		const result = await executeStages();

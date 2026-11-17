@@ -46,9 +46,10 @@ export async function approval(
 		identity: approvalIdentityFromRequest(frame.approval),
 		approvedBy,
 	});
-	frame.result.approved = true;
-	if (approvedBy) frame.result.approvedBy = approvedBy;
-	frame.phase = "completed";
-	await machine.save();
-	return frame.result;
+	// Through resolveWait: a question published earlier (in tool mode) is consumed with it.
+	return machine.resolveWait(key + "/approval", frame, {
+		...frame.result,
+		approved: true,
+		...(approvedBy ? { approvedBy } : {}),
+	});
 }

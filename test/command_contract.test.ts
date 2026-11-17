@@ -6,6 +6,7 @@ import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { promises as fs } from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { builtinPacks, createDefaultRegistry, createRegistry } from "../src/commands/registry.js";
@@ -267,4 +268,58 @@ test("lobster --help lists every command the registry knows", () => {
 	}).stdout;
 	const listed = help.split("Commands:\n")[1]?.trim().split(", ");
 	assert.deepEqual(listed, registry.list());
+});
+
+test("an unknown flag in a later stage fails before an earlier stage acts", async (t) => {
+	const dir = await fs.mkdtemp(path.join(os.tmpdir(), "lobster-flags-"));
+	t.after(() => fs.rm(dir, { recursive: true, force: true }));
+	const marker = path.join(dir, "acted");
+	await assert.rejects(
+		run(`exec --shell ${JSON.stringify(`touch ${marker}`)} | head --limit 1`),
+		/head has no flag --limit/,
+	);
+	assert.equal(existsSync(marker), false, "the first stage never ran");
+});
+
+test("the public parsePipeline keeps built-in boolean flags without a registry", async () => {
+	const { parsePipeline: publicParse } = await import("../src/core/index.js");
+	const [stage] = publicParse("exec --json node script.js");
+	assert.equal((stage.args as Record<string, unknown>).json, true);
+	assert.deepEqual(stage.args._, ["node", "script.js"]);
+});
+
+test("--flag=false and --flag false mean the same for a declared boolean", () => {
+	for (const text of ["openclaw.invoke --each=false", "openclaw.invoke --each false"])
+		assert.equal(parsePipeline(text, registry)[0].args["each"], false, text);
+	assert.equal(parsePipeline("openclaw.invoke --each=true", registry)[0].args["each"], true);
+});
+
+test("a host registry shaped { get, list } still sees the built-in named workflows", async () => {
+	const base = createDefaultRegistry();
+	const wrapped = { get: (name: string) => base.get(name), list: () => base.list() };
+	const result = await runPipeline({
+		pipeline: parsePipeline("workflows.list", wrapped),
+		registry: wrapped,
+		input: empty(),
+		stdin: process.stdin,
+		stdout: process.stdout,
+		stderr: process.stderr,
+		env: { ...process.env },
+		mode: "tool",
+	} as any);
+	assert.ok(result.items.some((w: any) => w.name === "github.pr.monitor"));
+});
+
+test("lobster help <cli command> shows the usage instead of failing", () => {
+	for (const topic of ["signal", "runs", "upgrade"]) {
+		const help = spawnSync(
+			process.execPath,
+			[path.join(repoRoot, "bin", "lobster.js"), "help", topic],
+			{
+				encoding: "utf8",
+			},
+		);
+		assert.equal(help.status, 0, topic);
+		assert.match(help.stdout, /Manage runs:/);
+	}
 });

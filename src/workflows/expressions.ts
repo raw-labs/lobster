@@ -64,6 +64,17 @@ export function evaluateCondition(condition: unknown, results: Record<string, Wo
 	return evaluateConditionExpression(trimmed, results);
 }
 
+/**
+ * Check that a condition parses, without step results: used when a workflow loads (before any
+ * step has run) and by dry-run for conditions that depend on output a plan does not have.
+ */
+export function checkConditionSyntax(condition: unknown) {
+	if (typeof condition !== "string") return;
+	const trimmed = condition.trim();
+	if (trimmed === "true" || trimmed === "false") return;
+	evaluateConditionExpression(trimmed, {}, true);
+}
+
 function renderTemplateValue(value: unknown) {
 	if (value === undefined || value === null) return "";
 	if (typeof value === "string") return value;
@@ -104,6 +115,7 @@ type ConditionToken =
 function evaluateConditionExpression(
 	expression: string,
 	results: Record<string, WorkflowStepResult>,
+	syntaxOnly = false,
 ) {
 	const tokens = tokenizeCondition(expression);
 	if (tokens.length === 0) {
@@ -112,7 +124,7 @@ function evaluateConditionExpression(
 	let index = 0;
 	// Operands that cannot change the result are parsed but not checked, so a guard
 	// such as `$x.json.score != null && $x.json.score > 0.8` works.
-	let skipping = 0;
+	let skipping = syntaxOnly ? 1 : 0;
 	const skipped = (parse: () => unknown) => {
 		skipping += 1;
 		try {
@@ -199,7 +211,9 @@ function evaluateConditionExpression(
 			return value;
 		}
 		if (token.type === "step_ref") {
-			return getStepRefValue(token.value, results, true);
+			if (syntaxOnly) return undefined;
+			// A side that cannot change the result is not checked, references included.
+			return getStepRefValue(token.value, results, skipping === 0);
 		}
 		if (
 			token.type === "string" ||
@@ -235,6 +249,8 @@ function evaluateConditionExpression(
 }
 
 function compareConditionValues(left: unknown, right: unknown) {
+	// A missing field and null are both "no value": `$x.json.v != null` guards either.
+	if ((left === undefined || left === null) && (right === undefined || right === null)) return true;
 	if (
 		Array.isArray(left) ||
 		Array.isArray(right) ||

@@ -7,7 +7,7 @@ export type {
 	LobsterCommand,
 	NamedWorkflow,
 } from "../commands/types.js";
-export { parsePipeline } from "../pipeline/parser.js";
+export { parsePipeline } from "./parse.js";
 export { runPipeline } from "../pipeline/runtime.js";
 export {
 	runWorkflowFile,

@@ -57,7 +57,11 @@ function parseArgs(tokens, booleanFlags: readonly string[] = []) {
 			if (eq !== -1) {
 				const key = tok.slice(2, eq);
 				const value = tok.slice(eq + 1);
-				args[key] = value;
+				// `--flag=false` and `--flag false` mean the same for a declared boolean.
+				args[key] =
+					booleanFlags.includes(key) && (value === "true" || value === "false")
+						? value === "true"
+						: value;
 				continue;
 			}
 

@@ -1,3 +1,4 @@
+import { checkConditionSyntax } from "./expressions.js";
 import { parseDuration } from "../util/duration.js";
 import { closestMatch } from "../util/suggest.js";
 import { promises as fsp } from "node:fs";
@@ -214,9 +215,10 @@ export async function loadWorkflowFile(filePath: string): Promise<WorkflowFile> 
 					throw new Error(`Workflow step ${step.id} duplicate for_each sub-step id: ${sub.id}`);
 				}
 				subStepIds.add(sub.id);
+				// Any value counts: a malformed gate must not load as "no gate" and run unguarded.
 				if (
-					isApprovalStep(sub.approval) ||
-					isInputStep(sub.input) ||
+					sub.approval !== undefined ||
+					sub.input !== undefined ||
 					sub.sleep !== undefined ||
 					sub.wait !== undefined
 				) {
@@ -300,7 +302,7 @@ export async function loadWorkflowFile(filePath: string): Promise<WorkflowFile> 
 		if (isWait) validateEventWait(step, `Workflow step ${step.id}`);
 		if (step.heartbeat_timeout_ms !== undefined && !shellCommand && !pipeline && !isForEach) {
 			throw new Error(
-				`Workflow step ${step.id} heartbeat_timeout_ms applies only to run, command and pipeline steps`,
+				`Workflow step ${step.id} heartbeat_timeout_ms applies only to run, command, pipeline and for_each steps`,
 			);
 		}
 		if (isInputStep(step.input)) validateWaitTimeout(step.input, `Workflow step ${step.id} input`);
@@ -541,6 +543,13 @@ function validateCondition(step: WorkflowStep, name: string) {
 			typeof value !== "string"
 		)
 			throw new Error(`${name} ${key} must be a boolean or an expression string`);
+		if (typeof value === "string") {
+			try {
+				checkConditionSyntax(value);
+			} catch (error: any) {
+				throw new Error(`${name} ${key} is not a valid condition: ${error?.message ?? error}`);
+			}
+		}
 	}
 }
 

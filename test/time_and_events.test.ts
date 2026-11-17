@@ -18,7 +18,7 @@ import { openStoreSession } from "../src/persistence/session.js";
 import { decodeToken } from "../src/resume/token.js";
 import { createDefaultRegistry } from "../src/commands/registry.js";
 import { defineCommand } from "../src/commands/define.js";
-import { workflowFixture } from "./helpers/workflow_runner.js";
+import { interactiveStdin, workflowFixture } from "./helpers/workflow_runner.js";
 import { crashAndRecover } from "./helpers/crash_recovery.js";
 
 const exec = promisify(execFile);
@@ -369,4 +369,72 @@ test("events are scoped to the caller that owns the run", async (t) => {
 		["ok"],
 	);
 	assert.equal(fx.fake.calls("after"), 1);
+});
+
+test("a match reference that resolves to nothing fails instead of matching every event", async (t) => {
+	const fx = await workflowFixture(t);
+	fx.fake.script({ send: [{ output: { other: 1 } }] });
+	await assert.rejects(
+		fx.run({
+			steps: [
+				{ id: "send", pipeline: "fake --name send" },
+				{ id: "reply", wait: { event: "email.reply", match: { thread: "$send.json.thread" } } },
+			],
+		}),
+		/wait\.match\.thread resolved to nothing/,
+	);
+});
+
+test("an event received after the wait's deadline does not count", async (t) => {
+	const fx = await workflowFixture(t);
+	await fx.run({
+		steps: [
+			{ id: "w", wait: { event: "late", timeout: "100ms", on_timeout: "continue" } },
+			{ id: "after", pipeline: "fake --name after", when: "$w.timedOut" },
+		],
+	});
+	await sleep(150);
+	// Delivered after the deadline, before anything advanced the run: the run times out.
+	const { advanced } = await signalEvent({ name: "late", ctx: fx.ctx() as any });
+	assert.deepEqual(
+		advanced.map((a) => a.status),
+		["ok"],
+	);
+	assert.equal(fx.fake.calls("after"), 1, "the step timed out instead of taking the late event");
+});
+
+test("an interactive deadline longer than 24.8 days does not fire at once", async (t) => {
+	const fx = await workflowFixture(t);
+	const stdin = interactiveStdin();
+	const running = fx.run(
+		{ steps: [{ id: "ok", approval: { prompt: "Ship?", timeout: "30d" } }, after] },
+		{ mode: "human", stdin },
+	);
+	await sleep(150);
+	stdin.write("y\n");
+	const result = await running;
+	assert.equal(result.status, "ok");
+	assert.equal(fx.fake.calls("after"), 1);
+});
+
+test("answering a published question at a terminal consumes its wait", async (t) => {
+	const fx = await workflowFixture(t);
+	const asked = await fx.run({ steps: [{ id: "ok", approval: "Ship?" }, after] });
+	assert.equal(asked.status, "needs_approval");
+	const stdin = interactiveStdin();
+	const running = advanceWorkflowRun({
+		runId: asked.runId!,
+		ctx: fx.ctx({ mode: "human", stdin }) as any,
+	});
+	await sleep(150);
+	stdin.write("y\n");
+	assert.equal((await running).status, "ok");
+	const session = await openStoreSession({ env: fx.env });
+	const run = (await session.getRunState(asked.runId!))!;
+	await session.close();
+	assert.deepEqual(
+		Object.values(run.waits).filter((w) => w.status === "pending"),
+		[],
+		"no question is left pending",
+	);
 });

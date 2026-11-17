@@ -179,3 +179,68 @@ test("a misspelled key is rejected instead of ignored", async () => {
 		await assert.rejects(runWorkflow(workflow), message);
 	}
 });
+
+test("a guard works for a missing field as well as for null", async () => {
+	const result = await runWorkflow({
+		steps: [
+			{ id: "data", command: `echo '{}'` },
+			{ id: "a", command: 'echo "a"', when: "$data.json.val != null && $data.json.val > 1" },
+			{ id: "b", command: 'echo "b"', when: "$data.json.val == null" },
+		],
+	});
+	assert.deepEqual(result.output, ["b\n"]);
+});
+
+test("condition syntax is checked when the workflow loads, before any step runs", async () => {
+	await assert.rejects(
+		runWorkflow({
+			steps: [
+				{ id: "first", command: "echo first" },
+				{ id: "x", command: "echo x", when: "$first.json.ok = 1" },
+			],
+		}),
+		/x when is not a valid condition/,
+	);
+});
+
+test("dry-run plans a comparison on step output instead of failing on its placeholder", async () => {
+	const result = await runWorkflowFile({
+		filePath: await (async () => {
+			const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-cond-dry-"));
+			const file = path.join(dir, "w.lobster");
+			await fsp.writeFile(
+				file,
+				JSON.stringify({
+					steps: [
+						{ id: "s", command: "echo '{\"v\":1}'" },
+						{ id: "big", command: "echo big", when: "$s.json.v > 0.8" },
+					],
+				}),
+			);
+			return file;
+		})(),
+		ctx: {
+			stdin: process.stdin,
+			stdout: process.stdout,
+			stderr: new (await import("node:stream")).PassThrough(),
+			env: { ...process.env },
+			mode: "tool",
+			dryRun: true,
+		} as any,
+	});
+	assert.equal(result.status, "ok");
+});
+
+test("any approval or input key in a for_each sub-step is rejected, whatever its value", async () => {
+	for (const gate of [{ approval: 1 }, { approval: [] }, { approval: "  " }, { input: "name?" }])
+		await assert.rejects(
+			runWorkflow({
+				steps: [
+					{ id: "items", command: "echo '[1]'" },
+					{ id: "loop", for_each: "$items.json", steps: [{ id: "s", command: "echo s", ...gate }] },
+				],
+			}),
+			/cannot contain approval or input steps/,
+			JSON.stringify(gate),
+		);
+});

@@ -23,7 +23,7 @@ For repeatable automation, put shell commands, native pipeline steps, and explic
 
 ## Quick start
 
-Requires Node.js 22 or newer and the pnpm version pinned in `package.json`. From this folder:
+Requires Node.js >=24.16.0 <25 or >=26.1.0 and the pnpm version pinned in `package.json`. From this folder:
 
 - `pnpm install --frozen-lockfile`
 - `pnpm build`
@@ -677,7 +677,7 @@ Notes:
 - If you need a human checkpoint before an LLM call, use a dedicated `approval:` step in the workflow file rather than `approve` inside the nested pipeline.
 - `cwd`, `env`, `stdin`, `when`, and `condition` work for both shell and pipeline steps.
 - Unknown keys are rejected when the file loads, with a suggestion for likely typos, so a misspelled `when:` cannot make a step run unconditionally.
-- `<`, `<=`, `>` and `>=` compare numbers (numeric strings such as `"0.9"` count). Comparing anything else, including a missing value or `null`, fails the step with an error rather than evaluating to false. Guard optional values with `&&` or `||`, which skip the right side when the left decides the result: `$score.json.value != null && $score.json.value > 0.8`.
+- `<`, `<=`, `>` and `>=` compare numbers (numeric strings such as `"0.9"` count). Comparing anything else, including a missing value or `null`, fails the step with an error rather than evaluating to false. Guard optional values with `&&` or `||`, which skip the right side when the left decides the result; a missing field equals `null`: `$score.json.value != null && $score.json.value > 0.8`.
 - Use `retry`, `timeout_ms`, and `on_error` per step to control transient-failure behavior and recovery.
 - On `for_each`, these policies cover the entire loop: each attempt gets one timeout budget (including batch pauses), and retry restarts at the first item. Previously completed children may run again, so only enable loop retries for work that is safe to repeat. A `cost_limit` stop or an attempted OpenClaw dispatch prevents retries; paid LLM usage is checked even when a later pipeline command fails. `on_error: continue` records `$loop.error` and proceeds to the next workflow step; `skip_rest` skips the remaining workflow steps.
 - Approval steps can optionally enforce identity constraints:

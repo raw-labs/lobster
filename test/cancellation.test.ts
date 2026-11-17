@@ -1689,7 +1689,12 @@ test("cancellation before a non-terminal lazy handoff does not wait for its next
 		runToolRequest({
 			pipeline: "test.abort-before-lazy-handoff | test.unreached",
 			ctx: {
-				registry: withCommands(createDefaultRegistry(), source),
+				registry: withCommands(createDefaultRegistry(), source, {
+					name: "test.unreached",
+					async run() {
+						throw new Error("test.unreached must not run");
+					},
+				}),
 				signal: controller.signal,
 			},
 		}),

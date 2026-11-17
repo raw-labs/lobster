@@ -18,7 +18,10 @@ export type CommandMeta = {
 	 * `false` when running the command twice could repeat an external action (send a message,
 	 * call a tool). Lobster then never repeats it on its own: a retry stops once the command
 	 * has reported dispatch through `ctx.onNonRetryableSideEffect`, and crash recovery never
-	 * re-runs a step that contains it, even with `recovery: repeat`.
+	 * re-runs a step that contains it, even with `recovery: repeat`. `true` only promises that
+	 * nothing external happens twice; a repeat may still see different state (`diff.last`
+	 * reports no change the second time). `exec` is `true` like a `run:` step: what an
+	 * arbitrary command does is the workflow author's call, through `recovery`.
 	 */
 	repeatable?: boolean;
 	/** Other names the command answers to. `ctx.commandName` holds the name that was used. */

@@ -410,14 +410,28 @@ export function questionDeadline(
 
 /** Read a line from a person, stopping at the question's deadline. */
 export async function readAnswer(
-	scope: { ctx: { stdin: any; env: Record<string, string | undefined>; signal?: AbortSignal } },
+	scope: {
+		ctx: {
+			stdin: any;
+			env: Record<string, string | undefined>;
+			signal?: AbortSignal;
+			_heartbeat?: () => void;
+		};
+	},
 	deadline: number | undefined,
 ): Promise<{ answer: string } | { expired: true }> {
 	const expiry = new AbortController();
-	const timer =
-		deadline === undefined
-			? undefined
-			: setTimeout(() => expiry.abort(), Math.max(0, deadline - Date.now()));
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	// Timers cap at about 24.8 days (longer delays fire at once), so re-arm until the deadline.
+	const arm = () => {
+		const left = deadline! - Date.now();
+		if (left <= 0) expiry.abort();
+		else timer = setTimeout(arm, Math.min(left, 2_147_483_647));
+	};
+	if (deadline !== undefined) arm();
+	// Waiting for a person is not a hung step: keep a heartbeat limit from expiring meanwhile.
+	const alive = scope.ctx._heartbeat ? setInterval(scope.ctx._heartbeat, 1000) : undefined;
+	scope.ctx._heartbeat?.();
 	try {
 		const answer = await readLineFromStream(scope.ctx.stdin, {
 			timeoutMs: parseApprovalTimeoutMs(scope.ctx.env),
@@ -429,5 +443,6 @@ export async function readAnswer(
 		throw error;
 	} finally {
 		if (timer) clearTimeout(timer);
+		if (alive) clearInterval(alive);
 	}
 }

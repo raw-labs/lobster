@@ -502,8 +502,12 @@ export class Machine {
 		const owner = run?.metadata?.callerId ?? "";
 		const consumed = new Set(this.state.events ?? []);
 		const events = await this.store.session.findEvents(wait.event, wait.since, owner);
+		// An event received after the deadline does not count, however late the run is advanced.
 		return events.find(
-			(event) => !consumed.has(eventKey(event)) && matchesEvent(wait.match, event.data),
+			(event) =>
+				!consumed.has(eventKey(event)) &&
+				(wait.deadline === undefined || event.at <= wait.deadline) &&
+				matchesEvent(wait.match, event.data),
 		) as InboxEvent | undefined;
 	}
 

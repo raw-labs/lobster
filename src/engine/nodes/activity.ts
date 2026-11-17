@@ -126,7 +126,10 @@ export async function activity(machine: Machine, step: WorkflowStep, key: string
 		if (historyId) await history!.finish(historyId, "completed", result);
 		// The result and completed marker are one checkpoint. Parent cursor advances later.
 		await machine.save();
-		ctx.signal?.throwIfAborted();
+		// Once the result is saved, the step's own timer or heartbeat may no longer fail it:
+		// that would retry, and run again, a command that already finished. Only the host may
+		// still stop the run here.
+		if (!scope.timeoutSignal?.aborted) ctx.signal?.throwIfAborted();
 		return result;
 	} catch (error) {
 		if (error instanceof WorkflowPipelineInputSuspension) {

@@ -28,7 +28,20 @@ import { renderWorkflowGraph } from "./workflows/graph.js";
 import { parseWorkflowArgsJson } from "./workflows/values.js";
 import type { WorkflowGraphFormat } from "./workflows/graph.js";
 
-const USAGE_TOPICS = new Set(["run", "resume", "doctor", "version", "help"]);
+// CLI commands without help of their own show the usage, which covers all of them.
+const USAGE_TOPICS = new Set([
+	"run",
+	"resume",
+	"signal",
+	"runs",
+	"waits",
+	"history",
+	"storage",
+	"upgrade",
+	"doctor",
+	"version",
+	"help",
+]);
 
 export async function runCli(argv) {
 	const cancellation = createCliCancellation();

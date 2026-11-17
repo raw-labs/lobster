@@ -1,6 +1,6 @@
 import { parsePipeline } from "../pipeline/parser.js";
 import { resolveRetryConfig, type RetryConfig } from "../engine/retry.js";
-import { resolveArgsTemplate, evaluateCondition } from "./expressions.js";
+import { resolveArgsTemplate, evaluateCondition, checkConditionSyntax } from "./expressions.js";
 import { createRecord, resolveInputValue } from "./values.js";
 import { getStepExecution, isApprovalStep, isInputStep } from "./load.js";
 import type { WorkflowStep, WorkflowStepResult, WorkflowRunResult } from "./types.js";
@@ -85,9 +85,12 @@ export function dryRunWorkflow({
 		const num = idx - startIndex + 1;
 
 		const condition = step.when ?? step.condition;
-		// Evaluated even when its value is unknown, so a malformed condition still fails the plan.
-		const holds = evaluateCondition(condition, results);
 		const unknownCondition = dependsOnStepOutput(condition, undecided);
+		// A condition on output the plan does not have is only checked for syntax: its value,
+		// and whether its comparisons are valid, are known only when the run gets there.
+		const holds = unknownCondition
+			? (checkConditionSyntax(condition), true)
+			: evaluateCondition(condition, results);
 		if (unknownCondition) undecided.add(step.id);
 		if (!unknownCondition && !holds) {
 			results[step.id] = { id: step.id, skipped: true };
@@ -154,8 +157,10 @@ export function dryRunWorkflow({
 			for (let subIdx = 0; subIdx < step.steps.length; subIdx++) {
 				const sub = step.steps[subIdx];
 				const subCondition = sub.when ?? sub.condition;
-				const subHolds = evaluateCondition(subCondition, loopScopedResults);
 				const unknownSubCondition = dependsOnStepOutput(subCondition, undecided);
+				const subHolds = unknownSubCondition
+					? (checkConditionSyntax(subCondition), true)
+					: evaluateCondition(subCondition, loopScopedResults);
 				if (unknownSubCondition) undecided.add(sub.id);
 				if (!unknownSubCondition && !subHolds) {
 					lines.push(`       ${subIdx + 1}. ${sub.id}  [skipped — condition: false]`);

@@ -57,7 +57,7 @@ for (const command of [
 				const port = (server.address() as { port: number }).port;
 				const pipeline =
 					`${command} --url http://127.0.0.1:${port} --token= --tool demo --action write` +
-					(failure === "downstream-error" ? " | missing.command" : "");
+					(failure === "downstream-error" ? ` | exec --shell "exit 3"` : "");
 				const message = await runWorkflow(dir, pipeline);
 				assert.match(
 					message,
@@ -65,7 +65,7 @@ for (const command of [
 						? /timed out/
 						: failure === "http-error"
 							? /503/
-							: /Unknown command/,
+							: /exec failed|exit code 3|failed \(3\)/,
 				);
 				assert.equal(hits, 1, "a failed step must not repeat a potentially completed tool call");
 			} finally {

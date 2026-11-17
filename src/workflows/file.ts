@@ -276,7 +276,16 @@ export async function signalEvent(options: {
 			after = page.nextCursor;
 		}
 		const advanced: DueRunOutcome[] = [];
-		for (const runId of waiting) advanced.push(await advanceReporting(runId, ctx, options.leaseMs));
+		for (const runId of waiting) {
+			// A run that is busy is usually just saving its wait; it looks at the inbox again
+			// after saving, but wait for it so this delivery reports what happened.
+			let outcome = await advanceReporting(runId, ctx, options.leaseMs);
+			for (let delay = 25; outcome.status === "busy" && delay <= 1600; delay *= 2) {
+				await new Promise((resolve) => setTimeout(resolve, delay));
+				outcome = await advanceReporting(runId, ctx, options.leaseMs);
+			}
+			advanced.push(outcome);
+		}
 		return { event: { id, name: options.name, inserted }, advanced };
 	});
 }
@@ -303,6 +312,9 @@ export async function abandonWorkflowRun(options: {
 		const store = new ExecutionStore(session, run.id, options.leaseMs);
 		try {
 			const state = (await store.claim())!;
+			// It may have finished between the first read and the claim: keep its result.
+			if (["completed", "failed", "cancelled"].includes(state.status))
+				return { runId: run.id, status: state.status, abandoned: [] };
 			const abandoned: string[] = [];
 			const waits: string[] = [];
 			for (const [path, frame] of Object.entries(state.activations)) {

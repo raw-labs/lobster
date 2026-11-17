@@ -2,7 +2,7 @@
 
 ## Scope
 
-Replace the workflow-file executor with a saved-state interpreter. Keep YAML, commands, expressions and accounting; persist runs in one SQLite store, and import state saved by older versions once with `lobster upgrade`. Do not add task planning, general external-event/timer features or a Gateway service in this change. Standalone pipelines and SDK function stages retain their existing execution contracts; they are not secretly restartable workflows.
+Replace the workflow-file executor with a saved-state interpreter. Keep YAML, commands, expressions and accounting; persist runs in one SQLite store, and import state saved by older versions once with `lobster upgrade`. Add durable sleeps, external-event waits and deadlines as pauses (see Time, events and liveness). Do not add task planning or a Gateway service in this change. Standalone pipelines and SDK function stages retain their existing execution contracts; they are not secretly restartable workflows.
 
 ## Source layout
 
@@ -10,7 +10,7 @@ Replace the workflow-file executor with a saved-state interpreter. Keep YAML, co
 - `engine/state.ts`: versioned execution data and activation identities.
 - `engine/store.ts`: serialized checkpoint writes, ownership leases and fencing.
 - `engine/machine.ts`: shared attempt/retry/accounting lifecycle and run advancement.
-- `engine/nodes/`: sequence, condition, activity, loop, parallel, child workflow, approval and input handlers.
+- `engine/nodes/`: sequence, condition, activity, loop, parallel, child workflow, approval, input, sleep and event-wait handlers.
 - `engine/activities/`: subprocess and pipeline execution; `engine/retry.ts`: the retry policy. No separate persistence engine.
 - `workflows/file.ts`: public start/resume/advance facade. The previous executor is removed.
 - `persistence/`: atomic transitions, storage receipts, history and the SQLite store.
@@ -50,7 +50,7 @@ Lobster stays run-on-demand: a process runs until the workflow finishes or must 
 
 **Deadlines on questions.** An approval or input request may carry `timeout` and `on_timeout`. The deadline is fixed when the question is first asked and becomes the wait's due time. When a due run re-enters the question after the deadline, it consumes the wait: `on_timeout: cancel` (default) cancels the run like a rejection; `continue` completes the step with `timedOut: true` and no approval or response. An answer and a timeout race through the same wait revision, so exactly one wins.
 
-**External events.** `lobster signal <name> [--data JSON] [--id ID]` (core `signal`) stores the event in a durable inbox (`--id` makes repeated delivery idempotent) and advances the waiting runs whose event wait matches. A `wait:` step waits for an event by name, optionally matching fields of its data, with an optional `timeout`/`on_timeout`. It matches the oldest event received since the run was created that the run has not consumed, so an event that arrives before the step publishes its wait is not lost. Each run consumes an event at most once; the event id is part of the step's result. Events are pruned with finished runs.
+**External events.** `lobster signal <name> [--data JSON] [--id ID]` (core `signalEvent`) stores the event in a durable inbox (`--id` makes repeated delivery idempotent) and advances the waiting runs whose event wait matches. A `wait:` step waits for an event by name, optionally matching fields of its data, with an optional `timeout`/`on_timeout`. It matches the oldest event received since the run was created that the run has not consumed, so an event that arrives before the step publishes its wait is not lost. Each run consumes an event at most once; the event id is part of the step's result. Events are pruned with finished runs, but never while an unfinished run that started before them could still wait for them. A `match` reference that resolves to nothing fails the step, and an event received after the wait's deadline does not count. After publishing its wait the step looks at the inbox once more, and `signal` retries a run that is briefly busy, so an event signalled while the run was saving its wait is not missed.
 
 **Heartbeats.** A step with `heartbeat_timeout_ms` must show progress at least that often: a shell command (or `exec`) touches the file named by `LOBSTER_HEARTBEAT_FILE`, a pipeline command calls `ctx.heartbeat()`. Missing it aborts the step like `timeout_ms` (the process tree is killed), after which retry, `on_error` and the repeatable rules apply. The run-level lease, renewed by the executor, already covers a dead process; heartbeats cover a live process whose step has hung.
 
@@ -58,12 +58,12 @@ Timers, deadlines and event waits are gates: like approvals and input requests t
 
 ## Verification
 
-`test/execution_machine.test.ts` kills a real child process and starts a fresh process against both file and SQLite stores. Cases cover result committed before cursor advancement, explicitly repeatable and uncertain activities, loop iteration progress, parallel branch progress, child-definition snapshots and retry count/deadline recovery. Counters prove which effects executed. The same file checks competing owners, stale checkpoint writes, interruption after question/decision/result commits, token versus short-ID competition, and host retirement before decision, dispatch or successor publication.
+`test/execution_machine.test.ts` kills a real child process and starts a fresh process against the SQLite store. Cases cover result committed before cursor advancement, explicitly repeatable and uncertain activities, loop iteration progress, parallel branch progress, child-definition snapshots and retry count/deadline recovery. Counters prove which effects executed. The same file checks competing owners, stale checkpoint writes, interruption after question/decision/result commits, token versus short-ID competition, and host retirement before decision, dispatch or successor publication.
 
 Existing suites cover conditions, retries, timeouts, cancellation, composition, accounting, pipelines, input protocols, storage and packaging. Old workflow tests tied to physical legacy checkpoint renames are replaced by execution-transition checks; standalone pipeline/SDK handoff tests remain.
 
 ## Limits
 
-Each checkpoint currently replaces the execution snapshot, including saved outputs. Both backends implement the same correctness contract; this change does not claim a high-throughput scheduler or incremental large-run storage. History is separate and optional. A blocked activity needs outcome inspection; there is no general adapter reconciliation/result-injection API yet. Code, external services and host environments remain outside the saved definition. Recovery of an OpenClaw agent launch is not inferred from a session name.
+Each checkpoint currently replaces the execution snapshot, including saved outputs. This change does not claim a high-throughput scheduler or incremental large-run storage. History is separate and optional. A blocked activity needs outcome inspection; there is no general adapter reconciliation/result-injection API yet. Code, external services and host environments remain outside the saved definition. Recovery of an OpenClaw agent launch is not inferred from a session name.
 
 Gateway background dispatch is deferred. Lobster provides `runs advance --due`; scheduling the call (host loop, cron, systemd timer) is the caller's choice.

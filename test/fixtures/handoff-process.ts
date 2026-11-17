@@ -1,4 +1,4 @@
-import { resumeToolRequest } from "../../src/core/index.js";
+import { createDefaultRegistry, resumeToolRequest } from "../../src/core/index.js";
 import { openStoreSession } from "../../src/persistence/session.js";
 
 const [directory, waitId, revision, phase] = process.argv.slice(2);
@@ -12,10 +12,20 @@ store.backend.transition = async (request, signal) => {
 	await new Promise(() => setInterval(() => {}, 1000));
 	throw new Error("Unreachable");
 };
+// The test's `effect` stage is never reached here (the process dies at the handoff), but the
+// whole pipeline is checked before it resumes, so it must be known.
+const defaults = createDefaultRegistry();
+const registry = {
+	get: (name: string) =>
+		name === "effect"
+			? { name, help: () => "", run: async () => ({ output: [] }) }
+			: defaults.get(name),
+	list: () => defaults.list(),
+};
 await resumeToolRequest({
 	waitId,
 	expectedRevision: Number(revision),
 	response: 1,
-	ctx: { storeSession: store },
+	ctx: { storeSession: store, registry },
 });
 throw new Error("Fixture failed to reach the handoff");
