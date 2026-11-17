@@ -48,11 +48,12 @@ function resolveDryRunTemplate(
 }
 
 // A plan has no step outputs: a condition that reads one is neither true nor false yet.
-// Only `approved` (gates are assumed granted) and `skipped` are modelled by the plan.
-function dependsOnStepOutput(condition: unknown) {
+// Only `approved` (gates are assumed granted) and `skipped` are modelled by the plan, and
+// only for steps whose own condition was decided (`undecided` holds the others).
+function dependsOnStepOutput(condition: unknown, undecided: Set<string>) {
 	if (typeof condition !== "string") return false;
-	for (const [, field] of condition.matchAll(/\$[A-Za-z0-9_-]+\.([A-Za-z0-9_]+)/g))
-		if (field !== "approved" && field !== "skipped") return true;
+	for (const [, id, field] of condition.matchAll(/\$([A-Za-z0-9_-]+)\.([A-Za-z0-9_]+)/g))
+		if ((field !== "approved" && field !== "skipped") || undecided.has(id)) return true;
 	return false;
 }
 
@@ -75,6 +76,7 @@ export function dryRunWorkflow({
 	ctx: { stderr: NodeJS.WritableStream; registry?: { get: (name: string) => unknown } };
 }): WorkflowRunResult {
 	const lines: string[] = [];
+	const undecided = new Set<string>();
 	const totalSteps = steps.length - startIndex;
 	lines.push(`[DRY RUN] Would execute ${totalSteps} step${totalSteps !== 1 ? "s" : ""}:\n`);
 
@@ -85,7 +87,8 @@ export function dryRunWorkflow({
 		const condition = step.when ?? step.condition;
 		// Evaluated even when its value is unknown, so a malformed condition still fails the plan.
 		const holds = evaluateCondition(condition, results);
-		const unknownCondition = dependsOnStepOutput(condition);
+		const unknownCondition = dependsOnStepOutput(condition, undecided);
+		if (unknownCondition) undecided.add(step.id);
 		if (!unknownCondition && !holds) {
 			results[step.id] = { id: step.id, skipped: true };
 			lines.push(`  ${num}. ${step.id}  [skipped — condition: false]`);
@@ -132,7 +135,8 @@ export function dryRunWorkflow({
 				const sub = step.steps[subIdx];
 				const subCondition = sub.when ?? sub.condition;
 				const subHolds = evaluateCondition(subCondition, loopScopedResults);
-				const unknownSubCondition = dependsOnStepOutput(subCondition);
+				const unknownSubCondition = dependsOnStepOutput(subCondition, undecided);
+				if (unknownSubCondition) undecided.add(sub.id);
 				if (!unknownSubCondition && !subHolds) {
 					lines.push(`       ${subIdx + 1}. ${sub.id}  [skipped — condition: false]`);
 					loopScopedResults[sub.id] = { id: sub.id, skipped: true };

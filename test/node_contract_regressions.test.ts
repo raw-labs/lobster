@@ -153,3 +153,32 @@ test("an approval gate in a child workflow is refused before its command runs", 
 	assert.equal(fx.fake.calls("skipped"), 0);
 	assert.equal((await fx.execution()).status, "failed");
 });
+
+test("dry-run treats skipped/approved of a step with an undecided condition as undecided", async (t) => {
+	const fx = await workflowFixture(t);
+	await fx.run(
+		{
+			steps: [
+				{ id: "seed", pipeline: "fake --name seed" },
+				{ id: "maybe", pipeline: "fake --name m", approval: true, when: "$seed.json.go == true" },
+				{ id: "fallback", pipeline: "fake --name f", when: "$maybe.skipped == true" },
+				{ id: "afterGate", pipeline: "fake --name a", when: "$maybe.approved == true" },
+				{ id: "decided", pipeline: "fake --name d", approval: true },
+				{ id: "notSkipped", pipeline: "fake --name n", when: "$decided.skipped == true" },
+			],
+		},
+		{ dryRun: true },
+	);
+	const plan = fx.stderr();
+	// `maybe` may or may not run, so a plan cannot say whether it was skipped or approved.
+	assert.match(
+		plan,
+		/3\. fallback {2}\[pipeline\]\n {5}when: \$maybe\.skipped == true {2}\[depends/,
+	);
+	assert.match(
+		plan,
+		/4\. afterGate {2}\[pipeline\]\n {5}when: \$maybe\.approved == true {2}\[depends/,
+	);
+	// A step whose own condition is decided is still modelled.
+	assert.match(plan, /6\. notSkipped {2}\[skipped — condition: false\]/);
+});
