@@ -92,13 +92,15 @@ if (!workerData.readOnly) {
 			PRIMARY KEY(run_id, sequence)
 		);
 		CREATE INDEX IF NOT EXISTS runs_wake ON runs(json_extract(record, '$.wakeAt'));
-		CREATE TABLE IF NOT EXISTS inbox (
-			id TEXT PRIMARY KEY,
+		CREATE TABLE IF NOT EXISTS event_inbox (
+			owner TEXT NOT NULL,
+			id TEXT NOT NULL,
 			name TEXT NOT NULL,
 			data TEXT NOT NULL,
-			at INTEGER NOT NULL
+			at INTEGER NOT NULL,
+			PRIMARY KEY(owner, id)
 		);
-		CREATE INDEX IF NOT EXISTS inbox_name ON inbox(name, at);
+		CREATE INDEX IF NOT EXISTS event_inbox_name ON event_inbox(name, at);
 		CREATE TABLE IF NOT EXISTS meta (
 			key TEXT PRIMARY KEY,
 			value TEXT NOT NULL
@@ -502,7 +504,7 @@ function handle(request: WorkerRequest): WorkerResult<WorkerMethod> {
 				.filter((row) => transaction(() => removeRun(row.id, args.before)))
 				.map((row) => row.id);
 			if (ids.length < PRUNE_BATCH) {
-				prepare("DELETE FROM inbox WHERE at < ?").run(Date.parse(args.before));
+				prepare("DELETE FROM event_inbox WHERE at < ?").run(Date.parse(args.before));
 				setMeta("pruneCursor", "");
 				setMeta("lastPrune", args.now);
 			} else {
@@ -524,16 +526,21 @@ function handle(request: WorkerRequest): WorkerResult<WorkerMethod> {
 			).map((row) => row.id);
 		case "appendEvent": {
 			const result = prepare(
-				"INSERT INTO inbox(id,name,data,at) VALUES(?,?,?,?) ON CONFLICT(id) DO NOTHING",
-			).run(args.id, args.name, JSON.stringify(args.data ?? null), args.at);
+				"INSERT INTO event_inbox(owner,id,name,data,at) VALUES(?,?,?,?,?) ON CONFLICT(owner,id) DO NOTHING",
+			).run(args.owner, args.id, args.name, JSON.stringify(args.data ?? null), args.at);
 			return { inserted: Number(result.changes) > 0 };
 		}
 		case "findEvents":
 			return (
-				prepare("SELECT id,name,data,at FROM inbox WHERE name=? AND at>=? ORDER BY at, id").all(
-					args.name,
-					args.since,
-				) as { id: string; name: string; data: string; at: number }[]
+				prepare(
+					"SELECT owner,id,name,data,at FROM event_inbox WHERE name=? AND at>=? AND (owner='' OR owner=?) ORDER BY at, owner, id",
+				).all(args.name, args.since, args.owner) as {
+					owner: string;
+					id: string;
+					name: string;
+					data: string;
+					at: number;
+				}[]
 			).map((row) => ({ ...row, data: JSON.parse(row.data), at: Number(row.at) }));
 		case "close":
 			db.close();

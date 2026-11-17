@@ -497,16 +497,19 @@ export class Machine {
 
 	/** The oldest inbox event matching an event wait that this run has not consumed yet. */
 	async findEvent(wait: Extract<NonNullable<Activation["wait"]>, { kind: "event" }>) {
+		// Only unscoped events and events from the caller that owns this run.
+		const run = await this.store.session.getRunState(this.store.runId);
+		const owner = run?.metadata?.callerId ?? "";
 		const consumed = new Set(this.state.events ?? []);
-		const events = await this.store.session.findEvents(wait.event, wait.since);
+		const events = await this.store.session.findEvents(wait.event, wait.since, owner);
 		return events.find(
-			(event) => !consumed.has(event.id) && matchesEvent(wait.match, event.data),
+			(event) => !consumed.has(eventKey(event)) && matchesEvent(wait.match, event.data),
 		) as InboxEvent | undefined;
 	}
 
 	/** Record that this run consumed an inbox event; saved with the step's result. */
-	consumeEvent(id: string) {
-		(this.state.events ??= []).push(id);
+	consumeEvent(event: InboxEvent) {
+		(this.state.events ??= []).push(eventKey(event));
 	}
 
 	async answer(
@@ -703,6 +706,11 @@ export class Machine {
 			throw error;
 		}
 	}
+}
+
+/** Delivery IDs are unique per sender, so a consumed event is remembered by both. */
+function eventKey(event: InboxEvent) {
+	return JSON.stringify([event.owner, event.id]);
 }
 
 /** Every field of `expected` is in `actual`; nested objects match as subsets. */

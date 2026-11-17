@@ -243,13 +243,16 @@ export async function signalEvent(options: {
 	return withStoreContext({ ...options.ctx, trackRuns: true }, async (ctx) => {
 		const session = sessionFromEnv(ctx.env)!;
 		const id = options.id ?? randomUUID();
+		const owner = callerId(ctx.runMetadata);
+		// Scoped to the sender: its events reach only its own runs (or any run, for an unscoped
+		// trusted caller), and its delivery IDs cannot collide with another caller's.
 		const { inserted } = await session.appendEvent({
 			id,
 			name: options.name,
 			data: options.data ?? null,
 			at: Date.now(),
+			owner: owner ?? "",
 		});
-		const owner = callerId(ctx.runMetadata);
 		const waiting: string[] = [];
 		for (let after = ""; ;) {
 			const page = await session.listRuns({

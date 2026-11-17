@@ -349,3 +349,24 @@ test("CLI: runs advance --due and signal", async (t) => {
 	);
 	assert.deepEqual(signalled.advanced, [{ runId: started.runId, status: "ok" }]);
 });
+
+test("events are scoped to the caller that owns the run", async (t) => {
+	const fx = await workflowFixture(t);
+	const as = (callerId: string) => ({ ...(fx.ctx() as any), runMetadata: { callerId } });
+	const filePath = await fx.write("scoped.lobster", {
+		steps: [{ id: "w", wait: { event: "job.done" } }, after],
+	});
+	const waiting = await runWorkflowFile({ filePath, ctx: as("bob") });
+	assert.equal(waiting.status, "waiting");
+	const fromAlice = await signalEvent({ name: "job.done", id: "d1", ctx: as("alice") });
+	assert.deepEqual(fromAlice.advanced, [], "another caller's event does not reach the run");
+	const stillWaiting = await advanceWorkflowRun({ runId: waiting.runId!, ctx: as("bob") });
+	assert.equal(stillWaiting.status, "waiting", "nor is it consumed when the run advances");
+	const fromBob = await signalEvent({ name: "job.done", id: "d1", ctx: as("bob") });
+	assert.equal(fromBob.event.inserted, true, "delivery IDs are per caller");
+	assert.deepEqual(
+		fromBob.advanced.map((a) => a.status),
+		["ok"],
+	);
+	assert.equal(fx.fake.calls("after"), 1);
+});

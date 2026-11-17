@@ -297,8 +297,8 @@ export class SqliteBackend implements Backend {
 		return this.request("appendEvent", event);
 	}
 
-	findEvents(name: string, since: number): Promise<InboxEvent[]> {
-		return this.request("findEvents", { name, since });
+	findEvents(name: string, since: number, owner: string): Promise<InboxEvent[]> {
+		return this.request("findEvents", { name, since, owner });
 	}
 
 	async close(): Promise<void> {

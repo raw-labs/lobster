@@ -46,7 +46,7 @@ export async function eventWait(machine: Machine, step: WorkflowStep, key: strin
 	if (wait.kind !== "event") throw new Error("Invalid event wait activation");
 	const event = await machine.findEvent(wait);
 	if (event) {
-		machine.consumeEvent(event.id);
+		machine.consumeEvent(event);
 		return machine.resolveWait(key, frame, {
 			id: step.id,
 			json: event.data,

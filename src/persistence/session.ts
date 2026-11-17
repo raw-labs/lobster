@@ -315,8 +315,8 @@ export class StoreSession {
 		return this.request(() => this.backend.appendEvent(event), true);
 	}
 
-	async findEvents(name: string, since: number): Promise<InboxEvent[]> {
-		return this.request(() => this.backend.findEvents(name, since));
+	async findEvents(name: string, since: number, owner = ""): Promise<InboxEvent[]> {
+		return this.request(() => this.backend.findEvents(name, since, owner));
 	}
 
 	async listRuns({

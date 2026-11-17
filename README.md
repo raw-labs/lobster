@@ -576,7 +576,12 @@ steps:
   fix a deadline when the step is first reached. After it, `cancel` (the default)
   cancels the run like a rejection, and `continue` completes the step with
   `timedOut: true` and no approval or response. An answer after the deadline is
-  refused.
+  refused. With `continue` on an approval, the following steps run without
+  approval unless they check it (`when: $approve.approved`); use it only for an
+  escalation path.
+- Events are scoped like runs: an event signalled by a caller with a `callerId`
+  reaches only that caller's runs, and its delivery `--id` cannot collide with
+  another caller's. An unscoped caller (the CLI, a trusted host) reaches any run.
 - Sleeps, waits and deadlines are gates: like approvals they are not allowed inside
   `for_each`, `parallel` branches or child workflows.
 

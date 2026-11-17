@@ -31,8 +31,11 @@ export type StateWriteResult = StateWriteCommit & {
 	signalAbortedAfterCommit: boolean;
 };
 
-/** An external event delivered with `lobster signal`. */
-export type InboxEvent = { id: string; name: string; data: unknown; at: number };
+/**
+ * An external event delivered with `lobster signal`. `owner` is the sender's caller ID ("" for
+ * an unscoped, trusted caller); a run sees unscoped events and those from its own caller.
+ */
+export type InboxEvent = { id: string; name: string; data: unknown; at: number; owner: string };
 
 export interface Backend {
 	readonly kind: BackendKind;
@@ -59,8 +62,8 @@ export interface Backend {
 	dueRuns(now: number, limit: number, callerId?: string): Promise<string[]>;
 	/** Store an external event; an id seen before is ignored. */
 	appendEvent(event: InboxEvent): Promise<{ inserted: boolean }>;
-	/** Events with this name received at or after `since`, oldest first. */
-	findEvents(name: string, since: number): Promise<InboxEvent[]>;
+	/** Events with this name received at or after `since` that `owner` may see, oldest first. */
+	findEvents(name: string, since: number, owner: string): Promise<InboxEvent[]>;
 
 	export(): Promise<LogicalArchive>;
 	import(data: LogicalArchive): Promise<void>;
