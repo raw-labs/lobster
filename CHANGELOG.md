@@ -11,6 +11,11 @@ All notable changes to Lobster will be documented in this file.
 - Update Node.js types to 24.19.2 to match the new runtime floor.
 - Reject unknown keys in workflow files instead of ignoring them, suggesting the intended key for likely typos. A misspelled `when:` previously made its step run unconditionally.
 - Fail a condition that orders anything other than numbers (strings, booleans, `null`, missing values) instead of evaluating it to false. `&&` and `||` now skip their right side when the left side decides the result, so guards like `$x.json.v != null && $x.json.v > 1` work.
+- Reject an `approval:` that is not `true`/`false`, a non-blank prompt or an object, and an `approval.prompt`/`preview` that is not a string or `approval.items` that is not a list. Such a value used to drop the gate, so the step ran without asking anyone.
+- Reject a `when:`/`condition:` that is not a boolean or an expression string when the workflow loads, instead of failing when the step is reached after earlier steps ran.
+- Validate `timeout_ms`, `retry`, `on_error` and `when` of `for_each` sub-steps like those of any other step. A quoted `timeout_ms: "5000"` inside a loop made the step time out at once.
+- Refuse an approval or input gate inside a sub-workflow before its command runs; the command used to run and only then fail the run.
+- Dry-run no longer lists a step as skipped when its condition reads an earlier step's output; the step is planned with its condition marked as unknown at plan time.
 
 ## 2026.10.1 - 2026-10-20
 
