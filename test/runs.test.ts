@@ -110,7 +110,8 @@ for (const backend of ["sqlite"] as const) {
 			);
 			assert.equal(await store.getWait(wait.id, { callerId: "other" }), null);
 			assert.equal(
-				(await store.getWait(wait.id, { callerId: "owner" })).request.prompt,
+				((await store.getWait(wait.id, { callerId: "owner" }))!.request as { prompt: string })
+					.prompt,
 				"Continue?",
 			);
 			const result = await build(store).resumeWait({
@@ -199,7 +200,7 @@ for (const backend of ["sqlite"] as const) {
 				const updated = await getRun({ runId: first.runId, ctx });
 				const next = await getWait({ waitId: updated.pendingWaits[0].id, ctx });
 				assert.notEqual(next.id, wait.id);
-				assert.equal(next.request.prompt, "Confirm your review");
+				assert.equal((next.request as { prompt: string }).prompt, "Confirm your review");
 				await store.close();
 				store = await openStoreSession({ directory: state });
 				const done = await resumeToolRequest({
@@ -252,7 +253,7 @@ for (const backend of ["sqlite"] as const) {
 			const run = await getRun({ runId: first.runId, ctx: scoped(store) });
 			assert.equal(run.status, "waiting");
 			const wait = await getWait({ waitId: run.pendingWaits[0].id, ctx: scoped(store) });
-			assert.equal(wait.request.prompt, prompt);
+			assert.equal((wait.request as { prompt: string }).prompt, prompt);
 			assert.equal(
 				(
 					await resumeToolRequest({
@@ -355,7 +356,7 @@ for (const backend of ["sqlite"] as const) {
 			const first = await runToolRequest({ filePath, ctx: scoped(store) });
 			const wait = (await getRun({ runId: first.runId, ctx: scoped(store) })).pendingWaits[0];
 			const question = await getWait({ waitId: wait.id, ctx: scoped(store) });
-			assert.equal(question.request.prompt, "Approve this fixture");
+			assert.equal((question.request as { prompt: string }).prompt, "Approve this fixture");
 			const results = await Promise.all([
 				resumeToolRequest({
 					waitId: wait.id,
@@ -527,7 +528,7 @@ for (const backend of ["sqlite"] as const) {
 			const run = await getRun({ runId: first.runId, ctx: scoped(store) });
 			const wait = await getWait({ waitId: run.pendingWaits[0].id, ctx: scoped(store) });
 			assert.equal(wait.kind, "input");
-			assert.equal(wait.request.prompt, "SDK question");
+			assert.equal((wait.request as { prompt: string }).prompt, "SDK question");
 			await store.close();
 			store = await openStoreSession({ directory });
 			await assert.rejects(
@@ -580,7 +581,7 @@ for (const backend of ["sqlite"] as const) {
 		assert.equal(page.runs[0].id, first.runId);
 		const run = await cli("runs", "show", first.runId);
 		const wait = await cli("waits", "show", run.pendingWaits[0].id);
-		assert.equal(wait.request.prompt, "CLI question");
+		assert.equal((wait.request as { prompt: string }).prompt, "CLI question");
 		const done = await cli(
 			"resume",
 			wait.id,

@@ -4,6 +4,7 @@ import { Worker } from "node:worker_threads";
 import {
 	PersistenceOutcomeUnknown,
 	type Backend,
+	type InboxEvent,
 	type StateWriteOptions,
 	type StateWriteResult,
 } from "./backend.js";
@@ -171,7 +172,14 @@ export class SqliteBackend implements Backend {
 			this.pending.set(id, {
 				resolve,
 				reject,
-				mutation: ["write", "transition", "import", "removeRun", "pruneFinished"].includes(method),
+				mutation: [
+					"write",
+					"transition",
+					"import",
+					"removeRun",
+					"pruneFinished",
+					"appendEvent",
+				].includes(method),
 				operationId,
 				runId,
 			});
@@ -279,6 +287,18 @@ export class SqliteBackend implements Backend {
 
 	pruneFinished(before: string, now: string): Promise<string[]> {
 		return this.request("pruneFinished", { before, now });
+	}
+
+	dueRuns(now: number, limit: number, callerId?: string): Promise<string[]> {
+		return this.request("dueRuns", { now, limit, ...(callerId ? { callerId } : {}) });
+	}
+
+	appendEvent(event: InboxEvent): Promise<{ inserted: boolean }> {
+		return this.request("appendEvent", event);
+	}
+
+	findEvents(name: string, since: number): Promise<InboxEvent[]> {
+		return this.request("findEvents", { name, since });
 	}
 
 	async close(): Promise<void> {

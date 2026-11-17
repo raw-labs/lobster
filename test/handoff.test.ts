@@ -147,7 +147,11 @@ for (const backend of ["sqlite"] as const) {
 					const pending = (await getRun({ runId: first.runId, ctx: f.ctx() })).pendingWaits;
 					assert.equal(pending.length, 1);
 					assert.equal(
-						(await getWait({ waitId: pending[0].id, ctx: f.ctx() })).request.prompt,
+						(
+							(await getWait({ waitId: pending[0].id, ctx: f.ctx() }))!.request as {
+								prompt: string;
+							}
+						).prompt,
 						phase === "before" ? "first" : "second",
 					);
 					assert.equal(run.states[boundary.successor] !== undefined, phase === "after");
@@ -243,7 +247,8 @@ for (const backend of ["sqlite"] as const) {
 				const pending = (await getRun({ runId: first.runId, ctx: f.ctx() })).pendingWaits;
 				assert.equal(pending.length, 1);
 				assert.equal(
-					(await getWait({ waitId: pending[0].id, ctx: f.ctx() })).request.prompt,
+					((await getWait({ waitId: pending[0].id, ctx: f.ctx() }))!.request as { prompt: string })
+						.prompt,
 					fault === "cancel-before" ? "first" : "second",
 				);
 				assert.equal(

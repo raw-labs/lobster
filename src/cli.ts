@@ -21,6 +21,8 @@ import {
 	runWorkflowFile,
 	advanceWorkflowRun,
 	abandonWorkflowRun,
+	advanceDueRuns,
+	signalEvent,
 } from "./workflows/file.js";
 import { renderWorkflowGraph } from "./workflows/graph.js";
 import { parseWorkflowArgsJson } from "./workflows/values.js";
@@ -100,6 +102,64 @@ async function runCliWithSignal(
 		await offerUpgrade(argv, signal);
 	}
 
+	if (argv[0] === "runs" && argv[1] === "advance" && argv.includes("--due")) {
+		try {
+			const options = argv.slice(2).filter((arg) => arg !== "--due");
+			let limit: number | undefined;
+			let dryRun = false;
+			for (let i = 0; i < options.length; i++) {
+				if (options[i] === "--dry-run") dryRun = true;
+				else if (options[i] === "--limit" && /^\d+$/.test(options[i + 1] ?? ""))
+					limit = Number(options[++i]);
+				else throw new Error("runs advance --due [--limit <n>] [--dry-run]");
+			}
+			const result = await advanceDueRuns({
+				ctx: createToolContext({ signal, forceTerminationSignal }),
+				limit,
+				dryRun,
+			});
+			process.stdout.write(JSON.stringify(result) + "\n");
+		} catch (error) {
+			process.stderr.write(`runs advance --due: ${error?.message ?? String(error)}\n`);
+			process.exitCode = 1;
+		}
+		return;
+	}
+
+	if (argv[0] === "signal") {
+		try {
+			const [name, ...options] = argv.slice(1);
+			if (!name || name.startsWith("--"))
+				throw new Error("signal <event> [--data '{...}'] [--id <id>]");
+			let data: unknown = null;
+			let id: string | undefined;
+			for (let i = 0; i < options.length; i++) {
+				const [flag, inline] = options[i].split(/=(.*)/s, 2);
+				const value = inline ?? options[++i];
+				if (value === undefined) throw new Error(`Missing value for ${flag}`);
+				if (flag === "--data") {
+					try {
+						data = JSON.parse(value);
+					} catch {
+						throw new Error("signal --data must be valid JSON");
+					}
+				} else if (flag === "--id") id = value;
+				else throw new Error(`signal has no flag ${flag}`);
+			}
+			const result = await signalEvent({
+				name,
+				data,
+				id,
+				ctx: createToolContext({ signal, forceTerminationSignal }),
+			});
+			process.stdout.write(JSON.stringify(result) + "\n");
+		} catch (error) {
+			process.stderr.write(`signal: ${error?.message ?? String(error)}\n`);
+			process.exitCode = 1;
+		}
+		return;
+	}
+
 	if (argv[0] === "runs" && argv[1] === "advance") {
 		try {
 			if (!argv[2] || argv.length !== 3) throw new Error("runs advance requires a run ID");
@@ -113,6 +173,7 @@ async function runCliWithSignal(
 				output: result.output,
 				requiresApproval: result.requiresApproval ?? null,
 				requiresInput: result.requiresInput ?? null,
+				...(result.waitingFor ? { waitingFor: result.waitingFor } : {}),
 				runId: result.runId,
 			});
 		} catch (error) {
@@ -391,6 +452,18 @@ async function handleRunInternal({
 					return output;
 				}
 
+				if (output.status === "waiting") {
+					emit({
+						ok: true,
+						status: "waiting",
+						output: [],
+						requiresApproval: null,
+						requiresInput: null,
+						waitingFor: output.waitingFor,
+					});
+					return output;
+				}
+
 				emit({
 					ok: true,
 					status: "ok",
@@ -398,6 +471,16 @@ async function handleRunInternal({
 					requiresApproval: null,
 					requiresInput: null,
 				});
+				return output;
+			}
+
+			if (output.status === "waiting") {
+				const waiting = output.waitingFor!;
+				process.stderr.write(
+					waiting.kind === "timer"
+						? `Run ${output.runId ?? ""} sleeps until ${waiting.until}; \`lobster runs advance --due\` continues it then.\n`
+						: `Run ${output.runId ?? ""} waits for the event "${waiting.event}"${waiting.until ? ` until ${waiting.until}` : ""}; deliver it with \`lobster signal ${waiting.event}\`.\n`,
+				);
 				return output;
 			}
 
@@ -732,16 +815,19 @@ async function handleResume({
 
 	let envelope;
 	try {
-		// A wait ID without --expected-revision answers the question as it stands now.
-		const expectedRevision =
-			parsed.waitId && parsed.expectedRevision === null
-				? (await getWait({ waitId: parsed.waitId, ctx: { env: process.env } }))?.revision
-				: parsed.expectedRevision;
+		// A wait ID without --expected-revision answers the question as it stands now, as a
+		// token or a short approval ID does; --expected-revision adds the stale-question guard.
+		let expectedRevision = parsed.expectedRevision;
+		if (parsed.waitId && expectedRevision === null) {
+			const wait = await getWait({ waitId: parsed.waitId, ctx: { env: process.env } });
+			if (!wait) throw new Error(`Wait ${parsed.waitId} not found`);
+			expectedRevision = wait.revision;
+		}
 		envelope = await resumeToolRequest({
 			token: parsed.token ?? undefined,
 			approvalId: parsed.approvalId ?? undefined,
 			waitId: parsed.waitId,
-			expectedRevision: parsed.waitId ? (expectedRevision ?? 0) : undefined,
+			expectedRevision: parsed.waitId ? expectedRevision : undefined,
 			approved: parsed.approved,
 			response: parsed.response,
 			cancel: parsed.cancel,
@@ -860,11 +946,13 @@ function helpText(registry: CommandRegistry) {
 		`  lobster resume <ref> --approve yes|no               answer a question\n` +
 		`  lobster resume <ref> --response-json '{...}'\n` +
 		`  lobster resume <ref> --cancel\n` +
-		`      <ref> is a resume token, a short approval ID or a wait ID.\n\n` +
+		`      <ref> is a resume token, a short approval ID or a wait ID.\n` +
+		`  lobster signal <event> [--data '{...}'] [--id <id>]   deliver an event to waiting runs\n\n` +
 		`Manage runs:\n` +
 		`  lobster runs list [--status waiting] [--limit 20] [--after <cursor>]\n` +
 		`  lobster runs show <runId>\n` +
 		`  lobster runs advance <runId>                       continue after a crash\n` +
+		`  lobster runs advance --due [--limit n] [--dry-run]  advance every run that is due\n` +
 		`  lobster runs abandon <runId>                       stop a run for good\n` +
 		`  lobster waits show <waitId>\n\n` +
 		`Diagnostics:\n` +

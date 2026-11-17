@@ -1,3 +1,4 @@
+import { waitDueAt } from "./waits.js";
 import type { ExecutionState, ExecutionLease } from "../engine/state.js";
 import { createHash } from "node:crypto";
 
@@ -77,6 +78,8 @@ export type RunEvent = {
 export type RunRecord = {
 	execution?: ExecutionState;
 	executionLease?: ExecutionLease;
+	/** When the run next needs attention (epoch ms); see wakeTime. */
+	wakeAt?: number;
 	version: 1;
 	id: string;
 	kind: string;
@@ -387,6 +390,9 @@ export function applyTransition(
 			restored: previous !== undefined && previous !== null,
 		};
 	}
+	const wakeAt = wakeTime(run);
+	if (wakeAt === undefined) delete run.wakeAt;
+	else run.wakeAt = wakeAt;
 	run.updatedAt = at;
 	run.revision++;
 	if (run.historyEnabled !== false)
@@ -641,4 +647,23 @@ export function historyPage(run: RunRecord, afterSequence: number, limit: number
 		attempts: attempts.filter((attempt) => ids.has(attempt.id)),
 		nextCursor: page.at(-1)?.sequence ?? afterSequence,
 	};
+}
+
+/**
+ * When a run next needs attention, if ever on its own. A running run is due when its lease
+ * lapses (a live owner keeps renewing it; a crashed one leaves it in the past). A waiting run
+ * is due at its earliest timer or question deadline. Blocked and finished runs never are.
+ */
+export function wakeTime(run: Pick<RunRecord, "execution" | "executionLease">): number | undefined {
+	const execution = run.execution;
+	if (!execution) return undefined;
+	if (execution.status === "running") return run.executionLease?.expiresAt ?? 0;
+	if (execution.status !== "waiting") return undefined;
+	let at: number | undefined;
+	for (const frame of Object.values(execution.activations)) {
+		if (frame.phase !== "waiting" || !frame.wait) continue;
+		const due = waitDueAt(frame.wait);
+		if (due !== undefined && (at === undefined || due < at)) at = due;
+	}
+	return at;
 }

@@ -5,7 +5,7 @@ import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { PassThrough } from "node:stream";
-import { runWorkflowFile } from "../../src/workflows/file.js";
+import { advanceWorkflowRun, runWorkflowFile, signalEvent } from "../../src/workflows/file.js";
 import { openStoreSession } from "../../src/persistence/session.js";
 import { decodeToken } from "../../src/resume/token.js";
 import type { WorkflowRunResult } from "../../src/workflows/types.js";
@@ -24,7 +24,8 @@ export type RunOptions = {
 	env?: Record<string, string>;
 };
 
-export type Answers = { approve?: boolean; response?: unknown };
+/** How gates are answered: approvals, input responses, and the data of awaited events. */
+export type Answers = { approve?: boolean; response?: unknown; event?: unknown };
 
 export type WorkflowFixture = Awaited<ReturnType<typeof workflowFixture>>;
 
@@ -96,12 +97,34 @@ export async function workflowFixture(t: TestContext, prefix = "lobster-contract
 					: { response: answers.response };
 			return runWorkflowFile({ resume, ...decision, ctx: fixture.ctx() as any });
 		},
-		/** Run to the end, answering every gate with `answers` (approve, or respond). */
+		/**
+		 * Continue a run that waits for time or an event: wait out a timer and advance it, or
+		 * deliver the awaited event (with `answers.event` as its data) and read the result.
+		 */
+		async proceed(result: RunResult, answers: Answers = {}): Promise<RunResult> {
+			const waiting = result.waitingFor;
+			assert(waiting && result.runId, `run is not waiting: ${JSON.stringify(result)}`);
+			if (waiting.kind === "timer") {
+				const due = Date.parse(waiting.until) - Date.now();
+				if (due > 0) await new Promise((resolve) => setTimeout(resolve, due + 5));
+			} else {
+				await signalEvent({
+					name: waiting.event,
+					data: answers.event ?? { ok: true },
+					ctx: fixture.ctx() as any,
+				});
+			}
+			return advanceWorkflowRun({ runId: result.runId, ctx: fixture.ctx() as any });
+		},
+		/** Run to the end, answering every gate with `answers` (approve, respond, or an event). */
 		async drive(workflow: unknown, answers: Answers = {}, options: RunOptions = {}) {
 			let result = await fixture.run(workflow, options);
-			for (let gates = 0; result.status === "needs_approval" || result.status === "needs_input";) {
+			for (let gates = 0; ["needs_approval", "needs_input", "waiting"].includes(result.status);) {
 				assert(++gates < 20, "too many gates");
-				result = await fixture.resume(result, answers);
+				result =
+					result.status === "waiting"
+						? await fixture.proceed(result, answers)
+						: await fixture.resume(result, answers);
 			}
 			return result;
 		},

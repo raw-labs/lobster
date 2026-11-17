@@ -132,6 +132,7 @@ export async function runPipelineStep({
 			: undefined,
 		onExecutionStart,
 		onNonRetryableSideEffect: ctx._onNonRetryableSideEffect,
+		heartbeat: ctx._heartbeat,
 	});
 	stdout.end();
 	ctx.signal?.throwIfAborted();

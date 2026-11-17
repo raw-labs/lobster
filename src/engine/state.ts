@@ -61,6 +61,10 @@ export type ExecutionState = {
 	cwd?: string;
 	activations: Record<string, Activation>;
 	status: "running" | "waiting" | "completed" | "failed" | "cancelled" | "blocked";
+	/** When the run started (epoch ms): event waits match events from then on. */
+	startedAt?: number;
+	/** Inbox events this run has consumed; each is consumed at most once. */
+	events?: string[];
 	output?: unknown[];
 	error?: string;
 	cost?: CostSummary;
@@ -108,5 +112,16 @@ export function nodeKind(step: WorkflowStep) {
 	if (step.parallel) return "parallel";
 	if (step.workflow) return "child-workflow";
 	if (step.input) return "input";
+	if (step.sleep !== undefined) return "sleep";
+	if (step.wait) return "event";
 	return "activity";
+}
+
+/** A gate (approval, input, timer or event deadline) cancelled the run; already saved. */
+export class RunCancelled extends Error {
+	readonly code = "LOBSTER_RUN_CANCELLED";
+	constructor(message: string) {
+		super(message);
+		this.name = "RunCancelled";
+	}
 }

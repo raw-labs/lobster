@@ -33,6 +33,7 @@ export async function runPipeline({
 	requestInputEnabled = true,
 	onExecutionStart = undefined,
 	onNonRetryableSideEffect = undefined,
+	heartbeat = undefined,
 	assertInvocationCurrent = undefined,
 	onUnsafeCommandDispatch = undefined,
 }: {
@@ -56,6 +57,8 @@ export async function runPipeline({
 	requestInputEnabled?: boolean;
 	onExecutionStart?: (() => void | Promise<void>) | undefined;
 	onNonRetryableSideEffect?: (() => void) | undefined;
+	/** Commands call ctx.heartbeat() to show progress (see heartbeat_timeout_ms). */
+	heartbeat?: (() => void) | undefined;
 	assertInvocationCurrent?: (() => void) | undefined;
 	onUnsafeCommandDispatch?: (() => void) | undefined;
 }) {
@@ -98,6 +101,7 @@ export async function runPipeline({
 		forceTerminationSignal,
 		onNonRetryableSideEffect,
 		assertInvocationCurrent,
+		heartbeat: heartbeat ?? (() => {}),
 	};
 
 	const unfinishedStages = new Set<() => Promise<void>>();

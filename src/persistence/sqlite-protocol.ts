@@ -1,4 +1,4 @@
-import type { StateWriteCommit } from "./backend.js";
+import type { InboxEvent, StateWriteCommit } from "./backend.js";
 import type {
 	HistoryPage,
 	LogicalArchive,
@@ -40,6 +40,9 @@ type Operations = {
 	};
 	removeRun: { args: { id: string; before: string }; result: boolean };
 	pruneFinished: { args: { before: string; now: string }; result: string[] };
+	dueRuns: { args: { now: number; limit: number; callerId?: string }; result: string[] };
+	appendEvent: { args: InboxEvent; result: { inserted: boolean } };
+	findEvents: { args: { name: string; since: number }; result: InboxEvent[] };
 	export: { args: Record<string, never>; result: LogicalArchive };
 	import: { args: LogicalArchive; result: void };
 	close: { args: Record<string, never>; result: void };

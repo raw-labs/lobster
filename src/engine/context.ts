@@ -20,4 +20,6 @@ export type RunContext = PersistenceOptions & {
 	_onExecutionStarted?: () => void | Promise<void>;
 	_onUnsafeDispatch?: () => void;
 	_onNonRetryableSideEffect?: () => void;
+	/** Report progress for a step with `heartbeat_timeout_ms`. */
+	_heartbeat?: () => void;
 };

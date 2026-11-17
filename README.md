@@ -484,9 +484,10 @@ lobster runs advance <runId>
 ```
 
 Embedded hosts use `advanceWorkflowRun({ runId, ctx })` from
-`@clawdbot/lobster/core`. There is no sleeping harness or automatic Gateway
-wake-up service in this change. An active execution lease prevents a competing
-advance; after process death, wait for lease expiry before recovery.
+`@clawdbot/lobster/core`. An active execution lease prevents a competing
+advance; after process death, wait for lease expiry before recovery, or let
+`lobster runs advance --due` pick the run up once its lease has lapsed (see
+[Waiting for time and events](#waiting-for-time-and-events)).
 
 An interrupted command with no saved result has an unknown outcome by default.
 Only commands safe to repeat should opt in:
@@ -514,8 +515,9 @@ lobster runs abandon <runId>
 Abandoning records the started commands as abandoned (nothing runs again),
 withdraws pending questions and approval IDs, and cancels the run, so `history
 prune` can remove it. Embedded hosts use `abandonWorkflowRun({ runId, ctx })`.
-A known OpenClaw pipeline dispatch remains non-replayable even with
-`recovery: repeat`. Arbitrary shell commands must be classified by the author;
+A step whose pipeline contains a command that may not be repeated
+(`openclaw.invoke`, `openclaw.agent`, `gog.gmail.send`) is never re-run after a
+crash, even with `recovery: repeat`. Arbitrary shell commands must be classified by the author;
 Lobster cannot infer their effects. `LOBSTER_RUN_ID` and `LOBSTER_ACTIVITY_ID`
 provide stable logical identities to adapters; `LOBSTER_ACTIVITY_ATTEMPT`
 identifies the saved attempt.
@@ -523,8 +525,8 @@ identifies the saved attempt.
 Explicit retries still respond to reported failures. They preserve their attempt
 count and selected backoff deadline across restarts. Whole-control-node retries
 deliberately repeat their subtree; recovery within an attempt skips completed
-children. Retry delays and existing batch pauses still wait inside the current
-invocation: general durable sleep/event operations are not added here.
+children. Retry delays and `for_each` batch pauses wait inside the current
+invocation; use a `sleep:` step for a durable pause.
 
 Shell commands and pipelines are whole activity boundaries, not arbitrary
 instruction-level checkpoints. A partially executed pipeline may have effects;
@@ -533,6 +535,96 @@ continuation. SDK JavaScript closures are not made restartable by this engine.
 
 See [execution-machine.md](docs/execution-machine.md) for the implementation
 boundary and source layout.
+
+## Waiting for time and events
+
+Lobster runs on demand: a run works until it finishes or has to wait, saves, and
+exits. It never runs a loop of its own. Waiting for time or for something outside
+is a pause, like an approval, and something outside decides when to look again.
+
+```yaml
+steps:
+  - id: send
+    pipeline: gog.gmail.send
+  - id: cool_off
+    sleep: 3d                 # 500ms, 30s, 5m, 2h, 3d, or a number of ms
+  - id: reply
+    wait:                     # resolved by `lobster signal email.reply`
+      event: email.reply
+      match: { thread: $send.json.thread }
+      timeout: 2d
+      on_timeout: continue    # default: cancel the run
+  - id: chase
+    run: send-reminder
+    when: $reply.timedOut
+  - id: approve
+    approval:
+      prompt: Close the ticket?
+      timeout: 24h            # questions can expire too
+```
+
+- **`sleep:`** fixes its wake time when first reached. Up to
+  `LOBSTER_INLINE_SLEEP_MS` (default 60 s) the process waits in place; a longer
+  sleep returns `status: "waiting"` with `waitingFor: { kind: "timer", until }`
+  and exits. Ctrl-C or a crash during a sleep leaves an ordinary sleeping run.
+- **`wait:`** completes with the oldest event of that name received since the run
+  started that it has not consumed, whose data contains every field of `match`
+  (references such as `$send.json.thread` are resolved first). `$reply.json` is
+  the event's data and `$reply.response` its id, name and time. Until then the run
+  returns `status: "waiting"` with `waitingFor: { kind: "event", event }`.
+- **`timeout`/`on_timeout`** on `wait:`, `approval:` (object form) and `input:`
+  fix a deadline when the step is first reached. After it, `cancel` (the default)
+  cancels the run like a rejection, and `continue` completes the step with
+  `timedOut: true` and no approval or response. An answer after the deadline is
+  refused.
+- Sleeps, waits and deadlines are gates: like approvals they are not allowed inside
+  `for_each`, `parallel` branches or child workflows.
+
+Something outside continues these runs:
+
+```sh
+lobster runs advance --due [--limit 100] [--dry-run]   # every run whose time has come
+lobster signal email.reply --data '{"thread":"t-42"}' [--id <delivery id>]
+```
+
+`runs advance --due` advances runs whose sleep or deadline has passed, and runs
+whose process died (their lease lapsed): completed work is kept, a step that may
+have acted re-runs only when it is repeatable and `recovery: repeat`, everything
+else becomes `blocked` for a person, and blocked runs are never due. Concurrent
+callers skip runs another process holds. Timers fire at or after their time,
+never early; how late depends on how often this is called. `lobster signal`
+stores the event (a repeated `--id` is ignored), then advances the runs waiting
+for it; a run that reaches its `wait:` later still finds it. Embedded hosts use
+`advanceDueRuns({ ctx })` and `signalEvent({ name, data, id, ctx })` from
+`@clawdbot/lobster/core`.
+
+Who calls `runs advance --due` is the caller's choice: a long-running host such as
+the OpenClaw gateway every minute or so, or the operating system:
+
+```sh
+# cron: every minute
+* * * * * LOBSTER_STATE_DIR=$HOME/.lobster/state lobster runs advance --due >/dev/null
+```
+
+On macOS a launchd agent with `StartInterval` 60, on Linux a systemd timer with
+`OnUnitActiveSec=60`, does the same.
+
+### Heartbeats
+
+A step can require signs of progress, so a hung but still running command is
+stopped instead of waiting for `timeout_ms`:
+
+```yaml
+- id: export
+  run: export-everything
+  heartbeat_timeout_ms: 60000
+```
+
+A shell command (or `exec`) shows progress by touching the file named in
+`LOBSTER_HEARTBEAT_FILE`; a pipeline command calls `ctx.heartbeat()`. Silence for
+longer than the limit stops the step like a timeout (its process tree is killed),
+after which `retry`, `on_error` and the repeatable rules apply. A dead process is
+already covered by the run's lease and `runs advance --due`.
 
 ## Workflow files
 

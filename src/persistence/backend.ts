@@ -31,6 +31,9 @@ export type StateWriteResult = StateWriteCommit & {
 	signalAbortedAfterCommit: boolean;
 };
 
+/** An external event delivered with `lobster signal`. */
+export type InboxEvent = { id: string; name: string; data: unknown; at: number };
+
 export interface Backend {
 	readonly kind: BackendKind;
 
@@ -52,6 +55,12 @@ export interface Backend {
 	removeRun(id: string, before: string): Promise<boolean>;
 	/** Remove finished runs last updated before `before`; throttled to once a day. */
 	pruneFinished(before: string, now: string): Promise<string[]>;
+	/** Runs whose wake time has passed, earliest first. */
+	dueRuns(now: number, limit: number, callerId?: string): Promise<string[]>;
+	/** Store an external event; an id seen before is ignored. */
+	appendEvent(event: InboxEvent): Promise<{ inserted: boolean }>;
+	/** Events with this name received at or after `since`, oldest first. */
+	findEvents(name: string, since: number): Promise<InboxEvent[]>;
 
 	export(): Promise<LogicalArchive>;
 	import(data: LogicalArchive): Promise<void>;

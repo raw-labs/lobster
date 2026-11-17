@@ -3,21 +3,38 @@ import { WaitConflictError } from "./backend.js";
 import { runSummary, type RunMetadata, type RunState, type RunSummary } from "./model.js";
 import type { StoreSession } from "./session.js";
 
+/** When a question or event wait stops waiting, and what happens then. */
+export type WaitDeadline = { deadline?: number; onTimeout?: "cancel" | "continue" };
+
 export type WaitRequest =
-	| {
+	| ({
 			kind: "input";
 			prompt: string;
 			responseSchema: unknown;
 			defaults?: unknown;
 			subject?: unknown;
-	  }
-	| { kind: "approval"; prompt: string; items: unknown[]; preview?: string };
+	  } & WaitDeadline)
+	| ({ kind: "approval"; prompt: string; items: unknown[]; preview?: string } & WaitDeadline)
+	/** A `sleep:` step: due at `until` (epoch ms). */
+	| { kind: "timer"; until: number }
+	/** A `wait:` step: the oldest matching event received at or after `since`. */
+	| ({
+			kind: "event";
+			event: string;
+			match?: Record<string, unknown>;
+			since: number;
+	  } & WaitDeadline);
+
+/** When a waiting activation is due: a timer's time, or a question's deadline. */
+export function waitDueAt(wait: WaitRequest): number | undefined {
+	return wait.kind === "timer" ? wait.until : wait.deadline;
+}
 
 export type WaitSummary = {
 	id: string;
 	runId: string;
 	revision: number;
-	kind: "input" | "approval";
+	kind: "input" | "approval" | "timer" | "event";
 };
 
 export type WaitView = WaitSummary & { request: WaitRequest | null };
@@ -29,6 +46,8 @@ export type RunView = RunSummary & {
 		status: string;
 		error?: string;
 		nextRetryAt?: number;
+		/** When `runs advance --due` next picks this run up (epoch ms). */
+		wakeAt?: number;
 		active: boolean;
 		unresolvedActivities: string[];
 	};
@@ -45,7 +64,12 @@ function waitSummary(run: RunState, key: string): WaitSummary {
 		id: waitId(run.id, key),
 		runId: run.id,
 		revision: run.waits[key].revision ?? 0,
-		kind: run.waits[key].kind === "input_request" ? "input" : "approval",
+		kind:
+			run.waits[key].kind === "input_request"
+				? "input"
+				: run.waits[key].kind === "timer" || run.waits[key].kind === "event"
+					? run.waits[key].kind
+					: "approval",
 	};
 }
 
@@ -63,6 +87,7 @@ export function runView(run: RunState): RunView {
 						status: run.execution.status,
 						...(run.execution.error ? { error: run.execution.error } : {}),
 						...(retryTimes.length ? { nextRetryAt: Math.min(...retryTimes) } : {}),
+						...(run.wakeAt !== undefined ? { wakeAt: run.wakeAt } : {}),
 						active: (run.executionLease?.expiresAt ?? 0) > Date.now(),
 						unresolvedActivities: Object.entries(run.execution.activations)
 							.filter(([key, frame]) => key.endsWith("/activity") && frame.phase === "started")
@@ -102,9 +127,20 @@ export async function findWait(store: StoreSession, id: string, owner?: string) 
 
 function savedRequest(state: Record<string, unknown>): WaitRequest | null {
 	const request = state.wait as WaitRequest | undefined;
+	if (request?.kind === "timer" && Number.isFinite(request.until))
+		return { kind: "timer", until: request.until };
+	if (request?.kind === "event" && typeof request.event === "string")
+		return {
+			kind: "event",
+			event: request.event,
+			since: request.since,
+			...(request.match ? { match: request.match } : {}),
+			...(request.deadline !== undefined
+				? { deadline: request.deadline, onTimeout: request.onTimeout }
+				: {}),
+		};
 	if (
-		request &&
-		["input", "approval"].includes(request.kind) &&
+		(request?.kind === "input" || request?.kind === "approval") &&
 		typeof request.prompt === "string"
 	) {
 		if (request.kind === "input" && request.responseSchema !== undefined) {
@@ -114,6 +150,9 @@ function savedRequest(state: Record<string, unknown>): WaitRequest | null {
 				responseSchema: request.responseSchema,
 				...(request.defaults !== undefined ? { defaults: request.defaults } : {}),
 				...(request.subject !== undefined ? { subject: request.subject } : {}),
+				...(request.deadline !== undefined
+					? { deadline: request.deadline, onTimeout: request.onTimeout }
+					: {}),
 			};
 		}
 		if (request.kind === "approval" && Array.isArray(request.items)) {
@@ -122,6 +161,9 @@ function savedRequest(state: Record<string, unknown>): WaitRequest | null {
 				prompt: request.prompt,
 				items: request.items,
 				...(typeof request.preview === "string" ? { preview: request.preview } : {}),
+				...(request.deadline !== undefined
+					? { deadline: request.deadline, onTimeout: request.onTimeout }
+					: {}),
 			};
 		}
 	}

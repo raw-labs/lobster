@@ -141,6 +141,8 @@ export async function crashAndRecover(
 		flowPath: string;
 		killWhen?: KillPoint;
 		leaseMs?: number;
+		/** false: stop once the lease has lapsed and leave recovery to the caller. */
+		recover?: boolean;
 	},
 ) {
 	const leaseMs = options.leaseMs ?? 1000;
@@ -155,6 +157,8 @@ export async function crashAndRecover(
 			await session.close();
 		}
 	}
+	if (options.recover === false)
+		return { runId: first.runId, killed: first.killed, first: first.outcome, recovered: undefined };
 	const recovered = await runWorker(t, {
 		...options,
 		runId: first.runId,

@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import path from "node:path";
 import { withStoreContext } from "../persistence/execution.js";
 import { bindRecorder, recorderFromEnv, sessionFromEnv } from "../persistence/context.js";
@@ -10,9 +11,9 @@ import { dryRunWorkflow } from "./dry_run.js";
 import { resolveWorkflowArgs } from "./args.js";
 import { snapshotDefinition } from "./definition.js";
 import { ExecutionStore } from "../engine/store.js";
-import { Machine } from "../engine/machine.js";
+import { Machine, matchesEvent } from "../engine/machine.js";
 import type { RunContext } from "../engine/context.js";
-import type { ExecutionState } from "../engine/state.js";
+import { ExecutionConflictError, type ExecutionState } from "../engine/state.js";
 import type { WorkflowRunResult } from "./types.js";
 import { visibleTo, callerId } from "../persistence/waits.js";
 
@@ -120,6 +121,7 @@ export async function runWorkflowFile(
 					cwd: path.resolve(ctx.cwd ?? process.cwd()),
 					activations: {},
 					status: "running",
+					startedAt: Date.now(),
 				};
 			}
 			if (state.version !== 1) throw new Error("Unsupported workflow execution version");
@@ -167,6 +169,112 @@ export async function advanceWorkflowRun(options: {
 		} finally {
 			await store.close();
 		}
+	});
+}
+
+export type DueRunOutcome = {
+	runId: string;
+	status: WorkflowRunResult["status"] | "blocked" | "failed" | "busy";
+	waitingFor?: WorkflowRunResult["waitingFor"];
+	error?: string;
+};
+
+/** Advance one run, reporting the outcome instead of throwing (used for batches). */
+async function advanceReporting(runId: string, ctx: RunContext, leaseMs?: number) {
+	try {
+		const result = await advanceWorkflowRun({ runId, ctx, leaseMs });
+		return {
+			runId,
+			status: result.status,
+			...(result.waitingFor ? { waitingFor: result.waitingFor } : {}),
+		} satisfies DueRunOutcome;
+	} catch (error: any) {
+		// Another process holds the run's lease: it is being advanced right now.
+		if (error instanceof ExecutionConflictError) return { runId, status: "busy" } as DueRunOutcome;
+		const session = sessionFromEnv(ctx.env);
+		const run = session ? await session.getRunState(runId) : null;
+		return {
+			runId,
+			status: run?.execution?.status === "blocked" ? "blocked" : "failed",
+			error: error?.message ?? String(error),
+		} as DueRunOutcome;
+	}
+}
+
+/**
+ * Advance every run whose time has come, then return: a crashed run whose lease lapsed, a
+ * timer that is due, a question or event wait past its deadline. Lobster never loops on its
+ * own; a host, cron job or person calls this. The usual rules apply: a step that may have
+ * acted re-runs only when repeatable, everything else becomes blocked for a person.
+ */
+export async function advanceDueRuns(options: {
+	ctx: RunContext;
+	limit?: number;
+	dryRun?: boolean;
+	leaseMs?: number;
+}): Promise<{ due: string[]; advanced: DueRunOutcome[] }> {
+	return withStoreContext({ ...options.ctx, trackRuns: true }, async (ctx) => {
+		const session = sessionFromEnv(ctx.env)!;
+		const due = await session.dueRuns({
+			limit: options.limit ?? 100,
+			callerId: callerId(ctx.runMetadata),
+		});
+		if (options.dryRun) return { due, advanced: [] };
+		const advanced: DueRunOutcome[] = [];
+		for (const runId of due) advanced.push(await advanceReporting(runId, ctx, options.leaseMs));
+		return { due, advanced };
+	});
+}
+
+/**
+ * Deliver an external event: store it in the inbox (a repeated `id` is ignored) and advance
+ * the waiting runs whose `wait:` step it matches. Runs that reach their `wait:` later still
+ * find it, since they match events received since they started.
+ */
+export async function signalEvent(options: {
+	name: string;
+	data?: unknown;
+	id?: string;
+	ctx: RunContext;
+	leaseMs?: number;
+}): Promise<{ event: { id: string; name: string; inserted: boolean }; advanced: DueRunOutcome[] }> {
+	if (!/^[A-Za-z0-9_.:/-]+$/.test(options.name))
+		throw new Error("Event names use letters, digits and . _ : / -");
+	return withStoreContext({ ...options.ctx, trackRuns: true }, async (ctx) => {
+		const session = sessionFromEnv(ctx.env)!;
+		const id = options.id ?? randomUUID();
+		const { inserted } = await session.appendEvent({
+			id,
+			name: options.name,
+			data: options.data ?? null,
+			at: Date.now(),
+		});
+		const owner = callerId(ctx.runMetadata);
+		const waiting: string[] = [];
+		for (let after = ""; ;) {
+			const page = await session.listRuns({
+				status: "waiting",
+				after,
+				limit: 100,
+				callerId: owner,
+			});
+			for (const summary of page.runs) {
+				const run = await session.getRunState(summary.id);
+				const listens = Object.values(run?.execution?.activations ?? {}).some(
+					(frame) =>
+						frame.phase === "waiting" &&
+						frame.wait?.kind === "event" &&
+						frame.wait.event === options.name &&
+						matchesEvent(frame.wait.match, options.data ?? null),
+				);
+				if (listens) waiting.push(summary.id);
+			}
+			if (!page.nextCursor) break;
+			after = page.nextCursor;
+		}
+		const advanced: DueRunOutcome[] = [];
+		for (const runId of waiting) advanced.push(await advanceReporting(runId, ctx, options.leaseMs));
+		return { event: { id, name: options.name, inserted }, advanced };
 	});
 }
 

@@ -100,6 +100,26 @@ export function dryRunWorkflow({
 			if (unknownCondition) lines.splice(header, 0, `     ${conditionNote(condition)}`);
 		};
 
+		if (step.sleep !== undefined) {
+			lines.push(`  ${num}. ${step.id}  [sleep]`);
+			lines.push(`     sleep: ${step.sleep}`);
+			results[step.id] = { id: step.id };
+			noteCondition();
+			continue;
+		}
+
+		if (step.wait) {
+			lines.push(`  ${num}. ${step.id}  [wait]`);
+			lines.push(`     event: ${step.wait.event}`);
+			if (step.wait.match) lines.push(`     match: ${JSON.stringify(step.wait.match)}`);
+			if (step.wait.timeout !== undefined)
+				lines.push(`     timeout: ${step.wait.timeout} (then ${step.wait.on_timeout ?? "cancel"})`);
+			lines.push(`     [event required]`);
+			results[step.id] = { id: step.id, json: { pending: true } };
+			noteCondition();
+			continue;
+		}
+
 		if (isInputStep(step.input)) {
 			lines.push(`  ${num}. ${step.id}  [input]`);
 			lines.push(`     prompt: ${step.input.prompt}`);

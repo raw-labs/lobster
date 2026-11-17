@@ -7,9 +7,9 @@ import {
 	validateInputResponse,
 	isInteractive,
 	parseResponseJson,
-	parseApprovalTimeoutMs,
+	questionDeadline,
+	readAnswer,
 } from "../gates.js";
-import { readLineFromStream } from "../../io/read_line.js";
 
 export async function input(
 	machine: Machine,
@@ -34,19 +34,20 @@ export async function input(
 			responseSchema: step.input!.responseSchema,
 			defaults: step.input!.defaults,
 			subject,
+			...questionDeadline(step.input, `Step ${step.id} input`),
 		};
 	}
 	const wait = frame.wait;
 	if (wait.kind !== "input") throw new Error("Invalid input activation");
+	if (machine.expired(frame))
+		return machine.timeOut(key, frame, { id: step.id, subject: wait.subject });
 	if (scope.ctx.mode === "tool" || !isInteractive(scope.ctx.stdin)) {
 		await machine.suspend(key, frame);
 	}
 	scope.ctx.stdout.write(wait.prompt + "\nEnter JSON response: ");
-	const raw = await readLineFromStream(scope.ctx.stdin, {
-		timeoutMs: parseApprovalTimeoutMs(scope.ctx.env),
-		signal: scope.ctx.signal,
-	});
-	const response = parseResponseJson(String(raw ?? "").trim());
+	const read = await readAnswer(scope, wait.deadline);
+	if ("expired" in read) return machine.timeOut(key, frame, { id: step.id, subject: wait.subject });
+	const response = parseResponseJson(String(read.answer ?? "").trim());
 	validateInputResponse({ schema: wait.responseSchema, response, stepId: step.id });
 	frame.result = { id: step.id, subject: wait.subject, response };
 	frame.phase = "completed";

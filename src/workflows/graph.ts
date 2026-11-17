@@ -40,6 +40,8 @@ function stepType(step: WorkflowStep) {
 	if (typeof step.workflow === "string" && step.workflow.trim()) return "workflow";
 	if (typeof step.pipeline === "string" && step.pipeline.trim()) return "pipeline";
 	if (typeof step.run === "string" || typeof step.command === "string") return "run";
+	if (step.sleep !== undefined) return "sleep";
+	if (step.wait) return "wait";
 	if (isApprovalStep(step)) return "approval";
 	if (isInputStep(step)) return "input";
 	return "step";
@@ -62,6 +64,8 @@ function stepDetails(step: WorkflowStep, args: Record<string, unknown>) {
 	if (typeof shell === "string" && shell.trim()) {
 		return `run: ${resolveArgsTemplate(shell, args)}`;
 	}
+	if (step.sleep !== undefined) return `sleep: ${step.sleep}`;
+	if (step.wait) return `wait for event: ${step.wait.event}`;
 	if (isApprovalStep(step)) return "approval gate";
 	if (isInputStep(step)) return "input request";
 	return "";

@@ -49,6 +49,12 @@ export type WorkflowStep = {
 	pause_ms?: number;
 	steps?: WorkflowStep[];
 	timeout_ms?: number;
+	/** Abort the step when it shows no progress for this long (see LOBSTER_HEARTBEAT_FILE). */
+	heartbeat_timeout_ms?: number;
+	/** Pause the run for a duration ("30s", "2h", "3d", or ms). */
+	sleep?: string | number;
+	/** Pause the run until an external event arrives (`lobster signal`). */
+	wait?: WorkflowEventWait;
 	on_error?: "stop" | "continue" | "skip_rest";
 	retry?: {
 		max?: number;
@@ -59,11 +65,23 @@ export type WorkflowStep = {
 	};
 };
 
+/** How long a question or event wait may take, and what happens after that. */
+export type WorkflowWaitTimeout = {
+	timeout?: string | number;
+	on_timeout?: "cancel" | "continue";
+};
+
+export type WorkflowEventWait = {
+	event: string;
+	/** Fields the event's data must contain (nested objects match as subsets). */
+	match?: Record<string, unknown>;
+} & WorkflowWaitTimeout;
+
 export type WorkflowApproval =
 	| boolean
 	| "required"
 	| string
-	| {
+	| ({
 			prompt?: string;
 			items?: unknown[];
 			preview?: string;
@@ -73,7 +91,7 @@ export type WorkflowApproval =
 			requiredApprover?: string;
 			require_different_approver?: boolean;
 			requireDifferentApprover?: boolean;
-	  };
+	  } & WorkflowWaitTimeout);
 
 export type WorkflowApprovalIdentity = {
 	initiatedBy?: string;
@@ -85,7 +103,7 @@ export type WorkflowInputRequest = {
 	prompt: string;
 	responseSchema: unknown;
 	defaults?: unknown;
-};
+} & WorkflowWaitTimeout;
 
 export type WorkflowStepResult = {
 	id: string;
@@ -97,13 +115,21 @@ export type WorkflowStepResult = {
 	subject?: unknown;
 	response?: unknown;
 	skipped?: boolean;
+	/** A question or event wait reached its timeout with `on_timeout: continue`. */
+	timedOut?: boolean;
 	error?: boolean;
 	errorMessage?: string;
 };
 
+/** What a run with `status: "waiting"` waits for; `runs advance --due` or `signal` continue it. */
+export type WorkflowWaitingFor =
+	| { kind: "timer"; stepId: string; until: string }
+	| { kind: "event"; stepId: string; event: string; until?: string };
+
 export type WorkflowRunResult = {
-	status: "ok" | "needs_approval" | "needs_input" | "cancelled";
+	status: "ok" | "needs_approval" | "needs_input" | "waiting" | "cancelled";
 	output: unknown[];
+	waitingFor?: WorkflowWaitingFor;
 	requiresApproval?: {
 		type: "approval_request";
 		prompt: string;

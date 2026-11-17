@@ -11,6 +11,7 @@ import {
 	PersistenceError,
 	PersistenceOutcomeUnknown,
 	type Backend,
+	type InboxEvent,
 	type StateWriteOptions,
 	type StateWriteResult,
 } from "./backend.js";
@@ -299,6 +300,23 @@ export class StoreSession {
 
 	async getRunState(id: string): Promise<RunState | null> {
 		return this.request(() => this.backend.getRunState(id));
+	}
+
+	/** Runs whose wake time has passed: a lapsed lease, a timer, a question's deadline. */
+	async dueRuns({
+		now = Date.now(),
+		limit = 100,
+		callerId,
+	}: { now?: number; limit?: number; callerId?: string } = {}): Promise<string[]> {
+		return this.request(() => this.backend.dueRuns(now, limit, callerId));
+	}
+
+	async appendEvent(event: InboxEvent): Promise<{ inserted: boolean }> {
+		return this.request(() => this.backend.appendEvent(event), true);
+	}
+
+	async findEvents(name: string, since: number): Promise<InboxEvent[]> {
+		return this.request(() => this.backend.findEvents(name, since));
 	}
 
 	async listRuns({

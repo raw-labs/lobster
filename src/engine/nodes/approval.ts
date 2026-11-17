@@ -6,9 +6,9 @@ import {
 	approvalIdentityFromRequest,
 	enforceApprovalIdentity,
 	isInteractive,
-	parseApprovalTimeoutMs,
+	questionDeadline,
+	readAnswer,
 } from "../gates.js";
-import { readLineFromStream } from "../../io/read_line.js";
 
 export async function approval(
 	machine: Machine,
@@ -27,15 +27,19 @@ export async function approval(
 		prompt: frame.approval.prompt,
 		items: frame.approval.items,
 		...(frame.approval.preview ? { preview: frame.approval.preview } : {}),
+		...questionDeadline(
+			typeof step.approval === "object" ? step.approval : undefined,
+			`Step ${step.id} approval`,
+		),
 	};
+	const deadline = frame.wait.kind === "approval" ? frame.wait.deadline : undefined;
+	if (machine.expired(frame)) return machine.timeOut(key + "/approval", frame, frame.result);
 	if (scope.ctx.mode === "tool" || !isInteractive(scope.ctx.stdin))
 		await machine.suspend(key + "/approval", frame);
 	scope.ctx.stdout.write(frame.approval.prompt + " [y/N] ");
-	const answer = await readLineFromStream(scope.ctx.stdin, {
-		timeoutMs: parseApprovalTimeoutMs(scope.ctx.env),
-		signal: scope.ctx.signal,
-	});
-	if (!/^y(es)?$/i.test(String(answer).trim())) throw new Error("Not approved");
+	const read = await readAnswer(scope, deadline);
+	if ("expired" in read) return machine.timeOut(key + "/approval", frame, frame.result);
+	if (!/^y(es)?$/i.test(String(read.answer).trim())) throw new Error("Not approved");
 	const approvedBy = String(scope.ctx.env.LOBSTER_APPROVAL_APPROVED_BY ?? "").trim() || undefined;
 	enforceApprovalIdentity({
 		stepId: step.id,

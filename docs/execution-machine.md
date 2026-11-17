@@ -36,7 +36,25 @@ Snapshot definitions and static child references before execution. Dynamic child
 
 ## Host boundary
 
-Start/advance/resume execute until finished or suspended. The host invokes unfinished runs after restart. The engine does not assume a conversation exists, start a background service or promise that agent launch can be deduplicated by session name. The Gateway adapter's external-run reconciliation is a separate integration.
+Start/advance/resume/signal execute until finished or suspended. The host, or a scheduler calling `lobster runs advance --due`, advances unfinished runs. The engine does not assume a conversation exists, start a background service or promise that agent launch can be deduplicated by session name. The Gateway adapter's external-run reconciliation is a separate integration.
+
+## Time, events and liveness
+
+Lobster stays run-on-demand: a process runs until the workflow finishes or must wait, saves, and exits. It never runs a loop of its own. Something outside — the host (OpenClaw's gateway), cron/launchd/systemd, or a person — decides when to look again. The design therefore has one primitive and one entry point.
+
+**Wake time.** Every run record carries `wakeAt`, derived from its execution on every transition: for a `running` run, the lease expiry (a live owner keeps pushing it forward; a crashed owner leaves it in the past); for a `waiting` run, the earliest timer or wait deadline; otherwise none. SQLite indexes it.
+
+**Advancing due runs.** `lobster runs advance --due` (core `advanceDueRuns`) claims every run whose `wakeAt` has passed and advances it, then exits. Claiming uses the existing lease, so concurrent callers skip each other's runs. The same rules as `runs advance <runId>` apply: completed work is never redone, a step that may have acted is re-run only when it is repeatable and marked `recovery: repeat`, and everything else becomes `blocked` for a person. Blocked runs are never due. Timers fire at or after their time, never early; how late depends on how often the caller looks.
+
+**Sleep.** A `sleep:` step publishes a timer wait with a fixed wake time in the same save that reaches it, exactly as an approval publishes its question. If the remaining time is short (`LOBSTER_INLINE_SLEEP_MS`, default 60 s) the process waits in place and consumes the wait itself; otherwise the run returns `status: "waiting"` with `waitingFor: { kind: "timer", until }` and exits. Re-entering the step before its time pauses again; after it, the step completes. A crash or Ctrl-C during an in-place sleep leaves an ordinary waiting run.
+
+**Deadlines on questions.** An approval or input request may carry `timeout` and `on_timeout`. The deadline is fixed when the question is first asked and becomes the wait's due time. When a due run re-enters the question after the deadline, it consumes the wait: `on_timeout: cancel` (default) cancels the run like a rejection; `continue` completes the step with `timedOut: true` and no approval or response. An answer and a timeout race through the same wait revision, so exactly one wins.
+
+**External events.** `lobster signal <name> [--data JSON] [--id ID]` (core `signal`) stores the event in a durable inbox (`--id` makes repeated delivery idempotent) and advances the waiting runs whose event wait matches. A `wait:` step waits for an event by name, optionally matching fields of its data, with an optional `timeout`/`on_timeout`. It matches the oldest event received since the run was created that the run has not consumed, so an event that arrives before the step publishes its wait is not lost. Each run consumes an event at most once; the event id is part of the step's result. Events are pruned with finished runs.
+
+**Heartbeats.** A step with `heartbeat_timeout_ms` must show progress at least that often: a shell command (or `exec`) touches the file named by `LOBSTER_HEARTBEAT_FILE`, a pipeline command calls `ctx.heartbeat()`. Missing it aborts the step like `timeout_ms` (the process tree is killed), after which retry, `on_error` and the repeatable rules apply. The run-level lease, renewed by the executor, already covers a dead process; heartbeats cover a live process whose step has hung.
+
+Timers, deadlines and event waits are gates: like approvals and input requests they are not allowed inside `for_each`, `parallel` branches or child workflows.
 
 ## Verification
 
@@ -48,4 +66,4 @@ Existing suites cover conditions, retries, timeouts, cancellation, composition, 
 
 Each checkpoint currently replaces the execution snapshot, including saved outputs. Both backends implement the same correctness contract; this change does not claim a high-throughput scheduler or incremental large-run storage. History is separate and optional. A blocked activity needs outcome inspection; there is no general adapter reconciliation/result-injection API yet. Code, external services and host environments remain outside the saved definition. Recovery of an OpenClaw agent launch is not inferred from a session name.
 
-Old workflow state conversion, Gateway background dispatch and new timed/event waits are deferred, not hidden compatibility modes.
+Gateway background dispatch is deferred. Lobster provides `runs advance --due`; scheduling the call (host loop, cron, systemd timer) is the caller's choice.

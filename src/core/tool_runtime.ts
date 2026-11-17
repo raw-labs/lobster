@@ -1,3 +1,4 @@
+import type { WorkflowWaitingFor } from "../workflows/types.js";
 import type { ResumeDecision, ResumeTarget } from "../resume/options.js";
 import path from "node:path";
 import { Writable } from "node:stream";
@@ -50,8 +51,10 @@ export type ToolEnvelope = {
 	protocolVersion: 1;
 	runId?: string;
 	ok: boolean;
-	status?: "ok" | "needs_approval" | "needs_input" | "cancelled";
+	status?: "ok" | "needs_approval" | "needs_input" | "waiting" | "cancelled";
 	output?: unknown[];
+	/** With `status: "waiting"`: the timer or event the run waits for. */
+	waitingFor?: WorkflowWaitingFor;
 	requiresApproval?: {
 		type?: "approval_request";
 		prompt: string;
@@ -133,6 +136,9 @@ async function runToolRequestInternal({
 			}
 			if (output.status === "needs_input") {
 				return okEnvelope("needs_input", [], null, output.requiresInput ?? null);
+			}
+			if (output.status === "waiting") {
+				return { ...okEnvelope("waiting", [], null, null), waitingFor: output.waitingFor };
 			}
 			if (output.status === "cancelled") {
 				return okEnvelope("cancelled", [], null, null);
@@ -392,6 +398,9 @@ async function resumeToolRequestInternal({
 				return okEnvelope("needs_input", [], null, output.requiresInput ?? null);
 			}
 			await cleanupIndex(workflowResumeStateKey);
+			if (output.status === "waiting") {
+				return { ...okEnvelope("waiting", [], null, null), waitingFor: output.waitingFor };
+			}
 			if (output.status === "cancelled") {
 				return okEnvelope("cancelled", [], null, null);
 			}
@@ -620,7 +629,7 @@ export function createCaptureStream() {
 }
 
 function okEnvelope(
-	status: "ok" | "needs_approval" | "needs_input" | "cancelled",
+	status: "ok" | "needs_approval" | "needs_input" | "waiting" | "cancelled",
 	output: unknown[],
 	requiresApproval: ToolEnvelope["requiresApproval"],
 	requiresInput: ToolEnvelope["requiresInput"],

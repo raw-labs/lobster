@@ -72,7 +72,10 @@ for (const backend of ["sqlite"] as const) {
 				assert.equal(updated.status, "waiting");
 				assert.equal(updated.pendingWaits.length, 1);
 				const remaining = await getWait({ waitId: updated.pendingWaits[0].id, ctx });
-				assert.equal(remaining.request.prompt, boundary === "before" ? "First" : "Second");
+				assert.equal(
+					(remaining.request as { prompt: string }).prompt,
+					boundary === "before" ? "First" : "Second",
+				);
 				assert.equal((await getWait({ waitId: wait.id, ctx })) !== null, boundary === "before");
 			});
 		}

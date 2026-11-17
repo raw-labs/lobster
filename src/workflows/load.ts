@@ -1,3 +1,4 @@
+import { parseDuration } from "../util/duration.js";
 import { closestMatch } from "../util/suggest.js";
 import { promises as fsp } from "node:fs";
 import path from "node:path";
@@ -213,9 +214,14 @@ export async function loadWorkflowFile(filePath: string): Promise<WorkflowFile> 
 					throw new Error(`Workflow step ${step.id} duplicate for_each sub-step id: ${sub.id}`);
 				}
 				subStepIds.add(sub.id);
-				if (isApprovalStep(sub.approval) || isInputStep(sub.input)) {
+				if (
+					isApprovalStep(sub.approval) ||
+					isInputStep(sub.input) ||
+					sub.sleep !== undefined ||
+					sub.wait !== undefined
+				) {
 					throw new Error(
-						`Workflow step ${step.id} for_each sub-steps cannot contain approval or input steps`,
+						`Workflow step ${step.id} for_each sub-steps cannot contain approval or input steps (nor sleep or wait steps)`,
 					);
 				}
 				if (sub.run !== undefined && typeof sub.run !== "string") {
@@ -262,27 +268,44 @@ export async function loadWorkflowFile(filePath: string): Promise<WorkflowFile> 
 		const pipeline = typeof step.pipeline === "string" ? step.pipeline : undefined;
 		const workflowRef =
 			typeof step.workflow === "string" && step.workflow.trim() ? step.workflow : undefined;
+		const isSleep = step.sleep !== undefined;
+		const isWait = step.wait !== undefined;
 		const executionCount =
 			Number(Boolean(shellCommand)) +
 			Number(Boolean(pipeline)) +
 			Number(Boolean(workflowRef)) +
 			Number(isParallel) +
-			Number(isForEach);
+			Number(isForEach) +
+			Number(isSleep) +
+			Number(isWait);
 		if (executionCount === 0 && !isApprovalStep(step.approval) && !isInputStep(step.input)) {
 			throw new Error(
-				`Workflow step ${step.id} requires run, command, pipeline, workflow, parallel, for_each, approval, or input`,
+				`Workflow step ${step.id} requires run, command, pipeline, workflow, parallel, for_each, sleep, wait, approval, or input`,
 			);
 		}
 		if (executionCount > 1) {
 			throw new Error(
-				`Workflow step ${step.id} can only define one of run, command, pipeline, workflow, parallel, or for_each`,
+				`Workflow step ${step.id} can only define one of run, command, pipeline, workflow, parallel, for_each, sleep, or wait`,
 			);
 		}
 		if (executionCount > 0 && isInputStep(step.input)) {
 			throw new Error(
-				`Workflow step ${step.id} input steps cannot define run, command, pipeline, workflow, parallel, or for_each`,
+				`Workflow step ${step.id} input steps cannot define run, command, pipeline, workflow, parallel, for_each, sleep, or wait`,
 			);
 		}
+		if ((isSleep || isWait) && isApprovalStep(step.approval)) {
+			throw new Error(`Workflow step ${step.id} sleep and wait steps cannot define approval`);
+		}
+		if (isSleep) parseDuration(step.sleep, `Workflow step ${step.id} sleep`);
+		if (isWait) validateEventWait(step, `Workflow step ${step.id}`);
+		if (step.heartbeat_timeout_ms !== undefined && !shellCommand && !pipeline && !isForEach) {
+			throw new Error(
+				`Workflow step ${step.id} heartbeat_timeout_ms applies only to run, command and pipeline steps`,
+			);
+		}
+		if (isInputStep(step.input)) validateWaitTimeout(step.input, `Workflow step ${step.id} input`);
+		if (step.approval && typeof step.approval === "object")
+			validateWaitTimeout(step.approval, `Workflow step ${step.id} approval`);
 		if (isApprovalStep(step.approval) && isInputStep(step.input)) {
 			throw new Error(`Workflow step ${step.id} cannot define both approval and input`);
 		}
@@ -471,7 +494,40 @@ function validateStepOptions(step: WorkflowStep, name: string) {
 			throw new Error(`${name} retry.jitter must be a boolean`);
 		}
 	}
+	if (
+		step.heartbeat_timeout_ms !== undefined &&
+		(typeof step.heartbeat_timeout_ms !== "number" ||
+			!Number.isInteger(step.heartbeat_timeout_ms) ||
+			step.heartbeat_timeout_ms < 1 ||
+			step.heartbeat_timeout_ms > 2_147_483_647)
+	) {
+		throw new Error(
+			`${name} heartbeat_timeout_ms must be a positive integer between 1 and 2147483647`,
+		);
+	}
 	validateCondition(step, name);
+}
+
+function validateWaitTimeout(config: Record<string, unknown>, name: string) {
+	if (config.timeout !== undefined) parseDuration(config.timeout, `${name}.timeout`);
+	if (
+		config.on_timeout !== undefined &&
+		config.on_timeout !== "cancel" &&
+		config.on_timeout !== "continue"
+	)
+		throw new Error(`${name}.on_timeout must be "cancel" or "continue"`);
+	if (config.on_timeout !== undefined && config.timeout === undefined)
+		throw new Error(`${name}.on_timeout needs a timeout`);
+}
+
+function validateEventWait(step: WorkflowStep, name: string) {
+	const wait = step.wait as unknown;
+	if (!isPlainObject(wait)) throw new Error(`${name} wait must be an object with an event name`);
+	if (typeof wait.event !== "string" || !/^[A-Za-z0-9_.:/-]+$/.test(wait.event))
+		throw new Error(`${name} wait.event must be an event name (letters, digits, . _ : / -)`);
+	if (wait.match !== undefined && !isPlainObject(wait.match))
+		throw new Error(`${name} wait.match must be an object`);
+	validateWaitTimeout(wait, `${name} wait`);
 }
 
 // Checked here, not when the step is reached: by then earlier steps have had their effects.
@@ -518,14 +574,18 @@ const STEP_KEYS = [
 	"pause_ms",
 	"steps",
 	"timeout_ms",
+	"heartbeat_timeout_ms",
+	"sleep",
+	"wait",
 	"on_error",
 	"retry",
 ];
+const WAIT_KEYS = ["event", "match", "timeout", "on_timeout"];
 const BRANCH_KEYS = ["id", "recovery", "run", "command", "pipeline", "env", "cwd", "stdin"];
 const PARALLEL_KEYS = ["wait", "timeout_ms", "branches"];
 const RETRY_KEYS = ["max", "backoff", "delay_ms", "max_delay_ms", "jitter"];
 const COST_LIMIT_KEYS = ["max_usd", "action"];
-const INPUT_KEYS = ["prompt", "responseSchema", "defaults"];
+const INPUT_KEYS = ["prompt", "responseSchema", "defaults", "timeout", "on_timeout"];
 const APPROVAL_KEYS = [
 	"prompt",
 	"items",
@@ -536,6 +596,8 @@ const APPROVAL_KEYS = [
 	"requiredApprover",
 	"require_different_approver",
 	"requireDifferentApprover",
+	"timeout",
+	"on_timeout",
 ];
 
 function rejectUnknownKeys(workflow: Record<string, unknown>) {
@@ -548,6 +610,7 @@ function rejectUnknownKeys(workflow: Record<string, unknown>) {
 		checkKeys(step.retry, RETRY_KEYS, `${name} retry`);
 		checkKeys(step.input, INPUT_KEYS, `${name} input`);
 		checkKeys(step.approval, APPROVAL_KEYS, `${name} approval`);
+		checkKeys(step.wait, WAIT_KEYS, `${name} wait`);
 		if (isPlainObject(step.parallel)) {
 			checkKeys(step.parallel, PARALLEL_KEYS, `${name} parallel`);
 			if (Array.isArray(step.parallel.branches)) {

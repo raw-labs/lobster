@@ -9,7 +9,14 @@ export type {
 } from "../commands/types.js";
 export { parsePipeline } from "../pipeline/parser.js";
 export { runPipeline } from "../pipeline/runtime.js";
-export { runWorkflowFile, advanceWorkflowRun, abandonWorkflowRun } from "../workflows/file.js";
+export {
+	runWorkflowFile,
+	advanceWorkflowRun,
+	abandonWorkflowRun,
+	advanceDueRuns,
+	signalEvent,
+	type DueRunOutcome,
+} from "../workflows/file.js";
 export { decodeResumeToken } from "../resume/resume.js";
 export { runToolRequest, resumeToolRequest, createToolContext } from "./tool_runtime.js";
 

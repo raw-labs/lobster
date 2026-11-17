@@ -1,4 +1,7 @@
 import { randomUUID } from "node:crypto";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import type { RunContext } from "./context.js";
 import type { WorkflowStep, WorkflowStepResult, WorkflowRunResult } from "../workflows/types.js";
 import type { LlmSpendLedger } from "../llm/accounting.js";
@@ -22,6 +25,7 @@ import {
 	InvocationRetiredError,
 	InterruptedActivityError,
 	ExecutionConflictError,
+	RunCancelled,
 	type Activation,
 	type Definition,
 	type ExecutionState,
@@ -35,6 +39,9 @@ import { childWorkflow } from "./nodes/child-workflow.js";
 import { WorkflowPipelineHaltError } from "./activities/pipeline.js";
 import { input } from "./nodes/input.js";
 import { approval } from "./nodes/approval.js";
+import { sleep } from "./nodes/sleep.js";
+import { eventWait } from "./nodes/event.js";
+import type { InboxEvent } from "../persistence/backend.js";
 import { toOutputItems } from "./values.js";
 import {
 	trackStepCost,
@@ -176,7 +183,8 @@ export class Machine {
 			error instanceof RequestInputResumeError ||
 			error instanceof CostLimitExceededError ||
 			error instanceof WorkflowResumeArgumentError ||
-			error instanceof WaitConflictError
+			error instanceof WaitConflictError ||
+			error instanceof RunCancelled
 		);
 	}
 
@@ -212,8 +220,13 @@ export class Machine {
 		if (frame.phase === "failed") throw new Error(frame.error);
 		if (await enter(this, step, frame, scope)) return frame.result!;
 		// Refused before dispatch: the command of a gated step must not run when nobody can be asked.
-		if (scope.nested && (isApprovalStep(step.approval) || nodeKind(step) === "input"))
-			throw new Error("Sub-workflow approval/input gates are not supported in composition.");
+		if (
+			scope.nested &&
+			(isApprovalStep(step.approval) || ["input", "sleep", "event"].includes(nodeKind(step)))
+		)
+			throw new Error(
+				"Sub-workflow approval/input gates are not supported in composition (nor sleep or wait steps).",
+			);
 		const config = resolveRetryConfig(step.retry);
 		while (true) {
 			if (frame.retryAt) {
@@ -226,7 +239,36 @@ export class Machine {
 			// The clock measures the step's own work. An activity starts it once its
 			// pre-dispatch checkpoint is written, so slow storage never eats the budget;
 			// the deadline is persisted by the next save and survives a crash.
+			// A step with heartbeat_timeout_ms must show progress: a shell command touches
+			// LOBSTER_HEARTBEAT_FILE, a pipeline command calls ctx.heartbeat(). Silence aborts it
+			// like a timeout, so retry, on_error and the repeatable rules apply.
+			const heartbeatFile = step.heartbeat_timeout_ms
+				? path.join(os.tmpdir(), `lobster-heartbeat-${randomUUID()}`)
+				: undefined;
+			let lastBeat = Date.now();
+			const startHeartbeat = () => {
+				if (!heartbeatFile || watchdog) return;
+				lastBeat = Date.now();
+				const limit = step.heartbeat_timeout_ms!;
+				watchdog = setInterval(
+					() => {
+						let beat = lastBeat;
+						try {
+							beat = Math.max(beat, fs.statSync(heartbeatFile).mtimeMs);
+						} catch {
+							// Not touched yet.
+						}
+						if (Date.now() - beat > limit)
+							timeout.abort(
+								new Error(`Step '${step.id}' showed no progress for ${limit}ms (heartbeat)`),
+							);
+					},
+					Math.max(25, Math.min(1000, Math.floor(limit / 4))),
+				);
+			};
+			let watchdog: ReturnType<typeof setInterval> | undefined;
 			const startTimeout = () => {
+				startHeartbeat();
 				if (!step.timeout_ms || timer || timeout.signal.aborted) return;
 				frame.deadline ??= Date.now() + step.timeout_ms;
 				if (frame.deadline <= Date.now()) {
@@ -245,10 +287,18 @@ export class Machine {
 				ctx: {
 					...scope.ctx,
 					signal: AbortSignal.any([scope.ctx.signal, timeout.signal].filter(Boolean)),
+					...(heartbeatFile
+						? {
+								env: { ...scope.ctx.env, LOBSTER_HEARTBEAT_FILE: heartbeatFile },
+								_heartbeat: () => {
+									lastBeat = Date.now();
+								},
+							}
+						: {}),
 				},
 			};
-			// Control nodes are timed as a whole. Input gates wait for people, not work.
-			if (nodeKind(step) !== "activity" && nodeKind(step) !== "input") startTimeout();
+			// Control nodes are timed as a whole. Gates wait for people, time or events, not work.
+			if (["for-each", "parallel", "child-workflow"].includes(nodeKind(step))) startTimeout();
 			let decidingApproval = false;
 			try {
 				let result: WorkflowStepResult;
@@ -277,6 +327,12 @@ export class Machine {
 						break;
 					case "input":
 						result = await input(this, step, attemptKey, local);
+						break;
+					case "sleep":
+						result = await sleep(this, step, attemptKey, local);
+						break;
+					case "event":
+						result = await eventWait(this, step, attemptKey, local);
 						break;
 					default:
 						result = await activity(this, step, attemptKey, local);
@@ -353,37 +409,104 @@ export class Machine {
 				return frame.result;
 			} finally {
 				if (timer) clearTimeout(timer);
+				if (watchdog) clearInterval(watchdog);
+				if (heartbeatFile) fs.rmSync(heartbeatFile, { force: true });
 			}
 		}
 	}
 
-	async suspend(key: string, frame: Activation): Promise<never> {
+	/**
+	 * Save the wait of `frame` as pending, in the same save that marks the run waiting.
+	 * Returns false when it was published before (a question asked again, e.g. on advance).
+	 */
+	async publishWait(key: string, frame: Activation): Promise<boolean> {
 		this.checkAuthority();
-		const fresh = !frame.waitKey;
-		if (!fresh && this.state.status !== "waiting") {
-			// Re-reaching an unanswered question (e.g. `runs advance`): still waiting.
-			this.state.status = "waiting";
-			await this.save();
+		if (frame.waitKey) {
+			if (this.state.status !== "waiting") {
+				this.state.status = "waiting";
+				await this.save();
+			}
+			return false;
 		}
-		if (fresh) {
-			frame.waitKey = "workflow_resume_" + randomUUID();
-			frame.phase = "waiting";
-			this.state.status = "waiting";
-			await this.save({
-				publish: {
-					key: frame.waitKey,
-					text: JSON.stringify({
-						machineVersion: 1,
-						runId: this.store.runId,
-						activation: key,
-						wait: frame.wait,
-						...(frame.wait!.kind === "input" ? { inputStepId: key } : { approvalStepId: key }),
-					}),
-				},
-			});
-		}
+		frame.waitKey = "workflow_resume_" + randomUUID();
+		frame.phase = "waiting";
+		this.state.status = "waiting";
+		const kind = frame.wait!.kind;
+		await this.save({
+			publish: {
+				key: frame.waitKey,
+				text: JSON.stringify({
+					machineVersion: 1,
+					runId: this.store.runId,
+					activation: key,
+					wait: frame.wait,
+					...(kind === "input"
+						? { inputStepId: key }
+						: kind === "approval"
+							? { approvalStepId: key }
+							: { haltType: kind }),
+				}),
+			},
+		});
+		return true;
+	}
+
+	async suspend(key: string, frame: Activation): Promise<never> {
+		const fresh = await this.publishWait(key, frame);
 		this.ctx.signal?.throwIfAborted();
 		throw new Suspension(key, frame, fresh);
+	}
+
+	/** Complete a waiting step with `result`, consuming its published wait in the same save. */
+	async resolveWait(key: string, frame: Activation, result: WorkflowStepResult) {
+		this.checkAuthority();
+		frame.result = result;
+		frame.phase = "completed";
+		this.state.status = "running";
+		const waitKey = frame.waitKey;
+		await this.save(waitKey ? { consume: { key: waitKey } } : {});
+		if (waitKey && frame.wait?.kind === "approval")
+			await cleanupApprovalIndexByStateKey({ env: this.ctx.env, stateKey: waitKey });
+		return result;
+	}
+
+	/** Whether a question or event wait is past its deadline. */
+	expired(frame: Activation, now = Date.now()) {
+		const deadline = frame.wait && "deadline" in frame.wait ? frame.wait.deadline : undefined;
+		return deadline !== undefined && now >= deadline;
+	}
+
+	/**
+	 * Apply a deadline that has passed: `on_timeout: continue` completes the step with
+	 * `timedOut: true`; `cancel` (the default) cancels the run like a rejection.
+	 */
+	async timeOut(key: string, frame: Activation, result: WorkflowStepResult) {
+		const wait = frame.wait!;
+		const onTimeout = "onTimeout" in wait ? wait.onTimeout : undefined;
+		if (onTimeout === "continue")
+			return this.resolveWait(key, frame, { ...result, timedOut: true });
+		const waitKey = frame.waitKey;
+		const message = `Step ${result.id} timed out waiting`;
+		this.finish("cancelled");
+		this.state.error = message;
+		await this.save(waitKey ? { consume: { key: waitKey } } : {});
+		if (waitKey && wait.kind === "approval")
+			await cleanupApprovalIndexByStateKey({ env: this.ctx.env, stateKey: waitKey });
+		throw new RunCancelled(message);
+	}
+
+	/** The oldest inbox event matching an event wait that this run has not consumed yet. */
+	async findEvent(wait: Extract<NonNullable<Activation["wait"]>, { kind: "event" }>) {
+		const consumed = new Set(this.state.events ?? []);
+		const events = await this.store.session.findEvents(wait.event, wait.since);
+		return events.find(
+			(event) => !consumed.has(event.id) && matchesEvent(wait.match, event.data),
+		) as InboxEvent | undefined;
+	}
+
+	/** Record that this run consumed an inbox event; saved with the step's result. */
+	consumeEvent(id: string) {
+		(this.state.events ??= []).push(id);
 	}
 
 	async answer(
@@ -398,6 +521,16 @@ export class Machine {
 		if (!entry) throw new Error("Workflow resume state not found");
 		const [path, frame] = entry;
 		const wait = frame.wait!;
+		if (wait.kind === "timer" || wait.kind === "event")
+			throw new WorkflowResumeArgumentError(
+				wait.kind === "timer"
+					? "This run is sleeping; `lobster runs advance --due` continues it when the time comes"
+					: `This run waits for the event "${wait.event}"; deliver it with \`lobster signal ${wait.event}\``,
+			);
+		if (this.expired(frame))
+			throw new WorkflowResumeArgumentError(
+				`This question expired at ${new Date(wait.deadline!).toISOString()}; \`lobster runs advance --due\` applies its timeout`,
+			);
 		// A step's timeout covers its work, not the time people take to answer it:
 		// the steps enclosing this gate get a fresh budget when it is answered.
 		for (const [ancestor, item] of Object.entries(this.state.activations))
@@ -452,6 +585,25 @@ export class Machine {
 	}
 
 	async resultForSuspension(frame: Activation, fresh = true): Promise<WorkflowRunResult> {
+		const pending = frame.wait!;
+		if (pending.kind === "timer" || pending.kind === "event") {
+			const stepId = frame.stepId ?? "";
+			return {
+				status: "waiting",
+				output: [],
+				waitingFor:
+					pending.kind === "timer"
+						? { kind: "timer", stepId, until: new Date(pending.until).toISOString() }
+						: {
+								kind: "event",
+								stepId,
+								event: pending.event,
+								...(pending.deadline !== undefined
+									? { until: new Date(pending.deadline).toISOString() }
+									: {}),
+							},
+			};
+		}
 		const resumeToken = encodeToken({
 			protocolVersion: 1,
 			v: 1,
@@ -517,6 +669,8 @@ export class Machine {
 			};
 		} catch (error) {
 			if (error instanceof Suspension) return this.resultForSuspension(error.frame, error.fresh);
+			// A gate's deadline cancelled the run; it was saved as cancelled already.
+			if (error instanceof RunCancelled) return { status: "cancelled", output: [] };
 			if (
 				error instanceof InvocationRetiredError ||
 				error instanceof PersistenceError ||
@@ -549,4 +703,16 @@ export class Machine {
 			throw error;
 		}
 	}
+}
+
+/** Every field of `expected` is in `actual`; nested objects match as subsets. */
+export function matchesEvent(expected: unknown, actual: unknown): boolean {
+	if (expected === undefined) return true;
+	if (expected && typeof expected === "object" && !Array.isArray(expected)) {
+		if (!actual || typeof actual !== "object" || Array.isArray(actual)) return false;
+		return Object.entries(expected).every(([key, value]) =>
+			matchesEvent(value, (actual as Record<string, unknown>)[key]),
+		);
+	}
+	return JSON.stringify(expected) === JSON.stringify(actual);
 }

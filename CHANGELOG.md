@@ -22,6 +22,9 @@ All notable changes to Lobster will be documented in this file.
 - Never re-run a step on crash recovery, even with `recovery: repeat`, when its pipeline contains a command that may not be repeated (`openclaw.invoke`, `openclaw.agent`, `gog.gmail.send`). Only `openclaw.agent` was covered before, so a crash right after `gog.gmail.send` sent could send again. A step whose pipeline fails before `openclaw.agent` dispatches can now be retried like the others.
 - Keep `clawd.invoke` as an alias of `openclaw.invoke` and `llm_task.invoke` as a configured variant of `llm.invoke`; `commands.list` reports `aliasOf` and `repeatable`.
 - `lobster resume <ref>` takes a resume token, a short approval ID or a wait ID as one argument; with a wait ID, `--expected-revision` is optional. `--token`, `--id` and `--decision` keep working. `lobster --help` is grouped into starting and answering, managing runs, diagnostics and setup.
+- Add durable waits without a server: a `sleep:` step, a `wait:` step for external events delivered with `lobster signal <event>` (core `signalEvent`), and `timeout`/`on_timeout` on approvals, input requests and event waits. Waiting runs return `status: "waiting"` with `waitingFor`.
+- Add `lobster runs advance --due` (core `advanceDueRuns`): advance every run whose sleep or deadline has passed, or whose process died. Every run records when it next needs attention (`wakeAt`); a host, cron or systemd timer decides how often to call it.
+- Add `heartbeat_timeout_ms`: a step that shows no progress (touching `LOBSTER_HEARTBEAT_FILE`, or `ctx.heartbeat()` in a pipeline command) for that long is stopped like a timeout.
 
 ## 2026.11.2 - 2026-11-15
 

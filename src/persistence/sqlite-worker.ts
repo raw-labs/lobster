@@ -91,6 +91,14 @@ if (!workerData.readOnly) {
 			record TEXT NOT NULL,
 			PRIMARY KEY(run_id, sequence)
 		);
+		CREATE INDEX IF NOT EXISTS runs_wake ON runs(json_extract(record, '$.wakeAt'));
+		CREATE TABLE IF NOT EXISTS inbox (
+			id TEXT PRIMARY KEY,
+			name TEXT NOT NULL,
+			data TEXT NOT NULL,
+			at INTEGER NOT NULL
+		);
+		CREATE INDEX IF NOT EXISTS inbox_name ON inbox(name, at);
 		CREATE TABLE IF NOT EXISTS meta (
 			key TEXT PRIMARY KEY,
 			value TEXT NOT NULL
@@ -494,6 +502,7 @@ function handle(request: WorkerRequest): WorkerResult<WorkerMethod> {
 				.filter((row) => transaction(() => removeRun(row.id, args.before)))
 				.map((row) => row.id);
 			if (ids.length < PRUNE_BATCH) {
+				prepare("DELETE FROM inbox WHERE at < ?").run(Date.parse(args.before));
 				setMeta("pruneCursor", "");
 				setMeta("lastPrune", args.now);
 			} else {
@@ -501,6 +510,31 @@ function handle(request: WorkerRequest): WorkerResult<WorkerMethod> {
 			}
 			return removed;
 		}
+		case "dueRuns":
+			return (
+				prepare(`SELECT id FROM runs
+				WHERE json_extract(record, '$.wakeAt') <= ?
+				AND (? IS NULL OR json_extract(record, '$.metadata.callerId') = ?)
+				ORDER BY json_extract(record, '$.wakeAt'), id LIMIT ?`).all(
+					args.now,
+					args.callerId ?? null,
+					args.callerId ?? null,
+					args.limit,
+				) as { id: string }[]
+			).map((row) => row.id);
+		case "appendEvent": {
+			const result = prepare(
+				"INSERT INTO inbox(id,name,data,at) VALUES(?,?,?,?) ON CONFLICT(id) DO NOTHING",
+			).run(args.id, args.name, JSON.stringify(args.data ?? null), args.at);
+			return { inserted: Number(result.changes) > 0 };
+		}
+		case "findEvents":
+			return (
+				prepare("SELECT id,name,data,at FROM inbox WHERE name=? AND at>=? ORDER BY at, id").all(
+					args.name,
+					args.since,
+				) as { id: string; name: string; data: string; at: number }[]
+			).map((row) => ({ ...row, data: JSON.parse(row.data), at: Number(row.at) }));
 		case "close":
 			db.close();
 			return;

@@ -19,7 +19,12 @@ import { setTimeout as sleep } from "node:timers/promises";
 import { loadWorkflowFile } from "../src/workflows/file.js";
 import { snapshotDefinition } from "../src/workflows/definition.js";
 import { renderWorkflowGraph } from "../src/workflows/graph.js";
-import { advanceWorkflowRun } from "../src/workflows/file.js";
+import {
+	abandonWorkflowRun,
+	advanceDueRuns,
+	advanceWorkflowRun,
+	signalEvent,
+} from "../src/workflows/file.js";
 import type { WorkflowStep } from "../src/workflows/types.js";
 import { fakeResult, type FakeBehavior } from "./helpers/fake_command.js";
 import {
@@ -102,6 +107,14 @@ const APPROVE: Answers = { approve: true, response: { ok: true } };
 const all = (cell: Cell) =>
 	Object.fromEntries(CONCERNS.map((c) => [c, cell])) as Record<Concern, Cell>;
 const rec = (recovery?: Recovery) => (recovery ? { recovery } : {});
+
+/** Cells for gates that do no work of their own: nothing can fail, so nothing retries. */
+const NO_WORK = (why: string): Partial<Record<Concern, Cell>> => ({
+	"on_error: stop": { skip: `${why}; on_error has nothing to handle` },
+	"on_error: continue": { skip: `${why}; on_error has nothing to handle` },
+	"on_error: skip_rest": { skip: `${why}; on_error has nothing to handle` },
+	retry: { skip: `${why}, so there is no failure to retry` },
+});
 
 // ---------------------------------------------------------------------------------------
 // Node examples
@@ -367,6 +380,67 @@ const NODES: NodeExample[] = [
 			},
 		},
 	},
+	{
+		name: "sleep",
+		engine: ["sleep"],
+		// Short enough to wait in place; sleepPausesAndResumes covers a sleep that pauses the run.
+		build: async () => ({ id: "n", sleep: "150ms" }),
+		workCalls: 0,
+		reference: { expr: "$n.id", expected: "n" },
+		dryRun: [/\d\. n {2}\[sleep\]/, /sleep: 150ms/],
+		graph: { type: "sleep" },
+		invalid: [
+			["sleep as a word", (step) => ({ ...step, sleep: "soon" })],
+			["negative sleep", (step) => ({ ...step, sleep: -1 })],
+			["sleep with a command", (step) => ({ ...step, run: "true" })],
+			["sleep with an approval", (step) => ({ ...step, approval: "Ok?" })],
+		],
+		rejectedIn: {
+			forEach: /cannot contain approval or input steps \(nor sleep or wait steps\)/,
+			child: /not supported in composition \(nor sleep or wait steps\)/,
+		},
+		cells: {
+			...all("generic"),
+			...NO_WORK("a sleep does no work that can fail"),
+			timeout_ms: (t, _fx, node) => gateTakesLongerThanTimeout(t, node, "400ms"),
+			cancellation: (t) => sleepSurvivesStop(t),
+			"recovery: repeat": (t, fx) => sleepSurvivesCrash(t, fx, "repeat"),
+			"recovery: manual": (t, fx) => sleepSurvivesCrash(t, fx, "manual"),
+		},
+	},
+	{
+		name: "wait (event)",
+		engine: ["event"],
+		build: async () => ({ id: "n", wait: { event: "contract.done", match: { ok: true } } }),
+		answers: { event: { ok: true, n: 7 } },
+		workCalls: 0,
+		reference: { expr: "$n.json.n", expected: 7 },
+		dryRun: [/\d\. n {2}\[wait\]/, /event: contract\.done/, /\[event required\]/],
+		graph: { type: "wait" },
+		invalid: [
+			["wait as a string", (step) => ({ ...step, wait: "contract.done" })],
+			["wait without an event", (step) => ({ ...step, wait: { match: {} } })],
+			["unknown wait key", (step) => ({ ...step, wait: { ...step.wait, evnet: "x" } })],
+			["wait.timeout as a word", (step) => ({ ...step, wait: { ...step.wait, timeout: "soon" } })],
+			[
+				"on_timeout without a timeout",
+				(step) => ({ ...step, wait: { ...step.wait, on_timeout: "continue" } }),
+			],
+			["wait with a command", (step) => ({ ...step, run: "true" })],
+		],
+		rejectedIn: {
+			forEach: /cannot contain approval or input steps \(nor sleep or wait steps\)/,
+			child: /not supported in composition \(nor sleep or wait steps\)/,
+		},
+		cells: {
+			...all("generic"),
+			...NO_WORK("an event wait does no work that can fail"),
+			timeout_ms: (t, _fx, node) => gateTakesLongerThanTimeout(t, node),
+			cancellation: (t, _fx, node) => abandoningWithdrawsTheWait(t, node),
+			"recovery: repeat": (t, fx, node) => eventWaitSurvivesRestart(t, fx, node, "repeat"),
+			"recovery: manual": (t, fx, node) => eventWaitSurvivesRestart(t, fx, node, "manual"),
+		},
+	},
 ];
 
 // ---------------------------------------------------------------------------------------
@@ -594,7 +668,10 @@ const GENERIC: Record<Concern, Custom> = {
 		const hold: WorkflowStep = { id: "hold", approval: { prompt: "Hold?" } };
 		let result = await fx.run(await workflowWith(fx, node, (s) => s, [hold]));
 		while (result.status !== "ok" && result.requiresApproval?.prompt !== "Hold?")
-			result = await fx.resume(result, node.answers ?? APPROVE);
+			result =
+				result.status === "waiting"
+					? await fx.proceed(result, node.answers ?? APPROVE)
+					: await fx.resume(result, node.answers ?? APPROVE);
 		// Paused after the node: only the sequence keeps its result, for later references.
 		const paused = await fx.execution();
 		const below = Object.keys(paused.activations).filter(
@@ -746,6 +823,100 @@ async function questionSurvivesRestart(
 	assert.equal(recovered.status, "needs_input", JSON.stringify(recovered));
 	assert.equal(recovered.requiresInput.resumeToken, first!.requiresInput.resumeToken);
 	const result = await fx.resume(recovered as RunResult, node.answers ?? APPROVE);
+	assert.equal(result.status, "ok");
+	assert.equal(fx.fake.calls("next"), 1);
+}
+
+/** A gate's waiting is not work: timeout_ms does not expire while it waits. */
+async function gateTakesLongerThanTimeout(t: TestContext, node: NodeExample, sleepFor?: string) {
+	const fx = await workflowFixture(t);
+	const workflow = await workflowWith(
+		fx,
+		node,
+		(s) => ({ ...s, timeout_ms: 100, ...(sleepFor ? { sleep: sleepFor } : {}) }),
+		[next],
+	);
+	let result = await fx.run(workflow);
+	if (result.status === "waiting" && result.waitingFor?.kind === "event") await sleep(300);
+	while (result.status === "waiting") result = await fx.proceed(result, node.answers ?? APPROVE);
+	assert.equal(result.status, "ok", JSON.stringify(result));
+	assert.equal(fx.fake.calls("next"), 1);
+}
+
+/** A sleep stopped by the host leaves a sleeping run that continues once it is due. */
+async function sleepSurvivesStop(t: TestContext) {
+	const fx = await workflowFixture(t);
+	const controller = new AbortController();
+	const running = fx.run(
+		{ steps: [{ id: "n", sleep: "1500ms" }, next] },
+		{ signal: controller.signal },
+	);
+	await sleep(200);
+	controller.abort(new Error("stopped by host"));
+	await assert.rejects(running, /stopped by host/);
+	assert.equal((await fx.execution()).status, "waiting");
+	const early = await advanceDueRuns({ ctx: fx.ctx() as any });
+	assert.deepEqual(early.due, [], "not due before its time");
+	await sleep(1400);
+	const { advanced } = await advanceDueRuns({ ctx: fx.ctx() as any });
+	assert.deepEqual(
+		advanced.map((a) => a.status),
+		["ok"],
+	);
+	assert.equal(fx.fake.calls("next"), 1);
+	await expectSettled(fx, "completed");
+}
+
+/** A process killed mid-sleep: the sleep keeps its wake time and nothing runs twice. */
+async function sleepSurvivesCrash(t: TestContext, fx: WorkflowFixture, recovery: Recovery) {
+	const flowPath = await fx.write("flow.lobster", {
+		steps: [
+			{ id: "before", pipeline: "fake --name before", recovery },
+			{ id: "n", sleep: "800ms" },
+			{ id: "after", pipeline: "fake --name after", recovery },
+		],
+	});
+	const { killed, recovered } = await crashAndRecover(t, {
+		dir: fx.dir,
+		env: fx.env,
+		flowPath,
+		killWhen: ({ saved }) => saved.includes('"kind":"timer"'),
+	});
+	assert.ok(killed);
+	assert.equal(recovered.status, "ok", JSON.stringify(recovered));
+	assert.equal(fx.fake.calls("before"), 1, "work before the sleep is not repeated");
+	assert.equal(fx.fake.calls("after"), 1);
+}
+
+/** Abandoning a run that waits for an event withdraws the wait; a later event finds nothing. */
+async function abandoningWithdrawsTheWait(t: TestContext, node: NodeExample) {
+	const fx = await workflowFixture(t);
+	const waiting = await fx.run(await workflowWith(fx, node, (s) => s, [next]));
+	assert.equal(waiting.status, "waiting");
+	const abandoned = await abandonWorkflowRun({ runId: waiting.runId!, ctx: fx.ctx() as any });
+	assert.equal(abandoned.status, "cancelled");
+	const delivered = await signalEvent({
+		name: "contract.done",
+		data: { ok: true },
+		ctx: fx.ctx() as any,
+	});
+	assert.deepEqual(delivered.advanced, []);
+	assert.equal(fx.fake.calls("next"), 0);
+}
+
+/** An event wait outlives the process that published it, and the event still arrives. */
+async function eventWaitSurvivesRestart(
+	t: TestContext,
+	fx: WorkflowFixture,
+	node: NodeExample,
+	recovery: Recovery,
+) {
+	const workflow = await workflowWith(fx, node, (s) => s, [next], recovery);
+	const flowPath = await fx.write("flow.lobster", workflow);
+	const { first, recovered } = await crashAndRecover(t, { dir: fx.dir, env: fx.env, flowPath });
+	assert.equal(first?.status, "waiting");
+	assert.equal(recovered.status, "waiting", JSON.stringify(recovered));
+	const result = await fx.proceed(recovered as RunResult, node.answers ?? APPROVE);
 	assert.equal(result.status, "ok");
 	assert.equal(fx.fake.calls("next"), 1);
 }

@@ -1,3 +1,5 @@
+import { parseDuration } from "../util/duration.js";
+import { readLineFromStream } from "../io/read_line.js";
 import type {
 	WorkflowStep,
 	WorkflowApprovalIdentity,
@@ -392,4 +394,40 @@ export function buildResultPreview(result: WorkflowStepResult) {
 	if (result.stdout) return result.stdout.trim().slice(0, 2000);
 	if (result.json !== undefined) return serializeValueForStdout(result.json).trim().slice(0, 2000);
 	return undefined;
+}
+
+/** The deadline a question gets when first asked, from its `timeout`/`on_timeout`. */
+export function questionDeadline(
+	config: { timeout?: string | number; on_timeout?: "cancel" | "continue" } | undefined,
+	what: string,
+): { deadline?: number; onTimeout?: "cancel" | "continue" } {
+	if (!config || config.timeout === undefined) return {};
+	return {
+		deadline: Date.now() + parseDuration(config.timeout, `${what} timeout`),
+		onTimeout: config.on_timeout ?? "cancel",
+	};
+}
+
+/** Read a line from a person, stopping at the question's deadline. */
+export async function readAnswer(
+	scope: { ctx: { stdin: any; env: Record<string, string | undefined>; signal?: AbortSignal } },
+	deadline: number | undefined,
+): Promise<{ answer: string } | { expired: true }> {
+	const expiry = new AbortController();
+	const timer =
+		deadline === undefined
+			? undefined
+			: setTimeout(() => expiry.abort(), Math.max(0, deadline - Date.now()));
+	try {
+		const answer = await readLineFromStream(scope.ctx.stdin, {
+			timeoutMs: parseApprovalTimeoutMs(scope.ctx.env),
+			signal: AbortSignal.any([scope.ctx.signal, expiry.signal].filter(Boolean) as AbortSignal[]),
+		});
+		return { answer };
+	} catch (error) {
+		if (expiry.signal.aborted && !scope.ctx.signal?.aborted) return { expired: true };
+		throw error;
+	} finally {
+		if (timer) clearTimeout(timer);
+	}
 }
