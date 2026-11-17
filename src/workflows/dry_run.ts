@@ -1,6 +1,7 @@
 import { parsePipeline } from "../pipeline/parser.js";
 import { resolveRetryConfig, type RetryConfig } from "../engine/retry.js";
-import { resolveArgsTemplate, evaluateCondition, checkConditionSyntax } from "./expressions.js";
+import { resolveArgsTemplate } from "./expressions.js";
+import { checkConditionSyntax, conditionRefs, evaluateCondition } from "./conditions.js";
 import { createRecord, resolveInputValue } from "./values.js";
 import { getStepExecution, isApprovalStep, isInputStep } from "./load.js";
 import type { WorkflowStep, WorkflowStepResult, WorkflowRunResult } from "./types.js";
@@ -51,10 +52,16 @@ function resolveDryRunTemplate(
 // Only `approved` (gates are assumed granted) and `skipped` are modelled by the plan, and
 // only for steps whose own condition was decided (`undecided` holds the others).
 function dependsOnStepOutput(condition: unknown, undecided: Set<string>) {
-	if (typeof condition !== "string") return false;
-	for (const [, id, field] of condition.matchAll(/\$([A-Za-z0-9_-]+)\.([A-Za-z0-9_]+)/g))
-		if ((field !== "approved" && field !== "skipped") || undecided.has(id)) return true;
-	return false;
+	let refs: { id: string; path: string }[];
+	try {
+		refs = conditionRefs(condition);
+	} catch {
+		return false; // Not a valid condition: evaluating it reports why.
+	}
+	return refs.some(({ id, path }) => {
+		const field = path.split(".")[0];
+		return (field !== "approved" && field !== "skipped") || undecided.has(id);
+	});
 }
 
 function conditionNote(condition: unknown) {

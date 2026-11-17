@@ -1,4 +1,4 @@
-import { evaluateCondition } from "../../workflows/expressions.js";
+import { evaluateCondition } from "../../workflows/conditions.js";
 import type { WorkflowStep } from "../../workflows/types.js";
 import type { Machine, Scope } from "../machine.js";
 import type { Activation } from "../state.js";

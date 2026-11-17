@@ -1,4 +1,4 @@
-import { checkConditionSyntax } from "./expressions.js";
+import { checkConditionSyntax } from "./conditions.js";
 import { parseDuration } from "../util/duration.js";
 import { closestMatch } from "../util/suggest.js";
 import { promises as fsp } from "node:fs";
