@@ -91,40 +91,46 @@ test("comparison operators combine with boolean operators", async () => {
 	assert.deepEqual(result.output, ["in range\n"]);
 });
 
-test("comparison with non-numeric string returns false", async () => {
+for (const [name, data, when] of [
+	["a non-numeric string", { val: "hello" }, "$data.json.val > 3"],
+	["a boolean", { val: true }, "$data.json.val > 0"],
+	["null", { val: null }, "$data.json.val >= 0"],
+	["a missing value", { val: 1 }, "$data.json.nope < 2"],
+	["two strings", { val: "b" }, '$data.json.val > "a"'],
+] as const) {
+	test(`ordering ${name} is an error, not a silent false`, async () => {
+		await assert.rejects(
+			runWorkflow({
+				steps: [
+					{ id: "data", command: `echo '${JSON.stringify(data)}'` },
+					{ id: "check", command: 'echo "yes"', when },
+					{ id: "fallback", command: 'echo "no"' },
+				],
+			}),
+			/cannot compare .* only numbers can be ordered/,
+		);
+	});
+}
+
+test("numeric strings still compare as numbers", async () => {
 	const result = await runWorkflow({
 		steps: [
-			{ id: "data", command: 'node -e "process.stdout.write(JSON.stringify({val:\\"hello\\"}))"' },
-			{ id: "check", command: 'echo "yes"', when: "$data.json.val > 3" },
-			{ id: "fallback", command: 'echo "no"' },
+			{ id: "data", command: `echo '{"val":"0.9"}'` },
+			{ id: "check", command: 'echo "yes"', when: "$data.json.val >= 0.8" },
 		],
 	});
-	assert.equal(result.status, "ok");
-	assert.deepEqual(result.output, ["no\n"]);
+	assert.deepEqual(result.output, ["yes\n"]);
 });
 
-test("comparison rejects boolean as non-numeric", async () => {
+test("a guard before && or || keeps a comparison from failing", async () => {
 	const result = await runWorkflow({
 		steps: [
-			{ id: "data", command: 'node -e "process.stdout.write(JSON.stringify({val:true}))"' },
-			{ id: "check", command: 'echo "yes"', when: "$data.json.val > 0" },
-			{ id: "fallback", command: 'echo "no"' },
+			{ id: "data", command: `echo '{"val":null}'` },
+			{ id: "a", command: 'echo "a"', when: "$data.json.val != null && $data.json.val > 1" },
+			{ id: "b", command: 'echo "b"', when: "$data.json.val == null || $data.json.val > 1" },
 		],
 	});
-	assert.equal(result.status, "ok");
-	assert.deepEqual(result.output, ["no\n"]);
-});
-
-test("comparison rejects null as non-numeric", async () => {
-	const result = await runWorkflow({
-		steps: [
-			{ id: "data", command: 'node -e "process.stdout.write(JSON.stringify({val:null}))"' },
-			{ id: "check", command: 'echo "yes"', when: "$data.json.val >= 0" },
-			{ id: "fallback", command: 'echo "no"' },
-		],
-	});
-	assert.equal(result.status, "ok");
-	assert.deepEqual(result.output, ["no\n"]);
+	assert.deepEqual(result.output, ["b\n"]);
 });
 
 test("existing == and != still work with new operators", async () => {
@@ -136,4 +142,40 @@ test("existing == and != still work with new operators", async () => {
 	});
 	assert.equal(result.status, "ok");
 	assert.deepEqual(result.output, ["good\n"]);
+});
+
+test("a misspelled key is rejected instead of ignored", async () => {
+	await assert.rejects(
+		runWorkflow({
+			steps: [
+				{ id: "data", command: "echo '{\"ok\":false}'" },
+				{ id: "danger", command: "echo ran", wehn: "$data.json.ok == true" },
+			],
+		}),
+		/Workflow step danger has unknown key "wehn" \(did you mean "when"\?\)/,
+	);
+	for (const [workflow, message] of [
+		[{ steps: [{ id: "a", run: "echo a", next: "a" }] }, /step a has unknown key "next"/],
+		[{ step: [], steps: [{ id: "a", run: "echo a" }] }, /Workflow file has unknown key "step"/],
+		[
+			{ steps: [{ id: "a", run: "echo a", retry: { maximum: 2 } }] },
+			/step a retry has unknown key "maximum"/,
+		],
+		[
+			{ steps: [{ id: "a", approval: { promt: "ok?" } }] },
+			/step a approval has unknown key "promt" \(did you mean "prompt"\?\)/,
+		],
+		[
+			{
+				steps: [{ id: "l", for_each: "$x.json", steps: [{ id: "s", run: "echo", wehn: "true" }] }],
+			},
+			/step l sub-step s has unknown key "wehn"/,
+		],
+		[
+			{ steps: [{ id: "p", parallel: { branches: [{ id: "b", run: "echo", when: "true" }] } }] },
+			/parallel branch b has unknown key "when"/,
+		],
+	] as const) {
+		await assert.rejects(runWorkflow(workflow), message);
+	}
 });

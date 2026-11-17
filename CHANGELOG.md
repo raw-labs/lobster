@@ -9,6 +9,8 @@ All notable changes to Lobster will be documented in this file.
 - Report runs stopped while a command was running as `blocked`, and add `lobster runs abandon <runId>` to stop them for good.
 - Delete finished runs (completed, failed or cancelled) 30 days after they last changed, at most once a day when the store is opened for writing; set `LOBSTER_RUN_RETENTION_DAYS` (or `retentionDays` when opening a store) to change this, `0` keeps them forever. Waiting and blocked runs are never deleted.
 - Update Node.js types to 24.19.2 to match the new runtime floor.
+- Reject unknown keys in workflow files instead of ignoring them, suggesting the intended key for likely typos. A misspelled `when:` previously made its step run unconditionally.
+- Fail a condition that orders anything other than numbers (strings, booleans, `null`, missing values) instead of evaluating it to false. `&&` and `||` now skip their right side when the left side decides the result, so guards like `$x.json.v != null && $x.json.v > 1` work.
 
 ## 2026.10.1 - 2026-10-20
 

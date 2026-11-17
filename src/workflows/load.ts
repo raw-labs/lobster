@@ -17,6 +17,7 @@ export async function loadWorkflowFile(filePath: string): Promise<WorkflowFile> 
 	if (!Array.isArray(steps) || steps.length === 0) {
 		throw new Error("Workflow file requires a non-empty steps array");
 	}
+	rejectUnknownKeys(parsed as Record<string, unknown>);
 
 	const costLimit = (parsed as WorkflowFile).cost_limit;
 	if (costLimit !== undefined) {
@@ -458,4 +459,104 @@ export function getStepExecution(step: WorkflowStep) {
 function validateRecovery(step: WorkflowStep) {
 	if (step.recovery !== undefined && step.recovery !== "repeat" && step.recovery !== "manual")
 		throw new Error("Workflow recovery must be repeat or manual");
+}
+
+// A misspelled key must not be ignored: `wehn:` would otherwise run its step unconditionally.
+const WORKFLOW_KEYS = ["name", "description", "args", "env", "cwd", "steps", "cost_limit"];
+const STEP_KEYS = [
+	"id",
+	"recovery",
+	"command",
+	"run",
+	"pipeline",
+	"workflow",
+	"workflow_args",
+	"env",
+	"cwd",
+	"stdin",
+	"approval",
+	"input",
+	"condition",
+	"when",
+	"parallel",
+	"for_each",
+	"item_var",
+	"index_var",
+	"batch_size",
+	"pause_ms",
+	"steps",
+	"timeout_ms",
+	"on_error",
+	"retry",
+];
+const BRANCH_KEYS = ["id", "recovery", "run", "command", "pipeline", "env", "cwd", "stdin"];
+const PARALLEL_KEYS = ["wait", "timeout_ms", "branches"];
+const RETRY_KEYS = ["max", "backoff", "delay_ms", "max_delay_ms", "jitter"];
+const COST_LIMIT_KEYS = ["max_usd", "action"];
+const INPUT_KEYS = ["prompt", "responseSchema", "defaults"];
+const APPROVAL_KEYS = [
+	"prompt",
+	"items",
+	"preview",
+	"initiated_by",
+	"initiatedBy",
+	"required_approver",
+	"requiredApprover",
+	"require_different_approver",
+	"requireDifferentApprover",
+];
+
+function rejectUnknownKeys(workflow: Record<string, unknown>) {
+	checkKeys(workflow, WORKFLOW_KEYS, "Workflow file");
+	checkKeys(workflow.cost_limit, COST_LIMIT_KEYS, "Workflow cost_limit");
+	const visit = (step: unknown, where: string) => {
+		if (!isPlainObject(step)) return;
+		const name = typeof step.id === "string" ? `${where} ${step.id}` : where;
+		checkKeys(step, STEP_KEYS, name);
+		checkKeys(step.retry, RETRY_KEYS, `${name} retry`);
+		checkKeys(step.input, INPUT_KEYS, `${name} input`);
+		checkKeys(step.approval, APPROVAL_KEYS, `${name} approval`);
+		if (isPlainObject(step.parallel)) {
+			checkKeys(step.parallel, PARALLEL_KEYS, `${name} parallel`);
+			if (Array.isArray(step.parallel.branches)) {
+				for (const branch of step.parallel.branches) {
+					const id = isPlainObject(branch) && typeof branch.id === "string" ? ` ${branch.id}` : "";
+					checkKeys(branch, BRANCH_KEYS, `${name} parallel branch${id}`);
+				}
+			}
+		}
+		if (Array.isArray(step.steps)) for (const sub of step.steps) visit(sub, `${name} sub-step`);
+	};
+	for (const step of workflow.steps as unknown[]) visit(step, "Workflow step");
+}
+
+function checkKeys(value: unknown, allowed: string[], where: string) {
+	if (!isPlainObject(value)) return;
+	for (const key of Object.keys(value)) {
+		if (allowed.includes(key)) continue;
+		const near = allowed.find((candidate) => editDistance(key, candidate) <= 2);
+		throw new Error(
+			`${where} has unknown key "${key}"${near ? ` (did you mean "${near}"?)` : ""}. Allowed: ${allowed.join(", ")}`,
+		);
+	}
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+	return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function editDistance(a: string, b: string): number {
+	let previous = Array.from({ length: b.length + 1 }, (_, i) => i);
+	for (let i = 1; i <= a.length; i++) {
+		const current = [i];
+		for (let j = 1; j <= b.length; j++) {
+			current[j] = Math.min(
+				previous[j] + 1,
+				current[j - 1] + 1,
+				previous[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1),
+			);
+		}
+		previous = current;
+	}
+	return previous[b.length];
 }

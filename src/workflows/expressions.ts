@@ -110,12 +110,24 @@ function evaluateConditionExpression(
 		throw new Error(`Unsupported condition: ${expression}`);
 	}
 	let index = 0;
+	// Operands that cannot change the result are parsed but not checked, so a guard
+	// such as `$x.json.score != null && $x.json.score > 0.8` works.
+	let skipping = 0;
+	const skipped = (parse: () => unknown) => {
+		skipping += 1;
+		try {
+			parse();
+		} finally {
+			skipping -= 1;
+		}
+	};
 
 	function parseOr(): unknown {
 		let left = parseAnd();
 		while (match("or")) {
-			const right = parseAnd();
-			left = Boolean(left) || Boolean(right);
+			if (left) skipped(parseAnd);
+			else left = Boolean(parseAnd());
+			left = Boolean(left);
 		}
 		return left;
 	}
@@ -123,10 +135,25 @@ function evaluateConditionExpression(
 	function parseAnd(): unknown {
 		let left = parseEquality();
 		while (match("and")) {
-			const right = parseEquality();
-			left = Boolean(left) && Boolean(right);
+			if (!left) skipped(parseEquality);
+			else left = Boolean(parseEquality());
+			left = Boolean(left);
 		}
 		return left;
+	}
+
+	function order(
+		left: unknown,
+		right: unknown,
+		op: string,
+		cmp: (a: number, b: number) => boolean,
+	) {
+		if (isStrictlyNumeric(left) && isStrictlyNumeric(right))
+			return cmp(Number(left), Number(right));
+		if (skipping) return false;
+		throw new Error(
+			`Condition "${expression}" cannot compare ${describeOperand(left)} ${op} ${describeOperand(right)}: only numbers can be ordered`,
+		);
 	}
 
 	function parseEquality(): unknown {
@@ -138,16 +165,16 @@ function evaluateConditionExpression(
 			return !compareConditionValues(left, parseUnary(true));
 		}
 		if (match("lt")) {
-			return numericCompare(left, parseUnary(true), (a, b) => a < b);
+			return order(left, parseUnary(true), "<", (a, b) => a < b);
 		}
 		if (match("lte")) {
-			return numericCompare(left, parseUnary(true), (a, b) => a <= b);
+			return order(left, parseUnary(true), "<=", (a, b) => a <= b);
 		}
 		if (match("gt")) {
-			return numericCompare(left, parseUnary(true), (a, b) => a > b);
+			return order(left, parseUnary(true), ">", (a, b) => a > b);
 		}
 		if (match("gte")) {
-			return numericCompare(left, parseUnary(true), (a, b) => a >= b);
+			return order(left, parseUnary(true), ">=", (a, b) => a >= b);
 		}
 		return left;
 	}
@@ -225,13 +252,11 @@ function isStrictlyNumeric(value: unknown): boolean {
 	return false;
 }
 
-function numericCompare(
-	left: unknown,
-	right: unknown,
-	cmp: (a: number, b: number) => boolean,
-): boolean {
-	if (!isStrictlyNumeric(left) || !isStrictlyNumeric(right)) return false;
-	return cmp(Number(left), Number(right));
+function describeOperand(value: unknown): string {
+	if (value === undefined) return "a missing value";
+	if (typeof value === "string") return JSON.stringify(value);
+	if (value === null || typeof value === "boolean") return String(value);
+	return Array.isArray(value) ? "a list" : typeof value === "object" ? "an object" : String(value);
 }
 
 function isPlainConditionObject(value: unknown): value is Record<string, unknown> {
