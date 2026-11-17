@@ -1,4 +1,4 @@
-import { runPipeline as runCorePipeline } from "../runtime.js";
+import { runPipeline as runCorePipeline } from "../pipeline/runtime.js";
 
 /**
  * SDK Runtime - Executes Lobster pipelines

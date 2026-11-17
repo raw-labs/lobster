@@ -1,5 +1,5 @@
 import { defineCommand } from "../define.js";
-import { runAbortableProcess } from "../../abortable_process.js";
+import { runAbortableProcess } from "../../process/abortable_process.js";
 
 export const execCommand = defineCommand({
 	name: "exec",

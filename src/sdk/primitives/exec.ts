@@ -1,4 +1,4 @@
-import { tokenizeCommand } from "../../command_tokens.js";
+import { tokenizeCommand } from "../../pipeline/command_tokens.js";
 /**
  * Exec primitive - Execute shell commands and return JSON output
  *
@@ -10,7 +10,7 @@ import { tokenizeCommand } from "../../command_tokens.js";
  *   .pipe(items => items.filter(e => e.unread))
  */
 
-import { runAbortableProcess } from "../../abortable_process.js";
+import { runAbortableProcess } from "../../process/abortable_process.js";
 
 function parseCommand(command: string) {
 	const [executable, ...argv] = tokenizeCommand(command, "sdk");

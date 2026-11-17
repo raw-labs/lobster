@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { Ajv } from "ajv";
 
-import { createCompileCached } from "../src/validation.js";
+import { createCompileCached } from "../src/util/validation.js";
 
 test("compileCached reuses validators for structurally equivalent schemas", () => {
 	const ajv = new Ajv({ strict: false });

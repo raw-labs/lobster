@@ -1,7 +1,7 @@
-import type { ResumeDecision, WaitResumeOptions } from "../resume_options.js";
+import type { ResumeDecision, WaitResumeOptions } from "../resume/options.js";
 import type { SdkResult } from "./types.js";
 import { randomUUID } from "node:crypto";
-import { validateCommandInputState, type CommandInputState } from "../input_request.js";
+import { validateCommandInputState, type CommandInputState } from "../pipeline/input_request.js";
 import {
 	publishTrackedCheckpoint,
 	type ContinuationPredecessor,
@@ -19,8 +19,8 @@ import {
 	writeStateJson,
 } from "../state/store.js";
 import { resolveWait, callerId } from "../persistence/waits.js";
-import { encodeToken, decodeToken } from "../token.js";
-import { compileCached } from "../validation.js";
+import { encodeToken, decodeToken } from "../resume/token.js";
+import { compileCached } from "../util/validation.js";
 import { runPipelineInternal } from "./runtime.js";
 import { stateEnv } from "./state_env.js";
 

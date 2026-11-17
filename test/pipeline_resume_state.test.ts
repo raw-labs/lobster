@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { mkdtemp, rm } from "node:fs/promises";
 import { writeStateJson } from "../src/state/store.js";
-import { loadPipelineResumeState, type PipelineResumeState } from "../src/pipeline_resume_state.js";
+import { loadPipelineResumeState, type PipelineResumeState } from "../src/pipeline/resume_state.js";
 
 function validApprovalState(): PipelineResumeState {
 	return {

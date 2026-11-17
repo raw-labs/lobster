@@ -1,6 +1,6 @@
 import { decodeToken, encodeToken } from "./token.js";
-import { decodeWorkflowResumePayload } from "./workflows/file.js";
-import { findStateKeyByApprovalId } from "./state/store.js";
+import { decodeWorkflowResumePayload } from "../workflows/file.js";
+import { findStateKeyByApprovalId } from "../state/store.js";
 
 /**
  * Determine the resume payload kind from a state key prefix.

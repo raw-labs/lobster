@@ -4,9 +4,9 @@ import type {
 	WorkflowStepResult,
 	WorkflowRunResult,
 } from "../workflows/types.js";
-import type { CostSummary } from "../core/cost_tracker.js";
-import type { LlmOutstandingCharge } from "../core/llm_accounting.js";
-import type { WorkflowPipelineInputResumeState } from "../activities/pipeline.js";
+import type { CostSummary } from "../llm/cost_tracker.js";
+import type { LlmOutstandingCharge } from "../llm/accounting.js";
+import type { WorkflowPipelineInputResumeState } from "./activities/pipeline.js";
 import type { WaitRequest } from "../persistence/waits.js";
 
 export type Definition = {

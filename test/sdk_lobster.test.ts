@@ -7,7 +7,7 @@ import path from "node:path";
 import { Lobster } from "../src/sdk/Lobster.js";
 import { stateSet } from "../src/sdk/primitives/state.js";
 import { openStoreSession } from "../src/persistence/session.js";
-import { decodeToken, encodeToken } from "../src/token.js";
+import { decodeToken, encodeToken } from "../src/resume/token.js";
 
 test("sdk Lobster.resume accepts structured input responses", async () => {
 	const workflow = new Lobster().pipe({

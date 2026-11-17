@@ -7,15 +7,15 @@ import path from "node:path";
 import { PassThrough } from "node:stream";
 
 import { createDefaultRegistry } from "../src/commands/registry.js";
-import { CostTracker } from "../src/core/cost_tracker.js";
+import { CostTracker } from "../src/llm/cost_tracker.js";
 import {
 	createLlmSpendLedger,
 	llmProvenanceOf,
 	restoreLlmProvenance,
-} from "../src/core/llm_accounting.js";
-import type { LlmOutstandingCharge } from "../src/core/llm_accounting.js";
+} from "../src/llm/accounting.js";
+import type { LlmOutstandingCharge } from "../src/llm/accounting.js";
 import { runWorkflowFile } from "../src/workflows/file.js";
-import { decodeToken } from "../src/token.js";
+import { decodeToken } from "../src/resume/token.js";
 import { openStoreSession } from "../src/persistence/session.js";
 
 test("CostTracker records usage and computes totals", () => {

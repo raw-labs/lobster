@@ -7,7 +7,7 @@ import path from "node:path";
 import { PassThrough } from "node:stream";
 import { runWorkflowFile } from "../../src/workflows/file.js";
 import { openStoreSession } from "../../src/persistence/session.js";
-import { decodeToken } from "../../src/token.js";
+import { decodeToken } from "../../src/resume/token.js";
 import type { WorkflowRunResult } from "../../src/workflows/types.js";
 import type { ExecutionState } from "../../src/engine/state.js";
 import { createFakeCommand, type FakeCommand } from "./fake_command.js";

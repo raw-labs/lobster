@@ -1,5 +1,5 @@
 import { defineCommand } from "../define.js";
-import { readLineFromStream } from "../../read_line.js";
+import { readLineFromStream } from "../../io/read_line.js";
 
 function isInteractive(stdin) {
 	return Boolean(stdin.isTTY);

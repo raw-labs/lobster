@@ -1,4 +1,4 @@
-import { runAbortableProcess } from "../abortable_process.js";
+import { runAbortableProcess } from "../../process/abortable_process.js";
 export async function runShellCommand({
 	command,
 	stdin,

@@ -1,21 +1,21 @@
-import type { ResumeDecision, ResumeTarget } from "../resume_options.js";
+import type { ResumeDecision, ResumeTarget } from "../resume/options.js";
 import path from "node:path";
 import { Writable } from "node:stream";
 import { createDefaultRegistry } from "../commands/registry.js";
-import { parsePipeline } from "../parser.js";
+import { parsePipeline } from "../pipeline/parser.js";
 import { runtimeErrorDetails } from "../persistence/backend.js";
 import { recorderFromEnv, bindResumeGuard, sessionFromEnv } from "../persistence/context.js";
 import { resolveWait, callerId } from "../persistence/waits.js";
-import { encodeToken } from "../token.js";
+import { encodeToken } from "../resume/token.js";
 import { withExecution, withStoreContext } from "../persistence/execution.js";
 import type { PersistenceOptions } from "../persistence/context.js";
 import {
 	finalizePipelineToolRun,
 	loadPipelineResumeState,
 	validatePipelineInputResponse,
-} from "../pipeline_resume_state.js";
-import { decodeResumeToken, resolveApprovalId, kindFromStateKey } from "../resume.js";
-import { runPipeline } from "../runtime.js";
+} from "../pipeline/resume_state.js";
+import { decodeResumeToken, resolveApprovalId, kindFromStateKey } from "../resume/resume.js";
+import { runPipeline } from "../pipeline/runtime.js";
 import {
 	deleteStateJsonWithBoundedResumeCleanup,
 	deleteUnconsumedResumeState,

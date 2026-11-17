@@ -1,4 +1,4 @@
-import { runAbortableProcess } from "../../abortable_process.js";
+import { runAbortableProcess } from "../../process/abortable_process.js";
 import { defineCommand } from "../../commands/define.js";
 
 const OPENCLAW_AGENT_MAX_OUTPUT_BYTES = 10 * 1024 * 1024;

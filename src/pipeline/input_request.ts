@@ -1,5 +1,5 @@
-import { stableStringify } from "./state/serialization.js";
-import { compileCached } from "./validation.js";
+import { stableStringify } from "../state/serialization.js";
+import { compileCached } from "../util/validation.js";
 
 export type RequestInputParams = {
 	prompt: string;
@@ -482,7 +482,7 @@ function assertJsonSerializable(value: unknown, label: string, seen: WeakSet<obj
 
 async function requestInputInteractively(ctx: any, metadata: RequestInputMetadata) {
 	ctx.stdout.write(`${metadata.prompt}\n> `);
-	const { readLineFromStream } = await import("./read_line.js");
+	const { readLineFromStream } = await import("../io/read_line.js");
 	const raw = await readLineFromStream(ctx.stdin, { timeoutMs: 0, signal: ctx.signal });
 	let response;
 	try {

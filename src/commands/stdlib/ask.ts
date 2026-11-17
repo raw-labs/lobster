@@ -1,5 +1,5 @@
 import { defineCommand } from "../define.js";
-import { compileCached } from "../../validation.js";
+import { compileCached } from "../../util/validation.js";
 
 function isInteractive(stdin) {
 	return Boolean(stdin.isTTY);
@@ -158,7 +158,7 @@ export const askCommand = defineCommand({
 		}
 
 		ctx.stdout.write(`${prompt}\n> `);
-		const { readLineFromStream } = await import("../../read_line.js");
+		const { readLineFromStream } = await import("../../io/read_line.js");
 		const raw = await readLineFromStream(ctx.stdin, { timeoutMs: 0, signal: ctx.signal });
 		const text = String(raw ?? "").trim();
 

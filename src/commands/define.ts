@@ -1,3 +1,4 @@
+import { closestMatch } from "../util/suggest.js";
 import type { CommandArgsSchema, CommandMeta, DefinedCommand, LobsterCommand } from "./types.js";
 
 const NAME = /^[A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*)*$/;
@@ -52,27 +53,11 @@ export function assertKnownFlags(
 	const allowed = Object.keys(properties).filter((key) => key !== "_");
 	for (const key of Object.keys(args)) {
 		if (key === "_" || allowed.includes(key)) continue;
-		const near = allowed.find((candidate) => editDistance(key, candidate) <= 2);
+		const near = closestMatch(key, allowed);
 		throw new Error(
 			`${invokedAs} has no flag --${key}${near ? ` (did you mean --${near}?)` : ""}. Flags: ${
 				allowed.map((flag) => `--${flag}`).join(", ") || "none"
 			}`,
 		);
 	}
-}
-
-export function editDistance(a: string, b: string): number {
-	let previous = Array.from({ length: b.length + 1 }, (_, i) => i);
-	for (let i = 1; i <= a.length; i++) {
-		const current = [i];
-		for (let j = 1; j <= b.length; j++) {
-			current[j] = Math.min(
-				previous[j] + 1,
-				current[j - 1] + 1,
-				previous[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1),
-			);
-		}
-		previous = current;
-	}
-	return previous[b.length];
 }

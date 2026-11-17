@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { resolveInlineShellCommand } from "../src/shell.js";
+import { resolveInlineShellCommand } from "../src/process/shell.js";
 
 test("resolveInlineShellCommand uses POSIX shell by default", () => {
 	const resolved = resolveInlineShellCommand({

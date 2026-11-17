@@ -1,7 +1,7 @@
 import { defineCommand } from "../define.js";
-import { getByPath } from "../../core/value_path.js";
+import { getByPath } from "../../util/value_path.js";
 import fs from "node:fs/promises";
-import { applyFilters } from "../../core/filters.js";
+import { applyFilters } from "./template_filters.js";
 
 function splitFilterChain(expr: string): string[] {
 	const parts: string[] = [];

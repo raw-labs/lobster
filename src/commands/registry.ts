@@ -25,6 +25,9 @@ export function createRegistry({ packs }: { packs: CommandPack[] }): CommandRegi
 			}
 		}
 		for (const workflow of pack.workflows ?? []) {
+			// workflows.run is declared repeatable, which only holds if every workflow is.
+			if (workflow.repeatable !== true)
+				throw new Error(`Workflow ${workflow.name} in pack ${pack.name} must be repeatable`);
 			claim(workflow.name, `pack ${pack.name}`);
 			workflows.set(workflow.name, workflow);
 		}
@@ -40,7 +43,7 @@ export function createDefaultRegistry(): CommandRegistry {
 	return createRegistry({ packs: builtinPacks });
 }
 
-/** Named workflows of a registry; a host registry without packs sees the built-in ones. */
+/** Named workflows of a registry. A registry that does not list any has none. */
 export function registryWorkflows(registry: CommandRegistry | undefined): NamedWorkflow[] {
-	return registry?.workflows?.() ?? builtinPacks.flatMap((pack) => pack.workflows ?? []);
+	return registry?.workflows?.() ?? [];
 }

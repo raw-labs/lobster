@@ -5,7 +5,7 @@ import { once } from "node:events";
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
 
-import { readLineFromStream } from "../src/read_line.js";
+import { readLineFromStream } from "../src/io/read_line.js";
 
 test("readLineFromStream resolves on newline", async () => {
 	const input = new PassThrough();

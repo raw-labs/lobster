@@ -10,14 +10,14 @@ import { PassThrough } from "node:stream";
 import { fileURLToPath } from "node:url";
 
 import { createDefaultRegistry } from "../src/commands/registry.js";
-import { runAbortableProcess } from "../src/abortable_process.js";
+import { runAbortableProcess } from "../src/process/abortable_process.js";
 import { resumeToolRequest, runToolRequest } from "../src/core/tool_runtime.js";
-import { decodeResumeToken } from "../src/resume.js";
-import { runPipeline } from "../src/runtime.js";
+import { decodeResumeToken } from "../src/resume/resume.js";
+import { runPipeline } from "../src/pipeline/runtime.js";
 import { openStoreSession } from "../src/persistence/session.js";
 import { SqliteBackend } from "../src/persistence/sqlite.js";
 import { keyToPath } from "../src/state/store.js";
-import { encodeToken } from "../src/token.js";
+import { encodeToken } from "../src/resume/token.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -161,7 +161,7 @@ test(
 		let terminal: ReturnType<typeof spawn> | undefined;
 		try {
 			const repoRoot = join(__dirname, "..", "..");
-			const runner = join(repoRoot, "dist", "src", "abortable_process.js");
+			const runner = join(repoRoot, "dist", "src", "process", "abortable_process.js");
 			const wrapper = join(repoRoot, "test", "fixtures", "abortable-process-terminal-direct.mjs");
 			const groupFile = join(dir, "process-group");
 			const startedFile = join(dir, "started");
@@ -3007,7 +3007,7 @@ test("process-tree escalation survives a short-lived caller", async () => {
 	const dir = await mkdtemp(join(tmpdir(), "lobster-cancel-short-lived-"));
 	try {
 		const repoRoot = join(__dirname, "..", "..");
-		const runner = join(repoRoot, "dist", "src", "abortable_process.js");
+		const runner = join(repoRoot, "dist", "src", "process", "abortable_process.js");
 		const mockGog = join(repoRoot, "test", "fixtures", "mock-gog-cancellation.mjs");
 		const wrapper = join(repoRoot, "test", "fixtures", "abortable-process-short-lived.mjs");
 		const childStarted = join(dir, "search-started");

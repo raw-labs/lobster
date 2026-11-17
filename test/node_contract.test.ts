@@ -17,7 +17,7 @@ import assert from "node:assert/strict";
 import { readdirSync } from "node:fs";
 import { setTimeout as sleep } from "node:timers/promises";
 import { loadWorkflowFile } from "../src/workflows/file.js";
-import { snapshotDefinition } from "../src/definition/normalize.js";
+import { snapshotDefinition } from "../src/workflows/definition.js";
 import { renderWorkflowGraph } from "../src/workflows/graph.js";
 import { advanceWorkflowRun } from "../src/workflows/file.js";
 import type { WorkflowStep } from "../src/workflows/types.js";

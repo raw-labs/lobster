@@ -1,5 +1,5 @@
 import { defineCommand } from "../../commands/define.js";
-import { runAbortableProcess } from "../../abortable_process.js";
+import { runAbortableProcess } from "../../process/abortable_process.js";
 
 export const gogGmailSearchCommand = defineCommand({
 	name: "gog.gmail.search",

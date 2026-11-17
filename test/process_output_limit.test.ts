@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import { Lobster, exec } from "../src/sdk/index.js";
-import { runAbortableProcess } from "../src/abortable_process.js";
+import { runAbortableProcess } from "../src/process/abortable_process.js";
 import { waitForPid } from "./helpers/wait_for_pid.js";
 import { nodeShellFixture } from "./helpers/node_shell_fixture.js";
 

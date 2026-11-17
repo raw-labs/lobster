@@ -1,6 +1,6 @@
-import { assertKnownFlags } from "./commands/define.js";
-import { PersistenceError } from "./persistence/backend.js";
-import type { LlmSpendLedger } from "./core/llm_accounting.js";
+import { assertKnownFlags } from "../commands/define.js";
+import { PersistenceError } from "../persistence/backend.js";
+import type { LlmSpendLedger } from "../llm/accounting.js";
 import {
 	InputRequestSuspension,
 	RequestInputResumeError,
@@ -9,8 +9,8 @@ import {
 	createStageRequestInput,
 	type CommandInputResume,
 } from "./input_request.js";
-import { recorderFromEnv } from "./persistence/context.js";
-import { createJsonRenderer } from "./renderers/json.js";
+import { recorderFromEnv } from "../persistence/context.js";
+import { createJsonRenderer } from "./render_json.js";
 
 export async function runPipeline({
 	pipeline,

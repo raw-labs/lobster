@@ -1,12 +1,12 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
-import { loadWorkflowFile } from "../workflows/load.js";
-import { resolveTemplate } from "../workflows/expressions.js";
+import { loadWorkflowFile } from "./load.js";
+import { resolveTemplate } from "./expressions.js";
 import { fingerprint } from "../persistence/model.js";
-import { resolveWorkflowStepArgs } from "../workflows/values.js";
+import { resolveWorkflowStepArgs } from "./values.js";
 import { resolveWorkflowArgs } from "./args.js";
 import type { Definition } from "../engine/state.js";
-import type { WorkflowStep } from "../workflows/types.js";
+import type { WorkflowStep } from "./types.js";
 
 /** Freeze the definition before effects; dynamic child paths are frozen on entry. */
 export async function snapshotDefinition(

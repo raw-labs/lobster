@@ -1,5 +1,5 @@
 import { defineCommand } from "../define.js";
-import { carryLlmProvenance } from "../../core/llm_accounting.js";
+import { carryLlmProvenance } from "../../llm/accounting.js";
 import {
 	defaultStateDir,
 	keyToPath,

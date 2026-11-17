@@ -1,5 +1,5 @@
 import { defineCommand } from "../define.js";
-import { getByPath } from "../../core/value_path.js";
+import { getByPath } from "../../util/value_path.js";
 
 export const groupByCommand = defineCommand({
 	name: "groupBy",

@@ -5,8 +5,8 @@ import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 
-import { decodeResumeToken } from "../src/resume.js";
-import { encodeToken } from "../src/token.js";
+import { decodeResumeToken } from "../src/resume/resume.js";
+import { encodeToken } from "../src/resume/token.js";
 
 function runCli(args: string[], env: Record<string, string | undefined>) {
 	const bin = path.join(process.cwd(), "bin", "lobster.js");
