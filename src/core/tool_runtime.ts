@@ -376,10 +376,13 @@ function okEnvelope(
 }
 
 function errorEnvelope(type: string, error: unknown): ToolEnvelope {
+	// A run that failed names itself, so the caller can retry it with `runs advance`.
+	const runId = (error as { runId?: unknown } | null)?.runId;
 	return {
 		protocolVersion: 1,
 		ok: false,
 		error: runtimeErrorDetails(error, type),
+		...(typeof runId === "string" ? { runId } : {}),
 	};
 }
 

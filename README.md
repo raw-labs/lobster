@@ -194,7 +194,8 @@ history pruning. Runs can also continue through `advanceWorkflowRun` or
 `lobster runs advance`, subject to interrupted-activity recovery policy. A failed run
 is retried from the step that failed: steps that completed keep their results, and a
 step that reported dispatch of a command that may not be repeated is not run again.
-Failed runs keep their step records for this until retention deletes them.
+A failed run or resume reports the run's `runId` in its envelope; once a resume is
+accepted its token is spent, so retry with `lobster runs advance <runId>`. Failed runs keep their step records for this until retention deletes them.
 No background dispatcher is included.
 
 ### Upgrading from an older version

@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { createDefaultRegistry, runToolRequest } from "../src/core/index.js";
+import { createDefaultRegistry, resumeToolRequest, runToolRequest } from "../src/core/index.js";
 import { defineCommand } from "../src/commands/define.js";
 import { Lobster } from "../src/sdk/Lobster.js";
 import { advanceWorkflowRun } from "../src/workflows/file.js";
@@ -136,6 +136,33 @@ test("a failed step that may have acted is not run again", async (t) => {
 	} finally {
 		await store.close();
 	}
+});
+
+test("a resume that fails names its run, so the caller can retry it", async (t) => {
+	const { dir, env, ran, advance } = await fixture(t);
+	const filePath = path.join(dir, "flow.lobster");
+	await fs.writeFile(
+		filePath,
+		JSON.stringify({
+			steps: [
+				{ id: "ok", approval: "Continue?" },
+				{ id: "two", run: flaky("two", "fixed") },
+			],
+		}),
+	);
+	const paused = await runToolRequest({ filePath, ctx: { env } });
+	assert.equal(paused.status, "needs_approval");
+	const token = paused.requiresApproval!.resumeToken!;
+	const failed = await resumeToolRequest({ token, approved: true, ctx: { env } });
+	assert.equal(failed.ok, false);
+	assert.equal(failed.runId, paused.runId);
+	// The answer stands: the token is spent, and the run is retried by its ID.
+	const again = await resumeToolRequest({ token, approved: true, ctx: { env } });
+	assert.equal(again.ok, false);
+	assert.match(again.error!.message, /Resume state not found/);
+	await fs.writeFile(path.join(dir, "fixed"), "");
+	assert.equal((await advance(failed.runId!)).status, "ok");
+	assert.equal(await ran("two"), 2);
 });
 
 test("an SDK host retries its failed run with Lobster.advance", async (t) => {
