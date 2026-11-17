@@ -169,12 +169,15 @@ function evaluateConditionExpression(
 	}
 
 	function parseEquality(): unknown {
+		const leftIsNull = nullLiteralAt(index);
 		const left = parseUnary(false);
 		if (match("eq")) {
-			return compareConditionValues(left, parseUnary(true));
+			const againstNull = leftIsNull || nullLiteralAt(index);
+			return compareConditionValues(left, parseUnary(true), againstNull);
 		}
 		if (match("neq")) {
-			return !compareConditionValues(left, parseUnary(true));
+			const againstNull = leftIsNull || nullLiteralAt(index);
+			return !compareConditionValues(left, parseUnary(true), againstNull);
 		}
 		if (match("lt")) {
 			return order(left, parseUnary(true), "<", (a, b) => a < b);
@@ -229,6 +232,15 @@ function evaluateConditionExpression(
 		throw new Error(`Unsupported condition: ${expression}`);
 	}
 
+	/** Whether the operand at `at` is the literal `null`, possibly in parentheses. */
+	function nullLiteralAt(at: number) {
+		let depth = 0;
+		while (tokens[at + depth]?.type === "lparen") depth++;
+		if (tokens[at + depth]?.type !== "null") return false;
+		for (let i = 1; i <= depth; i++) if (tokens[at + depth + i]?.type !== "rparen") return false;
+		return true;
+	}
+
 	function match(type: ConditionToken["type"]) {
 		if (tokens[index]?.type !== type) return false;
 		index += 1;
@@ -248,12 +260,12 @@ function evaluateConditionExpression(
 	return Boolean(value);
 }
 
-function compareConditionValues(left: unknown, right: unknown) {
-	// Compared with a null value (the literal, or a field that holds null), a missing field
-	// counts as null, so `$x.json.v != null` guards either. Two missing values are not equal:
-	// that would let `$a.json.token == $b.json.token` pass when both are absent.
+function compareConditionValues(left: unknown, right: unknown, againstNull = false) {
+	// Only against the literal `null` does a missing field count as null, so `$x.json.v != null`
+	// guards either; comparing two fields never matches on "no value" (absent, or one absent and
+	// one null), which would let `$a.json.token == $b.json.token` pass without a token.
 	if (
-		(left === null || right === null) &&
+		againstNull &&
 		(left === undefined || left === null) &&
 		(right === undefined || right === null)
 	)

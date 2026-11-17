@@ -267,3 +267,15 @@ test("a parenthesised null guards a missing field too", async () => {
 	});
 	assert.deepEqual(result.output, ["b\n"]);
 });
+
+test("comparing two fields never matches on a missing and a null value", async () => {
+	const result = await runWorkflow({
+		steps: [
+			{ id: "a", command: `echo '{"token":null}'` },
+			{ id: "b", command: `echo '{}'` },
+			{ id: "same", command: 'echo "same"', when: "$a.json.token == $b.json.token" },
+			{ id: "end", command: 'echo "end"' },
+		],
+	});
+	assert.deepEqual(result.output, ["end\n"]);
+});
