@@ -169,12 +169,16 @@ function evaluateConditionExpression(
 	}
 
 	function parseEquality(): unknown {
+		const leftIsNull = tokens[index]?.type === "null";
 		const left = parseUnary(false);
+		const nullLiteral = () => leftIsNull || tokens[index]?.type === "null";
 		if (match("eq")) {
-			return compareConditionValues(left, parseUnary(true));
+			const againstNull = nullLiteral();
+			return compareConditionValues(left, parseUnary(true), againstNull);
 		}
 		if (match("neq")) {
-			return !compareConditionValues(left, parseUnary(true));
+			const againstNull = nullLiteral();
+			return !compareConditionValues(left, parseUnary(true), againstNull);
 		}
 		if (match("lt")) {
 			return order(left, parseUnary(true), "<", (a, b) => a < b);
@@ -248,9 +252,16 @@ function evaluateConditionExpression(
 	return Boolean(value);
 }
 
-function compareConditionValues(left: unknown, right: unknown) {
-	// A missing field and null are both "no value": `$x.json.v != null` guards either.
-	if ((left === undefined || left === null) && (right === undefined || right === null)) return true;
+function compareConditionValues(left: unknown, right: unknown, againstNull = false) {
+	// Compared with the literal `null`, a missing field counts as null, so `$x.json.v != null`
+	// guards either. Two missing values are not equal to each other: that would let
+	// `$a.json.token == $b.json.token` pass when both are absent.
+	if (
+		againstNull &&
+		(left === undefined || left === null) &&
+		(right === undefined || right === null)
+	)
+		return true;
 	if (
 		Array.isArray(left) ||
 		Array.isArray(right) ||

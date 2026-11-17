@@ -244,3 +244,15 @@ test("any approval or input key in a for_each sub-step is rejected, whatever its
 			JSON.stringify(gate),
 		);
 });
+
+test("two missing values are not equal to each other", async () => {
+	const result = await runWorkflow({
+		steps: [
+			{ id: "a", command: `echo '{}'` },
+			{ id: "b", command: `echo '{}'` },
+			{ id: "same", command: 'echo "same"', when: "$a.json.token == $b.json.token" },
+			{ id: "end", command: 'echo "end"' },
+		],
+	});
+	assert.deepEqual(result.output, ["end\n"]);
+});
