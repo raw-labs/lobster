@@ -4,6 +4,7 @@ All notable changes to Lobster will be documented in this file.
 
 ## Unreleased
 
+- One option parser for every CLI command: `--flag value` and `--flag=value` work everywhere, and a missing value, an unknown flag or a non-number where a number belongs (`runs list --limit abc`, `history show <id> x`) is a usage error with exit code 2 instead of being ignored or becoming NaN. Output formats are unchanged.
 - Fixes from a review of this release's engine, loader and SDK work:
   - A for_each running items at once saves each item's output and its progress in the same save (they could be split across two saves, and a crash between them made the loop fail for good, or run an item again), and keeps how far it may run ahead bounded.
   - In conditions, a backslash in a quoted string is kept unless it escapes a quote or a backslash, so `matches "^\d+$"` means digits (it used to mean the letter d).

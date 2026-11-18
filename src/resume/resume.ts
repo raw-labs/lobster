@@ -1,7 +1,7 @@
 import { decodeToken, encodeToken } from "./token.js";
 import { decodeWorkflowResumePayload, type WorkflowResumePayload } from "../engine/runner.js";
 import { findStateKeyByApprovalId } from "../state/store.js";
-import { parseBoolLike } from "../util/bool.js";
+import { parseArgv } from "../util/argv.js";
 
 const APPROVAL_ID = /^[0-9a-f]{8}$/;
 const WAIT_ID = /^[0-9a-f-]{36}\.[0-9a-f]{64}$/;
@@ -23,92 +23,32 @@ export function classifyResumeRef(
  * `<ref>` is a resume token, a short approval ID or a wait ID. The released spellings
  * `--token <t>`, `--id <approvalId>` and `--decision` keep working.
  */
-export function parseResumeArgs(argv) {
+export function parseResumeArgs(argv: string[]) {
+	const { flags, positional } = parseArgv(
+		argv,
+		{
+			"expected-revision": { type: "integer", min: 0 },
+			token: { type: "string" },
+			id: { type: "string" },
+			"response-json": { type: "string" },
+			cancel: { type: "boolean" },
+			approve: { type: "string", aliases: ["decision"] },
+		},
+		{
+			usage:
+				"resume <token | approval ID | wait ID> --approve yes|no | --response-json '{...}' | --cancel",
+		},
+	);
+	if (positional.length > 1) throw new Error("resume takes one reference");
 	const args = {
-		decision: null,
-		ref: null as string | null,
-		token: null,
-		approvalId: null,
-		responseJson: null,
-		cancel: false,
-		expectedRevision: null as number | null,
+		decision: (flags.approve as string | undefined) ?? null,
+		ref: positional[0] ?? null,
+		token: (flags.token as string | undefined) ?? null,
+		approvalId: (flags.id as string | undefined) ?? null,
+		responseJson: (flags["response-json"] as string | undefined) ?? null,
+		cancel: flags.cancel === true,
+		expectedRevision: (flags["expected-revision"] as number | undefined) ?? null,
 	};
-
-	for (let i = 0; i < argv.length; i++) {
-		const tok = argv[i];
-		if (tok === "--expected-revision" || tok.startsWith("--expected-revision=")) {
-			const value =
-				tok === "--expected-revision" ? argv[++i] : tok.slice("--expected-revision=".length);
-			if (!value || !/^\d+$/.test(value))
-				throw new Error("resume --expected-revision requires a non-negative integer");
-			args.expectedRevision = Number(value);
-			if (!Number.isSafeInteger(args.expectedRevision))
-				throw new Error("Invalid expected wait revision");
-			continue;
-		}
-		if (tok === "--token") {
-			args.token = argv[i + 1];
-			i++;
-			continue;
-		}
-		if (tok.startsWith("--token=")) {
-			args.token = tok.slice("--token=".length);
-			continue;
-		}
-		if (tok === "--id") {
-			args.approvalId = argv[i + 1];
-			i++;
-			continue;
-		}
-		if (tok.startsWith("--id=")) {
-			args.approvalId = tok.slice("--id=".length);
-			continue;
-		}
-		if (tok === "--response-json") {
-			args.responseJson = argv[i + 1];
-			i++;
-			continue;
-		}
-		if (tok.startsWith("--response-json=")) {
-			args.responseJson = tok.slice("--response-json=".length);
-			continue;
-		}
-		if (tok === "--cancel") {
-			const next = argv[i + 1];
-			if (typeof next === "string" && !next.startsWith("--")) {
-				const parsed = parseBoolLike(next);
-				if (parsed !== undefined) {
-					args.cancel = parsed;
-					i++;
-					continue;
-				}
-			}
-			args.cancel = true;
-			continue;
-		}
-		if (tok.startsWith("--cancel=")) {
-			const parsed = parseBoolLike(tok.slice("--cancel=".length));
-			if (parsed === undefined) throw new Error("resume --cancel must be true or false");
-			args.cancel = parsed;
-			continue;
-		}
-		if (tok === "--approve" || tok === "--decision") {
-			args.decision = argv[i + 1];
-			i++;
-			continue;
-		}
-		if (tok.startsWith("--approve=")) {
-			args.decision = tok.slice("--approve=".length);
-			continue;
-		}
-		if (tok.startsWith("--decision=")) {
-			args.decision = tok.slice("--decision=".length);
-			continue;
-		}
-		if (tok.startsWith("--")) throw new Error(`resume has no flag ${tok.split("=")[0]}`);
-		if (args.ref !== null) throw new Error("resume takes one reference");
-		args.ref = String(tok);
-	}
 
 	const named = [args.ref, args.token, args.approvalId].filter((value) => value);
 	if (named.length !== 1)

@@ -30,6 +30,7 @@ import { renderWorkflowGraph } from "./workflows/graph.js";
 import { parseWorkflowArgsJson } from "./workflows/values.js";
 import type { WorkflowGraphFormat } from "./workflows/graph.js";
 import { resolveWorkflowFile, WORKFLOW_FILE_EXTENSIONS } from "./workflows/load.js";
+import { parseArgv, UsageError } from "./util/argv.js";
 
 // CLI commands without help of their own show the usage, which covers all of them.
 const USAGE_TOPICS = new Set([
@@ -45,9 +46,6 @@ const USAGE_TOPICS = new Set([
 	"version",
 	"help",
 ]);
-
-/** A command line Lobster does not understand: reported with exit code 2, like other parse errors. */
-class UsageError extends Error {}
 
 export async function runCli(argv) {
 	const cancellation = createCliCancellation();
@@ -130,24 +128,22 @@ async function runCliWithSignal(
 
 	if (argv[0] === "runs" && argv[1] === "advance" && argv.includes("--due")) {
 		try {
-			const options = argv.slice(2).filter((arg) => arg !== "--due");
-			let limit: number | undefined;
-			let concurrency: number | undefined;
-			let dryRun = false;
-			for (let i = 0; i < options.length; i++) {
-				if (options[i] === "--dry-run") dryRun = true;
-				else if (options[i] === "--limit" && /^\d+$/.test(options[i + 1] ?? ""))
-					limit = Number(options[++i]);
-				else if (options[i] === "--concurrency" && /^[1-9]\d*$/.test(options[i + 1] ?? ""))
-					concurrency = Number(options[++i]);
-				else
-					throw new UsageError("runs advance --due [--limit <n>] [--concurrency <n>] [--dry-run]");
-			}
+			const { flags, positional } = parseArgv(
+				argv.slice(2),
+				{
+					due: { type: "boolean" },
+					limit: { type: "integer", min: 1 },
+					concurrency: { type: "integer", min: 1 },
+					"dry-run": { type: "boolean" },
+				},
+				{ usage: "runs advance --due [--limit <n>] [--concurrency <n>] [--dry-run]" },
+			);
+			if (positional.length) throw new UsageError("runs advance --due takes no run ID");
 			const result = await advanceDueRuns({
 				ctx: createToolContext({ signal, forceTerminationSignal }),
-				limit,
-				concurrency,
-				dryRun,
+				limit: flags.limit as number | undefined,
+				concurrency: flags.concurrency as number | undefined,
+				dryRun: flags["dry-run"] === true,
 			});
 			process.stdout.write(JSON.stringify(result) + "\n");
 		} catch (error) {
@@ -160,24 +156,23 @@ async function runCliWithSignal(
 
 	if (argv[0] === "signal") {
 		try {
-			const [name, ...options] = argv.slice(1);
-			if (!name || name.startsWith("--"))
-				throw new UsageError("signal <event> [--data '{...}'] [--id <id>]");
+			const usage = "signal <event> [--data '{...}'] [--id <id>]";
+			const { flags, positional } = parseArgv(
+				argv.slice(1),
+				{ data: { type: "string" }, id: { type: "string" } },
+				{ usage },
+			);
+			const [name] = positional;
+			if (!name || positional.length > 1) throw new UsageError(`Usage: ${usage}`);
 			let data: unknown = null;
-			let id: string | undefined;
-			for (let i = 0; i < options.length; i++) {
-				const [flag, inline] = options[i].split(/=(.*)/s, 2);
-				const value = inline ?? options[++i];
-				if (value === undefined) throw new UsageError(`Missing value for ${flag}`);
-				if (flag === "--data") {
-					try {
-						data = JSON.parse(value);
-					} catch {
-						throw new UsageError("signal --data must be valid JSON");
-					}
-				} else if (flag === "--id") id = value;
-				else throw new UsageError(`signal has no flag ${flag}`);
+			if (flags.data !== undefined) {
+				try {
+					data = JSON.parse(flags.data as string);
+				} catch {
+					throw new UsageError("signal --data must be valid JSON");
+				}
 			}
+			const id = flags.id as string | undefined;
 			const result = await signalEvent({
 				name,
 				data,
@@ -195,9 +190,9 @@ async function runCliWithSignal(
 
 	if (argv[0] === "runs" && argv[1] === "advance") {
 		try {
-			if (!argv[2] || argv.length !== 3) throw new UsageError("runs advance requires a run ID");
+			const runId = oneId(argv.slice(2), "runs advance <runId>");
 			const result = await advanceWorkflowRun({
-				runId: argv[2],
+				runId,
 				ctx: createToolContext({ signal, forceTerminationSignal }),
 			});
 			writeToolEnvelope({
@@ -227,9 +222,9 @@ async function runCliWithSignal(
 
 	if (argv[0] === "runs" && argv[1] === "abandon") {
 		try {
-			if (!argv[2] || argv.length !== 3) throw new UsageError("runs abandon requires a run ID");
+			const runId = oneId(argv.slice(2), "runs abandon <runId>");
 			const result = await abandonWorkflowRun({
-				runId: argv[2],
+				runId,
 				ctx: createToolContext({ signal, forceTerminationSignal }),
 			});
 			process.stdout.write(JSON.stringify(result) + "\n");
@@ -375,7 +370,18 @@ type RunOptions = {
 };
 
 async function handleRun(options: RunOptions) {
-	const parsed = parseRunArgs(options.argv);
+	let parsed: ReturnType<typeof parseRunArgs>;
+	try {
+		parsed = parseRunArgs(options.argv);
+	} catch (error) {
+		// Reported like any parse error of the run: an envelope in tool mode.
+		const tool = options.argv.some(
+			(arg, index) =>
+				arg === "--mode=tool" || (arg === "--mode" && options.argv[index + 1] === "tool"),
+		);
+		reportRunError(tool ? "tool" : "human", "parse_error", error);
+		return { ok: false };
+	}
 	const prepared = await prepareRunTarget(parsed).catch(() => undefined);
 	if (!prepared) {
 		return handleRunInternal({ ...options, env: process.env });
@@ -659,133 +665,50 @@ async function prepareRunTarget(parsed: ReturnType<typeof parseRunArgs>) {
 	return { rest, workflowFile, dryRun };
 }
 
-function parseRunArgs(argv) {
-	const rest = [];
-	let mode = "human";
-	let filePath = null;
-	let argsJson = null;
-	let dryRun = false;
-
-	for (let i = 0; i < argv.length; i++) {
-		const tok = argv[i];
-
-		// Treat --dry-run as a Lobster flag only before positional command/pipeline
-		// args begin. Once rest has started, the token may belong to the command.
-		// Trailing workflow-file --dry-run is handled later after we can prove the
-		// first positional token is actually a workflow file.
-		if (tok === "--dry-run" && rest.length === 0) {
-			dryRun = true;
-			continue;
-		}
-
-		if (tok === "--mode") {
-			const value = argv[i + 1];
-			if (value) {
-				mode = value;
-				i++;
-			}
-			continue;
-		}
-
-		if (tok.startsWith("--mode=")) {
-			mode = tok.slice("--mode=".length) || "human";
-			continue;
-		}
-
-		if (tok === "--file") {
-			const value = argv[i + 1];
-			if (value) {
-				filePath = value;
-				i++;
-			}
-			continue;
-		}
-
-		if (tok.startsWith("--file=")) {
-			filePath = tok.slice("--file=".length);
-			continue;
-		}
-
-		if (tok === "--args-json") {
-			// An empty or missing value is rejected later instead of falling back to defaults.
-			argsJson = argv[i + 1] ?? "";
-			i++;
-			continue;
-		}
-
-		if (tok.startsWith("--args-json=")) {
-			argsJson = tok.slice("--args-json=".length);
-			continue;
-		}
-
-		rest.push(tok);
-	}
-
-	return { mode, rest, filePath, argsJson, dryRun };
+/**
+ * `lobster run`'s own flags. Everything else is the pipeline (or workflow file), whose words may
+ * be its commands' own flags, so unknown flags pass through. `--dry-run` is Lobster's only before
+ * the pipeline starts; after that it may belong to a command.
+ */
+function parseRunArgs(argv: string[]) {
+	const { flags, positional } = parseArgv(
+		argv,
+		{ mode: { type: "string" }, file: { type: "string" }, "args-json": { type: "string" } },
+		{
+			usage:
+				"lobster run [--mode tool] [--file <workflow>] [--args-json '{...}'] [--dry-run] <pipeline>",
+			passthrough: true,
+		},
+	);
+	const lead = positional.findIndex((token) => token !== "--dry-run");
+	const leading = lead === -1 ? positional.length : lead;
+	return {
+		mode: (flags.mode as string | undefined) || "human",
+		rest: positional.slice(leading),
+		filePath: (flags.file as string | undefined) ?? null,
+		argsJson: (flags["args-json"] as string | undefined) ?? null,
+		dryRun: leading > 0,
+	};
 }
-
 function parseGraphArgs(argv: string[]) {
-	const rest: string[] = [];
-	let filePath: string | null = null;
-	let format = "mermaid";
-	let argsJson: string | null = null;
-	let help = false;
-
-	for (let i = 0; i < argv.length; i++) {
-		const tok = argv[i];
-
-		if (tok === "-h" || tok === "--help") {
-			help = true;
-			continue;
-		}
-
-		if (tok === "--file") {
-			const value = argv[i + 1];
-			if (value) {
-				filePath = value;
-				i++;
-			}
-			continue;
-		}
-
-		if (tok.startsWith("--file=")) {
-			filePath = tok.slice("--file=".length);
-			continue;
-		}
-
-		if (tok === "--format") {
-			const value = argv[i + 1];
-			if (value) {
-				format = value;
-				i++;
-			}
-			continue;
-		}
-
-		if (tok.startsWith("--format=")) {
-			format = tok.slice("--format=".length) || "mermaid";
-			continue;
-		}
-
-		if (tok === "--args-json") {
-			// An empty or missing value is rejected later instead of falling back to defaults.
-			argsJson = argv[i + 1] ?? "";
-			i++;
-			continue;
-		}
-
-		if (tok.startsWith("--args-json=")) {
-			argsJson = tok.slice("--args-json=".length);
-			continue;
-		}
-
-		rest.push(tok);
-	}
-
-	if (!filePath && rest.length > 0) {
-		filePath = rest[0];
-	}
-	return { filePath, format, argsJson, help };
+	const { flags, positional } = parseArgv(
+		argv,
+		{
+			file: { type: "string" },
+			format: { type: "string" },
+			"args-json": { type: "string" },
+			help: { type: "boolean", aliases: ["h"] },
+		},
+		{
+			usage: "lobster graph <workflow.lobster> [--format mermaid|dot|ascii] [--args-json '{...}']",
+		},
+	);
+	return {
+		filePath: (flags.file as string | undefined) ?? positional[0] ?? null,
+		format: (flags.format as string | undefined) || "mermaid",
+		argsJson: (flags["args-json"] as string | undefined) ?? null,
+		help: flags.help === true || positional.includes("-h"),
+	};
 }
 
 async function resolveRunTarget(parsed: {
@@ -1026,25 +949,32 @@ function graphHelpText() {
 }
 
 async function handlePersistence(argv: string[]) {
+	const usage =
+		"history list [after]|show <runId> [afterSequence]|prune <before> [--apply]; storage export";
+	const [command, action = "list"] = argv;
+	const { flags, positional } = parseArgv(argv.slice(2), { apply: { type: "boolean" } }, { usage });
+	const known =
+		(command === "history" && action === "list" && positional.length <= 1) ||
+		(command === "history" &&
+			action === "show" &&
+			positional.length >= 1 &&
+			positional.length <= 2) ||
+		(command === "history" && action === "prune" && positional.length === 1) ||
+		(command === "storage" && action === "export" && positional.length === 0);
+	if (!known || (flags.apply !== undefined && action !== "prune")) throw new UsageError(usage);
+	const afterSequence = positional[1] === undefined ? 0 : Number(positional[1]);
+	if (!Number.isSafeInteger(afterSequence) || afterSequence < 0)
+		throw new UsageError(`history show afterSequence must be a whole number. Usage: ${usage}`);
 	const session = await openStoreSession({
 		env: process.env,
-		readOnly: !(argv[0] === "history" && argv[1] === "prune" && argv.includes("--apply")),
+		readOnly: !(command === "history" && action === "prune" && flags.apply === true),
 	});
 	try {
 		let result: unknown;
-		if (argv[0] === "history" && (!argv[1] || argv[1] === "list")) {
-			result = await session.listRuns({ after: argv[2] ?? "" });
-		} else if (argv[0] === "history" && argv[1] === "show" && argv[2]) {
-			result = await session.inspect(argv[2], { afterSequence: Number(argv[3] ?? 0) });
-		} else if (argv[0] === "history" && argv[1] === "prune" && argv[2]) {
-			result = await session.retain({ before: argv[2], dryRun: !argv.includes("--apply") });
-		} else if (argv[0] === "storage" && argv[1] === "export") {
-			result = await session.backend.export();
-		} else {
-			throw new UsageError(
-				"history list|show <runId> [afterSequence]|prune <before> [--apply]; storage export",
-			);
-		}
+		if (command === "storage") result = await session.backend.export();
+		else if (action === "list") result = await session.listRuns({ after: positional[0] ?? "" });
+		else if (action === "show") result = await session.inspect(positional[0], { afterSequence });
+		else result = await session.retain({ before: positional[0], dryRun: flags.apply !== true });
 		process.stdout.write(JSON.stringify(result) + "\n");
 	} finally {
 		await session.close();
@@ -1054,42 +984,38 @@ async function handlePersistence(argv: string[]) {
 async function handleRuns(argv: string[], signal: AbortSignal) {
 	const [command, action, ...rest] = argv;
 	const ctx = { env: process.env, signal };
+	const usage =
+		"runs list [--status <status>] [--limit <limit>] [--after <cursor>]; runs show <runId>; waits show <waitId>";
 	let result: unknown;
 	if (command === "runs" && (!action || action === "list")) {
-		const options: Parameters<typeof listRuns>[0] = { ctx };
-		for (let i = 0; i < rest.length; i += 2) {
-			const value = rest[i + 1];
-			if (!value) throw new UsageError(`Missing value for ${rest[i]}`);
-			switch (rest[i]) {
-				case "--status":
-					options.status = value as NonNullable<typeof options.status>;
-					break;
-				case "--limit":
-					options.limit = Number(value);
-					break;
-				case "--after":
-					options.after = value;
-					break;
-				default:
-					throw new UsageError(`Unknown runs option: ${rest[i]}`);
-			}
-		}
-		result = await listRuns(options);
-	} else if (action === "show" && rest.length === 1) {
+		const { flags, positional } = parseArgv(
+			rest,
+			{
+				status: { type: "string" },
+				limit: { type: "integer", min: 1 },
+				after: { type: "string" },
+			},
+			{ usage },
+		);
+		if (positional.length) throw new UsageError(`runs list takes no arguments. Usage: ${usage}`);
+		result = await listRuns({
+			ctx,
+			...(flags.status !== undefined
+				? { status: flags.status as NonNullable<Parameters<typeof listRuns>[0]["status"]> }
+				: {}),
+			...(flags.limit !== undefined ? { limit: flags.limit as number } : {}),
+			...(flags.after !== undefined ? { after: flags.after as string } : {}),
+		});
+	} else if (action === "show") {
+		const id = oneId(rest, command === "runs" ? "runs show <runId>" : "waits show <waitId>");
 		result =
-			command === "runs"
-				? await getRun({ runId: rest[0], ctx })
-				: await getWait({ waitId: rest[0], ctx });
+			command === "runs" ? await getRun({ runId: id, ctx }) : await getWait({ waitId: id, ctx });
 		if (result === null)
 			throw new Error(
-				command === "runs"
-					? `Run ${rest[0]} not found`
-					: `Wait ${rest[0]} not found (or no longer pending)`,
+				command === "runs" ? `Run ${id} not found` : `Wait ${id} not found (or no longer pending)`,
 			);
 	} else {
-		throw new UsageError(
-			"runs list [--status <status>] [--limit <limit>] [--after <cursor>]; runs show <runId>; waits show <waitId>",
-		);
+		throw new UsageError(usage);
 	}
 	process.stdout.write(JSON.stringify(result) + "\n");
 }
@@ -1124,17 +1050,18 @@ async function offerUpgrade(argv: string[], signal: AbortSignal) {
 }
 
 async function handleUpgrade(argv: string[]) {
-	const unknown = argv.filter((arg) => arg !== "--dry-run" && arg !== "--json");
-	if (unknown.length) {
-		process.stderr.write("Usage: lobster upgrade [--dry-run] [--json]\n");
-		process.exitCode = 2;
-		return;
-	}
+	const usage = "lobster upgrade [--dry-run] [--json]";
+	const { flags, positional } = parseArgv(
+		argv,
+		{ "dry-run": { type: "boolean" }, json: { type: "boolean" } },
+		{ usage },
+	);
+	if (positional.length) throw new UsageError(`Usage: ${usage}`);
 	let report: UpgradeReport;
 	try {
 		report = await upgradeStore({
 			directory: defaultStateDir(process.env),
-			dryRun: argv.includes("--dry-run"),
+			dryRun: flags["dry-run"] === true,
 		});
 	} catch (error) {
 		process.stderr.write(`Upgrade failed: ${error?.message ?? String(error)}\n`);
@@ -1142,7 +1069,7 @@ async function handleUpgrade(argv: string[]) {
 		return;
 	}
 	process.stdout.write(
-		argv.includes("--json") ? JSON.stringify(report) + "\n" : formatUpgradeReport(report),
+		flags.json === true ? JSON.stringify(report) + "\n" : formatUpgradeReport(report),
 	);
 }
 
@@ -1175,4 +1102,11 @@ function formatUpgradeReport(report: UpgradeReport): string {
 	}
 	if (report.backup) lines.push(`The original files were moved to ${report.backup}`);
 	return lines.join("\n") + "\n";
+}
+
+/** The one ID a command takes, or a UsageError naming its usage. */
+function oneId(args: string[], usage: string) {
+	const { positional } = parseArgv(args, {}, { usage });
+	if (positional.length !== 1) throw new UsageError(`Usage: ${usage}`);
+	return positional[0];
 }

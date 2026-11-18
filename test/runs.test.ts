@@ -643,7 +643,7 @@ test("resume takes one reference of any kind and keeps the released flags", () =
 	);
 	assert.throws(
 		() => parseResumeArgs([waitId, "--expected-revision", "-1", "--cancel"]),
-		/non-negative/,
+		/at least 0/,
 	);
 	assert.throws(() => parseResumeArgs([token, "--wait", waitId, "--cancel"]), /no flag --wait/);
 });

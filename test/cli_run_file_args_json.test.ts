@@ -63,7 +63,9 @@ test("cli: run --file rejects a non-object --args-json before any step runs", as
 	for (const emptyArgs of emptyArgsJsonForms) {
 		const res = runLobster(["run", "--file", filePath, ...emptyArgs]);
 		assert.equal(res.status, 2, `exit for ${emptyArgs.join(" ")}: ${res.stderr}`);
-		assert.equal(res.stderr, "run --args-json must be valid JSON\n");
+		if (emptyArgs.length === 1 && emptyArgs[0] === "--args-json")
+			assert.match(res.stderr, /--args-json needs a value/);
+		else assert.equal(res.stderr, "run --args-json must be valid JSON\n");
 	}
 
 	await assert.rejects(fsp.stat(markerPath), { code: "ENOENT" });
@@ -108,7 +110,10 @@ test("cli: graph rejects invalid, empty and non-object --args-json", async () =>
 	for (const emptyArgs of emptyArgsJsonForms) {
 		const res = runLobster(["graph", "--file", filePath, ...emptyArgs]);
 		assert.equal(res.status, 2, `exit for ${emptyArgs.join(" ")}: ${res.stderr}`);
-		assert.equal(res.stderr, "graph --args-json must be valid JSON\n");
+		// With no value at all, the flag is reported as missing its value.
+		if (emptyArgs.length === 1 && emptyArgs[0] === "--args-json")
+			assert.match(res.stderr, /--args-json needs a value/);
+		else assert.equal(res.stderr, "graph --args-json must be valid JSON\n");
 	}
 
 	for (const argsJson of nonObjectArgsJson) {
