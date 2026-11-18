@@ -29,6 +29,8 @@
 		"bin",
 		"dist/src",
 		"README.md",
+		"docs/reference.md",
+		"docs/execution-machine.md",
 		"LICENSE",
 		"VISION.md"
 	],

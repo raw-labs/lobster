@@ -4,6 +4,7 @@ All notable changes to Lobster will be documented in this file.
 
 ## Unreleased
 
+- Split the README into a one-page guide (what Lobster is, five ideas, a first workflow, tool mode, operating runs) and a full reference in `docs/reference.md`, which keeps every section of the old README, grouped by topic. The package now ships the reference.
 - Add `switch` steps: the first case whose `when` holds runs its steps (any kind of step, approvals and nested switches included), or `else`. The choice is saved, `$switch.json` is the output of the case that ran, `$switch.case` says which, and steps of other cases count as skipped. A switch with no matching case and no `else` fails.
 - Conditions gain `in`, `contains` (list membership or substring), `matches` (a quoted regular expression) and list literals such as `[refund, spam]`. Every syntax error gives a character position.
 - Conditions are checked further when the file loads: a condition that reads a step that does not run before it, or a literal operand that fails on every run (`$n.json.count > "high"`), is refused before any step runs. Before, a reference to an unknown step failed only when the condition was evaluated.
