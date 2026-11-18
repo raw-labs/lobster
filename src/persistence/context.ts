@@ -80,7 +80,7 @@ export function bindStoreSession(env: StoreEnvironment, handle: StoreHandle): St
 
 export function bindRecorder(env: StoreEnvironment, recorder: ExecutionRecorder): StoreEnvironment {
 	const bound = bindStoreSession(env, recorder.session);
-	return { ...bound, [PERSISTENCE]: { ...bound[PERSISTENCE], recorder } };
+	return { ...bound, [PERSISTENCE]: { ...bound[PERSISTENCE]!, recorder } };
 }
 
 export function bindResumeGuard(env: StoreEnvironment, guard: ResumeGuard): StoreEnvironment {

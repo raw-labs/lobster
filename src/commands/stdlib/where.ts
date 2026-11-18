@@ -1,10 +1,10 @@
 import { defineCommand } from "../define.js";
-function parsePredicate(expr) {
+function parsePredicate(expr: string) {
 	const m = expr.match(/^([a-zA-Z0-9_.]+)\s*(==|=|!=|<=|>=|<|>)\s*(.+)$/);
 	if (!m) throw new Error(`Invalid where expression: ${expr}`);
 	const [, path, op, rawValue] = m;
 
-	let value = rawValue;
+	let value: string | number | boolean | null = rawValue;
 	if (rawValue === "true") value = true;
 	else if (rawValue === "false") value = false;
 	else if (rawValue === "null") value = null;
@@ -13,9 +13,9 @@ function parsePredicate(expr) {
 	return { path, op: op === "=" ? "==" : op, value };
 }
 
-function getPath(obj, path) {
+function getPath(obj: unknown, path: string) {
 	const parts = path.split(".");
-	let cur = obj;
+	let cur: any = obj;
 	for (const p of parts) {
 		if (cur === null || typeof cur !== "object") return undefined;
 		cur = cur[p];
@@ -23,7 +23,7 @@ function getPath(obj, path) {
 	return cur;
 }
 
-function compare(left, op, right) {
+function compare(left: any, op: string, right: any) {
 	switch (op) {
 		case "==":
 			return left == right; // intentional loose equality for convenience

@@ -31,9 +31,9 @@ type PendingRequest = {
 
 export class SqliteBackend implements Backend {
 	readonly kind = "sqlite" as const;
-	private worker: Worker;
+	private worker!: Worker;
 	private pending = new Map<string, PendingRequest>();
-	private ready: Promise<void>;
+	private ready!: Promise<void>;
 	private failed?: Error;
 	private closing = false;
 	private recovering?: Promise<void>;

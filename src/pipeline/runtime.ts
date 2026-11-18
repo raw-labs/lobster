@@ -71,7 +71,8 @@ export async function runPipeline({
 	let rendered = false;
 	const renderedItems: unknown[] = [];
 	let halted = false;
-	let haltedAt = null;
+	let haltedAt: { index: number; stage: (typeof pipeline)[number]; inPlace?: boolean } | null =
+		null;
 	let pipelineOutputStarted = false;
 	let executionStarted = false;
 	let executionStart: Promise<void> | undefined;
@@ -168,7 +169,7 @@ export async function runPipeline({
 					historyError = error;
 					throw error;
 				} finally {
-					if (attemptId) {
+					if (attemptId && history) {
 						await history.finish(
 							attemptId,
 							historyWaiting

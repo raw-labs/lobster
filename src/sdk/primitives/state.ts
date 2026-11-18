@@ -17,6 +17,7 @@ import { stateEnv } from "../state_env.js";
  */
 
 import { readStateJsonWithLock, writeStateJson } from "../../state/store.js";
+import type { SdkStageArgs } from "../runtime.js";
 
 /**
  * Create a state.get stage
@@ -24,14 +25,14 @@ import { readStateJsonWithLock, writeStateJson } from "../../state/store.js";
  * @param {string} key - State key to read
  * @returns {Object} Stage object with run method
  */
-export function stateGet(key) {
+export function stateGet(key: string) {
 	if (!key) throw new Error("stateGet requires a key");
 
 	return {
 		type: "state.get",
 		key,
 
-		async run({ input, ctx }) {
+		async run({ input, ctx }: SdkStageArgs) {
 			// Drain input
 			for await (const _item of input) {
 				// no-op
@@ -54,15 +55,15 @@ export function stateGet(key) {
  * @param {string} key - State key to write
  * @returns {Object} Stage object with run method
  */
-export function stateSet(key) {
+export function stateSet(key: string) {
 	if (!key) throw new Error("stateSet requires a key");
 
 	return {
 		type: "state.set",
 		key,
 
-		async run({ input, ctx }) {
-			const items = [];
+		async run({ input, ctx }: SdkStageArgs) {
+			const items: unknown[] = [];
 			for await (const item of input) {
 				items.push(item);
 			}
@@ -101,7 +102,7 @@ export const state = {
  * @param {Object} [ctx]
  * @returns {Promise<any>}
  */
-export async function readState(key, ctx: any = {}) {
+export async function readState(key: string, ctx: any = {}) {
 	return readStateJsonWithLock({ env: stateEnv(ctx), key, signal: ctx?.signal });
 }
 
@@ -112,6 +113,6 @@ export async function readState(key, ctx: any = {}) {
  * @param {Object} [ctx]
  * @returns {Promise<void>}
  */
-export async function writeState(key, value, ctx: any = {}) {
+export async function writeState(key: string, value: unknown, ctx: any = {}) {
 	await writeStateJson({ env: stateEnv(ctx), key, value, signal: ctx?.signal });
 }

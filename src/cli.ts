@@ -12,6 +12,7 @@ import { recorderFromEnv } from "./persistence/context.js";
 import { withExecution } from "./persistence/execution.js";
 import { openStoreSession } from "./persistence/session.js";
 import { parseResumeArgs } from "./resume/resume.js";
+import type { ResumeTarget } from "./resume/options.js";
 import { readLineFromStream } from "./io/read_line.js";
 import { defaultStateDir } from "./state/store.js";
 import { pendingUpgrade, upgradeStore, type UpgradeReport } from "./workflows/upgrade.js";
@@ -47,7 +48,7 @@ const USAGE_TOPICS = new Set([
 	"help",
 ]);
 
-export async function runCli(argv) {
+export async function runCli(argv: string[]) {
 	const cancellation = createCliCancellation();
 	try {
 		await runCliWithSignal(argv, cancellation.signal, cancellation.signal);
@@ -67,7 +68,7 @@ export async function runCli(argv) {
 }
 
 async function runCliWithSignal(
-	argv,
+	argv: string[],
 	signal: AbortSignal,
 	forceTerminationSignal: AbortSignal = signal,
 ) {
@@ -288,14 +289,13 @@ function createCliCancellation() {
 		signal: controller.signal,
 		get exitCode() {
 			if (!received) return undefined;
-			return (
-				{
-					SIGINT: 130,
-					SIGHUP: 129,
-					SIGQUIT: 131,
-					SIGTERM: 143,
-				} as const
-			)[received];
+			const codes: Partial<Record<NodeJS.Signals, number>> = {
+				SIGINT: 130,
+				SIGHUP: 129,
+				SIGQUIT: 131,
+				SIGTERM: 143,
+			};
+			return codes[received];
 		},
 		dispose() {
 			for (const [terminatingSignal, listener] of listeners) {
@@ -305,7 +305,7 @@ function createCliCancellation() {
 	};
 }
 
-async function handleGraph({ argv }) {
+async function handleGraph({ argv }: { argv: string[] }) {
 	const parsed = parseGraphArgs(argv);
 	if (parsed.help) {
 		process.stdout.write(graphHelpText());
@@ -430,7 +430,7 @@ async function handleRunInternal({
 	const emit = (envelope: ToolPayload) =>
 		(onEnvelope ?? writeToolEnvelope)({
 			...envelope,
-			...(recorderFromEnv(env) ? { runId: recorderFromEnv(env).runId } : {}),
+			...(recorderFromEnv(env) ? { runId: recorderFromEnv(env)!.runId } : {}),
 		});
 	const parsed = parseRunArgs(argv);
 	const { mode, argsJson } = parsed;
@@ -646,7 +646,7 @@ function reportRunError(
 	type: "parse_error" | "runtime_error",
 	error: unknown,
 	prefix = type === "parse_error" ? "Parse error: " : "Error: ",
-	emit = writeToolEnvelope,
+	emit: (payload: ToolPayload) => void = writeToolEnvelope,
 ) {
 	const message = (error as { message?: string })?.message ?? String(error);
 	if (mode === "tool") {
@@ -730,11 +730,11 @@ async function resolveRunTarget(parsed: {
 	return parsed;
 }
 
-function normalizeMode(mode) {
+function normalizeMode(mode: string) {
 	return mode === "tool" ? "tool" : "human";
 }
 
-async function detectWorkflowFile(rest) {
+async function detectWorkflowFile(rest: string[]) {
 	if (rest.length !== 1) return null;
 	const candidate = rest[0];
 	if (!candidate || candidate.includes("|")) return null;
@@ -759,8 +759,8 @@ async function handleResume({
 	signal,
 	forceTerminationSignal,
 }: {
-	argv;
-	registry;
+	argv: string[];
+	registry: CommandRegistry;
 	signal: AbortSignal;
 	forceTerminationSignal: AbortSignal;
 }) {
@@ -780,20 +780,24 @@ async function handleResume({
 	try {
 		// A wait ID without --expected-revision answers the question as it stands now, as a
 		// token or a short approval ID does; --expected-revision adds the stale-question guard.
-		let expectedRevision = parsed.expectedRevision;
-		if (parsed.waitId && expectedRevision === null) {
-			const wait = await getWait({ waitId: parsed.waitId, ctx: { env: process.env } });
-			if (!wait) throw new Error(`Wait ${parsed.waitId} not found`);
-			expectedRevision = wait.revision;
-		}
+		let target: ResumeTarget;
+		if (parsed.waitId) {
+			let expectedRevision = parsed.expectedRevision;
+			if (expectedRevision == null) {
+				const wait = await getWait({ waitId: parsed.waitId, ctx: { env: process.env } });
+				if (!wait) throw new Error(`Wait ${parsed.waitId} not found`);
+				expectedRevision = wait.revision;
+			}
+			target = { waitId: parsed.waitId, expectedRevision };
+		} else if (parsed.token) target = { token: parsed.token };
+		else target = { approvalId: parsed.approvalId! };
 		envelope = await resumeToolRequest({
-			token: parsed.token ?? undefined,
-			approvalId: parsed.approvalId ?? undefined,
-			waitId: parsed.waitId,
-			expectedRevision: parsed.waitId ? expectedRevision : undefined,
-			approved: parsed.approved,
-			response: parsed.response,
-			cancel: parsed.cancel,
+			...target,
+			...(parsed.cancel
+				? { cancel: true as const }
+				: parsed.response !== undefined
+					? { response: parsed.response }
+					: { approved: parsed.approved === true }),
 			ctx: {
 				cwd: process.cwd(),
 				env: process.env,
@@ -830,8 +834,8 @@ async function handleDoctor({
 	signal,
 	forceTerminationSignal,
 }: {
-	argv;
-	registry;
+	argv: string[];
+	registry: CommandRegistry;
 	signal: AbortSignal;
 	forceTerminationSignal: AbortSignal;
 }) {
@@ -883,7 +887,7 @@ async function handleDoctor({
 	});
 }
 
-function writeToolEnvelope(payload) {
+function writeToolEnvelope(payload: object) {
 	const envelope = {
 		protocolVersion: 1,
 		...payload,
@@ -1001,7 +1005,11 @@ async function handleRuns(argv: string[], signal: AbortSignal) {
 		result = await listRuns({
 			ctx,
 			...(flags.status !== undefined
-				? { status: flags.status as NonNullable<Parameters<typeof listRuns>[0]["status"]> }
+				? {
+						status: flags.status as NonNullable<
+							NonNullable<Parameters<typeof listRuns>[0]>["status"]
+						>,
+					}
 				: {}),
 			...(flags.limit !== undefined ? { limit: flags.limit as number } : {}),
 			...(flags.after !== undefined ? { after: flags.after as string } : {}),

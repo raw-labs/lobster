@@ -25,7 +25,7 @@ export const pickCommand = defineCommand({
 		if (!spec) throw new Error("pick requires a comma-separated field list");
 		const fields = spec
 			.split(",")
-			.map((s) => s.trim())
+			.map((s: string) => s.trim())
 			.filter(Boolean);
 
 		return {
@@ -35,7 +35,9 @@ export const pickCommand = defineCommand({
 						yield item;
 						continue;
 					}
-					yield Object.fromEntries(fields.map((field) => [field, item[field]]));
+					yield Object.fromEntries(
+						fields.map((field: string) => [field, (item as Record<string, unknown>)[field]]),
+					);
 				}
 			})(),
 		};

@@ -111,7 +111,11 @@ export async function ensureDirectory(dir: string) {
  * power loss. New state files are private by default; existing file modes are
  * preserved across replacement. The temp file is removed on any failed path.
  */
-export async function writeFileAtomic(filePath, data, options: AtomicWriteOptions = {}) {
+export async function writeFileAtomic(
+	filePath: string,
+	data: string | Buffer,
+	options: AtomicWriteOptions = {},
+) {
 	const renameFile = options.renameFile ?? fsp.rename;
 	const syncDir = options.syncParentDir ?? syncParentDir;
 	const dir = path.dirname(filePath);

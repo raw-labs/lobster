@@ -2,10 +2,10 @@ import { tokenizeCommand } from "./command_tokens.js";
 import { booleanFlags } from "../commands/define.js";
 import type { CommandRegistry } from "../commands/types.js";
 
-function splitPipes(input) {
-	const parts = [];
+function splitPipes(input: string) {
+	const parts: string[] = [];
 	let current = "";
-	let quote = null;
+	let quote: string | null = null;
 
 	for (let i = 0; i < input.length; i++) {
 		const ch = input[i];
@@ -46,8 +46,8 @@ function splitPipes(input) {
 	return parts;
 }
 
-function parseArgs(tokens, booleanFlags: readonly string[] = []) {
-	const args = { _: [] };
+function parseArgs(tokens: string[], booleanFlags: readonly string[] = []) {
+	const args: { _: string[]; [flag: string]: unknown } = { _: [] };
 
 	for (let i = 0; i < tokens.length; i++) {
 		const tok = tokens[i];

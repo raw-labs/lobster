@@ -59,7 +59,7 @@ type ProcessResult = {
 	code: number | null;
 };
 
-type RunAbortableOptions = {
+export type RunAbortableOptions = {
 	env: NodeJS.ProcessEnv;
 	cwd?: string;
 	stdin?: string | null;
@@ -161,7 +161,7 @@ export function runAbortableProcess(options: RunAbortableProcessOptions): Promis
 		// Keep direct argv and shell command dataflow at distinct spawn sites.
 		// Merging them makes shell interpretation leak into direct executable callers.
 		const child =
-			"shellCommand" in options
+			options.shellCommand !== undefined
 				? (() => {
 						const shell = resolveInlineShellCommand({ command: options.shellCommand, env });
 						options.onEffectDispatch?.();

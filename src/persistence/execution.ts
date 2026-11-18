@@ -26,7 +26,7 @@ type ExecutionOutcome = {
 
 export async function withStoreContext<C extends ExecutionContext, T>(
 	ctx: C,
-	task: (ctx: C) => Promise<T>,
+	task: (ctx: C & { env: StoreEnvironment }) => Promise<T>,
 ): Promise<T> {
 	const env = ctx.env ?? process.env;
 	const injected = ctx.storeSession ? resolveStoreSession(ctx.storeSession) : sessionFromEnv(env);

@@ -11,6 +11,7 @@
  */
 
 import { runGithubPr, parseGithubPr } from "./read_pr.js";
+import type { SdkStageArgs } from "../../sdk/runtime.js";
 
 /**
  * Create a GitHub PR view stage
@@ -21,7 +22,7 @@ import { runGithubPr, parseGithubPr } from "./read_pr.js";
  * @param {string[]} [options.fields] - Fields to fetch
  * @returns {Object} Stage object with run method
  */
-export function ghPrView(options) {
+export function ghPrView(options: { repo: string; pr: string | number; fields?: string[] }) {
 	const { repo, pr } = options;
 
 	if (!repo) throw new Error("ghPrView requires repo");
@@ -32,7 +33,7 @@ export function ghPrView(options) {
 		repo,
 		pr,
 
-		async run({ input, ctx }) {
+		async run({ input, ctx }: SdkStageArgs) {
 			// Drain input
 			for await (const _item of input) {
 				// no-op

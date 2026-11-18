@@ -1,9 +1,13 @@
 import { diffAndStore } from "../../state/store.js";
+import type { NamedWorkflow } from "../../commands/types.js";
 import { runGithubPr, parseGithubPr } from "./read_pr.js";
 import { buildPrChangeSummary, formatPrChangeMessage } from "./snapshot.js";
 export { buildPrChangeSummary } from "./snapshot.js";
 
-export async function runGithubPrMonitorWorkflow({ args, ctx }) {
+export async function runGithubPrMonitorWorkflow({
+	args,
+	ctx,
+}: Parameters<NamedWorkflow["run"]>[0]) {
 	ctx.signal?.throwIfAborted();
 	const repo = args.repo;
 	const pr = args.pr;
@@ -75,7 +79,10 @@ export async function runGithubPrMonitorWorkflow({ args, ctx }) {
 	};
 }
 
-export async function runGithubPrMonitorNotifyWorkflow({ args, ctx }) {
+export async function runGithubPrMonitorNotifyWorkflow({
+	args,
+	ctx,
+}: Parameters<NamedWorkflow["run"]>[0]) {
 	const base = await runGithubPrMonitorWorkflow({
 		args: {
 			...args,

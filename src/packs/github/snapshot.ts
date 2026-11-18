@@ -1,4 +1,4 @@
-function pickSubset(snapshot: Record<string, unknown> | null) {
+function pickSubset(snapshot: Record<string, unknown> | null): Record<string, unknown> | null {
 	if (!snapshot || typeof snapshot !== "object") return null;
 	return {
 		number: snapshot.number,
@@ -42,7 +42,17 @@ export function buildPrChangeSummary(
 	};
 }
 
-export function formatPrChangeMessage({ repo, pr, changedFields, prInfo }) {
+export function formatPrChangeMessage({
+	repo,
+	pr,
+	changedFields,
+	prInfo,
+}: {
+	repo: string;
+	pr: string | number;
+	changedFields: string[];
+	prInfo?: { title?: unknown; url?: unknown } | null;
+}) {
 	const fields = changedFields.length ? ` (${changedFields.join(", ")})` : "";
 	const title = prInfo?.title ? `: ${prInfo.title}` : "";
 	const url = prInfo?.url ? ` ${prInfo.url}` : "";

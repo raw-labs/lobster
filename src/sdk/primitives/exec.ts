@@ -11,6 +11,7 @@ import { tokenizeCommand } from "../../pipeline/command_tokens.js";
  */
 
 import { runAbortableProcess } from "../../process/abortable_process.js";
+import type { SdkStageArgs } from "../runtime.js";
 
 function parseCommand(command: string) {
 	const [executable, ...argv] = tokenizeCommand(command, "sdk");
@@ -27,7 +28,7 @@ function parseCommand(command: string) {
  * @param {string} [options.cwd] - Working directory
  * @returns {Object} Stage object with run method
  */
-export function exec(cmdString, options: any = {}) {
+export function exec(cmdString: string, options: any = {}) {
 	const parseJson = options.json !== false;
 	const useShell = options.shell === true;
 	const cwd = options.cwd ?? process.cwd();
@@ -36,7 +37,7 @@ export function exec(cmdString, options: any = {}) {
 		type: "exec",
 		command: cmdString,
 
-		async run({ input, ctx }) {
+		async run({ input, ctx }: SdkStageArgs) {
 			// Drain input (exec doesn't use input stream)
 			for await (const _item of input) {
 				// no-op
@@ -93,6 +94,6 @@ export function exec(cmdString, options: any = {}) {
  * @param {Object} [options]
  * @returns {Object}
  */
-export function shell(cmdString, options = {}) {
+export function shell(cmdString: string, options: Record<string, unknown> = {}) {
 	return exec(cmdString, { ...options, shell: true });
 }

@@ -32,7 +32,7 @@ type RunMetadataRecord = Omit<RunRecord, "attempts" | "waits" | "events" | "rece
 // another one recovers the WAL would otherwise fail at once with "database is locked".
 const db = new DatabaseSync(workerData.path, { readOnly: workerData.readOnly, timeout: 5000 });
 try {
-	const version = db.prepare("SELECT sqlite_version() AS version").get().version;
+	const version = db.prepare("SELECT sqlite_version() AS version").get()!.version;
 	assertSqliteRuntime(process.versions.node, String(version));
 } catch (error) {
 	db.close();
@@ -52,7 +52,7 @@ function prepare(sql: string): ReturnType<DatabaseSync["prepare"]> {
 
 db.exec("PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON;");
 
-const version = Number(prepare("PRAGMA user_version").get().user_version);
+const version = Number(prepare("PRAGMA user_version").get()!.user_version);
 
 if (version !== 0 && version !== SCHEMA_VERSION) {
 	throw new Error(`Unsupported persistence schema ${version}`);
@@ -292,7 +292,7 @@ function transition(request: Transition): TransitionResult {
 				request.action.attempt.path,
 			);
 			// Supply the count separately so the request fingerprint stays stable on replay.
-			previousAttempts = Number(row.count);
+			previousAttempts = Number(row!.count);
 		}
 		if (request.action.kind === "execution-claim") {
 			const rows = prepare(

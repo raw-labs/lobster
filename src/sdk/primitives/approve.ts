@@ -1,3 +1,5 @@
+import type { SdkStageArgs } from "../runtime.js";
+
 /**
  * Approve primitive - Creates a hard halt point requiring human approval
  *
@@ -26,8 +28,8 @@ export function approve(options: any = {}) {
 		type: "approve",
 		prompt,
 
-		async run({ input, ctx: _ctx }) {
-			const items = [];
+		async run({ input, ctx: _ctx }: SdkStageArgs) {
+			const items: unknown[] = [];
 			for await (const item of input) {
 				items.push(item);
 			}

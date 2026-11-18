@@ -23,7 +23,18 @@ export function classifyResumeRef(
  * `<ref>` is a resume token, a short approval ID or a wait ID. The released spellings
  * `--token <t>`, `--id <approvalId>` and `--decision` keep working.
  */
-export function parseResumeArgs(argv: string[]) {
+/** A parsed `lobster resume`: one reference and one decision. */
+export type ResumeArgs = {
+	token: string | null;
+	approvalId: string | null;
+	waitId?: string;
+	expectedRevision?: number | null;
+	approved?: boolean;
+	response?: unknown;
+	cancel?: boolean;
+};
+
+export function parseResumeArgs(argv: string[]): ResumeArgs {
 	const { flags, positional } = parseArgv(
 		argv,
 		{
@@ -114,7 +125,7 @@ export async function resolveApprovalId(
 	});
 }
 
-export function decodeResumeToken(token) {
+export function decodeResumeToken(token: string) {
 	const payload = decodeToken(token);
 	if (!payload || typeof payload !== "object") throw new Error("Invalid token");
 	if (payload.protocolVersion !== 1) throw new Error("Unsupported protocol version");

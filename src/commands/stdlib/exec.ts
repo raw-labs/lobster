@@ -1,6 +1,7 @@
 import { defineCommand } from "../define.js";
 import { runAbortableProcess } from "../../process/abortable_process.js";
 import { streamOf } from "../../io/terminal.js";
+import type { RunAbortableOptions } from "../../process/abortable_process.js";
 
 export const execCommand = defineCommand({
 	name: "exec",
@@ -97,10 +98,16 @@ export const execCommand = defineCommand({
 	},
 });
 
+/** What a spawned command gets from the stage that runs it. */
+type ProcessContext = Pick<
+	RunAbortableOptions,
+	"env" | "cwd" | "stdin" | "signal" | "assertInvocationCurrent" | "forceTerminationSignal"
+>;
+
 async function runProcess(
-	command,
-	argv,
-	{ env, cwd, stdin, signal, assertInvocationCurrent, forceTerminationSignal },
+	command: string,
+	argv: string[],
+	{ env, cwd, stdin, signal, assertInvocationCurrent, forceTerminationSignal }: ProcessContext,
 ) {
 	const { stdout, stderr, code } = await runAbortableProcess({
 		command,
@@ -118,8 +125,8 @@ async function runProcess(
 }
 
 function runShellLine(
-	commandLine,
-	{ env, cwd, stdin, signal, assertInvocationCurrent, forceTerminationSignal },
+	commandLine: string,
+	{ env, cwd, stdin, signal, assertInvocationCurrent, forceTerminationSignal }: ProcessContext,
 ) {
 	return runAbortableProcess({
 		shellCommand: commandLine,
@@ -136,7 +143,7 @@ function runShellLine(
 	});
 }
 
-function encodeStdin(items, mode) {
+function encodeStdin(items: unknown[], mode: string) {
 	if (mode === "json") return JSON.stringify(items);
 	if (mode === "jsonl") {
 		return items.map((item) => JSON.stringify(item)).join("\n") + (items.length ? "\n" : "");

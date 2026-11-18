@@ -16,6 +16,7 @@ import { stateEnv } from "../state_env.js";
  */
 
 import { diffAndStore } from "../../state/store.js";
+import type { SdkStageArgs } from "../runtime.js";
 
 /**
  * Create a diff.last stage
@@ -28,7 +29,7 @@ import { diffAndStore } from "../../state/store.js";
  * @param {boolean} [options.changesOnly=false] - If true, suppress output when unchanged
  * @returns {Object} Stage object with run method
  */
-export function diffLast(key, options: any = {}) {
+export function diffLast(key: string, options: any = {}) {
 	if (!key) throw new Error("diffLast requires a key");
 
 	const changesOnly = options.changesOnly === true;
@@ -37,8 +38,8 @@ export function diffLast(key, options: any = {}) {
 		type: "diff.last",
 		key,
 
-		async run({ input, ctx }) {
-			const items = [];
+		async run({ input, ctx }: SdkStageArgs) {
+			const items: unknown[] = [];
 			for await (const item of input) {
 				items.push(item);
 			}
@@ -85,6 +86,6 @@ export function diffLast(key, options: any = {}) {
  * @param {Object} [ctx]
  * @returns {Promise<{before: any, after: any, changed: boolean}>}
  */
-export async function diffAndStoreValue(key, value, ctx: any = {}) {
+export async function diffAndStoreValue(key: string, value: unknown, ctx: any = {}) {
 	return diffAndStore({ env: stateEnv(ctx), key, value, signal: ctx?.signal });
 }

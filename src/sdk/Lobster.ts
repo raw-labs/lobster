@@ -27,7 +27,7 @@ import {
 	type PausedPipeline,
 } from "../workflows/upgrade.js";
 import { CheckpointTakenError } from "../persistence/session.js";
-import { sdkInputItems, sdkPipelineText, sdkStageRegistry } from "./runtime.js";
+import { sdkInputItems, sdkPipelineText, sdkStageRegistry, type SdkStage } from "./runtime.js";
 import { stateEnv } from "./state_env.js";
 
 /** A token handed out by Lobster versions before SDK pipelines became runs. */
@@ -55,9 +55,9 @@ export type LobsterOptions = PersistenceOptions & {
  * an instance with the same stages, once per token, like any other run.
  */
 export class Lobster {
-	#stages = [];
-	#options: LobsterOptions;
-	#meta = null;
+	#stages: SdkStage[] = [];
+	#options: LobsterOptions & { env: NodeJS.ProcessEnv };
+	#meta: Record<string, unknown> | null = null;
 
 	constructor(options: LobsterOptions = {}) {
 		this.#options = {
@@ -71,7 +71,7 @@ export class Lobster {
 		};
 	}
 
-	pipe(stage) {
+	pipe(stage: SdkStage) {
 		if (typeof stage !== "function" && typeof stage?.run !== "function") {
 			throw new Error("Stage must be a function or have a run() method");
 		}
@@ -79,7 +79,7 @@ export class Lobster {
 		return this;
 	}
 
-	meta(meta) {
+	meta(meta: Record<string, unknown>) {
 		this.#meta = meta;
 		return this;
 	}

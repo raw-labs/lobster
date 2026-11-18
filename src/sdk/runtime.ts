@@ -8,19 +8,26 @@ import { runPipeline as runCorePipeline } from "../pipeline/runtime.js";
  */
 
 /**
- * Collect async iterable to array
- * @param {AsyncIterable} iterable
- * @returns {Promise<any[]>}
+ * What a stage object's `run` gets: the stream of items, and the command context (the same
+ * one built-in commands get, with `requestInput`, `env`, `signal` and the rest).
  */
-async function collectItems(iterable) {
-	const items = [];
+export type SdkStageArgs = { input: AsyncIterable<unknown>; ctx: any };
+
+/**
+ * A stage of an SDK pipeline: a function of the stage's items (a generator function gets the
+ * stream instead), or an object with a command-like `run`.
+ */
+export type SdkStage = ((items: any, ctx: any) => unknown) | { run(args: SdkStageArgs): unknown };
+
+async function collectItems(iterable: AsyncIterable<unknown> | Iterable<unknown>) {
+	const items: unknown[] = [];
 	for await (const item of iterable) {
 		items.push(item);
 	}
 	return items;
 }
 
-function normalizeSdkOutput(output) {
+function normalizeSdkOutput(output: any): unknown[] | AsyncIterable<unknown> | Iterable<unknown> {
 	if (output === null || output === undefined) return [];
 	if (Array.isArray(output)) return output;
 	if (
@@ -32,15 +39,6 @@ function normalizeSdkOutput(output) {
 	return [output];
 }
 
-/**
- * Run a pipeline of stages
- *
- * @param {Object} options
- * @param {Array<Function|Object>} options.stages - Pipeline stages
- * @param {Object} options.ctx - Execution context
- * @param {any[]} [options.input] - Initial input items
- * @returns {Promise<PipelineResult>}
- */
 /** The pipeline text naming SDK stages: `sdk.stage.0 | sdk.stage.1 | ...`. */
 export function sdkPipelineText(count: number) {
 	return Array.from({ length: count }, (_stage, index) => `sdk.stage.${index}`).join(" | ");
@@ -50,13 +48,13 @@ export function sdkPipelineText(count: number) {
  * Commands named `sdk.stage.<n>` that run an SDK instance's stages. A run saves only these
  * names, so the instance that resumes it supplies the stages again.
  */
-export function sdkStageRegistry(stages, runtimeCtx: Record<string, unknown> = {}) {
+export function sdkStageRegistry(stages: SdkStage[], runtimeCtx: Record<string, unknown> = {}) {
 	const commands = new Map(
 		stages.map((stage, index) => [
 			`sdk.stage.${index}`,
 			{
 				meta: { description: `SDK stage ${index}`, argsSchema: { type: "object" } },
-				async run({ input, ctx }) {
+				async run({ input, ctx }: { input: AsyncIterable<unknown>; ctx: Record<string, unknown> }) {
 					const stageCtx = { ...runtimeCtx, ...ctx };
 					if (typeof stage === "function") {
 						const isGenerator =
@@ -72,7 +70,7 @@ export function sdkStageRegistry(stages, runtimeCtx: Record<string, unknown> = {
 					}
 
 					if (typeof stage?.run === "function") {
-						const result = await stage.run({ input, ctx: stageCtx });
+						const result: any = await stage.run({ input, ctx: stageCtx });
 						return result && "output" in result
 							? { ...result, output: normalizeSdkOutput(result.output) }
 							: result;
@@ -118,7 +116,20 @@ export async function runPipeline({
 	signal = undefined,
 	requestInputResume = undefined,
 	requestInputEnabled = true,
-}) {
+}: Pick<
+	Parameters<typeof runCorePipeline>[0],
+	| "pipeline"
+	| "registry"
+	| "stdin"
+	| "stdout"
+	| "stderr"
+	| "env"
+	| "mode"
+	| "input"
+	| "signal"
+	| "requestInputResume"
+	| "requestInputEnabled"
+>) {
 	return runCorePipeline({
 		pipeline,
 		registry,

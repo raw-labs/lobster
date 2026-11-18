@@ -24,7 +24,15 @@ function rememberWrite(filePath: string, text: string, value: unknown) {
 	}
 }
 
-async function readRememberedState({ env, key, signal }) {
+async function readRememberedState({
+	env,
+	key,
+	signal,
+}: {
+	env: Record<string, string | undefined>;
+	key: string;
+	signal?: AbortSignal;
+}) {
 	const text = await readStateTextWithLock({ env, key, signal });
 	if (text === null) return null;
 	const value = JSON.parse(text);

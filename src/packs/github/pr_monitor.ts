@@ -28,7 +28,17 @@ import { ghPrView } from "./pr_view.js";
  * @param {AbortSignal} [options.signal] - Cancel the running GitHub command
  * @returns {Lobster}
  */
-export function prMonitor(options) {
+/** Options of the GitHub PR monitors. */
+export type PrMonitorOptions = {
+	repo: string;
+	pr: string | number;
+	key?: string;
+	changesOnly?: boolean;
+	summaryOnly?: boolean;
+	signal?: AbortSignal;
+};
+
+export function prMonitor(options: PrMonitorOptions) {
 	const { repo, pr, changesOnly = false, summaryOnly = false } = options;
 	const key = options.key ?? `github.pr:${repo}#${pr}`;
 
@@ -133,7 +143,7 @@ prMonitor.meta = {
  * @param {AbortSignal} [options.signal] - Cancel the running GitHub command
  * @returns {Lobster}
  */
-export function prMonitorNotify(options) {
+export function prMonitorNotify(options: PrMonitorOptions) {
 	const { repo, pr } = options;
 	const key = options.key ?? `github.pr:${repo}#${pr}`;
 

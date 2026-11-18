@@ -85,7 +85,7 @@ async function ask(machine: Machine, stepId: string, key: string, frame: Activat
 	});
 	// Through resolveWait: a question published earlier (in tool mode) is consumed with it.
 	return machine.resolveWait(key, frame, {
-		...frame.result,
+		...frame.result!,
 		approved,
 		...(approvedBy ? { approvedBy } : {}),
 	});

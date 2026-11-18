@@ -33,21 +33,22 @@ export async function repeat(machine: Machine, step: WorkflowStep, key: string, 
 	const frame = activation(machine.state, key);
 	const config = step.repeat!;
 	frame.cursor ??= 0;
+	let rounds = frame.cursor;
 	frame.results ??= createRecord();
 	const gatesRefused = loopGatesRefused(step, scope);
 	while (true) {
 		const seen = Object.assign(createRecord(scope.results), frame.results);
 		// Decided from saved results each time, so recovery decides the same way.
-		if (frame.cursor > 0) {
+		if (rounds > 0) {
 			if (evaluateCondition(config.until, seen)) break;
-			if (frame.cursor >= config.max) {
+			if (rounds >= config.max) {
 				if (config.on_max === "continue") break;
 				throw new Error(
 					`Workflow step ${step.id} repeat: until did not hold after ${config.max} round${config.max === 1 ? "" : "s"}`,
 				);
 			}
 		}
-		const round = frame.cursor + 1;
+		const round: number = rounds + 1;
 		const bodyKey = occurrence(key, "round-" + round);
 		await sequence(machine, step.steps!, bodyKey, {
 			...scope,
@@ -59,7 +60,7 @@ export async function repeat(machine: Machine, step: WorkflowStep, key: string, 
 		const body = activation(machine.state, bodyKey);
 		frame.results = Object.assign(createRecord(), body.results);
 		frame.lastStepId = body.lastStepId;
-		frame.cursor = round;
+		frame.cursor = rounds = round;
 		// The round's results are kept above; its records are not needed to recover.
 		machine.forgetBelow(bodyKey, true, frame);
 	}

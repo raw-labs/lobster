@@ -1,5 +1,5 @@
 import { defineCommand } from "../define.js";
-function stringifyCell(v) {
+function stringifyCell(v: unknown) {
 	if (v === null || v === undefined) return "";
 	if (typeof v === "string") return v;
 	if (typeof v === "number" || typeof v === "boolean") return String(v);
@@ -29,8 +29,8 @@ export const tableCommand = defineCommand({
 
 		const sample = items.slice(0, 20);
 		if (sample.every((x) => x && typeof x === "object" && !Array.isArray(x))) {
-			const cols = [];
-			const seen = new Set();
+			const cols: string[] = [];
+			const seen = new Set<string>();
 			for (const obj of sample) {
 				for (const k of Object.keys(obj)) {
 					if (!seen.has(k)) {
@@ -48,7 +48,7 @@ export const tableCommand = defineCommand({
 				rows.reduce((width, row) => Math.max(width, row[i].length), 3),
 			);
 
-			const renderRow = (row) => row.map((cell, i) => cell.padEnd(widths[i])).join("  ");
+			const renderRow = (row: string[]) => row.map((cell, i) => cell.padEnd(widths[i])).join("  ");
 			ctx.stdout.write(renderRow(rows[0]) + "\n");
 			ctx.stdout.write(widths.map((w) => "-".repeat(w)).join("  ") + "\n");
 			for (const row of rows.slice(1)) ctx.stdout.write(renderRow(row) + "\n");

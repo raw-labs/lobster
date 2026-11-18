@@ -72,7 +72,7 @@ export const approveCommand = defineCommand({
 	},
 });
 
-function buildPreview(items) {
+function buildPreview(items: unknown[]) {
 	if (!items.length) return "";
 	if (items.every((item) => typeof item === "string")) {
 		return items.join("\n");

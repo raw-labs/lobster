@@ -1,4 +1,4 @@
-import type { WorkflowStep } from "./types.js";
+import type { WorkflowInputRequest, WorkflowStep } from "./types.js";
 
 /** What a step does. The loader admits one kind per step (an approval may follow a command). */
 export type StepKind =
@@ -38,7 +38,7 @@ export function isApprovalStep(approval: WorkflowStep["approval"]) {
 	return false;
 }
 
-export function isInputStep(input: WorkflowStep["input"]) {
+export function isInputStep(input: WorkflowStep["input"]): input is WorkflowInputRequest {
 	return Boolean(input && typeof input === "object" && !Array.isArray(input));
 }
 

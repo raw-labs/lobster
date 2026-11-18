@@ -1,10 +1,10 @@
-export function createJsonRenderer(stdout) {
+export function createJsonRenderer(stdout: NodeJS.WritableStream) {
 	return {
-		json(items) {
+		json(items: unknown) {
 			stdout.write(JSON.stringify(items, null, 2));
 			stdout.write("\n");
 		},
-		lines(lines) {
+		lines(lines: Iterable<unknown>) {
 			for (const line of lines) stdout.write(String(line) + "\n");
 		},
 	};

@@ -1,8 +1,12 @@
 import { defineCommand } from "../define.js";
-import { prepareSchema, schemaValidationMessage } from "../../util/validation.js";
+import {
+	prepareSchema,
+	schemaValidationMessage,
+	type SchemaValidator,
+} from "../../util/validation.js";
 import { isInteractive, PREVIEW_CHARS, streamOf } from "../../io/terminal.js";
 
-function compileAskValidator(schema) {
+function compileAskValidator(schema: unknown) {
 	try {
 		return prepareSchema(schema);
 	} catch {
@@ -10,12 +14,12 @@ function compileAskValidator(schema) {
 	}
 }
 
-function validateAskResponse(validator, response) {
+function validateAskResponse(validator: SchemaValidator, response: unknown) {
 	const result = validator.validate(response);
 	if (!result.ok) throw new Error(schemaValidationMessage("ask response", result.errors));
 }
 
-function parseInteractiveCandidates(text) {
+function parseInteractiveCandidates(text: string) {
 	let parsed;
 	try {
 		parsed = JSON.parse(text);

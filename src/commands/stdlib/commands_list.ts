@@ -34,7 +34,7 @@ export const commandsListCommand = defineCommand({
 		}
 
 		const names = ctx.registry.list();
-		const output = names.map((name) => {
+		const output = names.map((name: string) => {
 			const cmd = ctx.registry.get(name) as LobsterCommand | undefined;
 			const help = typeof cmd?.help === "function" ? String(cmd.help(name)) : "";
 			const description = cmd?.meta?.description ?? parseDescriptionFromHelp(help);

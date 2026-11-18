@@ -28,7 +28,7 @@ test("parsePipeline preserves JSON escapes in double-quoted args", () => {
 	);
 	assert.equal(p.length, 1);
 	const raw = p[0].args["args-json"];
-	const parsed = JSON.parse(raw);
+	const parsed = JSON.parse(String(raw));
 	assert.equal(parsed.prompt, "line1\nline2");
 	assert.equal(parsed.schema.type, "object");
 });
@@ -43,7 +43,7 @@ test("parsePipeline preserves escaped apostrophes in single-quoted args", () => 
 	const p = parsePipeline('openclaw.invoke --args-json \'{"prompt":"don\\\'t"}\'');
 	assert.equal(p.length, 1);
 	const raw = p[0].args["args-json"];
-	const parsed = JSON.parse(raw);
+	const parsed = JSON.parse(String(raw));
 	assert.equal(parsed.prompt, "don't");
 });
 

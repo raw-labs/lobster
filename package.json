@@ -59,7 +59,7 @@
 		"clean": "node -e \"require('fs').rmSync('dist', { recursive: true, force: true })\"",
 		"build": "pnpm clean && tsc -p tsconfig.build.json",
 		"prepack": "pnpm build",
-		"typecheck": "tsc -p tsconfig.json --noEmit",
+		"typecheck": "tsc -p tsconfig.build.json --noEmit && tsc -p tsconfig.json --noEmit",
 		"format": "oxfmt --write package.json tsconfig.json tsconfig.build.json bin src test",
 		"format:check": "oxfmt --check package.json tsconfig.json tsconfig.build.json bin src test",
 		"lint": "pnpm format:check && oxlint --tsconfig tsconfig.json bin src test",
