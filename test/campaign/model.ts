@@ -10,11 +10,12 @@
 // of the same workflow meet the same decisions whatever happens in between.
 import { AsyncLocalStorage } from "node:async_hooks";
 import { openStoreSession } from "../../src/persistence/session.js";
-import { ExecutionConflictError } from "../../src/engine/state.js";
-import { advanceWorkflowRun, runWorkflowFile, signalEvent } from "../../src/engine/runner.js";
+import { ExecutionConflictError } from "../../src/engine/errors.js";
+import { advanceWorkflowRun, runWorkflowFile } from "../../src/engine/runner.js";
+import { signalEvent } from "../../src/engine/due.js";
 import { decodeToken } from "../../src/resume/token.js";
 import type { WorkflowStep } from "../../src/workflows/types.js";
-import type { ExecutionState } from "../../src/engine/state.js";
+import type { ExecutionState } from "../../src/engine/checkpoint.js";
 import type { FakeBehavior } from "../helpers/fake_command.js";
 import type { WorkflowFixture } from "../helpers/workflow_runner.js";
 import { random, type Random } from "./settings.js";

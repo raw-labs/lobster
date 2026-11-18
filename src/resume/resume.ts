@@ -1,5 +1,5 @@
 import { decodeToken, encodeToken } from "./token.js";
-import { decodeWorkflowResumePayload, type WorkflowResumePayload } from "../engine/runner.js";
+import { decodeWorkflowResumePayload, type WorkflowResumePayload } from "./token.js";
 import { findStateKeyByApprovalId } from "../state/store.js";
 import { parseArgv } from "../util/argv.js";
 

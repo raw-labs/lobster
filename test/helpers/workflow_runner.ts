@@ -5,11 +5,12 @@ import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { PassThrough } from "node:stream";
-import { advanceWorkflowRun, runWorkflowFile, signalEvent } from "../../src/engine/runner.js";
+import { advanceWorkflowRun, runWorkflowFile } from "../../src/engine/runner.js";
+import { signalEvent } from "../../src/engine/due.js";
 import { openStoreSession } from "../../src/persistence/session.js";
 import { decodeToken } from "../../src/resume/token.js";
 import type { WorkflowRunResult } from "../../src/workflows/types.js";
-import type { ExecutionState } from "../../src/engine/state.js";
+import type { ExecutionState } from "../../src/engine/checkpoint.js";
 import { createFakeCommand, type FakeCommand } from "./fake_command.js";
 
 export type RunResult = WorkflowRunResult & { runId?: string };

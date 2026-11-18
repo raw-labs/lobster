@@ -1,3 +1,4 @@
+import type { RetryConfig } from "./retry.js";
 import type { CostLimit, CostSummary } from "../llm/cost_tracker.js";
 
 export type WorkflowFile = {
@@ -69,13 +70,7 @@ export type WorkflowStep = {
 	/** Pause the run until an external event arrives (`lobster signal`). */
 	wait?: WorkflowEventWait;
 	on_error?: "stop" | "continue" | "skip_rest";
-	retry?: {
-		max?: number;
-		backoff?: "fixed" | "exponential";
-		delay_ms?: number;
-		max_delay_ms?: number;
-		jitter?: boolean;
-	};
+	retry?: RetryConfig;
 };
 
 /** How long a question or event wait may take, and what happens after that. */
@@ -151,6 +146,8 @@ export type WorkflowWaitingFor =
 export type WorkflowRunResult = {
 	status: "ok" | "needs_approval" | "needs_input" | "waiting" | "cancelled";
 	output: unknown[];
+	/** Why a cancelled run was cancelled ("Not approved", a deadline). */
+	reason?: string;
 	/** A standalone pipeline whose renderer (`table`, `json`) already wrote its output. */
 	rendered?: boolean;
 	waitingFor?: WorkflowWaitingFor;

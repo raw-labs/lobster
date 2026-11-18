@@ -1,7 +1,10 @@
-import { activation } from "../state.js";
-import type { Machine, Scope } from "../machine.js";
+// A `sleep:` step: waits in place when short, otherwise pauses the run until its time.
 import type { WorkflowStep } from "../../workflows/types.js";
-import { parseDuration } from "../../util/duration.js";
+import { parseDuration, sleepUntil } from "../../util/duration.js";
+import { activation } from "../checkpoint.js";
+import type { Machine } from "../machine.js";
+import type { Scope } from "../scope.js";
+import { publishWait, resolveWait, suspend, waitOf } from "../waits.js";
 
 const DEFAULT_INLINE_SLEEP_MS = 60_000;
 
@@ -13,29 +16,26 @@ function inlineSleepMs(env: Record<string, string | undefined>) {
 }
 
 /**
- * `sleep:` publishes a timer wait with a fixed wake time, then either waits in place (short
- * sleeps) or pauses the run until `lobster runs advance --due` comes back after that time.
+ * Publish a timer wait with a fixed wake time, then wait in place (short sleeps) or pause the
+ * run until `lobster runs advance --due` comes back after that time.
  */
-export async function sleep(machine: Machine, step: WorkflowStep, key: string, scope: Scope) {
+export async function sleepStep(machine: Machine, step: WorkflowStep, key: string, scope: Scope) {
 	const frame = activation(machine.state, key);
-	frame.stepId = step.id;
 	if (frame.phase === "completed") return frame.result!;
 	// Fixed on first entry, so re-entering after a pause or a crash keeps the same time.
-	frame.wait ??= {
+	const { until } = waitOf(frame, "timer", step.id, () => ({
 		kind: "timer",
 		until: Date.now() + parseDuration(step.sleep, `Step ${step.id} sleep`),
-	};
-	const wait = frame.wait;
-	if (wait.kind !== "timer") throw new Error("Invalid sleep activation");
-	const remaining = wait.until - Date.now();
+	}));
+	const remaining = until - Date.now();
 	if (remaining > 0) {
-		if (remaining > inlineSleepMs(scope.ctx.env)) await machine.suspend(key, frame);
+		if (remaining > inlineSleepMs(scope.ctx.env)) await suspend(machine, key, frame);
 		// Saved first: a crash or Ctrl-C while waiting leaves an ordinary sleeping run.
-		await machine.publishWait(key, frame);
-		await machine.delay(wait.until, scope.ctx.signal);
+		await publishWait(machine, key, frame);
+		await sleepUntil(until, scope.ctx.signal);
 	}
-	return machine.resolveWait(key, frame, {
+	return resolveWait(machine, frame, {
 		id: step.id,
-		json: { until: new Date(wait.until).toISOString() },
+		json: { until: new Date(until).toISOString() },
 	});
 }

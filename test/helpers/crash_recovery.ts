@@ -14,6 +14,7 @@ import { openStoreSession } from "../../src/persistence/session.js";
 import { createFakeCommand } from "./fake_command.js";
 
 const fileUrl = new URL("../../src/engine/runner.js", import.meta.url).href;
+const dueUrl = new URL("../../src/engine/due.js", import.meta.url).href;
 const sessionUrl = new URL("../../src/persistence/session.js", import.meta.url).href;
 const coreUrl = new URL("../../src/core/tool_runtime.js", import.meta.url).href;
 const fakeUrl = new URL("./fake_command.js", import.meta.url).href;
@@ -40,7 +41,8 @@ if (process.env.CLOCK_OFFSET_MS) {
   Date.now = () => real() + Number(process.env.CLOCK_OFFSET_MS);
 }
 import { createToolContext } from ${JSON.stringify(coreUrl)};
-import { runWorkflowFile, advanceWorkflowRun, advanceDueRuns } from ${JSON.stringify(fileUrl)};
+import { runWorkflowFile, advanceWorkflowRun } from ${JSON.stringify(fileUrl)};
+import { advanceDueRuns } from ${JSON.stringify(dueUrl)};
 import { openStoreSession } from ${JSON.stringify(sessionUrl)};
 import { createFakeCommand } from ${JSON.stringify(fakeUrl)};
 const store = await openStoreSession({ env: process.env });

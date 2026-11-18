@@ -1,0 +1,60 @@
+// What a node runs in: the workflow, the results it can read, its environment and cost
+// limits, and whether the steps inside it may pause.
+import type { WorkflowStep, WorkflowStepResult } from "../workflows/types.js";
+import type { Definition } from "../workflows/definition.js";
+import { resolveRetryConfig } from "../workflows/retry.js";
+import type { LlmSpendLedger } from "../llm/accounting.js";
+import type { CostLimit } from "../llm/cost_tracker.js";
+import type { RunContext } from "./context.js";
+
+export type Scope = {
+	definition: Definition;
+	/** The step's place in the definition (`/a/b`), to find a child workflow frozen for it. */
+	definitionPath?: string;
+	args: Record<string, unknown>;
+	/** Results the steps here can read: everything before them, in this workflow. */
+	results: Record<string, WorkflowStepResult>;
+	/** The last step before this one that ran (an input step's default subject). */
+	lastStepId?: string;
+	/** A child workflow's environment, resolved when it was entered. */
+	baseEnv?: Record<string, string | undefined>;
+	env?: Record<string, string>;
+	cwd?: string;
+	/** The workflow files above this one, to refuse a child workflow that calls itself. */
+	ancestors: string[];
+	ctx: RunContext;
+	ledger: LlmSpendLedger;
+	/** Cost limits of the workflows above, with the spend each started from. */
+	parentLimits?: Array<{ limit: CostLimit; start: number }>;
+	/** The spend this workflow started from, for its own cost limit. */
+	costStart?: number;
+	/** Prefix of the names steps are charged under (`loop.` inside a loop). */
+	costPrefix: string;
+	/** Charge every step here to this name instead (the steps of a child workflow). */
+	accountAs?: string;
+	/** Why steps here cannot pause, if they cannot (see GATES_REFUSED). */
+	gatesRefused?: string;
+	/** Aborts when the enclosing step times out. */
+	timeoutSignal?: AbortSignal;
+	/** Start the enclosing step's timeout; activities call it right before dispatch. */
+	startTimeout?: () => void;
+};
+
+const GATES = "approvals, input, sleeps and waits are not supported";
+
+/** Why the steps inside a node cannot pause for a person, a time or an event. */
+export const GATES_REFUSED = {
+	child: `${GATES} inside a child workflow`,
+	parallel: `${GATES} inside a parallel branch`,
+	concurrent: `${GATES} inside a for_each with concurrency: several items would wait at once`,
+	retried: `${GATES} inside a for_each, repeat or switch with retry: a retry would run it again and ask again`,
+};
+
+/**
+ * Why the steps inside a loop or a switch cannot pause: the enclosing scope's reason, or a
+ * retry of the step, which would run them again and ask again.
+ */
+export function bodyGatesRefused(step: WorkflowStep, scope: Scope): string | undefined {
+	if (scope.gatesRefused) return scope.gatesRefused;
+	return resolveRetryConfig(step.retry).max > 1 ? GATES_REFUSED.retried : undefined;
+}

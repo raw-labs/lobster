@@ -15,6 +15,7 @@ import type {
 	RepeatConfig,
 	SwitchConfig,
 } from "./types.js";
+import { messageOf } from "../util/errors.js";
 
 export const WORKFLOW_FILE_EXTENSIONS = [".lobster", ".yaml", ".yml", ".json"];
 
@@ -33,9 +34,9 @@ export async function loadWorkflowFile(filePath: string): Promise<WorkflowFile> 
 	let parsed: unknown;
 	try {
 		parsed = ext === ".json" ? JSON.parse(text) : parseYaml(text);
-	} catch (error: any) {
+	} catch (error) {
 		throw new Error(
-			`Workflow file ${filePath} is not valid ${ext === ".json" ? "JSON" : "YAML"}: ${error?.message ?? error}`,
+			`Workflow file ${filePath} is not valid ${ext === ".json" ? "JSON" : "YAML"}: ${messageOf(error)}`,
 		);
 	}
 
@@ -390,9 +391,9 @@ function validateSteps(steps: WorkflowStep[], seen: Set<string>, known: Set<stri
 		if (step.input) {
 			try {
 				prepareSchema(step.input.responseSchema);
-			} catch (err: any) {
+			} catch (err) {
 				throw new Error(
-					`Workflow step ${step.id} input.responseSchema is invalid: ${err?.message ?? String(err)}`,
+					`Workflow step ${step.id} input.responseSchema is invalid: ${messageOf(err)}`,
 				);
 			}
 		}
@@ -505,8 +506,8 @@ function validateSwitch(step: WorkflowStep, seen: Set<string>, known: Set<string
 			throw new Error(`${where} requires when: a condition, or true`);
 		try {
 			checkCondition(entry.when, known);
-		} catch (error: any) {
-			throw new Error(`${where} when is not a valid condition: ${error?.message ?? error}`);
+		} catch (error) {
+			throw new Error(`${where} when is not a valid condition: ${messageOf(error)}`);
 		}
 		if (!Array.isArray(entry.steps) || entry.steps.length === 0)
 			throw new Error(`${where} requires a non-empty steps array`);
@@ -548,8 +549,8 @@ function validateRepeat(step: WorkflowStep, seen: Set<string>, known: Set<string
 	validateSteps(step.steps, seen, inside);
 	try {
 		checkCondition(config.until, inside);
-	} catch (error: any) {
-		throw new Error(`${name} until is not a valid condition: ${error?.message ?? error}`);
+	} catch (error) {
+		throw new Error(`${name} until is not a valid condition: ${messageOf(error)}`);
 	}
 	refuseGatesUnderRetry(step, "repeat");
 }
@@ -685,8 +686,8 @@ function validateCondition(step: WorkflowStep, name: string, known: ReadonlySet<
 		if (typeof value === "string") {
 			try {
 				checkCondition(value, known);
-			} catch (error: any) {
-				throw new Error(`${name} ${key} is not a valid condition: ${error?.message ?? error}`);
+			} catch (error) {
+				throw new Error(`${name} ${key} is not a valid condition: ${messageOf(error)}`);
 			}
 		}
 	}

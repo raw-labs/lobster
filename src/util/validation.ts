@@ -24,6 +24,7 @@ import { CheckContext, CheckSchema, Errors, Meta, NextStack, Resolve, Stack } fr
 
 import { stableStringify } from "./serialization.js";
 import { isPlainObject } from "./objects.js";
+import { messageOf } from "./errors.js";
 
 /** One way a value does not match its schema. `path` is a JSON pointer, "/" for the value itself. */
 export type SchemaError = { path: string; message: string };
@@ -134,7 +135,7 @@ function fromHostCompiler(compile: HostSchemaCompiler, schema: unknown): SchemaV
 		try {
 			return compile(schema, { scope: hostScope, allErrors, addUsedSchema: false });
 		} catch (error) {
-			throw new InvalidSchemaError((error as Error)?.message ?? String(error));
+			throw new InvalidSchemaError(messageOf(error));
 		}
 	};
 	const first = prepare(false);

@@ -45,7 +45,7 @@ export function resolveStoreSession(handle: StoreHandle): StoreSession {
 	throw new Error("Invalid persistence session");
 }
 
-export type ResumeGuard = { key: string; expectedRevision: number; admitted: boolean };
+type ResumeGuard = { key: string; expectedRevision: number; admitted: boolean };
 
 type PersistenceContext = {
 	session: StoreSession;

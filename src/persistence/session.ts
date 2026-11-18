@@ -1,4 +1,4 @@
-import type { ExecutionState } from "../engine/state.js";
+import type { ExecutionState } from "../engine/checkpoint.js";
 import { assertSqliteNodeSupport } from "./sqlite-support.js";
 import { randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";

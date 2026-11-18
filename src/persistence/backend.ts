@@ -16,7 +16,7 @@ import type {
  */
 export const STATE_EXISTS = "LOBSTER_STATE_EXISTS";
 
-export type BackendKind = "sqlite";
+type BackendKind = "sqlite";
 
 export type StateWriteOptions = {
 	exclusive?: boolean;

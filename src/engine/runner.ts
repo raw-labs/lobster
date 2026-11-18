@@ -1,55 +1,32 @@
-import { randomUUID } from "node:crypto";
+// The run API: start a run (a workflow file, a standalone pipeline, an SDK pipeline), answer
+// a wait, advance a run that stopped, and abandon one. Each holds the run's execution lease
+// while it works. Many runs at once: due.ts.
 import path from "node:path";
 import { withStoreContext } from "../persistence/execution.js";
 import { bindRecorder, recorderFromEnv, sessionFromEnv } from "../persistence/context.js";
-import {
-	readStateJsonWithLock as readStateJson,
-	cleanupApprovalIndexByStateKey,
-} from "../state/store.js";
+import { readStateJsonWithLock } from "../state/store.js";
 import { loadWorkflowFile } from "../workflows/load.js";
 import { dryRunWorkflow } from "../workflows/dry_run.js";
 import { resolveWorkflowArgs } from "../workflows/args.js";
 import { pipelineDefinition, snapshotDefinition } from "../workflows/definition.js";
 import { ExecutionStore } from "./store.js";
-import { Machine, matchesEvent } from "./machine.js";
+import { Machine } from "./machine.js";
+import { answer, cancelWithdrawing } from "./waits.js";
 import type { RunContext } from "./context.js";
-import { ExecutionConflictError, type Definition, type ExecutionState } from "./state.js";
+import {
+	asContinuation,
+	isFinished,
+	keys,
+	unresolvedActivities,
+	type ExecutionState,
+} from "./checkpoint.js";
+import type { Definition } from "../workflows/definition.js";
 import type { WorkflowRunResult } from "../workflows/types.js";
 import { visibleTo, callerId } from "../persistence/waits.js";
-
-export { loadWorkflowFile } from "../workflows/load.js";
-export { resolveWorkflowArgs } from "../workflows/args.js";
-export { WorkflowResumeArgumentError, ResumeRefusedError } from "./gates.js";
-import { ResumeRefusedError } from "./gates.js";
-export type {
-	WorkflowFile,
-	ParallelBranch,
-	ParallelConfig,
-	WorkflowStep,
-	WorkflowApproval,
-	WorkflowInputRequest,
-	WorkflowStepResult,
-	WorkflowRunResult,
-} from "../workflows/types.js";
-
-/** A pause saved by an older Lobster. `lobster upgrade` converts it in place. */
-export class UpgradeRequiredError extends Error {
-	readonly code = "LOBSTER_UPGRADE_REQUIRED";
-	constructor() {
-		super(
-			"This was paused by an older version of Lobster. Run `lobster upgrade`, then resume it again with the same token or approval ID.",
-		);
-		this.name = "UpgradeRequiredError";
-	}
-}
-
-export type WorkflowResumePayload = {
-	protocolVersion: 1;
-	v: 1;
-	kind: "workflow-file";
-	stateKey?: string;
-	filePath?: string;
-};
+import type { StoreSession } from "../persistence/session.js";
+import { ExecutionRecorder } from "../persistence/session.js";
+import { ResumeRefusedError, UpgradeRequiredError } from "./errors.js";
+import type { WorkflowResumePayload } from "../resume/token.js";
 
 export type WorkflowRunOptions = {
 	filePath?: string;
@@ -63,8 +40,8 @@ export type WorkflowRunOptions = {
 	leaseMs?: number;
 	/** Run this definition instead of loading `filePath` (a standalone pipeline). */
 	definition?: Definition;
-	/** The kind recorded for a new run: "workflow" (default), "pipeline" or "sdk". */
-	kind?: string;
+	/** The kind recorded for a new run (default "workflow"). */
+	kind?: "workflow" | "pipeline" | "sdk";
 	/**
 	 * Set by the Lobster SDK, whose stages are closures only its host has: the run's pipeline
 	 * must name exactly these stages. Runs of kind "sdk" are refused without it.
@@ -108,8 +85,6 @@ export async function runWorkflowFile(
 		return dryRunWorkflow({
 			steps: workflow.steps,
 			resolvedArgs: resolveWorkflowArgs(workflow.args, options.args),
-			results: {},
-			startIndex: 0,
 			ctx: options.ctx,
 		});
 	}
@@ -118,44 +93,27 @@ export async function runWorkflowFile(
 			const session = sessionFromEnv(ctx.env)!;
 			let recorder = recorderFromEnv(ctx.env);
 			let runId: string;
-			// Load and validate first: a workflow that cannot start leaves no run behind.
 			let fresh: Pick<ExecutionState, "definition" | "args"> | undefined;
-			if (!options.resume) {
+			const stateKey = options.resume?.stateKey;
+			if (options.resume) {
+				runId = await resumedRunId(stateKey, ctx);
+				ctx.hooks?.onResumeStateResolved?.(stateKey!);
+			} else {
+				// Load and validate first: a workflow that cannot start leaves no run behind.
 				if (!options.filePath && !options.definition)
 					throw new Error("Workflow file path required");
 				const definition =
 					options.definition ?? (await snapshotDefinition(options.filePath!, options.args ?? {}));
 				fresh = { definition, args: resolveWorkflowArgs(definition.workflow.args, options.args) };
-			}
-			if (options.resume) {
-				if (!options.resume.stateKey)
-					throw new Error(
-						"This resume token is from a Lobster version that kept workflow state inside the token; it cannot be resumed",
-					);
-				const state = (await readStateJson({
-					env: ctx.env,
-					key: options.resume.stateKey,
-					signal: ctx.signal,
-				})) as { machineVersion?: number; runId?: string; type?: string } | null;
-				// A token an older Lobster already used left this marker behind.
-				if (!state || state.type === "lobster.consumed-resume-state.v1")
-					throw new ResumeRefusedError();
-				if (state.machineVersion !== 1 || !state.runId) throw new UpgradeRequiredError();
-				runId = state.runId;
-				ctx._onResumeStateResolved?.(options.resume.stateKey);
-			} else {
 				recorder ??= await session.createRun(options.kind ?? "workflow", ctx.runMetadata);
 				runId = recorder.runId;
 			}
-			const run = await session.getRunState(runId);
-			if (!run || !visibleTo(run, callerId(ctx.runMetadata)))
-				throw new Error("Workflow run not found");
+			const run = await findRun(session, runId, ctx);
 			assertRunnableHere(run.kind, options.sdk);
-			recorder ??= await session.recorderForState(options.resume!.stateKey!);
+			recorder ??= await session.recorderForState(stateKey!);
 			const bound = { ...ctx, env: recorder ? bindRecorder(ctx.env, recorder) : ctx.env };
-			const store = new ExecutionStore(session, runId, options.leaseMs);
-			try {
-				let state = await store.claim();
+			return withClaimedRun(session, runId, options, label, async (store, saved) => {
+				let state = saved;
 				if (!state) {
 					if (!fresh) throw new UpgradeRequiredError();
 					state = {
@@ -168,19 +126,12 @@ export async function runWorkflowFile(
 						startedAt: Date.now(),
 					};
 				}
-				if (state.version !== 1) throw new Error("Unsupported workflow execution version");
-				if (options.sdk) assertSdkPipeline(state, options.sdk);
+				checkExecution(state, options.sdk);
 				const machine = new Machine(state, store, bound);
 				if (!state.revision) await machine.save();
-				if (options.resume) {
-					await machine.answer(options.resume.stateKey!, options);
-				}
+				if (stateKey) await answer(machine, stateKey, options);
 				return { ...(await machine.run()), runId };
-			} catch (error) {
-				throw label(error, runId);
-			} finally {
-				await store.close();
-			}
+			});
 		}),
 	);
 }
@@ -199,177 +150,33 @@ export async function advanceWorkflowRun(options: {
 	return ownFailure((label) =>
 		withStoreContext({ ...options.ctx, trackRuns: true }, async (ctx) => {
 			const session = sessionFromEnv(ctx.env)!;
-			const run = await session.getRunState(options.runId);
-			if (!run || !visibleTo(run, callerId(ctx.runMetadata)))
-				throw new Error("Workflow run not found");
+			const run = await findRun(session, options.runId, ctx);
 			if (!run.execution)
 				throw new Error(
 					"Run has no restartable workflow checkpoint; migration or inspection required",
 				);
 			assertRunnableHere(run.kind, options.sdk);
-			const store = new ExecutionStore(session, run.id, options.leaseMs);
-			try {
-				const state = await store.claim();
-				if (state!.version !== 1) throw new Error("Unsupported workflow execution version");
-				if (options.sdk) assertSdkPipeline(state!, options.sdk);
-				const { ExecutionRecorder } = await import("../persistence/session.js");
+			return withClaimedRun(session, run.id, options, label, async (store, saved) => {
+				const state = saved!;
+				checkExecution(state, options.sdk);
 				const recorder = new ExecutionRecorder(session, run.id, "", run.historyEnabled !== false);
-				const machine = new Machine(state!, store, {
-					...ctx,
-					env: bindRecorder(ctx.env, recorder),
-				});
-				if (state!.status === "failed") {
+				const machine = new Machine(state, store, { ...ctx, env: bindRecorder(ctx.env, recorder) });
+				if (state.status === "failed") {
 					machine.retryFailed();
 					await machine.save();
 				}
 				return { ...(await machine.run()), runId: run.id };
-			} catch (error) {
-				throw label(error, run.id);
-			} finally {
-				await store.close();
-			}
+			});
 		}),
 	);
 }
 
-export type DueRunOutcome = {
-	runId: string;
-	status: WorkflowRunResult["status"] | "blocked" | "failed" | "busy";
-	waitingFor?: WorkflowRunResult["waitingFor"];
-	error?: string;
-};
-
-/** Advance one run, reporting the outcome instead of throwing (used for batches). */
-async function advanceReporting(runId: string, ctx: RunContext, leaseMs?: number) {
-	try {
-		const result = await advanceWorkflowRun({ runId, ctx, leaseMs });
-		return {
-			runId,
-			status: result.status,
-			...(result.waitingFor ? { waitingFor: result.waitingFor } : {}),
-		} satisfies DueRunOutcome;
-	} catch (error: any) {
-		// Another process holds the run's lease: it is being advanced right now.
-		if (error instanceof ExecutionConflictError) return { runId, status: "busy" } as DueRunOutcome;
-		const session = sessionFromEnv(ctx.env);
-		// Reporting must not fail the batch: the other runs' outcomes would be lost.
-		const run = session ? await session.getRunState(runId).catch(() => null) : null;
-		return {
-			runId,
-			status: run?.execution?.status === "blocked" ? "blocked" : "failed",
-			error: error?.message ?? String(error),
-		} as DueRunOutcome;
-	}
-}
-
 /**
- * Advance every run whose time has come, then return: a crashed run whose lease lapsed, a
- * timer that is due, a question or event wait past its deadline. Lobster never loops on its
- * own; a host, cron job or person calls this. The usual rules apply: a step that may have
- * acted re-runs only when repeatable, everything else becomes blocked for a person.
- */
-export async function advanceDueRuns(options: {
-	ctx: RunContext;
-	limit?: number;
-	/** How many runs to advance at once (default 4). Each is a separate run with its own lease. */
-	concurrency?: number;
-	dryRun?: boolean;
-	leaseMs?: number;
-}): Promise<{ due: string[]; advanced: DueRunOutcome[] }> {
-	const concurrency = options.concurrency ?? 4;
-	if (!Number.isSafeInteger(concurrency) || concurrency < 1)
-		throw new Error("concurrency must be a positive integer");
-	return withStoreContext({ ...options.ctx, trackRuns: true }, async (ctx) => {
-		const session = sessionFromEnv(ctx.env)!;
-		const due = await session.dueRuns({
-			limit: options.limit ?? 100,
-			callerId: callerId(ctx.runMetadata),
-		});
-		if (options.dryRun) return { due, advanced: [] };
-		// Runs share nothing but the store, whose writes are serialized: a slow run no longer
-		// delays the others beyond the number of runs advanced at once.
-		const advanced: DueRunOutcome[] = Array.from({ length: due.length });
-		let next = 0;
-		const worker = async () => {
-			while (next < due.length) {
-				const index = next++;
-				advanced[index] = await advanceReporting(due[index], ctx, options.leaseMs);
-			}
-		};
-		await Promise.all(Array.from({ length: Math.min(concurrency, due.length) }, worker));
-		return { due, advanced };
-	});
-}
-
-/**
- * Deliver an external event: store it in the inbox (a repeated `id` is ignored) and advance
- * the waiting runs whose `wait:` step it matches. Runs that reach their `wait:` later still
- * find it, since they match events received since they started.
- */
-export async function signalEvent(options: {
-	name: string;
-	data?: unknown;
-	id?: string;
-	ctx: RunContext;
-	leaseMs?: number;
-}): Promise<{ event: { id: string; name: string; inserted: boolean }; advanced: DueRunOutcome[] }> {
-	if (!/^[A-Za-z0-9_.:/-]+$/.test(options.name))
-		throw new Error("Event names use letters, digits and . _ : / -");
-	return withStoreContext({ ...options.ctx, trackRuns: true }, async (ctx) => {
-		const session = sessionFromEnv(ctx.env)!;
-		const id = options.id ?? randomUUID();
-		const owner = callerId(ctx.runMetadata);
-		// Scoped to the sender: its events reach only its own runs (or any run, for an unscoped
-		// trusted caller), and its delivery IDs cannot collide with another caller's.
-		const { inserted } = await session.appendEvent({
-			id,
-			name: options.name,
-			data: options.data ?? null,
-			at: Date.now(),
-			owner: owner ?? "",
-		});
-		const waiting: string[] = [];
-		for (let after = ""; ;) {
-			const page = await session.listRuns({
-				status: "waiting",
-				after,
-				limit: 100,
-				callerId: owner,
-			});
-			for (const summary of page.runs) {
-				const run = await session.getRunState(summary.id);
-				const listens = Object.values(run?.execution?.activations ?? {}).some(
-					(frame) =>
-						frame.phase === "waiting" &&
-						frame.wait?.kind === "event" &&
-						frame.wait.event === options.name &&
-						matchesEvent(frame.wait.match, options.data ?? null),
-				);
-				if (listens) waiting.push(summary.id);
-			}
-			if (!page.nextCursor) break;
-			after = page.nextCursor;
-		}
-		const advanced: DueRunOutcome[] = [];
-		for (const runId of waiting) {
-			// A run that is busy is usually just saving its wait; it looks at the inbox again
-			// after saving, but wait for it so this delivery reports what happened.
-			let outcome = await advanceReporting(runId, ctx, options.leaseMs);
-			for (let delay = 25; outcome.status === "busy" && delay <= 1600; delay *= 2) {
-				await new Promise((resolve) => setTimeout(resolve, delay));
-				outcome = await advanceReporting(runId, ctx, options.leaseMs);
-			}
-			advanced.push(outcome);
-		}
-		return { event: { id, name: options.name, inserted }, advanced };
-	});
-}
-
-/**
- * Stop a run for good: one that is blocked, was interrupted, or waits for an answer.
- * Steps that had started are recorded as abandoned (their outcome stays unknown and
- * nothing runs again), pending questions are withdrawn, and the run is cancelled, so
- * retention can clean it up. Refuses while another process is executing the run.
+ * Stop a run for good: one that is blocked, was interrupted, waits for an answer, or failed
+ * while commands of it were cut off. Steps that had started are recorded as abandoned
+ * (their outcome stays unknown and nothing runs again), pending questions are withdrawn,
+ * and the run is cancelled, so retention can clean it up. A run that ended otherwise is
+ * returned as it is. Refuses while another process is executing the run.
  */
 export async function abandonWorkflowRun(options: {
 	runId: string;
@@ -378,62 +185,91 @@ export async function abandonWorkflowRun(options: {
 }): Promise<{ runId: string; status: string; abandoned: string[] }> {
 	return withStoreContext({ ...options.ctx, trackRuns: true }, async (ctx) => {
 		const session = sessionFromEnv(ctx.env)!;
-		const run = await session.getRunState(options.runId);
-		if (!run || !visibleTo(run, callerId(ctx.runMetadata)))
-			throw new Error("Workflow run not found");
+		const run = await findRun(session, options.runId, ctx);
 		if (!run.execution) throw new Error("Run has no workflow execution to abandon");
-		if (["completed", "failed", "cancelled"].includes(run.execution.status))
+		if (settled(run.execution))
 			return { runId: run.id, status: run.execution.status, abandoned: [] };
-		const store = new ExecutionStore(session, run.id, options.leaseMs);
-		try {
-			const state = (await store.claim())!;
-			// It may have finished between the first read and the claim: keep its result.
-			if (["completed", "failed", "cancelled"].includes(state.status))
-				return { runId: run.id, status: state.status, abandoned: [] };
-			const abandoned: string[] = [];
-			const waits: string[] = [];
-			for (const [path, frame] of Object.entries(state.activations)) {
-				if (frame.phase === "started" && path.endsWith("/activity")) abandoned.push(path);
-				else if (frame.phase === "waiting" && frame.waitKey) waits.push(frame.waitKey);
-				else continue;
-				frame.phase = "abandoned";
-			}
-			state.status = "cancelled";
-			state.error =
-				"Abandoned" + (abandoned.length ? `; outcome unknown for ${abandoned.join(", ")}` : "");
-			// A cancelled run never runs again; the error above keeps what was abandoned.
-			state.activations = {};
-			const current = await session.getRunState(run.id);
-			const pending = waits.filter((key) => current?.waits[key]?.status === "pending");
-			if (!pending.length) await store.save(state);
-			for (const key of pending) await store.save(state, { consume: { key } });
-			for (const key of waits)
-				await cleanupApprovalIndexByStateKey({ env: ctx.env, stateKey: key }).catch(() => {});
-			return { runId: run.id, status: "cancelled", abandoned };
-		} finally {
-			await store.close();
-		}
+		return withClaimedRun(
+			session,
+			run.id,
+			options,
+			(error) => error,
+			async (store, saved) => {
+				const state = saved!;
+				// It may have finished between the first read and the claim: keep its result.
+				if (settled(state)) return { runId: run.id, status: state.status, abandoned: [] };
+				// A cancelled run never runs again; its error keeps what was abandoned.
+				const abandoned = unresolvedActivities(state);
+				await cancelWithdrawing(
+					new Machine(state, store, ctx),
+					"Abandoned" +
+						(abandoned.length
+							? `; outcome unknown for ${abandoned.map(keys.describe).join(", ")}`
+							: ""),
+				);
+				return { runId: run.id, status: "cancelled", abandoned };
+			},
+		);
 	});
 }
 
-export function decodeWorkflowResumePayload(payload: unknown): WorkflowResumePayload | null {
-	if (
-		!payload ||
-		typeof payload !== "object" ||
-		(payload as WorkflowResumePayload).kind !== "workflow-file"
-	)
-		return null;
-	const value = payload as WorkflowResumePayload;
-	if (value.protocolVersion !== 1 || value.v !== 1) throw new Error("Unsupported token version");
-	return value;
+/** A run abandoning would not change: finished, and with no command whose outcome is unknown. */
+function settled(state: ExecutionState) {
+	return isFinished(state) && !unresolvedActivities(state).length;
 }
 
-function stageCount(pipeline: string) {
-	return pipeline ? pipeline.split(" | ").length : 0;
+/** The run a resume token's continuation belongs to. */
+async function resumedRunId(stateKey: string | undefined, ctx: RunContext) {
+	if (!stateKey)
+		throw new Error(
+			"This resume token is from a Lobster version that kept workflow state inside the token; it cannot be resumed",
+		);
+	const saved = (await readStateJsonWithLock({
+		env: ctx.env,
+		key: stateKey,
+		signal: ctx.signal,
+	})) as {
+		type?: string;
+	} | null;
+	// A token an older Lobster already used left this marker behind.
+	if (!saved || saved.type === "lobster.consumed-resume-state.v1") throw new ResumeRefusedError();
+	const continuation = asContinuation(saved);
+	if (!continuation) throw new UpgradeRequiredError();
+	return continuation.runId;
 }
 
-/** An SDK instance continues only a run of the same stages. */
-function assertSdkPipeline(state: ExecutionState, sdk: { pipeline: string }) {
+/** The run `runId`, if this caller may see it. */
+async function findRun(session: StoreSession, runId: string, ctx: Pick<RunContext, "runMetadata">) {
+	const run = await session.getRunState(runId);
+	if (!run || !visibleTo(run, callerId(ctx.runMetadata))) throw new Error("Workflow run not found");
+	return run;
+}
+
+/**
+ * Claim the run's execution lease, run `task` with its saved checkpoint, and release the
+ * lease. A failure is labelled with the run (see ownFailure).
+ */
+async function withClaimedRun<T>(
+	session: StoreSession,
+	runId: string,
+	options: { leaseMs?: number },
+	label: (error: unknown, runId: string) => unknown,
+	task: (store: ExecutionStore, saved: ExecutionState | undefined) => Promise<T>,
+): Promise<T> {
+	const store = new ExecutionStore(session, runId, options.leaseMs);
+	try {
+		return await task(store, await store.claim());
+	} catch (error) {
+		throw label(error, runId);
+	} finally {
+		await store.close();
+	}
+}
+
+/** A checkpoint this version can continue, of the SDK instance's stages if it is one. */
+function checkExecution(state: ExecutionState, sdk: { pipeline: string } | undefined) {
+	if (state.version !== 1) throw new Error("Unsupported workflow execution version");
+	if (!sdk) return;
 	const saved = String(state.definition.workflow.steps[0]?.pipeline ?? "");
 	if (saved !== sdk.pipeline)
 		throw new ResumeRefusedError(
@@ -441,7 +277,10 @@ function assertSdkPipeline(state: ExecutionState, sdk: { pipeline: string }) {
 		);
 }
 
-/** Name the run an error stopped, so a host can inspect or retry it. */
+function stageCount(pipeline: string) {
+	return pipeline ? pipeline.split(" | ").length : 0;
+}
+
 /** The run each failure belongs to, set only here so a command cannot claim another run. */
 const failedRuns = new WeakMap<object, string>();
 

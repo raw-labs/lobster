@@ -78,6 +78,12 @@ export type CommandPack = {
 	workflows?: NamedWorkflow[];
 };
 
+/** A command as a host may supply it: only `run` is required (`meta` declares flags and safety). */
+export type CommandLike = Partial<LobsterCommand> & Pick<LobsterCommand, "run">;
+
+/** What running a pipeline needs of a registry: each command by name. */
+export type CommandLookup = { get(name: string): CommandLike | undefined };
+
 export type CommandRegistry = {
 	get(name: string): LobsterCommand | undefined;
 	/** Every name a command can be invoked by, aliases included, sorted. */

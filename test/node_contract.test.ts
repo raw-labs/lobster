@@ -16,15 +16,11 @@ import test, { type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { readdirSync } from "node:fs";
 import { setTimeout as sleep } from "node:timers/promises";
-import { loadWorkflowFile } from "../src/engine/runner.js";
+import { loadWorkflowFile } from "../src/workflows/load.js";
 import { snapshotDefinition } from "../src/workflows/definition.js";
 import { renderWorkflowGraph } from "../src/workflows/graph.js";
-import {
-	abandonWorkflowRun,
-	advanceDueRuns,
-	advanceWorkflowRun,
-	signalEvent,
-} from "../src/engine/runner.js";
+import { abandonWorkflowRun, advanceWorkflowRun } from "../src/engine/runner.js";
+import { advanceDueRuns, signalEvent } from "../src/engine/due.js";
 import type { WorkflowStep } from "../src/workflows/types.js";
 import { fakeResult, type FakeBehavior } from "./helpers/fake_command.js";
 import {
@@ -251,7 +247,7 @@ const NODES: NodeExample[] = [
 	},
 	{
 		name: "for_each",
-		engine: ["for-each", "activity", "condition", "sequence"],
+		engine: ["for_each", "activity", "condition", "sequence"],
 		setup: [{ id: "items", pipeline: "fake --name items" }],
 		script: { items: [{ output: ["a", "b"] }] },
 		build: async (_fx, o = {}) => ({
@@ -283,7 +279,7 @@ const NODES: NodeExample[] = [
 	},
 	{
 		name: "for_each (concurrency)",
-		engine: ["for-each", "activity", "condition", "sequence"],
+		engine: ["for_each", "activity", "condition", "sequence"],
 		setup: [{ id: "items", pipeline: "fake --name items" }],
 		script: { items: [{ output: ["a", "b", "c"] }] },
 		build: async (_fx, o = {}) => ({
@@ -368,7 +364,7 @@ const NODES: NodeExample[] = [
 	})),
 	{
 		name: "child workflow",
-		engine: ["child-workflow", "activity", "condition", "sequence"],
+		engine: ["child_workflow", "activity", "condition", "sequence"],
 		build: async (fx, o = {}) => {
 			const file = o.file ?? "child.lobster";
 			await fx.write(file, { steps: [{ id: "w", pipeline: "fake --name w", ...rec(o.recovery) }] });
@@ -522,7 +518,7 @@ const NODES: NodeExample[] = [
 	},
 	{
 		name: "wait (event)",
-		engine: ["event"],
+		engine: ["wait"],
 		build: async () => ({ id: "n", wait: { event: "contract.done", match: { ok: true } } }),
 		answers: { event: { ok: true, n: 7 } },
 		workCalls: 0,
@@ -727,7 +723,7 @@ const GENERIC: Record<Concern, Custom> = {
 		await assert.rejects(running, /stopped by host/);
 		const execution = await fx.execution();
 		assert.equal(execution.status, "blocked");
-		assert.match(execution.error ?? "", /^Interrupted while root\/n\/.*\/activity was running/);
+		assert.match(execution.error ?? "", /^Interrupted while n\/.*\/activity was running/);
 	},
 
 	"recovery: repeat": (t, fx, node) => recoveryCell(t, fx, node, "repeat"),
@@ -1064,7 +1060,9 @@ async function eventWaitSurvivesRestart(
 test("node contract: every engine node file is exercised by an example", () => {
 	const files = readdirSync(new URL("../src/engine/nodes/", import.meta.url))
 		.filter((file) => file.endsWith(".js"))
-		.map((file) => file.slice(0, -3));
+		.map((file) => file.slice(0, -3))
+		// The table of nodes, not a node.
+		.filter((file) => file !== "index");
 	const covered = new Set(NODES.flatMap((node) => node.engine));
 	assert.deepEqual(
 		files.filter((file) => !covered.has(file)),

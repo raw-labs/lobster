@@ -5,7 +5,8 @@ import os from "node:os";
 import path from "node:path";
 
 import { createDefaultRegistry } from "../src/commands/registry.js";
-import { loadWorkflowFile, runWorkflowFile } from "../src/engine/runner.js";
+import { runWorkflowFile } from "../src/engine/runner.js";
+import { loadWorkflowFile } from "../src/workflows/load.js";
 
 async function runWorkflow(workflow: unknown) {
 	const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-onerror-"));

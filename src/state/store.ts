@@ -10,7 +10,6 @@ import { keyToPath, resolveStateDirectory } from "./paths.js";
 export { withFileLock } from "./file_lock.js";
 export { keyToPath } from "./paths.js";
 export { atomicWriteWasPublished, ensureDirectory, writeFileAtomic } from "./atomic_file.js";
-export { stableStringify } from "../util/serialization.js";
 
 type Env = Record<string, string | undefined>;
 

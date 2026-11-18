@@ -1,31 +1,24 @@
-import type { ResumeDecision, WaitResumeOptions } from "../resume/options.js";
+// The SDK's `Lobster` class: a pipeline of JavaScript stages, run, resumed and advanced as a
+// run of the engine, and the conversion of tokens handed out before SDK pipelines were runs.
+import { decisionCount, type ResumeDecision, type WaitResumeOptions } from "../resume/options.js";
 import type { SdkResult } from "./types.js";
 import { createHash, randomUUID } from "node:crypto";
-import { Writable } from "node:stream";
+import { discardStream } from "../io/terminal.js";
 import { validateCommandInputState } from "../pipeline/input_request.js";
 import { parsePipeline } from "../pipeline/parser.js";
 import { runtimeErrorDetails } from "../persistence/backend.js";
 import { sessionFromEnv, bindResumeGuard, bindStoreSession } from "../persistence/context.js";
 import { withStoreContext } from "../persistence/execution.js";
-import type { PersistenceOptions, StoreHandle } from "../persistence/context.js";
-import { resolveWait, callerId } from "../persistence/waits.js";
+import type { PersistenceOptions, StoreEnvironment, StoreHandle } from "../persistence/context.js";
+import { findWaitAtRevision, callerId } from "../persistence/waits.js";
 import { decodeToken } from "../resume/token.js";
 import type { RunContext } from "../engine/context.js";
 import { pipelineDefinition } from "../workflows/definition.js";
-import {
-	advanceWorkflowRun,
-	runWorkflowFile,
-	ResumeRefusedError,
-	UpgradeRequiredError,
-	WorkflowResumeArgumentError,
-	runIdOf,
-	type WorkflowRunResult,
-} from "../engine/runner.js";
-import {
-	savedByOlderVersion,
-	waitingPipelineRun,
-	type PausedPipeline,
-} from "../workflows/upgrade.js";
+import { advanceWorkflowRun, runWorkflowFile, runIdOf } from "../engine/runner.js";
+import { ResumeRefusedError, UpgradeRequiredError, InvalidAnswerError } from "../engine/errors.js";
+import { type WorkflowRunResult } from "../workflows/types.js";
+import { savedByOlderVersion } from "../engine/upgrade.js";
+import { waitingPipelineRun, type PausedPipeline } from "../engine/legacy_pauses.js";
 import { CheckpointTakenError } from "../persistence/session.js";
 import { sdkInputItems, sdkPipelineText, sdkStageRegistry, type SdkStage } from "./runtime.js";
 
@@ -134,7 +127,7 @@ export class Lobster {
 			async (ctx) => {
 				const store = sessionFromEnv(ctx.env);
 				if (!store) throw new Error("Wait resume requires a persistence session");
-				const wait = await resolveWait(
+				const wait = await findWaitAtRevision(
 					store,
 					options.waitId,
 					options.expectedRevision,
@@ -166,13 +159,13 @@ export class Lobster {
 	}
 
 	async #resumeKey(
-		key: string | ((env: NodeJS.ProcessEnv) => Promise<string>),
+		key: string | ((env: StoreEnvironment) => Promise<string>),
 		decision: { approved?: boolean; response?: unknown; cancel?: boolean },
 		env: NodeJS.ProcessEnv,
 	): Promise<SdkResult> {
 		try {
 			return await this.#execute(env, async (ctx) => {
-				const stateKey = typeof key === "string" ? key : await key(ctx.env as NodeJS.ProcessEnv);
+				const stateKey = typeof key === "string" ? key : await key(ctx.env);
 				return runWorkflowFile({
 					resume: { protocolVersion: 1, v: 1, kind: "workflow-file", stateKey },
 					...decision,
@@ -182,12 +175,7 @@ export class Lobster {
 			});
 		} catch (err) {
 			// Nothing ran: the token, the answer or this instance does not fit the paused run.
-			if (
-				err instanceof WorkflowResumeArgumentError ||
-				err instanceof ResumeRefusedError ||
-				(err as Error)?.message === "Invalid token"
-			)
-				throw err;
+			if (err instanceof InvalidAnswerError || err instanceof ResumeRefusedError) throw err;
 			return failed(err);
 		}
 	}
@@ -204,8 +192,8 @@ export class Lobster {
 						env: store.env!,
 						mode: "sdk",
 						stdin: { isTTY: false } as unknown as NodeJS.ReadableStream,
-						stdout: discard(),
-						stderr: discard(),
+						stdout: discardStream(),
+						stderr: discardStream(),
 						cwd: process.cwd(),
 						signal: this.#options.signal,
 						registry: sdkStageRegistry(this.#stages),
@@ -223,7 +211,7 @@ export class Lobster {
 	 * Turn a pause saved by an older Lobster into a waiting run, once. Its token then
 	 * resumes that run, and a token used before is refused instead of acting again.
 	 */
-	async #convertLegacyToken(token: string, legacy: LegacySdkToken, env: NodeJS.ProcessEnv) {
+	async #convertLegacyToken(token: string, legacy: LegacySdkToken, env: StoreEnvironment) {
 		const session = sessionFromEnv(env);
 		if (!session) throw new Error("SDK resume requires a persistence session");
 		let key: string;
@@ -254,7 +242,7 @@ export class Lobster {
 				resumeAtIndex: state.resumeAtIndex,
 				items: state.items,
 				inputSchema: state.inputSchema,
-				commandInput: validateCommandInputState(state.commandInput) as any,
+				commandInput: validateCommandInputState(state.commandInput),
 			};
 		} else {
 			// Older tokens carried their whole state, so nothing marked them used: they are marked
@@ -287,11 +275,7 @@ export class Lobster {
 			);
 		const text = this.#pipeline();
 		const registry = sdkStageRegistry(this.#stages);
-		const stages = parsePipeline(text, registry as any).map((stage) => ({
-			name: stage.name,
-			args: stage.args,
-			raw: stage.raw,
-		}));
+		const stages = parsePipeline(text, registry);
 		const { execution, continuation } = waitingPipelineRun(
 			key,
 			pipelineDefinition(text, []),
@@ -316,10 +300,7 @@ export class Lobster {
 }
 
 function assertOneDecision(options: { approved?: boolean; response?: unknown; cancel?: boolean }) {
-	const count =
-		Number(typeof options.approved === "boolean") +
-		Number(options.response !== undefined) +
-		Number(options.cancel === true);
+	const count = decisionCount(options);
 	if (count > 1) throw new Error("resume accepts only one of approved, response, or cancel");
 	if (count === 0) throw new Error("resume requires approved, response, or cancel");
 }
@@ -360,7 +341,11 @@ function finished(output: Partial<WorkflowRunResult> & { runId?: string }): SdkR
 			ok: true,
 			status: "needs_approval",
 			output: [],
-			requiresApproval: output.requiresApproval as any,
+			// A paused run always reports the token that resumes it.
+			requiresApproval: {
+				...output.requiresApproval!,
+				resumeToken: output.requiresApproval!.resumeToken!,
+			},
 			requiresInput: null,
 		};
 	if (output.status === "needs_input")
@@ -370,7 +355,7 @@ function finished(output: Partial<WorkflowRunResult> & { runId?: string }): SdkR
 			status: "needs_input",
 			output: [],
 			requiresApproval: null,
-			requiresInput: output.requiresInput as any,
+			requiresInput: { ...output.requiresInput!, resumeToken: output.requiresInput!.resumeToken! },
 		};
 	if (output.status === "cancelled")
 		return {
@@ -404,14 +389,6 @@ function failed(err: unknown, runId = runIdOf(err)): SdkResult {
 		requiresInput: null,
 		error,
 	};
-}
-
-function discard() {
-	return new Writable({
-		write(_chunk, _encoding, callback) {
-			callback();
-		},
-	});
 }
 
 /** The environment a run of these options uses: `stateDir` and `storeSession` applied. */

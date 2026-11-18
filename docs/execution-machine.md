@@ -6,14 +6,17 @@ Replace the workflow-file executor with a saved-state interpreter. Keep YAML, co
 
 ## Source layout
 
-- `workflows/definition.ts`, `workflows/args.ts`: resolve arguments and snapshot YAML/static children; hash the saved definition tree.
-- `engine/state.ts`: versioned execution data and activation identities.
-- `engine/store.ts`: serialized checkpoint writes, ownership leases and fencing.
-- `engine/machine.ts`: shared attempt/retry/accounting lifecycle and run advancement.
-- `engine/nodes/`: sequence, condition, activity, loop, parallel, child workflow, approval, input, sleep and event-wait handlers.
-- `engine/activities/`: subprocess and pipeline execution; `engine/retry.ts`: the retry policy. No separate persistence engine.
-- `engine/runner.ts`: the run API: start, resume, advance, abandon, advance due runs, signal events. Workflow definitions (`workflows/`) sit below the engine; the runner sits above it. The previous executor is removed.
-- `persistence/`: atomic transitions, storage receipts, history and the SQLite store.
+- `workflows/`: loading, validating and freezing workflow files (`definition.ts`, `args.ts`), the step kinds (`steps.ts`) and the retry policy (`retry.ts`). Below the engine.
+- `engine/checkpoint.ts`: the saved execution: its activations (one occurrence of a node, typed per kind of node), what waits wait for, and the queries persistence uses (wake time, unresolved activities).
+- `engine/machine.ts`: visiting a step: its condition, attempts, retries, `on_error`, timeouts, cost and the approval after it. `engine/step_clock.ts` times one attempt (timeout and heartbeat).
+- `engine/nodes/`: one handler per kind of step (activity, input, sleep, wait, for_each, repeat, switch, parallel, child workflow), mapped from step kinds in `nodes/index.ts`, which also says how the machine treats each (activity, control or gate); plus the pieces the machine calls directly: sequence, the step's condition, and the approval after a step.
+- `engine/due.ts`: advancing every run whose time has come, and the runs an event wakes. `engine/legacy_pauses.ts`: pauses saved by older versions, rebuilt as waiting runs.
+- `engine/activities/`: running a shell command or a pipeline.
+- `engine/waits.ts`: publishing, answering, timing out, resolving and withdrawing waits, and asking at a terminal (or pausing when nobody can answer). `engine/asking.ts`: reading an answer at a terminal, and checking an answer and who gave it. `engine/outcome.ts`: what a paused run reports (token, approval ID, request).
+- `engine/records.ts`: values kept beside the checkpoint (loop items and outputs, large step outputs). `engine/store.ts`: serialized checkpoint writes, ownership leases and fencing.
+- `engine/scope.ts`, `engine/context.ts`, `engine/results.ts`, `engine/accounting.ts`, `engine/errors.ts`: what a node runs in, the run's context, step results, cost accounting, and the engine's errors.
+- `engine/runner.ts`: the run API for one run: start, resume, advance, abandon. `engine/upgrade.ts`: `lobster upgrade`, importing a state directory written by older versions.
+- `persistence/`: atomic transitions, storage receipts, history and the SQLite store. It stores checkpoints whole and reads them through `engine/checkpoint.ts`.
 - `commands/`, `packs/`: the command contract (`defineCommand`), the pack registry, `stdlib` and the integration packs; `repeatable: false` commands are never re-run on crash recovery.
 
 This is a saved-state interpreter, not a bytecode VM or arbitrary JavaScript replay engine. Existing YAML nesting restrictions remain unchanged.
@@ -66,7 +69,7 @@ Lobster stays run-on-demand: a process runs until the workflow finishes or must 
 
 **Heartbeats.** A step with `heartbeat_timeout_ms` must show progress at least that often: a shell command (or `exec`) touches the file named by `LOBSTER_HEARTBEAT_FILE`, a pipeline command calls `ctx.heartbeat()`. Missing it aborts the step like `timeout_ms` (the process tree is killed), after which retry, `on_error` and the repeatable rules apply. The run-level lease, renewed by the executor, already covers a dead process; heartbeats cover a live process whose step has hung.
 
-Timers, deadlines and event waits are gates: like approvals and input requests they are not allowed inside `for_each`, `parallel` branches or child workflows.
+Timers, deadlines and event waits are gates, like approvals and input requests: they are not allowed inside `parallel` branches, child workflows, a `for_each` with `concurrency`, or a loop or switch with `retry`.
 
 ## Verification
 
@@ -76,6 +79,6 @@ Existing suites cover conditions, retries, timeouts, cancellation, composition, 
 
 ## Limits
 
-Each checkpoint currently replaces the execution snapshot, including saved outputs. This change does not claim a high-throughput scheduler or incremental large-run storage. History is separate and optional. A blocked activity needs outcome inspection; there is no general adapter reconciliation/result-injection API yet. Code, external services and host environments remain outside the saved definition. Recovery of an OpenClaw agent launch is not inferred from a session name.
+Each checkpoint replaces the execution snapshot; a loop's items and outputs, and step outputs over 1 KB, are records written once beside it. This change does not claim a high-throughput scheduler. History is separate and optional. A blocked activity needs outcome inspection; there is no general adapter reconciliation/result-injection API yet. Code, external services and host environments remain outside the saved definition. Recovery of an OpenClaw agent launch is not inferred from a session name.
 
 Gateway background dispatch is deferred. Lobster provides `runs advance --due`; scheduling the call (host loop, cron, systemd timer) is the caller's choice.

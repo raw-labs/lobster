@@ -10,7 +10,7 @@ import { createDefaultRegistry, resumeToolRequest, runToolRequest } from "../src
 import { openStoreSession } from "../src/persistence/session.js";
 import { withFileLock } from "../src/state/file_lock.js";
 import { encodeToken } from "../src/resume/token.js";
-import { pendingUpgrade, savedByOlderVersion, upgradeStore } from "../src/workflows/upgrade.js";
+import { pendingUpgrade, savedByOlderVersion, upgradeStore } from "../src/engine/upgrade.js";
 
 const exec = promisify(execFile);
 const repoRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "..");

@@ -1,25 +1,25 @@
+// Tool mode: a host (an agent's tool call, `lobster --mode tool`) runs a pipeline or workflow
+// file, or answers a wait, and gets one JSON envelope back: ok, the status, the output, and
+// what it waits for.
 import type { WorkflowRunResult, WorkflowWaitingFor } from "../workflows/types.js";
-import type { ResumeDecision, ResumeTarget } from "../resume/options.js";
-import { Writable } from "node:stream";
+import { decisionCount, type ResumeDecision, type ResumeTarget } from "../resume/options.js";
+import { discardStream } from "../io/terminal.js";
 import { createDefaultRegistry } from "../commands/registry.js";
 import { parsePipeline } from "../pipeline/parser.js";
 import { runtimeErrorDetails } from "../persistence/backend.js";
 import { bindResumeGuard, sessionFromEnv } from "../persistence/context.js";
-import { resolveWait, callerId } from "../persistence/waits.js";
+import { findWaitAtRevision, callerId } from "../persistence/waits.js";
 import { encodeToken } from "../resume/token.js";
 import { withExecution, withStoreContext } from "../persistence/execution.js";
 import type { PersistenceOptions } from "../persistence/context.js";
 import { decodeResumeToken, resolveApprovalId } from "../resume/resume.js";
 import { deleteApprovalId, cleanupApprovalIndexByStateKey } from "../state/store.js";
-import {
-	WorkflowResumeArgumentError,
-	UpgradeRequiredError,
-	runWorkflowFile,
-	runPipelineText,
-	runIdOf,
-} from "../engine/runner.js";
-import { savedByOlderVersion } from "../workflows/upgrade.js";
+import { runWorkflowFile, runPipelineText, runIdOf } from "../engine/runner.js";
+import { InvalidAnswerError, UpgradeRequiredError } from "../engine/errors.js";
+import { savedByOlderVersion } from "../engine/upgrade.js";
 import { resolveWorkflowFile } from "../workflows/load.js";
+import { messageOf } from "../util/errors.js";
+import type { CommandLookup } from "../commands/types.js";
 
 export type ToolRunContext = PersistenceOptions & {
 	_resumeSignalAborted?: boolean;
@@ -32,8 +32,9 @@ export type ToolRunContext = PersistenceOptions & {
 	signal?: AbortSignal;
 	forceTerminationSignal?: AbortSignal;
 	assertInvocationCurrent?: () => void;
-	registry?: any;
-	llmAdapters?: Record<string, any>;
+	/** The commands pipelines may use (default: the built-in packs). */
+	registry?: CommandLookup;
+	llmAdapters?: Record<string, unknown>;
 };
 
 export type ToolEnvelope = {
@@ -109,42 +110,21 @@ async function runToolRequestInternal({
 		let resolvedFilePath: string;
 		try {
 			resolvedFilePath = await resolveWorkflowFile(filePath!, runtime.cwd);
-		} catch (err: any) {
-			return errorEnvelope("parse_error", err?.message ?? String(err));
+		} catch (err) {
+			return errorEnvelope("parse_error", messageOf(err));
 		}
 
 		try {
-			const output = await runWorkflowFile({
-				filePath: resolvedFilePath,
-				args,
-				ctx: runtime,
-			});
-
-			if (output.status === "needs_approval") {
-				return okEnvelope("needs_approval", [], output.requiresApproval ?? null, null);
-			}
-			if (output.status === "needs_input") {
-				return okEnvelope("needs_input", [], null, output.requiresInput ?? null);
-			}
-			if (output.status === "waiting") {
-				return {
-					...okEnvelope("waiting", [], null, null),
-					waitingFor: output.waitingFor,
-				};
-			}
-			if (output.status === "cancelled") {
-				return okEnvelope("cancelled", [], null, null);
-			}
-			return okEnvelope("ok", output.output, null, null);
-		} catch (err: any) {
+			return runEnvelope(await runWorkflowFile({ filePath: resolvedFilePath, args, ctx: runtime }));
+		} catch (err) {
 			return errorEnvelope("runtime_error", err);
 		}
 	}
 
 	try {
 		parsePipeline(String(pipeline), runtime.registry);
-	} catch (err: any) {
-		return errorEnvelope("parse_error", err?.message ?? String(err));
+	} catch (err) {
+		return errorEnvelope("parse_error", messageOf(err));
 	}
 
 	try {
@@ -154,7 +134,7 @@ async function runToolRequestInternal({
 				ctx: { ...runtime, mode: "tool" },
 			}),
 		);
-	} catch (err: any) {
+	} catch (err) {
 		return errorEnvelope("runtime_error", err);
 	}
 }
@@ -195,12 +175,8 @@ export async function resumeToolRequest(
 						"waitId requires expectedRevision and cannot be combined with token or approvalId",
 					);
 				}
-				const decisions =
-					Number(typeof options.approved === "boolean") +
-					Number(options.response !== undefined) +
-					Number(options.cancel === true);
 				if (
-					decisions !== 1 ||
+					decisionCount(options) !== 1 ||
 					!Number.isSafeInteger(options.expectedRevision) ||
 					options.expectedRevision < 0
 				) {
@@ -211,7 +187,7 @@ export async function resumeToolRequest(
 				}
 				const store = sessionFromEnv(ctx.env);
 				if (!store) throw new Error("Wait resume requires a persistence session");
-				const wait = await resolveWait(
+				const wait = await findWaitAtRevision(
 					store,
 					options.waitId,
 					options.expectedRevision,
@@ -297,8 +273,8 @@ async function resumeToolRequestInternal({
 			return errorEnvelope("parse_error", "resume requires token or approvalId");
 		}
 		payload = decodeResumeToken(resolvedToken);
-	} catch (err: any) {
-		return errorEnvelope("parse_error", err?.message ?? String(err));
+	} catch (err) {
+		return errorEnvelope("parse_error", messageOf(err));
 	}
 
 	// Pipelines and workflow files are both runs: one resume path for every token.
@@ -308,8 +284,10 @@ async function resumeToolRequestInternal({
 			filePath: payload.filePath,
 			ctx: {
 				...runtime,
-				_onResumeStateResolved: (key) => {
-					stateKey = key;
+				hooks: {
+					onResumeStateResolved: (key) => {
+						stateKey = key;
+					},
 				},
 			},
 			resume: payload,
@@ -322,8 +300,8 @@ async function resumeToolRequestInternal({
 			else if (stateKey) await cleanupApprovalIndexByStateKey({ env: runtime.env, stateKey });
 		}
 		return runEnvelope(output);
-	} catch (err: any) {
-		if (err instanceof WorkflowResumeArgumentError) {
+	} catch (err) {
+		if (err instanceof InvalidAnswerError) {
 			return errorEnvelope("parse_error", err.message);
 		}
 		// Non-abort failures and cancellations before step execution remain retryable.
@@ -337,8 +315,8 @@ export function createToolContext(ctx: ToolRunContext = {}) {
 		env: { ...process.env, ...ctx.env },
 		mode: "tool" as const,
 		stdin: ctx.stdin ?? process.stdin,
-		stdout: ctx.stdout ?? createCaptureStream(),
-		stderr: ctx.stderr ?? createCaptureStream(),
+		stdout: ctx.stdout ?? discardStream(),
+		stderr: ctx.stderr ?? discardStream(),
 		signal: ctx.signal,
 		forceTerminationSignal: ctx.forceTerminationSignal,
 		assertInvocationCurrent: ctx.assertInvocationCurrent,
@@ -350,14 +328,6 @@ export function createToolContext(ctx: ToolRunContext = {}) {
 		runMetadata: ctx.runMetadata,
 		_resumeSignalAborted: ctx._resumeSignalAborted,
 	};
-}
-
-export function createCaptureStream() {
-	return new Writable({
-		write(_chunk, _encoding, callback) {
-			callback();
-		},
-	});
 }
 
 function okEnvelope(

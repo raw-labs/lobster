@@ -8,7 +8,8 @@ import { fileURLToPath } from "node:url";
 import { createDefaultRegistry, resumeToolRequest, runToolRequest } from "../src/core/index.js";
 import { defineCommand } from "../src/commands/define.js";
 import { Lobster } from "../src/sdk/Lobster.js";
-import { advanceWorkflowRun } from "../src/engine/runner.js";
+import { abandonWorkflowRun, advanceWorkflowRun } from "../src/engine/runner.js";
+import { unresolvedActivities } from "../src/engine/checkpoint.js";
 import { openStoreSession } from "../src/persistence/session.js";
 
 const repoRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
@@ -254,4 +255,106 @@ test("CLI: `runs advance` retries a failed run", async (t) => {
 	assert.equal(advanced.status, 0, advanced.stderr);
 	assert.equal(await ran("one"), 1);
 	assert.equal(await ran("two"), 2);
+});
+
+test("a retried failed run gives the failed step its whole retry budget again", async (t) => {
+	const { dir, env, ran, advance } = await fixture(t);
+	const filePath = path.join(dir, "flow.lobster");
+	await fs.writeFile(
+		filePath,
+		JSON.stringify({
+			steps: [{ id: "flaky", run: flaky("flaky", "fixed"), retry: { max: 3, delay_ms: 0 } }],
+		}),
+	);
+	const first = await runToolRequest({ filePath, ctx: { env } });
+	assert.equal(first.ok, false);
+	assert.equal(await ran("flaky"), 3, "three attempts on the first run");
+
+	await assert.rejects(advance(first.runId!), /workflow command failed/);
+	assert.equal(await ran("flaky"), 6, "three more attempts after runs advance");
+
+	await fs.writeFile(path.join(dir, "fixed"), "");
+	assert.equal((await advance(first.runId!)).status, "ok");
+	assert.equal(await ran("flaky"), 7);
+});
+
+test("a retried failed run gives the failed step a fresh timeout", async (t) => {
+	const { dir, env, ran, advance } = await fixture(t);
+	const filePath = path.join(dir, "flow.lobster");
+	await fs.writeFile(
+		filePath,
+		JSON.stringify({ steps: [{ id: "slow", run: flaky("slow", "fixed"), timeout_ms: 300 }] }),
+	);
+	const first = await runToolRequest({ filePath, ctx: { env } });
+	assert.equal(first.ok, false);
+	// The first attempt's deadline passes before the run is advanced.
+	await new Promise((resolve) => setTimeout(resolve, 500));
+	await fs.writeFile(path.join(dir, "fixed"), "");
+	assert.equal((await advance(first.runId!)).status, "ok");
+	assert.equal(await ran("slow"), 2);
+});
+
+test("a step that timed out failed: nothing is left with an unknown outcome, and it retries", async (t) => {
+	const { dir, env, ran, advance } = await fixture(t);
+	const filePath = path.join(dir, "flow.lobster");
+	await fs.writeFile(
+		filePath,
+		JSON.stringify({
+			steps: [
+				{
+					id: "slow",
+					run: 'echo x >> "$RETRY_DIR/slow"; test -f "$RETRY_DIR/fixed" || sleep 5',
+					timeout_ms: 300,
+					retry: { max: 2, delay_ms: 0 },
+				},
+			],
+		}),
+	);
+	const first = await runToolRequest({ filePath, ctx: { env } });
+	assert.equal(first.ok, false);
+	assert.equal(await ran("slow"), 2);
+	const store = await openStoreSession({ env, readOnly: true });
+	try {
+		const run = await store.getRunState(first.runId!);
+		assert.deepEqual(unresolvedActivities(run!.execution!), []);
+	} finally {
+		await store.close();
+	}
+	await fs.writeFile(path.join(dir, "fixed"), "");
+	assert.equal((await advance(first.runId!)).status, "ok");
+	assert.equal(await ran("slow"), 3);
+});
+
+test("a failed run whose parallel branch was cut off can be abandoned", async (t) => {
+	const { dir, env } = await fixture(t);
+	const filePath = path.join(dir, "flow.lobster");
+	await fs.writeFile(
+		filePath,
+		JSON.stringify({
+			steps: [
+				{
+					id: "both",
+					parallel: {
+						branches: [
+							{ id: "fails", run: "sleep 0.2; exit 1" },
+							{ id: "slow", run: "sleep 5" },
+						],
+					},
+				},
+			],
+		}),
+	);
+	const first = await runToolRequest({ filePath, ctx: { env } });
+	assert.equal(first.ok, false);
+	const ctx = {
+		env,
+		mode: "tool" as const,
+		stdin: process.stdin,
+		stdout: process.stdout,
+		stderr: process.stderr,
+	};
+	const abandoned = await abandonWorkflowRun({ runId: first.runId!, ctx });
+	assert.equal(abandoned.status, "cancelled");
+	assert.equal(abandoned.abandoned.length, 1);
+	assert.match(abandoned.abandoned[0], /slow/);
 });

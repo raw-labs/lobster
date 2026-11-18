@@ -13,3 +13,16 @@ export type ResumeTarget =
 	| { token: string; approvalId?: undefined; waitId?: undefined; expectedRevision?: undefined }
 	| { approvalId: string; token?: undefined; waitId?: undefined; expectedRevision?: undefined }
 	| { waitId: string; expectedRevision: number; token?: undefined; approvalId?: undefined };
+
+/** How many decisions `options` makes (approve or reject, a response, a cancel): one is valid. */
+export function decisionCount(options: {
+	approved?: unknown;
+	response?: unknown;
+	cancel?: unknown;
+}) {
+	return (
+		Number(typeof options.approved === "boolean") +
+		Number(options.response !== undefined) +
+		Number(options.cancel === true)
+	);
+}

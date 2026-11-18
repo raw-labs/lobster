@@ -1,64 +1,48 @@
+// Running a pipeline step: parse it, run its stages, and turn a halt into a pause (it asked
+// a question) or an error. Its items become the step's result.
+import { messageOf } from "../../util/errors.js";
 import { PassThrough } from "node:stream";
 import { isDeepStrictEqual } from "node:util";
 import { parsePipeline } from "../../pipeline/parser.js";
 import { runPipeline } from "../../pipeline/runtime.js";
 import { RequestInputResumeError, type CommandInputState } from "../../pipeline/input_request.js";
+import { isPlainObject } from "../../util/objects.js";
 import { recorderFromEnv, bindRecorder } from "../../persistence/context.js";
 import { carryLlmProvenance } from "../../llm/accounting.js";
 import type { LlmSpendLedger } from "../../llm/accounting.js";
-import { stableStringify } from "../../state/store.js";
+import { stableStringify } from "../../util/serialization.js";
 import type { WorkflowStepResult } from "../../workflows/types.js";
+import type { PipelinePause, PipelineStage, WaitRequest } from "../checkpoint.js";
 import type { RunContext } from "../context.js";
-import { stepScopedLedger, attachPipelineSourceItems } from "../accounting.js";
-import { parseJson, serializePipelineItemsToStdout, inputValueToPipelineItems } from "../values.js";
-
-/**
- * Where a paused pipeline continues. `same_stage` (a command asked mid-run, `ctx.requestInput`)
- * re-runs that stage with `commandInput`; `next_stage` (it halted for `approve` or `ask --emit`)
- * continues with the next stage, fed `items` after an approval or `[response]` after an input.
- */
-export type WorkflowPipelineInputResumeState = {
-	pipeline: Array<{ name: string; args: Record<string, unknown>; raw: string }>;
-	resumeAtIndex: number;
-	items: unknown[];
-	commandInput?: CommandInputState;
-	mode?: "same_stage" | "next_stage";
-	gate?: "approval" | "input";
-};
+import { PipelineHaltError } from "../errors.js";
+import { stepScopedLedger } from "../accounting.js";
+import {
+	attachPipelineSourceItems,
+	inputValueToPipelineItems,
+	parseJson,
+	serializePipelineItemsToStdout,
+} from "../results.js";
 
 /** A question a pipeline asked: the step pauses on it, and the pipeline resumes afterwards. */
-export type PipelineGateRequest =
-	| { kind: "approval"; prompt: string; items: unknown[]; preview?: string }
-	| {
-			kind: "input";
-			prompt: string;
-			responseSchema: unknown;
-			defaults?: unknown;
-			subject?: unknown;
-	  };
+type PipelineQuestion = Extract<WaitRequest, { kind: "approval" | "input" }>;
 
-export class WorkflowPipelineInputSuspension extends Error {
-	stepId: string;
-	request: PipelineGateRequest;
-	pipelineInput: WorkflowPipelineInputResumeState;
-
-	constructor({
-		stepId,
-		request,
-		pipelineInput,
-	}: {
-		stepId: string;
-		request: PipelineGateRequest;
-		pipelineInput: WorkflowPipelineInputResumeState;
-	}) {
-		super(`Workflow step ${stepId} pipeline asked: ${request.prompt}`);
-		this.name = "WorkflowPipelineInputSuspension";
-		this.stepId = stepId;
-		this.request = request;
-		this.pipelineInput = pipelineInput;
+/** The pipeline paused to ask `question`; it continues from `pause` once answered. */
+export class PipelinePausedError extends Error {
+	constructor(
+		readonly question: PipelineQuestion,
+		readonly pause: PipelinePause,
+		stepId: string,
+	) {
+		super(`Workflow step ${stepId} pipeline asked: ${question.prompt}`);
+		this.name = "PipelinePausedError";
 	}
 }
 
+/**
+ * Run a pipeline step's pipeline, or continue it after the question it paused on. A pipeline
+ * that halts to ask throws PipelinePausedError where steps may pause (`gatesRefused` unset),
+ * and PipelineHaltError where they cannot.
+ */
 export async function runPipelineStep({
 	stepId,
 	pipelineText,
@@ -68,7 +52,6 @@ export async function runPipelineStep({
 	env,
 	cwd,
 	resume,
-	requestInputEnabled = true,
 	gatesRefused,
 	onExecutionStart,
 	standalone = false,
@@ -80,46 +63,37 @@ export async function runPipelineStep({
 	llmSpendLedger?: LlmSpendLedger;
 	env: Record<string, string | undefined>;
 	cwd?: string;
-	resume?: {
-		pipelineInput: WorkflowPipelineInputResumeState;
-		response: unknown;
-	};
-	requestInputEnabled?: boolean;
-	/** Why the pipeline cannot pause here, for the error when it tries to. */
+	/** Continue after the question it paused on, with the answer (`response`, for an input). */
+	resume?: { pause: PipelinePause; question: PipelineQuestion; response: unknown };
+	/** Why the pipeline cannot pause here, if it cannot: the error when it tries to says so. */
 	gatesRefused?: string;
 	onExecutionStart?: () => void | Promise<void>;
 	/** A standalone pipeline: render to the terminal in human mode and keep its items. */
 	standalone?: boolean;
 }) {
-	let pipeline;
+	const requestInputEnabled = !gatesRefused;
+	let pipeline: PipelineStage[];
 	try {
 		const currentPipeline = parsePipeline(pipelineText, ctx.registry);
-		if (resume) {
-			if (!isDeepStrictEqual(currentPipeline, resume.pipelineInput.pipeline)) {
-				throw new RequestInputResumeError("workflow pipeline changed since input request");
-			}
-			pipeline = resume.pipelineInput.pipeline;
-		} else {
-			pipeline = currentPipeline;
-		}
-	} catch (err: any) {
+		if (resume && !isDeepStrictEqual(currentPipeline, resume.pause.pipeline))
+			throw new RequestInputResumeError("workflow pipeline changed since input request");
+		pipeline = resume ? resume.pause.pipeline : currentPipeline;
+	} catch (err) {
 		if (err instanceof RequestInputResumeError) throw err;
-		throw new Error(
-			`Workflow step ${stepId} pipeline parse failed: ${err?.message ?? String(err)}`,
-		);
+		throw new Error(`Workflow step ${stepId} pipeline parse failed: ${messageOf(err)}`);
 	}
 
 	// A standalone pipeline in human mode renders straight to the terminal, as it always did.
 	const live = standalone && ctx.mode !== "tool";
 	const stdout = new PassThrough();
-	if (live) stdout.pipe(ctx.stdout as NodeJS.WritableStream, { end: false });
+	if (live) stdout.pipe(ctx.stdout, { end: false });
 	let renderedStdout = "";
 	stdout.setEncoding("utf8");
 	stdout.on("data", (chunk) => {
 		renderedStdout += String(chunk);
 	});
 
-	const pipelineStartIndex = resume ? resume.pipelineInput.resumeAtIndex : 0;
+	const pipelineStartIndex = resume ? resume.pause.resumeAtIndex : 0;
 	const remainingPipeline = pipeline.slice(pipelineStartIndex);
 	const pipelineRecorder = recorderFromEnv(env)?.child(`step/${stepId}`);
 	if (pipelineRecorder) {
@@ -139,26 +113,23 @@ export async function runPipelineStep({
 		forceTerminationSignal: ctx.forceTerminationSignal,
 		haltAfterStageOnAbort: true,
 		assertInvocationCurrent: ctx.assertInvocationCurrent,
-		onUnsafeCommandDispatch: ctx._onUnsafeDispatch,
+		onUnsafeCommandDispatch: ctx.hooks?.onUnsafeDispatch,
 		llmAdapters: ctx.llmAdapters,
 		// Scoped so a charge nothing bills can still name the step that opened it.
 		llmSpendLedger: llmSpendLedger ? stepScopedLedger(llmSpendLedger, stepId) : undefined,
 		input: resume
-			? resume.pipelineInput.mode === "next_stage" && resume.pipelineInput.gate === "input"
+			? resume.pause.mode === "next_stage" && resume.question.kind === "input"
 				? [resume.response]
-				: resume.pipelineInput.items
+				: resume.pause.items
 			: inputValueToPipelineItems(inputValue),
 		requestInputEnabled,
 		requestInputResume:
-			resume && resume.pipelineInput.mode !== "next_stage"
-				? {
-						state: resume.pipelineInput.commandInput!,
-						response: resume.response,
-					}
+			resume?.pause.mode === "same_stage"
+				? { state: resume.pause.commandInput, response: resume.response }
 				: undefined,
 		onExecutionStart,
-		onNonRetryableSideEffect: ctx._onNonRetryableSideEffect,
-		heartbeat: ctx._heartbeat,
+		onNonRetryableSideEffect: ctx.hooks?.onNonRetryableSideEffect,
+		heartbeat: ctx.hooks?.heartbeat,
 	});
 	stdout.end();
 	ctx.signal?.throwIfAborted();
@@ -166,59 +137,54 @@ export async function runPipelineStep({
 	if (result.halted) {
 		const haltedName = result.haltedAt?.stage?.name ?? "unknown";
 		const haltedAt = pipelineStartIndex + (result.haltedAt?.index ?? 0);
+		// What it halted with: one request object (`approval_request` or `input_request`).
 		const item =
-			result.items.length === 1 && result.items[0] && typeof result.items[0] === "object"
-				? (result.items[0] as Record<string, any>)
-				: null;
+			result.items.length === 1 && isPlainObject(result.items[0]) ? result.items[0] : undefined;
 		// A pipeline that halts to ask pauses the step; the run resumes it after the answer.
 		// Gates are not supported in child workflows, so there the halt stays an error.
 		if (item?.type === "approval_request" && requestInputEnabled) {
-			throw new WorkflowPipelineInputSuspension({
-				stepId,
-				request: {
+			const items = Array.isArray(item.items) ? item.items : [];
+			throw new PipelinePausedError(
+				{
 					kind: "approval",
 					prompt: String(item.prompt ?? "Approve?"),
-					items: Array.isArray(item.items) ? item.items : [],
+					items,
 					...(typeof item.preview === "string" ? { preview: item.preview } : null),
 				},
-				pipelineInput: {
-					pipeline,
-					resumeAtIndex: haltedAt + 1,
-					items: Array.isArray(item.items) ? item.items : [],
-					mode: "next_stage",
-					gate: "approval",
-				},
-			});
+				{ pipeline, resumeAtIndex: haltedAt + 1, items, mode: "next_stage" },
+				stepId,
+			);
 		}
 		if (item?.type === "approval_request") {
-			throw new WorkflowPipelineHaltError(
+			throw new PipelineHaltError(
 				`Workflow step ${stepId} halted for approval inside pipeline stage ${haltedName}; ${gatesRefused ?? "approvals are not supported here"}.`,
 			);
 		}
-		const request = item?.type === "input_request" ? item : null;
-		if (request && (request.commandInput || requestInputEnabled)) {
-			const question = {
-				kind: "input" as const,
-				prompt: String(request.prompt),
-				responseSchema: request.responseSchema,
-				...(request.defaults !== undefined ? { defaults: request.defaults } : null),
-				...(request.subject !== undefined ? { subject: request.subject } : null),
-			};
-			throw new WorkflowPipelineInputSuspension({
-				stepId,
-				request: question,
-				pipelineInput: request.commandInput
+		// Only a stage that may ask can produce a `commandInput` (ctx.requestInput); with
+		// pausing refused, the field in an item is just output.
+		const request = item?.type === "input_request" ? item : undefined;
+		if (request && requestInputEnabled) {
+			throw new PipelinePausedError(
+				{
+					kind: "input",
+					prompt: String(request.prompt),
+					responseSchema: request.responseSchema,
+					...(request.defaults !== undefined ? { defaults: request.defaults } : null),
+					...(request.subject !== undefined ? { subject: request.subject } : null),
+				},
+				request.commandInput
 					? {
 							pipeline,
 							resumeAtIndex: haltedAt,
 							items: Array.isArray(request.items) ? request.items : [],
-							commandInput: request.commandInput,
 							mode: "same_stage",
+							commandInput: request.commandInput as CommandInputState,
 						}
-					: { pipeline, resumeAtIndex: haltedAt + 1, items: [], mode: "next_stage", gate: "input" },
-			});
+					: { pipeline, resumeAtIndex: haltedAt + 1, items: [], mode: "next_stage" },
+				stepId,
+			);
 		}
-		throw new WorkflowPipelineHaltError(
+		throw new PipelineHaltError(
 			`Workflow step ${stepId} halted before completion at pipeline stage ${haltedName}`,
 		);
 	}
@@ -251,5 +217,3 @@ export async function runPipelineStep({
 	}
 	return stepResult;
 }
-
-export class WorkflowPipelineHaltError extends Error {}

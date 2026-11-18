@@ -33,6 +33,7 @@ import {
 	parseOptionalNumber,
 	flag,
 } from "../../llm/flags.js";
+import { messageOf } from "../../util/errors.js";
 
 const DEFAULT_MAX_VALIDATION_RETRIES = 1;
 
@@ -296,8 +297,8 @@ async function runLlmInvoke({
 	if (userOutputSchema) {
 		try {
 			validator = prepareSchema(userOutputSchema);
-		} catch (err: any) {
-			throw new Error(`${config.name} output schema is invalid: ${err?.message ?? String(err)}`);
+		} catch (err) {
+			throw new Error(`${config.name} output schema is invalid: ${messageOf(err)}`);
 		}
 	}
 	let attempt = 0;
@@ -330,12 +331,12 @@ async function runLlmInvoke({
 				signal,
 			);
 			ctx.signal?.throwIfAborted();
-		} catch (err: any) {
+		} catch (err) {
 			// Cancellation is the caller's error, not an adapter failure: surface it
 			// as an abort so workflow timeout and abort handling still recognizes it,
 			// rather than wrapping it in a "request failed" adapter error.
 			if (signal?.aborted) throw asCancellation(err, signal);
-			throw new Error(`${config.name} request failed: ${err?.message ?? String(err)}`);
+			throw new Error(`${config.name} request failed: ${messageOf(err)}`);
 		}
 
 		if (!responseEnvelopeValidator.validate(responseEnvelope).ok) {

@@ -8,7 +8,8 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 
 import { createDefaultRegistry } from "../src/commands/registry.js";
-import { keyToPath, stableStringify } from "../src/state/store.js";
+import { keyToPath } from "../src/state/store.js";
+import { stableStringify } from "../src/util/serialization.js";
 
 function streamOf(items: any[]) {
 	return (async function* () {

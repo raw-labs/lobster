@@ -13,7 +13,7 @@ import type { SdkStageArgs } from "./runtime.js";
 type StageResult = { output: AsyncIterable<unknown> | Iterable<unknown>; halt?: boolean };
 
 /** An SDK stage that runs a built-in command: its name, flags and meta, and how it runs. */
-export type CommandStage = {
+type CommandStage = {
 	type: string;
 	args: Record<string, unknown>;
 	meta: CommandMeta;
@@ -116,8 +116,8 @@ export function diffLast(key: string, options: DiffLastOptions = {}) {
 	if (!options.changesOnly) return commandStage(diffLastCommand, args);
 	return commandStage(diffLastCommand, args, async ({ input, ctx }) => {
 		const result = await diffLastCommand.run({ input, args, ctx });
-		const diffs: any[] = [];
-		for await (const diff of result.output) diffs.push(diff);
+		const diffs: Array<{ changed: boolean }> = [];
+		for await (const diff of result.output) diffs.push(diff as { changed: boolean });
 		return {
 			output: diffs.map((diff) =>
 				diff.changed ? diff : { kind: "diff.last", key, changed: false, suppressed: true },

@@ -1,3 +1,5 @@
+import { Writable } from "node:stream";
+
 /** Whether a person is at the other end of `stdin` (a terminal), so a question can be asked here. */
 export function isInteractive(stdin: unknown) {
 	return Boolean((stdin as NodeJS.ReadStream | undefined)?.isTTY);
@@ -17,3 +19,12 @@ export async function* streamOf<T>(items: Iterable<T>): AsyncGenerator<T> {
 
 /** How much of a subject a question shows as its preview. */
 export const PREVIEW_CHARS = 2000;
+
+/** A stream that drops what is written to it: output nobody reads (the SDK's, a host's). */
+export function discardStream(): Writable {
+	return new Writable({
+		write(_chunk, _encoding, callback) {
+			callback();
+		},
+	});
+}

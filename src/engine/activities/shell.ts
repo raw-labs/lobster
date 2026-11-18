@@ -1,4 +1,7 @@
+// Running a `run:` step's shell command.
 import { runAbortableProcess } from "../../process/abortable_process.js";
+
+/** Run `command` through the system shell; a non-zero exit fails with its output. */
 export async function runShellCommand({
 	command,
 	stdin,

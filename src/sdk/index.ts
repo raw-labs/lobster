@@ -36,7 +36,7 @@ export {
 	bindStoreSession,
 	type StoreSession,
 	type StoreOptions,
-} from "../persistence/public.js";
+} from "../core/store.js";
 export {
 	PersistenceError,
 	PersistenceOutcomeUnknown,
@@ -47,7 +47,7 @@ export { listRuns, getRun, getWait, type RunQuery, type RunPage } from "../core/
 export type { RunView, WaitView, WaitSummary, WaitRequest } from "../persistence/waits.js";
 export type { RunStatus, RunSummary } from "../persistence/model.js";
 
-export { upgradeStore, type UpgradeReport } from "../workflows/upgrade.js";
+export { upgradeStore, type UpgradeReport } from "../engine/upgrade.js";
 
 export type { ResumeDecision, WaitResumeOptions, ResumeTarget } from "../resume/options.js";
 export type { PersistenceOptions, RunScope } from "../persistence/context.js";

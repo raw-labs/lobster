@@ -540,7 +540,7 @@ finally { await store.close(); }
 					action.kind === "execution-save" &&
 					boundary === "dispatch" &&
 					Object.values(action.execution.activations).some(
-						(frame) => frame.phase === "started" && frame.input?.text === "effect",
+						(frame) => frame.phase === "started" && frame.activity?.input.text === "effect",
 					)
 				) {
 					retired = true;

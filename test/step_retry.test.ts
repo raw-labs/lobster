@@ -5,10 +5,9 @@ import path from "node:path";
 import os from "node:os";
 import { PassThrough } from "node:stream";
 
-import { runWorkflowFile, loadWorkflowFile } from "../src/engine/runner.js";
-import { withRetry, resolveRetryConfig } from "../src/engine/retry.js";
-
-// --- Retry utility unit tests ---
+import { runWorkflowFile } from "../src/engine/runner.js";
+import { loadWorkflowFile } from "../src/workflows/load.js";
+import { computeDelay, resolveRetryConfig } from "../src/workflows/retry.js";
 
 test("resolveRetryConfig fills defaults", () => {
 	const config = resolveRetryConfig(undefined);
@@ -27,96 +26,29 @@ test("resolveRetryConfig preserves provided values", () => {
 	assert.equal(config.delay_ms, 1000); // default
 });
 
-test("withRetry succeeds on first try", async () => {
-	let calls = 0;
-	const result = await withRetry(
-		async () => {
-			calls++;
-			return "ok";
-		},
-		resolveRetryConfig({ max: 3 }),
+test("computeDelay waits a fixed time, or doubles up to max_delay_ms", () => {
+	const fixed = resolveRetryConfig({ delay_ms: 50 });
+	assert.deepEqual(
+		[0, 1, 2].map((attempt) => computeDelay(fixed, attempt)),
+		[50, 50, 50],
 	);
-	assert.equal(result, "ok");
-	assert.equal(calls, 1);
+	const exponential = resolveRetryConfig({
+		backoff: "exponential",
+		delay_ms: 50,
+		max_delay_ms: 150,
+	});
+	assert.deepEqual(
+		[0, 1, 2, 3].map((attempt) => computeDelay(exponential, attempt)),
+		[50, 100, 150, 150],
+	);
 });
 
-test("withRetry retries and succeeds", async () => {
-	let calls = 0;
-	const result = await withRetry(
-		async () => {
-			calls++;
-			if (calls < 3) throw new Error("transient");
-			return "ok";
-		},
-		resolveRetryConfig({ max: 3, delay_ms: 10 }),
-	);
-	assert.equal(result, "ok");
-	assert.equal(calls, 3);
-});
-
-test("withRetry throws after max exhausted", async () => {
-	let calls = 0;
-	await assert.rejects(
-		withRetry(
-			async () => {
-				calls++;
-				throw new Error("always fails");
-			},
-			resolveRetryConfig({ max: 2, delay_ms: 10 }),
-		),
-		/always fails/,
-	);
-	assert.equal(calls, 2);
-});
-
-test("withRetry never retries external abort errors", async () => {
-	let calls = 0;
-	const controller = new AbortController();
-	controller.abort();
-	const abortErr = new DOMException("aborted", "AbortError");
-	await assert.rejects(
-		withRetry(
-			async () => {
-				calls++;
-				throw abortErr;
-			},
-			resolveRetryConfig({ max: 3, delay_ms: 10 }),
-			{ signal: controller.signal },
-		),
-		(err: any) => err.name === "AbortError",
-	);
-	assert.equal(calls, 1);
-});
-
-test("withRetry retries per-attempt timeout AbortErrors when external signal is not aborted", async () => {
-	let calls = 0;
-	const timeoutAbortErr = new DOMException("step timed out", "AbortError");
-	// No external signal — per-attempt timeout abort should be retriable
-	const result = await withRetry(
-		async () => {
-			calls++;
-			if (calls < 3) throw timeoutAbortErr;
-			return "recovered";
-		},
-		resolveRetryConfig({ max: 3, delay_ms: 10 }),
-	);
-	assert.equal(result, "recovered");
-	assert.equal(calls, 3);
-});
-
-test("withRetry calls onRetry callback", async () => {
-	const retries: number[] = [];
-	let calls = 0;
-	await withRetry(
-		async () => {
-			calls++;
-			if (calls < 3) throw new Error("fail");
-			return "ok";
-		},
-		resolveRetryConfig({ max: 3, delay_ms: 10 }),
-		{ onRetry: (attempt) => retries.push(attempt) },
-	);
-	assert.deepEqual(retries, [1, 2]);
+test("computeDelay jitters by at most 10% and never past max_delay_ms", () => {
+	const config = resolveRetryConfig({ delay_ms: 1000, max_delay_ms: 1050, jitter: true });
+	for (let i = 0; i < 200; i++) {
+		const delay = computeDelay(config, 0);
+		assert.ok(delay >= 900 && delay <= 1050, String(delay));
+	}
 });
 
 // --- Validation tests ---

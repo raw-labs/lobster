@@ -6,7 +6,7 @@ import path from "node:path";
 
 import { Lobster } from "../src/sdk/Lobster.js";
 import { approve, stateSet } from "../src/sdk/primitives.js";
-import { advanceDueRuns } from "../src/engine/runner.js";
+import { advanceDueRuns } from "../src/engine/due.js";
 import { resumeToolRequest } from "../src/core/tool_runtime.js";
 import { openStoreSession } from "../src/persistence/session.js";
 import { decodeToken, encodeToken } from "../src/resume/token.js";

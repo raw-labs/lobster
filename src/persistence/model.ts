@@ -1,9 +1,14 @@
-import type { WaitRequest } from "./waits.js";
-import type { ExecutionState, ExecutionLease } from "../engine/state.js";
+import {
+	asContinuation,
+	earliestWaitDue,
+	unresolvedActivities,
+	type ExecutionState,
+	type ExecutionLease,
+} from "../engine/checkpoint.js";
 import { createHash } from "node:crypto";
 
 export const SCHEMA_VERSION = 1;
-export const CAPTURE_BYTES = 4096;
+const CAPTURE_BYTES = 4096;
 
 /** `blocked`: interrupted while a step was running; its outcome is unknown. */
 export type RunStatus = "running" | "waiting" | "blocked" | "completed" | "failed" | "cancelled";
@@ -213,9 +218,22 @@ export function capture(value: unknown): unknown {
 	return { truncated: true, bytes: Buffer.byteLength(text) };
 }
 
-/** When a waiting activation is due: a timer's time, or a question's deadline. */
-export function waitDueAt(wait: WaitRequest): number | undefined {
-	return wait.kind === "timer" ? wait.until : wait.deadline;
+/**
+ * The kind of wait a saved value publishes: a continuation says so; a pause an older version
+ * saved is told by its fields.
+ */
+function savedWaitKind(value: any): string {
+	const continuation = asContinuation(value);
+	if (continuation) {
+		const { kind } = continuation.wait;
+		return kind === "input" ? "input_request" : kind === "approval" ? "approval_request" : kind;
+	}
+	if (value.haltType) return value.haltType;
+	return value.inputStepId ||
+		value.inputSchema !== undefined ||
+		value.payload?.inputSchema !== undefined
+		? "input_request"
+		: "approval_request";
 }
 
 export function applyTransition(
@@ -401,16 +419,7 @@ function setCheckpoint(run: RunRecord, key: string, text: string | null): void {
 			Object.assign(run.waits[key], { status: "consumed", claimId: value.claimId });
 			run.status = "running";
 		} else {
-			run.waits[key] = {
-				status: "pending",
-				kind:
-					value.haltType ??
-					(value.inputStepId ||
-					value.inputSchema !== undefined ||
-					value.payload?.inputSchema !== undefined
-						? "input_request"
-						: "approval_request"),
-			};
+			run.waits[key] = { status: "pending", kind: savedWaitKind(value) };
 			run.status = "waiting";
 		}
 	}
@@ -554,7 +563,7 @@ export function validateArchive(value: unknown): asserts value is LogicalArchive
 	}
 }
 
-export function isRetiredCheckpoint(text: string | null): boolean {
+function isRetiredCheckpoint(text: string | null): boolean {
 	if (text === null) return true;
 	try {
 		const value = JSON.parse(text);
@@ -570,13 +579,7 @@ export function isRetiredCheckpoint(text: string | null): boolean {
 }
 
 export function canRetain(run: RunRecord, before: string): boolean {
-	if (
-		run.execution &&
-		Object.entries(run.execution.activations).some(
-			([key, frame]) => key.endsWith("/activity") && frame.phase === "started",
-		)
-	)
-		return false;
+	if (run.execution && unresolvedActivities(run.execution).length) return false;
 	return (
 		["completed", "failed", "cancelled"].includes(run.status) &&
 		Date.parse(run.updatedAt) < Date.parse(before) &&
@@ -623,16 +626,10 @@ export function historyPage(run: RunRecord, afterSequence: number, limit: number
  * lapses (a live owner keeps renewing it; a crashed one leaves it in the past). A waiting run
  * is due at its earliest timer or question deadline. Blocked and finished runs never are.
  */
-export function wakeTime(run: Pick<RunRecord, "execution" | "executionLease">): number | undefined {
+function wakeTime(run: Pick<RunRecord, "execution" | "executionLease">): number | undefined {
 	const execution = run.execution;
 	if (!execution) return undefined;
 	if (execution.status === "running") return run.executionLease?.expiresAt ?? 0;
 	if (execution.status !== "waiting") return undefined;
-	let at: number | undefined;
-	for (const frame of Object.values(execution.activations)) {
-		if (frame.phase !== "waiting" || !frame.wait) continue;
-		const due = waitDueAt(frame.wait);
-		if (due !== undefined && (at === undefined || due < at)) at = due;
-	}
-	return at;
+	return earliestWaitDue(execution);
 }

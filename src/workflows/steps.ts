@@ -1,3 +1,4 @@
+// What kind of step a workflow step is, and the ids of the steps nested in it.
 import type { WorkflowInputRequest, WorkflowStep } from "./types.js";
 
 /** What a step does. The loader admits one kind per step (an approval may follow a command). */
@@ -58,4 +59,22 @@ export function getStepExecution(step: WorkflowStep) {
 		return { kind: "shell" as const, value: shellCommand };
 	}
 	return { kind: "none" as const };
+}
+
+/**
+ * Every step id a list of steps produces: the steps, their parallel branches, and the steps
+ * of their switch cases and repeats, nested ones included. A skipped step skips all of them.
+ */
+export function stepIds(steps: WorkflowStep[]): string[] {
+	return steps.flatMap((step) => [
+		step.id,
+		...(step.parallel?.branches ?? []).map((branch) => branch.id),
+		...(step.repeat ? stepIds(step.steps ?? []) : []),
+		...(step.switch
+			? [
+					...step.switch.cases.flatMap((entry) => stepIds(entry.steps)),
+					...stepIds(step.switch.else ?? []),
+				]
+			: []),
+	]);
 }

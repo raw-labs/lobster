@@ -1,10 +1,15 @@
+// `lobster run --dry-run`: the plan of a workflow, step by step, without running anything.
+// Conditions, templates and pipelines are checked as a run would check them; what depends on
+// output the plan does not have is marked as such.
 import { parsePipeline } from "../pipeline/parser.js";
-import { resolveRetryConfig, type RetryConfig } from "../engine/retry.js";
+import { resolveRetryConfig } from "./retry.js";
+import type { CommandLookup } from "../commands/types.js";
 import { resolveArgsTemplate } from "./expressions.js";
 import { checkConditionSyntax, conditionRefs, evaluateCondition } from "./conditions.js";
 import { createRecord, resolveInputValue } from "./values.js";
-import { getStepExecution, isApprovalStep, isInputStep } from "./steps.js";
+import { getStepExecution, isApprovalStep, isInputStep, stepIds } from "./steps.js";
 import type { WorkflowStep, WorkflowStepResult, WorkflowRunResult } from "./types.js";
+import { messageOf } from "../util/errors.js";
 
 function dryRunStdinNote(stdin: unknown): string | null {
 	if (stdin === null || stdin === undefined) return null;
@@ -72,20 +77,15 @@ function conditionNote(condition: unknown) {
 export function dryRunWorkflow({
 	steps,
 	resolvedArgs,
-	results,
-	startIndex,
 	ctx,
 }: {
 	steps: WorkflowStep[];
 	resolvedArgs: Record<string, unknown>;
-	results: Record<string, WorkflowStepResult>;
-	startIndex: number;
-	ctx: { stderr: NodeJS.WritableStream; registry?: { get: (name: string) => unknown } };
+	ctx: { stderr: NodeJS.WritableStream; registry?: CommandLookup };
 }): WorkflowRunResult {
-	const totalSteps = steps.length - startIndex;
 	const lines = [
-		`[DRY RUN] Would execute ${totalSteps} step${totalSteps !== 1 ? "s" : ""}:\n`,
-		...planSteps(steps, resolvedArgs, results, startIndex, ctx, new Set<string>()),
+		`[DRY RUN] Would execute ${steps.length} step${steps.length !== 1 ? "s" : ""}:\n`,
+		...planSteps(steps, resolvedArgs, {}, ctx, new Set<string>()),
 		"",
 	];
 	ctx.stderr.write(lines.join("\n"));
@@ -102,14 +102,12 @@ function planSteps(
 	steps: WorkflowStep[],
 	resolvedArgs: Record<string, unknown>,
 	results: Record<string, WorkflowStepResult>,
-	startIndex: number,
 	ctx: PlanContext,
 	undecided: Set<string>,
 ): string[] {
 	const lines: string[] = [];
-	for (let idx = startIndex; idx < steps.length; idx++) {
-		const step = steps[idx];
-		const num = idx - startIndex + 1;
+	for (const [idx, step] of steps.entries()) {
+		const num = idx + 1;
 
 		const condition = step.when ?? step.condition;
 		const unknownCondition = dependsOnStepOutput(condition, undecided);
@@ -179,7 +177,7 @@ function planSteps(
 			);
 			lines.push(`     each round:`);
 			// Planned once; the last round's steps are what later steps see.
-			for (const line of planSteps(step.steps, resolvedArgs, results, 0, ctx, undecided))
+			for (const line of planSteps(step.steps, resolvedArgs, results, ctx, undecided))
 				lines.push(`     ${line}`);
 			if (step.timeout_ms) lines.push(`     timeout: ${step.timeout_ms}ms`);
 			if (step.on_error && step.on_error !== "stop") lines.push(`     on_error: ${step.on_error}`);
@@ -198,8 +196,8 @@ function planSteps(
 			if (forEachRef.trim().startsWith("$")) {
 				try {
 					resolveInputValue(forEachRef, resolvedArgs, results);
-				} catch (err: any) {
-					throw new Error(`Workflow step ${step.id} for_each: ${err?.message ?? String(err)}`);
+				} catch (err) {
+					throw new Error(`Workflow step ${step.id} for_each: ${messageOf(err)}`);
 				}
 			}
 			const dryItemVar = step.item_var ?? "item";
@@ -214,18 +212,12 @@ function planSteps(
 			loopScopedResults[dryItemVar] = { id: dryItemVar, json: { _placeholder: true } };
 			loopScopedResults[dryIndexVar] = { id: dryIndexVar, json: 0 };
 			// The body is planned once, for an item the plan does not know.
-			for (const line of planSteps(step.steps, resolvedArgs, loopScopedResults, 0, ctx, undecided))
+			for (const line of planSteps(step.steps, resolvedArgs, loopScopedResults, ctx, undecided))
 				lines.push(`     ${line}`);
 			if (step.timeout_ms) lines.push(`     timeout: ${step.timeout_ms}ms`);
 			if (step.on_error && step.on_error !== "stop") lines.push(`     on_error: ${step.on_error}`);
-			if (step.retry && typeof step.retry === "object") {
-				const rc = resolveRetryConfig(step.retry as RetryConfig);
-				if (rc.max > 1) {
-					lines.push(
-						`     retry: up to ${rc.max} attempts, ${rc.backoff} backoff (base: ${rc.delay_ms}ms${rc.jitter ? ", jitter" : ""})`,
-					);
-				}
-			}
+			const retry = retryNote(step);
+			if (retry) lines.push(`     ${retry}`);
 			results[step.id] = { id: step.id };
 			noteCondition();
 			continue;
@@ -238,8 +230,8 @@ function planSteps(
 		if (step.stdin !== undefined && step.stdin !== null) {
 			try {
 				resolveInputValue(step.stdin, resolvedArgs, results);
-			} catch (err: any) {
-				throw new Error(`Workflow step ${step.id} stdin: ${err?.message ?? String(err)}`);
+			} catch (err) {
+				throw new Error(`Workflow step ${step.id} stdin: ${messageOf(err)}`);
 			}
 		}
 
@@ -261,20 +253,7 @@ function planSteps(
 				if (typeof branch.pipeline === "string" && branch.pipeline.trim()) {
 					const pipelineText = resolveDryRunTemplate(branch.pipeline, resolvedArgs, results);
 					const pipelineNote = dryRunTemplateNote(pipelineText);
-					if (!ctx.registry) {
-						throw new Error(
-							`Parallel branch ${branch.id} requires a command registry for pipeline execution`,
-						);
-					}
-					const stages = parsePipeline(pipelineText, ctx.registry as any);
-					for (const stage of stages) {
-						if (hasDeferredDryRunStageName(stage.name)) continue;
-						if (!ctx.registry.get(stage.name)) {
-							throw new Error(
-								`Parallel branch ${branch.id} pipeline references unknown command: ${stage.name}`,
-							);
-						}
-					}
+					checkedStages(pipelineText, ctx, `Parallel branch ${branch.id}`);
 					lines.push(
 						`     branch ${branch.id}: [pipeline] ${pipelineText}${pipelineNote ? `  ${pipelineNote}` : ""}`,
 					);
@@ -308,24 +287,7 @@ function planSteps(
 		} else if (execution.kind === "pipeline") {
 			const pipelineText = resolveDryRunTemplate(execution.value, resolvedArgs, results);
 			const pipelineNote = dryRunTemplateNote(pipelineText);
-			// Validate pipeline syntax and registry even in dry-run so errors surface early.
-			if (!ctx.registry) {
-				throw new Error(
-					`Workflow step ${step.id} requires a command registry for pipeline execution`,
-				);
-			}
-			// Validate that every stage name is a known command.
-			const stages = parsePipeline(pipelineText, ctx.registry as any);
-			for (const stage of stages) {
-				if (hasDeferredDryRunStageName(stage.name)) {
-					continue;
-				}
-				if (!ctx.registry.get(stage.name)) {
-					throw new Error(
-						`Workflow step ${step.id} pipeline references unknown command: ${stage.name}`,
-					);
-				}
-			}
+			const stages = checkedStages(pipelineText, ctx, `Workflow step ${step.id}`);
 			lines.push(`  ${num}. ${step.id}  [pipeline]`);
 			lines.push(`     pipeline: ${pipelineText}${pipelineNote ? `  ${pipelineNote}` : ""}`);
 			if (stages.some((stage) => hasDeferredDryRunStageName(stage.name))) {
@@ -338,14 +300,8 @@ function planSteps(
 		if (stdinNote) lines.push(`     stdin: ${stdinNote}`);
 		if (step.timeout_ms) lines.push(`     timeout: ${step.timeout_ms}ms`);
 		if (step.on_error && step.on_error !== "stop") lines.push(`     on_error: ${step.on_error}`);
-		if (step.retry && typeof step.retry === "object") {
-			const rc = resolveRetryConfig(step.retry as RetryConfig);
-			if (rc.max > 1) {
-				lines.push(
-					`     retry: up to ${rc.max} attempts, ${rc.backoff} backoff (base: ${rc.delay_ms}ms${rc.jitter ? ", jitter" : ""})`,
-				);
-			}
-		}
+		const retry = retryNote(step);
+		if (retry) lines.push(`     ${retry}`);
 		if (isApprovalStep(step.approval)) {
 			lines.push(`     [approval required]`);
 		}
@@ -388,7 +344,7 @@ function planSwitch(
 			for (const id of stepIds(steps)) results[id] ??= { id, skipped: true };
 			return;
 		}
-		for (const line of planSteps(steps, resolvedArgs, results, 0, ctx, undecided))
+		for (const line of planSteps(steps, resolvedArgs, results, ctx, undecided))
 			lines.push(`     ${line}`);
 		// Whether these steps run is not known, so neither is anything that reads them.
 		if (state === MAY_RUN) for (const id of stepIds(steps)) undecided.add(id);
@@ -416,17 +372,22 @@ function planSwitch(
 	results[step.id] = { id: step.id };
 }
 
-/** Every step id a list of steps can produce, nested switches included. */
-function stepIds(steps: WorkflowStep[]): string[] {
-	return steps.flatMap((step) => [
-		step.id,
-		...(step.parallel?.branches ?? []).map((branch) => branch.id),
-		...(step.repeat ? stepIds(step.steps ?? []) : []),
-		...(step.switch
-			? [
-					...step.switch.cases.flatMap((entry) => stepIds(entry.steps)),
-					...stepIds(step.switch.else ?? []),
-				]
-			: []),
-	]);
+/** The retry line of a step's plan, when it retries. */
+function retryNote(step: WorkflowStep) {
+	const retry = resolveRetryConfig(step.retry);
+	if (retry.max <= 1) return undefined;
+	return `retry: up to ${retry.max} attempts, ${retry.backoff} backoff (base: ${retry.delay_ms}ms${retry.jitter ? ", jitter" : ""})`;
+}
+
+/**
+ * A pipeline's stages, checked as a run would check them: it parses, and every stage names a
+ * known command (unless its name depends on output the plan does not have).
+ */
+function checkedStages(pipelineText: string, ctx: PlanContext, what: string) {
+	if (!ctx.registry) throw new Error(`${what} requires a command registry for pipeline execution`);
+	const stages = parsePipeline(pipelineText, ctx.registry);
+	for (const stage of stages)
+		if (!hasDeferredDryRunStageName(stage.name) && !ctx.registry.get(stage.name))
+			throw new Error(`${what} pipeline references unknown command: ${stage.name}`);
+	return stages;
 }

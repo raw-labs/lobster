@@ -1,3 +1,5 @@
+// Freezing a workflow for a run: the file, its arguments and the child workflows it names,
+// so a run that resumes later runs the same definition even if the files changed.
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import { loadWorkflowFile } from "./load.js";
@@ -5,8 +7,23 @@ import { resolveTemplate } from "./expressions.js";
 import { fingerprint } from "../persistence/model.js";
 import { resolveWorkflowStepArgs } from "./values.js";
 import { resolveWorkflowArgs } from "./args.js";
-import type { Definition } from "../engine/state.js";
-import type { WorkflowStep } from "./types.js";
+import type { WorkflowFile, WorkflowStep } from "./types.js";
+
+/** A workflow frozen for a run: the file, its hash, and the child workflows it names. */
+export type Definition = {
+	filePath: string;
+	hash: string;
+	workflow: WorkflowFile;
+	children: Record<string, Definition>;
+	/**
+	 * A standalone pipeline (`lobster '...'`, `runToolRequest({ pipeline })`) run as a one-step
+	 * workflow: its output is the pipeline's items as they are, and in human mode renderers write
+	 * to the terminal as the pipeline runs.
+	 */
+	standalone?: boolean;
+	/** A standalone pipeline's input items, used as they are (never read as templates). */
+	input?: unknown[];
+};
 
 /** Freeze the definition before effects; dynamic child paths are frozen on entry. */
 export async function snapshotDefinition(

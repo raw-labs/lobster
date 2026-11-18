@@ -16,8 +16,8 @@ async function savedPipelineInput(env: Record<string, string | undefined>, key: 
 	try {
 		const pointer = JSON.parse((await store.read(key)).text!);
 		const run = await store.getRunState(pointer.runId);
-		return Object.values(run!.execution!.activations).find((frame) => frame.pipelineInput)!
-			.pipelineInput!;
+		return Object.values(run!.execution!.activations).find((frame) => frame.activity?.pause)!
+			.activity!.pause!;
 	} finally {
 		await store.close();
 	}
@@ -1028,10 +1028,14 @@ test("workflow pipeline command input pauses and resumes the same pipeline step"
 	const pipelineInput = await savedPipelineInput(env, payload.stateKey!);
 	assert.equal(pipelineInput.resumeAtIndex, 0);
 	assert.deepEqual(pipelineInput.items, [{ text: "hello" }]);
-	assert.deepEqual(pipelineInput.commandInput.pending.suspendedState, {
-		type: "ask",
-		subject: { text: '{"text":"hello"}' },
-	});
+	assert.equal(pipelineInput.mode, "same_stage");
+	assert.deepEqual(
+		pipelineInput.mode === "same_stage" && pipelineInput.commandInput.pending.suspendedState,
+		{
+			type: "ask",
+			subject: { text: '{"text":"hello"}' },
+		},
+	);
 
 	const resumed = await runWorkflowFile({
 		filePath,

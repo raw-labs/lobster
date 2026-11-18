@@ -1,3 +1,4 @@
+// Listing and inspecting runs and waits, for hosts and the CLI (`runs list/show`, `waits show`).
 import { sessionFromEnv, resolveStoreSession } from "../persistence/context.js";
 import { openStoreSession, type StoreSession } from "../persistence/session.js";
 import type { RunStatus, RunSummary } from "../persistence/model.js";

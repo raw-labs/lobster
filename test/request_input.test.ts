@@ -43,13 +43,13 @@ async function pausedFrame(env: Record<string, string | undefined>, stateKey: st
 		const { runId } = JSON.parse((await store.read(stateKey)).text!);
 		const run = await store.getRunState(runId);
 		const frame = Object.values(run!.execution!.activations).find(
-			(item) => item.phase === "waiting" && item.pipelineInput,
-		)!.pipelineInput!;
+			(item) => item.phase === "waiting" && item.activity?.pause,
+		)!.activity!.pause!;
 		return {
 			resumeMode: frame.mode,
 			resumeAtIndex: frame.resumeAtIndex,
 			items: frame.items,
-			commandInput: frame.commandInput as any,
+			commandInput: frame.mode === "same_stage" ? (frame.commandInput as any) : undefined,
 		};
 	} finally {
 		await store.close();

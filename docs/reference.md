@@ -94,7 +94,7 @@ Notes:
   - `approval.initiated_by` (or `initiatedBy`) sets the initiator id for comparison.
   - `LOBSTER_APPROVAL_INITIATED_BY` can provide a default initiator id at run time.
   - `LOBSTER_APPROVAL_APPROVED_BY` is used at resume/approval time for identity checks.
-- A rejected approval cancels the run. With `approval: { prompt: ..., on_reject: continue }`, a "no" completes the step with `approved: false` and the run goes on, so later steps can check `when: $step.approved`. Such a rejection is a decision like an approval: the identity rules above apply to it.
+- A rejected approval cancels the run, whether the "no" is typed at the terminal or sent with `resume --approve no`. In human mode, `lobster run` reports a cancelled run on stderr and exits 1. With `approval: { prompt: ..., on_reject: continue }`, a "no" completes the step with `approved: false` and the run goes on, so later steps can check `when: $step.approved`. Such a rejection is a decision like an approval: the identity rules above apply to it.
 
 ### Conditions
 

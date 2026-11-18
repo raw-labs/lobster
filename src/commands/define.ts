@@ -1,5 +1,11 @@
 import { closestMatch } from "../util/suggest.js";
-import type { CommandArgsSchema, CommandMeta, DefinedCommand, LobsterCommand } from "./types.js";
+import type {
+	CommandArgsSchema,
+	CommandLike,
+	CommandMeta,
+	DefinedCommand,
+	LobsterCommand,
+} from "./types.js";
 
 const NAME = /^[A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*)*$/;
 
@@ -31,7 +37,7 @@ export function defineCommand<T extends CommandDefinition>(command: T): T & Defi
 }
 
 /** Flags declared as booleans, which never take the next word as their value (except true/false). */
-export function booleanFlags(command: LobsterCommand | undefined): string[] {
+export function booleanFlags(command: CommandLike | undefined): string[] {
 	const properties = (command?.meta?.argsSchema as CommandArgsSchema | undefined)?.properties;
 	if (!properties) return [];
 	return Object.entries(properties)
@@ -44,7 +50,7 @@ export function booleanFlags(command: LobsterCommand | undefined): string[] {
  * Commands without a schema (custom host commands) are not checked.
  */
 export function assertKnownFlags(
-	command: LobsterCommand,
+	command: CommandLike,
 	invokedAs: string,
 	args: Record<string, unknown>,
 ) {

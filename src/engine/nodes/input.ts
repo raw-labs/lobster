@@ -1,54 +1,82 @@
-import { activation } from "../state.js";
-import type { Machine, Scope } from "../machine.js";
-import type { WorkflowStep } from "../../workflows/types.js";
-import type { WaitRequest } from "../../persistence/waits.js";
-import {
-	resolveInputSubject,
-	validateInputResponse,
-	parseResponseJson,
-	questionDeadline,
-	readAnswer,
-} from "../gates.js";
-import { isInteractive } from "../../io/terminal.js";
+// An `input:` step, or a question a pipeline asked: a structured answer from a person.
+import type { WorkflowStep, WorkflowStepResult } from "../../workflows/types.js";
+import { resolveInputValue } from "../../workflows/values.js";
+import { activation, type WaitRequest } from "../checkpoint.js";
+import type { Machine } from "../machine.js";
+import type { Scope } from "../scope.js";
+import { validateInputResponse } from "../asking.js";
+import { askAtTerminal, resolveWait, waitDeadline, waitOf } from "../waits.js";
 
-export async function input(
+type InputWait = Extract<WaitRequest, { kind: "input" }>;
+
+/** Ask for an answer to the step's question (or to `request`, a pipeline's). */
+export async function inputStep(
 	machine: Machine,
 	step: WorkflowStep,
 	key: string,
 	scope: Scope,
-	request?: WaitRequest,
+	request?: InputWait,
 ) {
 	const frame = activation(machine.state, key);
-	frame.stepId = step.id;
 	if (frame.phase === "completed") return frame.result!;
-	if (!frame.wait) {
-		const subject = resolveInputSubject({
-			step,
-			args: scope.args,
-			results: scope.results,
-			lastStepId: scope.lastStepId ?? null,
-		});
-		frame.wait = request ?? {
-			kind: "input",
-			prompt: step.input!.prompt,
-			responseSchema: step.input!.responseSchema,
-			defaults: step.input!.defaults,
-			subject,
-			...questionDeadline(step.input, `Step ${step.id} input`),
-		};
-	}
-	const wait = frame.wait;
-	if (wait.kind !== "input") throw new Error("Invalid input activation");
-	if (machine.expired(frame))
-		return machine.timeOut(key, frame, { id: step.id, subject: wait.subject });
-	if (scope.ctx.mode === "tool" || !isInteractive(scope.ctx.stdin)) {
-		await machine.suspend(key, frame);
-	}
-	scope.ctx.stdout.write(wait.prompt + "\nEnter JSON response: ");
-	const read = await readAnswer(scope, wait.deadline);
-	if ("expired" in read) return machine.timeOut(key, frame, { id: step.id, subject: wait.subject });
-	const response = parseResponseJson(String(read.answer ?? "").trim());
-	validateInputResponse({ schema: wait.responseSchema, response, stepId: step.id });
+	const wait = waitOf(
+		frame,
+		"input",
+		step.id,
+		() =>
+			request ?? {
+				kind: "input",
+				prompt: step.input!.prompt,
+				responseSchema: step.input!.responseSchema,
+				defaults: step.input!.defaults,
+				subject: resolveInputSubject({ step, ...scope }),
+				...waitDeadline(step.input, `Step ${step.id} input`),
+			},
+	);
+	const unanswered = { id: step.id, subject: wait.subject };
+	const read = await askAtTerminal(
+		machine,
+		key,
+		frame,
+		scope,
+		wait.prompt + "\nEnter JSON response: ",
+		unanswered,
+	);
+	if ("timedOut" in read) return read.timedOut;
+	const response = parseResponseJson(read.answer);
+	validateInputResponse({
+		schema: wait.responseSchema,
+		response,
+		stepId: step.id,
+		standalone: scope.definition.standalone,
+	});
 	// Through resolveWait: a question published earlier (in tool mode) is consumed with it.
-	return machine.resolveWait(key, frame, { id: step.id, subject: wait.subject, response });
+	return resolveWait(machine, frame, { ...unanswered, response });
+}
+
+/** What an input step shows with its question: its `stdin:`, or the last step's value. */
+function resolveInputSubject(params: {
+	step: WorkflowStep;
+	args: Record<string, unknown>;
+	results: Record<string, WorkflowStepResult>;
+	lastStepId?: string;
+}) {
+	if (params.step.stdin !== undefined) {
+		return resolveInputValue(params.step.stdin, params.args, params.results);
+	}
+	if (!params.lastStepId) return null;
+	const previous = params.results[params.lastStepId];
+	if (!previous) return null;
+	if (previous.json !== undefined) return previous.json;
+	if (previous.response !== undefined) return previous.response;
+	if (previous.stdout !== undefined) return previous.stdout;
+	return null;
+}
+
+function parseResponseJson(raw: string): unknown {
+	try {
+		return JSON.parse(raw);
+	} catch {
+		throw new Error("Input response must be valid JSON");
+	}
 }

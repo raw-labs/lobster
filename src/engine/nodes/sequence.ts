@@ -1,40 +1,49 @@
-import { activation, occurrence } from "../state.js";
-import type { Machine, Scope } from "../machine.js";
-import type { WorkflowStep } from "../../workflows/types.js";
+// Steps one after another: each sees the results of those before it.
+import type { WorkflowStep, WorkflowStepResult } from "../../workflows/types.js";
 import { createRecord } from "../../workflows/values.js";
+import { activation, keys } from "../checkpoint.js";
+import type { Machine } from "../machine.js";
+import type { Scope } from "../scope.js";
 
-export async function sequence(machine: Machine, steps: WorkflowStep[], key: string, scope: Scope) {
+/** Run `steps` in order; the result is that of the last step that ran. */
+export async function sequence(
+	machine: Machine,
+	steps: WorkflowStep[],
+	key: string,
+	scope: Scope,
+): Promise<WorkflowStepResult> {
 	const frame = activation(machine.state, key);
 	// The checkpoint holds only this sequence's own results. Inherited results (a loop
 	// body sees everything before the loop) are combined in memory: copying them into
 	// every iteration's checkpoint made state, and every save, grow with the square of
 	// the item count.
 	frame.results ??= createRecord();
-	frame.cursor ??= 0;
+	const progress = (frame.sequence ??= { cursor: 0 });
 	const results = Object.assign(createRecord(scope.results), frame.results);
-	const local = { ...scope, results };
-	for (; frame.cursor < steps.length;) {
-		const step = steps[frame.cursor];
-		const result = await machine.visit(step, occurrence(key, step.id), {
-			...local,
-			lastStepId: frame.lastStepId,
+	while (progress.cursor < steps.length) {
+		const step = steps[progress.cursor];
+		const childKey = keys.occurrence(key, step.id);
+		const result = await machine.visit(step, childKey, {
+			...scope,
+			results,
+			lastStepId: progress.lastStepId,
 			definitionPath: (scope.definitionPath ?? "") + "/" + step.id,
 		});
 		frame.results[step.id] = results[step.id] = result;
-		const childKey = occurrence(key, step.id);
-		const node = activation(machine.state, childKey);
-		if (node.results) {
-			Object.assign(frame.results, node.results);
-			Object.assign(results, node.results);
+		// The steps inside it (a switch's case, a repeat's last round) are readable too.
+		const inner = machine.state.activations[childKey]?.results;
+		if (inner) {
+			Object.assign(frame.results, inner);
+			Object.assign(results, inner);
 		}
-		frame.cursor++;
-		if (!result.skipped && !result.error) frame.lastStepId = step.id;
-		if (result.error && step.on_error === "skip_rest") frame.cursor = steps.length;
+		progress.cursor++;
+		if (!result.skipped && !result.error) progress.lastStepId = step.id;
+		if (result.error && step.on_error === "skip_rest") progress.cursor = steps.length;
 		// The cursor is past this step and its result is kept above: one copy is enough.
 		machine.forgetBelow(childKey, true, frame);
 	}
 	frame.phase = "completed";
-	return frame.lastStepId !== undefined
-		? frame.results[frame.lastStepId]
+	return progress.lastStepId !== undefined
+		? frame.results[progress.lastStepId]
 		: { id: steps.at(-1)?.id ?? "" };
 }

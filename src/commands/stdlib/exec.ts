@@ -2,6 +2,7 @@ import { defineCommand } from "../define.js";
 import { runAbortableProcess } from "../../process/abortable_process.js";
 import { streamOf } from "../../io/terminal.js";
 import type { RunAbortableOptions } from "../../process/abortable_process.js";
+import { messageOf } from "../../util/errors.js";
 
 export const execCommand = defineCommand({
 	name: "exec",
@@ -93,8 +94,8 @@ export async function runExec(
 		let parsed;
 		try {
 			parsed = JSON.parse(result.stdout.trim() || "null");
-		} catch (err: any) {
-			throw new Error(`exec --json could not parse stdout as JSON: ${err?.message ?? String(err)}`);
+		} catch (err) {
+			throw new Error(`exec --json could not parse stdout as JSON: ${messageOf(err)}`);
 		}
 		return { output: streamOf(Array.isArray(parsed) ? parsed : [parsed]) };
 	}

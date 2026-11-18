@@ -8,12 +8,8 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { setTimeout as sleep } from "node:timers/promises";
-import {
-	advanceDueRuns,
-	advanceWorkflowRun,
-	runWorkflowFile,
-	signalEvent,
-} from "../src/engine/runner.js";
+import { advanceWorkflowRun, runWorkflowFile } from "../src/engine/runner.js";
+import { advanceDueRuns, signalEvent } from "../src/engine/due.js";
 import { openStoreSession } from "../src/persistence/session.js";
 import { decodeToken } from "../src/resume/token.js";
 import { createDefaultRegistry } from "../src/commands/registry.js";
@@ -194,7 +190,7 @@ test("resuming a timer or event wait points to advance and signal", async (t) =>
 	const session = await openStoreSession({ env: fx.env });
 	const run = (await session.getRunState(waiting.runId!))!;
 	await session.close();
-	const stateKey = Object.values(run.execution!.activations).find((f) => f.waitKey)!.waitKey!;
+	const stateKey = Object.values(run.execution!.activations).find((f) => f.wait?.key)!.wait!.key!;
 	await assert.rejects(
 		runWorkflowFile({
 			resume: decodeToken(

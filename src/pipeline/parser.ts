@@ -1,6 +1,6 @@
 import { tokenizeCommand } from "./command_tokens.js";
 import { booleanFlags } from "../commands/define.js";
-import type { CommandRegistry } from "../commands/types.js";
+import type { CommandLookup } from "../commands/types.js";
 
 function splitPipes(input: string) {
 	const parts: string[] = [];
@@ -94,7 +94,7 @@ function parseArgs(tokens: string[], booleanFlags: readonly string[] = []) {
  * Split a pipeline into stages. With a registry, each command's boolean flags come from its
  * schema, so `exec --json node -e ...` keeps `node` as the program rather than the flag value.
  */
-export function parsePipeline(input: string, registry?: Pick<CommandRegistry, "get">) {
+export function parsePipeline(input: string, registry?: CommandLookup) {
 	const stages = splitPipes(input);
 	if (stages.length === 0) throw new Error("Empty pipeline");
 

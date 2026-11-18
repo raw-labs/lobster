@@ -1,36 +1,12 @@
+// Waits as hosts see them: their IDs, revisions and requests, and the run views that list
+// them. Finding a wait by ID is checked against the caller that owns the run.
 import { createHash } from "node:crypto";
 import { WaitConflictError } from "./backend.js";
 import { runSummary, type RunMetadata, type RunState, type RunSummary } from "./model.js";
 import type { StoreSession } from "./session.js";
+import { nextRetryAt, unresolvedActivities, type WaitRequest } from "../engine/checkpoint.js";
 
-/** When a question or event wait stops waiting, and what happens then. */
-export type WaitDeadline = { deadline?: number; onTimeout?: "cancel" | "continue" };
-
-export type WaitRequest =
-	| ({
-			kind: "input";
-			prompt: string;
-			responseSchema: unknown;
-			defaults?: unknown;
-			subject?: unknown;
-	  } & WaitDeadline)
-	| ({
-			kind: "approval";
-			prompt: string;
-			items: unknown[];
-			preview?: string;
-			/** A rejection completes the step (`approved: false`) instead of cancelling the run. */
-			onReject?: "continue";
-	  } & WaitDeadline)
-	/** A `sleep:` step: due at `until` (epoch ms). */
-	| { kind: "timer"; until: number }
-	/** A `wait:` step: the oldest matching event received at or after `since`. */
-	| ({
-			kind: "event";
-			event: string;
-			match?: Record<string, unknown>;
-			since: number;
-	  } & WaitDeadline);
+export type { WaitRequest };
 
 export type WaitSummary = {
 	id: string;
@@ -76,9 +52,7 @@ function waitSummary(run: RunState, key: string): WaitSummary {
 }
 
 export function runView(run: RunState): RunView {
-	const retryTimes = Object.values(run.execution?.activations ?? {}).flatMap((frame) =>
-		frame.retryAt === undefined ? [] : [frame.retryAt],
-	);
+	const retryAt = run.execution ? nextRetryAt(run.execution) : undefined;
 	return {
 		...runSummary(run),
 		historyEnabled: run.historyEnabled !== false,
@@ -88,12 +62,10 @@ export function runView(run: RunState): RunView {
 						version: run.execution.version,
 						status: run.execution.status,
 						...(run.execution.error ? { error: run.execution.error } : {}),
-						...(retryTimes.length ? { nextRetryAt: Math.min(...retryTimes) } : {}),
+						...(retryAt !== undefined ? { nextRetryAt: retryAt } : {}),
 						...(run.wakeAt !== undefined ? { wakeAt: run.wakeAt } : {}),
 						active: (run.executionLease?.expiresAt ?? 0) > Date.now(),
-						unresolvedActivities: Object.entries(run.execution.activations)
-							.filter(([key, frame]) => key.endsWith("/activity") && frame.phase === "started")
-							.map(([key]) => key),
+						unresolvedActivities: unresolvedActivities(run.execution),
 					},
 				}
 			: {}),
@@ -184,7 +156,8 @@ function savedRequest(state: Record<string, unknown>): WaitRequest | null {
 	return null;
 }
 
-export async function resolveWait(
+/** The wait `id`, which must still be at `revision`: an answer to an older question conflicts. */
+export async function findWaitAtRevision(
 	store: StoreSession,
 	id: string,
 	revision: number,

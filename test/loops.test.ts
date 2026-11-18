@@ -6,7 +6,7 @@ import path from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 
 import { resumeToolRequest, runToolRequest } from "../src/core/index.js";
-import { advanceDueRuns } from "../src/engine/runner.js";
+import { advanceDueRuns } from "../src/engine/due.js";
 
 async function setup(t: test.TestContext, workflow: unknown, env: Record<string, string> = {}) {
 	const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-loops-"));

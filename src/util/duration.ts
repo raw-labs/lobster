@@ -19,3 +19,32 @@ export function parseDuration(value: unknown, what = "duration"): number {
 
 /** The longest delay a timer can wait; beyond it, setTimeout fires at once (about 24.8 days). */
 export const MAX_TIMER_MS = 2_147_483_647;
+
+/** Call `fire` at `until` (epoch ms), however far off: the timer re-arms past MAX_TIMER_MS. */
+export function timerUntil(until: number, fire: () => void): () => void {
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	const arm = () => {
+		const left = until - Date.now();
+		if (left <= 0) fire();
+		else timer = setTimeout(arm, Math.min(left, MAX_TIMER_MS));
+	};
+	arm();
+	return () => clearTimeout(timer);
+}
+
+/** Wait until `until` (epoch ms), however far off; `signal` stops the wait with its reason. */
+export async function sleepUntil(until: number, signal?: AbortSignal): Promise<void> {
+	signal?.throwIfAborted();
+	if (Date.now() >= until) return;
+	await new Promise<void>((resolve, reject) => {
+		const aborted = () => {
+			cancel();
+			reject(signal!.reason);
+		};
+		const cancel = timerUntil(until, () => {
+			signal?.removeEventListener("abort", aborted);
+			resolve();
+		});
+		signal?.addEventListener("abort", aborted, { once: true });
+	});
+}

@@ -1,16 +1,21 @@
-import { getRun, getWait } from "../core/runs.js";
-import { registerHandle, type PublicStoreSession, type RunScope } from "./context.js";
+// The run store as hosts see it: open a session, inspect runs and waits, close it. Executor
+// transitions stay inside Lobster.
+import { getRun, getWait } from "./runs.js";
+import { registerHandle, type PublicStoreSession, type RunScope } from "../persistence/context.js";
 import {
 	openStoreSession as openSession,
 	type StoreOptions,
 	type StoreSession as Session,
-} from "./session.js";
+} from "../persistence/session.js";
 
-export { bindStoreSession, type PublicStoreSession as StoreSession } from "./context.js";
-export type { StoreOptions } from "./session.js";
+export {
+	bindStoreSession,
+	type PublicStoreSession as StoreSession,
+} from "../persistence/context.js";
+export type { StoreOptions } from "../persistence/session.js";
 
 /** A host's view of a session: inspection and lifecycle, not executor transitions. */
-export function exposeStoreSession(session: Session): PublicStoreSession {
+function exposeStoreSession(session: Session): PublicStoreSession {
 	const handle: PublicStoreSession = Object.freeze({
 		directory: session.directory,
 		history: session.history,

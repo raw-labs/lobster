@@ -1,5 +1,6 @@
 // This is the only module that loads node:sqlite.
 import { STATE_EXISTS, WaitConflictError } from "./backend.js";
+import { messageOf } from "../util/errors.js";
 import { assertSqliteRuntime } from "./sqlite-support.js";
 import { DatabaseSync } from "node:sqlite";
 import { parentPort, workerData } from "node:worker_threads";
@@ -612,7 +613,7 @@ parentPort!.on("message", (request: WorkerRequest) => {
 			parentPort!.close();
 		}
 	} catch (error: unknown) {
-		const message = error instanceof Error ? error.message : String(error);
+		const message = messageOf(error);
 		const code = error && typeof error === "object" && "code" in error ? error.code : undefined;
 		parentPort!.postMessage({ id: request.id, error: { message, code } });
 	}

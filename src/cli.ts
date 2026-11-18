@@ -15,23 +15,23 @@ import { parseResumeArgs } from "./resume/resume.js";
 import type { ResumeTarget } from "./resume/options.js";
 import { readLineFromStream } from "./io/read_line.js";
 import { defaultStateDir } from "./state/store.js";
-import { pendingUpgrade, upgradeStore, type UpgradeReport } from "./workflows/upgrade.js";
+import { pendingUpgrade, upgradeStore, type UpgradeReport } from "./engine/upgrade.js";
 import { runPipeline } from "./pipeline/runtime.js";
 import {
-	loadWorkflowFile,
-	resolveWorkflowArgs,
 	runWorkflowFile,
 	advanceWorkflowRun,
 	abandonWorkflowRun,
-	advanceDueRuns,
-	signalEvent,
 	runPipelineText,
 } from "./engine/runner.js";
+import { advanceDueRuns, signalEvent } from "./engine/due.js";
+import { loadWorkflowFile } from "./workflows/load.js";
+import { resolveWorkflowArgs } from "./workflows/args.js";
 import { renderWorkflowGraph } from "./workflows/graph.js";
 import { parseWorkflowArgsJson } from "./workflows/values.js";
 import type { WorkflowGraphFormat } from "./workflows/graph.js";
 import { resolveWorkflowFile, WORKFLOW_FILE_EXTENSIONS } from "./workflows/load.js";
 import { parseArgv, UsageError } from "./util/argv.js";
+import { messageOf } from "./util/errors.js";
 
 // CLI commands without help of their own show the usage, which covers all of them.
 const USAGE_TOPICS = new Set([
@@ -56,7 +56,7 @@ export async function runCli(argv: string[]) {
 		// Whatever reaches here is reported as one line, not a stack trace; LOBSTER_DEBUG shows it.
 		if (cancellation.signal.aborted) throw error;
 		process.stderr.write(
-			`${process.env.LOBSTER_DEBUG ? (error?.stack ?? error) : `Error: ${error?.message ?? String(error)}`}\n`,
+			`${process.env.LOBSTER_DEBUG ? (error?.stack ?? error) : `Error: ${messageOf(error)}`}\n`,
 		);
 		process.exitCode = error instanceof UsageError ? 2 : 1;
 	} finally {
@@ -149,7 +149,7 @@ async function runCliWithSignal(
 			process.stdout.write(JSON.stringify(result) + "\n");
 		} catch (error) {
 			if (error instanceof UsageError) throw error;
-			process.stderr.write(`runs advance --due: ${error?.message ?? String(error)}\n`);
+			process.stderr.write(`runs advance --due: ${messageOf(error)}\n`);
 			process.exitCode = 1;
 		}
 		return;
@@ -183,7 +183,7 @@ async function runCliWithSignal(
 			process.stdout.write(JSON.stringify(result) + "\n");
 		} catch (error) {
 			if (error instanceof UsageError) throw error;
-			process.stderr.write(`signal: ${error?.message ?? String(error)}\n`);
+			process.stderr.write(`signal: ${messageOf(error)}\n`);
 			process.exitCode = 1;
 		}
 		return;
@@ -231,7 +231,7 @@ async function runCliWithSignal(
 			process.stdout.write(JSON.stringify(result) + "\n");
 		} catch (error) {
 			if (error instanceof UsageError) throw error;
-			process.stderr.write(`runs abandon: ${error?.message ?? String(error)}\n`);
+			process.stderr.write(`runs abandon: ${messageOf(error)}\n`);
 			process.exitCode = 1;
 		}
 		return;
@@ -339,7 +339,7 @@ async function handleGraph({ argv }: { argv: string[] }) {
 	try {
 		filePath = await resolveWorkflowFile(parsed.filePath);
 	} catch (err) {
-		process.stderr.write(`Error: ${err?.message ?? String(err)}\n`);
+		process.stderr.write(`Error: ${messageOf(err)}\n`);
 		process.exitCode = 1;
 		return;
 	}
@@ -351,7 +351,7 @@ async function handleGraph({ argv }: { argv: string[] }) {
 		process.stdout.write(graph);
 		process.stdout.write("\n");
 	} catch (err) {
-		process.stderr.write(`Error: ${err?.message ?? String(err)}\n`);
+		process.stderr.write(`Error: ${messageOf(err)}\n`);
 		process.exitCode = 1;
 	}
 }
@@ -526,6 +526,8 @@ async function handleRunInternal({
 				return output;
 			}
 
+			if (output.status === "cancelled") return reportCancelled(output);
+
 			if (output.status === "needs_approval" || output.status === "needs_input") {
 				process.stdout.write(
 					JSON.stringify(
@@ -614,6 +616,7 @@ async function handleRunInternal({
 			});
 			return output;
 		}
+		if (output.status === "cancelled") return reportCancelled(output);
 		if (output.status === "needs_approval" || output.status === "needs_input") {
 			process.stdout.write(
 				JSON.stringify(
@@ -641,6 +644,14 @@ async function handleRunInternal({
 	}
 }
 
+/** A run that ended cancelled (a "no", a deadline): it did not complete, so exit 1. */
+function reportCancelled<T extends { runId?: string; reason?: string }>(output: T): T {
+	const run = output.runId ? `Run ${output.runId}` : "The run";
+	process.stderr.write(`${run} was cancelled${output.reason ? `: ${output.reason}` : ""}.\n`);
+	process.exitCode = 1;
+	return output;
+}
+
 function reportRunError(
 	mode: "human" | "tool",
 	type: "parse_error" | "runtime_error",
@@ -648,7 +659,7 @@ function reportRunError(
 	prefix = type === "parse_error" ? "Parse error: " : "Error: ",
 	emit: (payload: ToolPayload) => void = writeToolEnvelope,
 ) {
-	const message = (error as { message?: string })?.message ?? String(error);
+	const message = messageOf(error);
 	if (mode === "tool") {
 		emit({ ok: false, error: runtimeErrorDetails(error, type) });
 	} else {
@@ -770,7 +781,7 @@ async function handleResume({
 	} catch (err) {
 		writeToolEnvelope({
 			ok: false,
-			error: { type: "parse_error", message: err?.message ?? String(err) },
+			error: { type: "parse_error", message: messageOf(err) },
 		});
 		process.exitCode = 2;
 		return;
@@ -810,7 +821,7 @@ async function handleResume({
 				forceTerminationSignal,
 			},
 		});
-	} catch (err: any) {
+	} catch (err) {
 		envelope = {
 			ok: false,
 			error: runtimeErrorDetails(err),
@@ -857,7 +868,7 @@ async function handleDoctor({
 				forceTerminationSignal,
 				haltAfterStageOnAbort: true,
 			});
-		} catch (err: any) {
+		} catch (err) {
 			return { error: err };
 		}
 	})();
@@ -865,7 +876,7 @@ async function handleDoctor({
 	if (output?.error) {
 		writeToolEnvelope({
 			ok: false,
-			error: { type: "doctor_error", message: output.error?.message ?? String(output.error) },
+			error: { type: "doctor_error", message: messageOf(output.error) },
 		});
 		process.exitCode = 1;
 		return;
@@ -1053,7 +1064,7 @@ async function offerUpgrade(argv: string[], signal: AbortSignal) {
 	try {
 		process.stderr.write(formatUpgradeReport(await upgradeStore({ directory })));
 	} catch (error) {
-		process.stderr.write(`Upgrade failed: ${error?.message ?? String(error)}\n`);
+		process.stderr.write(`Upgrade failed: ${messageOf(error)}\n`);
 	}
 }
 
@@ -1072,7 +1083,7 @@ async function handleUpgrade(argv: string[]) {
 			dryRun: flags["dry-run"] === true,
 		});
 	} catch (error) {
-		process.stderr.write(`Upgrade failed: ${error?.message ?? String(error)}\n`);
+		process.stderr.write(`Upgrade failed: ${messageOf(error)}\n`);
 		process.exitCode = 1;
 		return;
 	}

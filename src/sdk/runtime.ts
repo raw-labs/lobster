@@ -1,12 +1,8 @@
+// SDK stages as commands: each stage of a `Lobster` instance becomes the command
+// `sdk.stage.<n>`, so an SDK pipeline runs, pauses and resumes on the engine like any other.
 import { runPipeline as runCorePipeline } from "../pipeline/runtime.js";
-import type { CommandMeta } from "../commands/types.js";
-
-/**
- * SDK Runtime - Executes Lobster pipelines
- *
- * This adapts SDK stages to the core runtime so command-level suspension rules
- * stay identical across CLI, tool mode, and SDK entry points.
- */
+import type { CommandMeta, LobsterCommand } from "../commands/types.js";
+import { isPlainObject } from "../util/objects.js";
 
 /**
  * What a stage object's `run` gets: the stream of items, and the command context (the same
@@ -34,15 +30,18 @@ async function collectItems(iterable: AsyncIterable<unknown> | Iterable<unknown>
 	return items;
 }
 
-function normalizeSdkOutput(output: any): unknown[] | AsyncIterable<unknown> | Iterable<unknown> {
+/** A stage's output as items: nothing, an array or iterable as it is, or one value. */
+function normalizeSdkOutput(
+	output: unknown,
+): unknown[] | AsyncIterable<unknown> | Iterable<unknown> {
 	if (output === null || output === undefined) return [];
 	if (Array.isArray(output)) return output;
+	const iterable = output as Partial<AsyncIterable<unknown> & Iterable<unknown>>;
 	if (
-		typeof output?.[Symbol.asyncIterator] === "function" ||
-		typeof output?.[Symbol.iterator] === "function"
-	) {
-		return output;
-	}
+		typeof iterable[Symbol.asyncIterator] === "function" ||
+		typeof iterable[Symbol.iterator] === "function"
+	)
+		return iterable as AsyncIterable<unknown> | Iterable<unknown>;
 	return [output];
 }
 
@@ -63,10 +62,12 @@ function engineMeta(meta: CommandMeta | undefined) {
  * names, so the instance that resumes it supplies the stages again.
  */
 export function sdkStageRegistry(stages: SdkStage[]) {
-	const commands = new Map(
+	const commands = new Map<string, LobsterCommand>(
 		stages.map((stage, index) => [
 			`sdk.stage.${index}`,
 			{
+				name: `sdk.stage.${index}`,
+				help: () => `SDK stage ${index}`,
 				meta: {
 					...engineMeta(typeof stage === "function" ? undefined : stage?.meta),
 					description: `SDK stage ${index}`,
@@ -86,16 +87,11 @@ export function sdkStageRegistry(stages: SdkStage[]) {
 						return { output: normalizeSdkOutput(await stage(items, ctx)) };
 					}
 
-					if (typeof stage?.run === "function") {
-						const result: any = await stage.run({ input, ctx: ctx });
-						return result && "output" in result
-							? { ...result, output: normalizeSdkOutput(result.output) }
-							: result;
-					}
-
-					throw new Error(
-						`Invalid stage at index ${index}: must be a function or have run() method`,
-					);
+					// A stage object (`pipe` accepts nothing else).
+					const result = await stage.run({ input, ctx });
+					return isPlainObject(result) && "output" in result
+						? { ...result, output: normalizeSdkOutput(result.output) }
+						: result;
 				},
 			},
 		]),

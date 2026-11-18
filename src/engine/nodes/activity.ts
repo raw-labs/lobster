@@ -1,8 +1,8 @@
-import { activation, InterruptedActivityError } from "../state.js";
-import type { Machine, Scope } from "../machine.js";
-import type { WorkflowStep } from "../../workflows/types.js";
+// A step that runs a command: a shell command, a pipeline, or nothing (a value or an approval).
+import { messageOf } from "../../util/errors.js";
+import type { WorkflowStep, WorkflowStepResult } from "../../workflows/types.js";
 import { parsePipeline } from "../../pipeline/parser.js";
-import { getStepExecution } from "../../workflows/load.js";
+import { getStepExecution } from "../../workflows/steps.js";
 import { resolveTemplate } from "../../workflows/expressions.js";
 import {
 	mergeEnv,
@@ -10,78 +10,82 @@ import {
 	resolveInputValue,
 	encodeShellInput,
 } from "../../workflows/values.js";
-import { runShellCommand } from "../activities/shell.js";
-import { runPipelineStep, WorkflowPipelineInputSuspension } from "../activities/pipeline.js";
-import { parseJson, createSyntheticStepResult } from "../values.js";
 import { bindRecorder, recorderFromEnv } from "../../persistence/context.js";
-import { input } from "./input.js";
+import { activation, keys, type Activation, type ActivityInput } from "../checkpoint.js";
+import type { RunContext } from "../context.js";
+import type { Machine } from "../machine.js";
+import type { Scope } from "../scope.js";
+import { InterruptedActivityError, lostRun } from "../errors.js";
+import { runShellCommand } from "../activities/shell.js";
+import { runPipelineStep, PipelinePausedError } from "../activities/pipeline.js";
+import { parseJson, createSyntheticStepResult } from "../results.js";
+import { inputStep } from "./input.js";
 import { pipelineApproval } from "./approval.js";
 
-export async function activity(machine: Machine, step: WorkflowStep, key: string, scope: Scope) {
-	const record = activation(machine.state, key + "/activity");
+/**
+ * Run the step's command once per attempt (`key` is the attempt). What it runs is resolved
+ * and saved before dispatch; its result is saved with the completed marker. A pipeline that
+ * paused to ask continues here once answered. After a crash, a command that may have acted
+ * runs again only when the step allows it (`recovery: repeat`, nothing unrepeatable).
+ */
+export async function activityStep(
+	machine: Machine,
+	step: WorkflowStep,
+	key: string,
+	scope: Scope,
+): Promise<WorkflowStepResult> {
+	const record = activation(machine.state, keys.activity(key));
 	if (record.phase === "completed") return record.result!;
-	if (record.phase === "waiting") {
-		const paused = record.pipelineInput!;
-		if (paused.mode === "next_stage") {
-			// The pipeline halted after a stage to ask; it continues with the next one.
-			const gateKey = key + "/pipeline-gate-" + paused.resumeAtIndex;
-			if (paused.gate === "approval" && record.wait?.kind === "approval")
-				await pipelineApproval(machine, step, gateKey, scope, record.wait);
-			else {
-				await input(machine, step, gateKey, scope, record.wait);
-				record.response = activation(machine.state, gateKey).result!.response;
-			}
-		} else {
-			const gateKey =
-				key +
-				"/pipeline-input-" +
-				paused.resumeAtIndex +
-				"-" +
-				paused.commandInput!.pending.requestIndex;
-			await input(machine, step, gateKey, scope, record.wait);
-			record.response = activation(machine.state, gateKey).result!.response;
-		}
-	} else if (record.phase === "started") {
-		if (
-			record.input?.kind !== "none" &&
-			(step.recovery !== "repeat" ||
-				record.nonRetryable ||
-				containsUnrepeatable(record.input, scope.ctx.registry))
-		)
+	if (record.phase === "failed") throw new Error(record.error);
+	if (record.phase === "waiting") await answerPipelineQuestion(machine, step, key, scope, record);
+	else if (record.phase === "started") {
+		if (record.activity?.input.kind !== "none" && !mayRepeat(step, record, scope.ctx))
 			throw new InterruptedActivityError(key);
 		record.phase = "ready";
 	}
-	if (record.phase === "failed") throw new Error(record.error);
-	if (!record.input) {
-		const execution = getStepExecution(step);
-		if (execution.kind !== "shell" && execution.kind !== "pipeline" && execution.kind !== "none")
-			throw new Error("Control node dispatched as activity");
-		record.input = {
-			kind: execution.kind,
-			...(execution.kind !== "none"
-				? { text: resolveTemplate(execution.value, scope.args, scope.results) }
-				: {}),
-			input:
-				scope.definition.standalone && scope.definition.input !== undefined
-					? scope.definition.input
-					: resolveInputValue(step.stdin, scope.args, scope.results),
-			// Do not persist the host environment or credentials. Resolve only explicit workflow values.
-			env: mergeEnv(scope.baseEnv ?? {}, scope.env, step.env, scope.args, scope.results),
-			cwd: resolveCwd(step.cwd ?? scope.cwd, scope.args) ?? scope.ctx.cwd,
-		};
-	}
-	const saved = record.input;
-
-	const activityKey = key.slice(0, key.lastIndexOf("/attempt-"));
 	if (record.phase !== "waiting") {
-		const logical = activation(machine.state, activityKey);
-		record.attempt = logical.dispatchAttempts = (logical.dispatchAttempts ?? 0) + 1;
+		// Counted on the step's own frame, over all its attempts and recoveries.
+		const stepFrame = activation(machine.state, keys.stepOf(key));
+		stepFrame.dispatches = (stepFrame.dispatches ?? 0) + 1;
+		record.activity ??= { input: resolveActivityInput(step, scope), dispatch: 0 };
+		record.activity.dispatch = stepFrame.dispatches;
 	}
+	return dispatch(machine, step, key, scope, record);
+}
+
+/** What the step runs, resolved from its templates; saved before it is dispatched. */
+function resolveActivityInput(step: WorkflowStep, scope: Scope): ActivityInput {
+	const execution = getStepExecution(step);
+	if (execution.kind !== "shell" && execution.kind !== "pipeline" && execution.kind !== "none")
+		throw new Error("Control node dispatched as activity");
+	return {
+		kind: execution.kind,
+		...(execution.kind !== "none"
+			? { text: resolveTemplate(execution.value, scope.args, scope.results) }
+			: {}),
+		input:
+			scope.definition.standalone && scope.definition.input !== undefined
+				? scope.definition.input
+				: resolveInputValue(step.stdin, scope.args, scope.results),
+		// Do not persist the host environment or credentials. Resolve only explicit workflow values.
+		env: mergeEnv(scope.baseEnv ?? {}, scope.env, step.env, scope.args, scope.results),
+		cwd: resolveCwd(step.cwd ?? scope.cwd, scope.args) ?? scope.ctx.cwd,
+	};
+}
+
+async function dispatch(
+	machine: Machine,
+	step: WorkflowStep,
+	key: string,
+	scope: Scope,
+	record: Activation,
+) {
+	const { input: saved, dispatch: count } = record.activity!;
+	const activityId = keys.stepOf(key);
 	const history = recorderFromEnv(scope.ctx.env)?.child(key + "/");
 	const historyId = await history?.start("activity", step.id);
 	record.phase = "started";
 	await machine.save();
-	let result;
 	// Whether a command may have started. Until then, stopping leaves nothing to inspect: a
 	// stop between the save above and the dispatch puts the step back to ready (below).
 	let dispatched = false;
@@ -89,23 +93,27 @@ export async function activity(machine: Machine, step: WorkflowStep, key: string
 		scope.startTimeout?.();
 		scope.ctx.signal?.throwIfAborted();
 		machine.checkAuthority(scope.ctx);
-		await scope.ctx._onExecutionStarted?.();
-		const ctx = {
+		const hooks = scope.ctx.hooks;
+		await hooks?.onExecutionStarted?.();
+		const ctx: RunContext = {
 			...scope.ctx,
-			_onNonRetryableSideEffect: () => {
-				record.nonRetryable = true;
-				scope.ctx._onNonRetryableSideEffect?.();
+			hooks: {
+				...hooks,
+				onNonRetryableSideEffect: () => {
+					record.nonRetryable = true;
+					hooks?.onNonRetryableSideEffect?.();
+				},
 			},
-			_onUnsafeDispatch: () => scope.ctx._onUnsafeDispatch?.(),
 		};
 		const baseEnv = {
 			...ctx.env,
 			...saved.env,
 			LOBSTER_RUN_ID: machine.store.runId,
-			LOBSTER_ACTIVITY_ID: machine.store.runId + "/" + activityKey,
-			LOBSTER_ACTIVITY_ATTEMPT: String(record.attempt),
+			LOBSTER_ACTIVITY_ID: machine.store.runId + "/" + activityId,
+			LOBSTER_ACTIVITY_ATTEMPT: String(count),
 		};
 		const env = history ? bindRecorder(baseEnv, history) : baseEnv;
+		let result;
 		if (saved.kind === "shell") {
 			dispatched = true;
 			const { stdout } = await runShellCommand({
@@ -116,7 +124,7 @@ export async function activity(machine: Machine, step: WorkflowStep, key: string
 				signal: ctx.signal,
 				forceTerminationSignal: ctx.forceTerminationSignal,
 				assertInvocationCurrent: ctx.assertInvocationCurrent,
-				onEffectDispatch: ctx._onUnsafeDispatch,
+				onEffectDispatch: ctx.hooks?.onUnsafeDispatch,
 				killSignal: () => (scope.timeoutSignal?.aborted ? "SIGKILL" : undefined),
 			});
 			result = { id: step.id, stdout, json: parseJson(stdout) };
@@ -133,14 +141,11 @@ export async function activity(machine: Machine, step: WorkflowStep, key: string
 				llmSpendLedger: scope.ledger,
 				env,
 				cwd: saved.cwd,
-				requestInputEnabled: !scope.gatesRefused,
 				gatesRefused: scope.gatesRefused,
-				resume: record.pipelineInput
-					? { pipelineInput: record.pipelineInput, response: record.response }
-					: undefined,
+				resume: resumeOf(record.activity!),
 				onExecutionStart: () => {
 					dispatched = true;
-					return ctx._onExecutionStarted?.();
+					return ctx.hooks?.onExecutionStarted?.();
 				},
 				standalone: scope.definition.standalone,
 			});
@@ -152,24 +157,30 @@ export async function activity(machine: Machine, step: WorkflowStep, key: string
 		// The result and completed marker are one checkpoint. Parent cursor advances later.
 		await machine.save();
 		// Once the result is saved, the step's own timer or heartbeat may no longer fail it:
-		// that would retry, and run again, a command that already finished. Only the host may
-		// still stop the run here.
-		if (!scope.timeoutSignal?.aborted) ctx.signal?.throwIfAborted();
+		// that would retry, and run again, a command that already finished. Only a stop from
+		// outside the step (the host, an enclosing step's timeout, a parallel sibling, a lost
+		// lease) may still end the run here.
+		if (stoppedFromOutside(scope)) throw scope.ctx.signal!.reason;
 		return result;
 	} catch (error) {
-		if (error instanceof WorkflowPipelineInputSuspension) {
+		if (error instanceof PipelinePausedError) {
 			if (historyId) await history!.finish(historyId, "waiting");
-			record.pipelineInput = error.pipelineInput;
-			record.wait = error.request;
+			record.activity!.pause = error.pause;
+			record.activity!.question = error.question;
+			delete record.activity!.response;
 			record.phase = "waiting";
 			await machine.save();
-			return activity(machine, step, key, scope);
+			return activityStep(machine, step, key, scope);
 		}
-		if (machine.fatal(error) || scope.ctx.signal?.aborted) {
+		// The run was stopped from outside the step or is no longer this invocation's: a command
+		// that started may have acted, so the activity stays started and its outcome unknown.
+		// Its own timeout is a failure like any other: the command was stopped by the step,
+		// which then retries or fails as its settings say.
+		if (lostRun(error) || stoppedFromOutside(scope)) {
 			// Stopped before any command started (a history write failed, Ctrl-C while
 			// preparing): the step can simply start again. If this save fails too, it stays
 			// started and is treated as interrupted, which is never wrong.
-			if (!dispatched && !(error instanceof InterruptedActivityError)) {
+			if (!dispatched) {
 				record.phase = "ready";
 				if (historyId) await history!.finish(historyId, "closed").catch(() => {});
 				await machine.save().catch(() => {});
@@ -178,7 +189,7 @@ export async function activity(machine: Machine, step: WorkflowStep, key: string
 		}
 		machine.checkAuthority(scope.ctx);
 		record.phase = "failed";
-		record.error = error?.message ?? String(error);
+		record.error = messageOf(error);
 		if (historyId) await history!.finish(historyId, "failed", error);
 		await machine.save();
 		throw error;
@@ -186,16 +197,60 @@ export async function activity(machine: Machine, step: WorkflowStep, key: string
 }
 
 /**
- * A crash leaves no record of whether a command that may not be repeated already acted, so a
- * step running one is never re-run on recovery, whatever its `recovery` says. Retries in the
- * same process stay precise: the command reports dispatch through `onNonRetryableSideEffect`.
+ * Whether the step was stopped by something other than its own clock: the host, an enclosing
+ * step's timeout, a parallel sibling's failure, a lost lease. (When the step's clock fires
+ * first, the combined signal carries the clock's reason.)
  */
-function containsUnrepeatable(
-	saved: { kind: string; text?: string } | undefined,
-	registry: { get(name: string): { meta?: { repeatable?: boolean } } | undefined } | undefined,
+function stoppedFromOutside(scope: Scope) {
+	const signal = scope.ctx.signal;
+	if (!signal?.aborted) return false;
+	return !(scope.timeoutSignal?.aborted && signal.reason === scope.timeoutSignal.reason);
+}
+
+/**
+ * The pipeline paused to ask its question: ask through a gate activation, which publishes it,
+ * and keep the answer for the pipeline to continue with.
+ */
+async function answerPipelineQuestion(
+	machine: Machine,
+	step: WorkflowStep,
+	key: string,
+	scope: Scope,
+	record: Activation,
 ) {
-	if (saved?.kind !== "pipeline" || !saved.text || !registry) return false;
-	return parsePipeline(saved.text, registry as any).some(
+	const pause = record.activity!.pause!;
+	const question = record.activity!.question!;
+	if (question.kind === "approval") {
+		// The pipeline halted after a stage to ask; it continues with the next one.
+		const gateKey = keys.pipelineGate(key, pause.resumeAtIndex);
+		await pipelineApproval(machine, step, gateKey, scope, question);
+		return;
+	}
+	const gateKey =
+		pause.mode === "next_stage"
+			? keys.pipelineGate(key, pause.resumeAtIndex)
+			: keys.pipelineInput(key, pause.resumeAtIndex, pause.commandInput.pending.requestIndex);
+	await inputStep(machine, step, gateKey, scope, question);
+	record.activity!.response = activation(machine.state, gateKey).result!.response;
+}
+
+/**
+ * Whether an activity interrupted by a crash may run again. A crash leaves no record of
+ * whether a command that may not be repeated already acted, so a step running one never runs
+ * again on recovery, whatever its `recovery` says.
+ */
+function mayRepeat(step: WorkflowStep, record: Activation, ctx: RunContext) {
+	if (step.recovery !== "repeat" || record.nonRetryable) return false;
+	const saved = record.activity?.input;
+	if (saved?.kind !== "pipeline" || !saved.text || !ctx.registry) return true;
+	const registry = ctx.registry;
+	return !parsePipeline(saved.text, registry).some(
 		(stage) => registry.get(stage.name)?.meta?.repeatable === false,
 	);
+}
+
+/** Where a paused pipeline continues, with the question it asked and the answer. */
+function resumeOf(activity: NonNullable<Activation["activity"]>) {
+	const { pause, question, response } = activity;
+	return pause && question ? { pause, question, response } : undefined;
 }

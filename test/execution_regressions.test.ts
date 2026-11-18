@@ -4,8 +4,9 @@ import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { PassThrough } from "node:stream";
-import { createToolContext } from "../src/core/tool_runtime.js";
-import { runWorkflowFile } from "../src/engine/runner.js";
+import { createToolContext, resumeToolRequest } from "../src/core/tool_runtime.js";
+import { advanceWorkflowRun, runWorkflowFile } from "../src/engine/runner.js";
+import { openStoreSession } from "../src/persistence/session.js";
 
 for (const backend of ["sqlite"]) {
 	test(`machine ${backend}: parent budget stops further child and parent effects`, async (t) => {
@@ -367,11 +368,73 @@ for (const decision of ["rejection", "timeout"]) {
 							}
 						: original.get(name),
 			};
-			await assert.rejects(
-				runWorkflowFile({ filePath, ctx: { ...ctx, mode: "human" } }),
-				decision === "rejection" ? /Not approved/ : /Timed out waiting for input/,
-			);
+			const run = runWorkflowFile({ filePath, ctx: { ...ctx, mode: "human" } });
+			if (decision === "rejection") {
+				// A "no" cancels the run, as an answered rejection does.
+				const result = await run;
+				assert.equal(result.status, "cancelled");
+				assert.equal(result.reason, "Not approved");
+			} else await assert.rejects(run, /Timed out waiting for input/);
 			assert.equal(calls, 1);
 		},
 	);
 }
+
+test("a question published earlier and rejected at a terminal leaves nothing to answer", async (t) => {
+	const directory = await fs.mkdtemp(path.join(os.tmpdir(), "lobster-terminal-no-"));
+	t.after(() => fs.rm(directory, { recursive: true, force: true }));
+	const filePath = path.join(directory, "root.lobster");
+	await fs.writeFile(
+		filePath,
+		JSON.stringify({ steps: [{ id: "ship", approval: { prompt: "Ship?" } }] }),
+	);
+	const env = { ...process.env, LOBSTER_STATE_DIR: path.join(directory, "state") };
+	const paused = await runWorkflowFile({ filePath, ctx: createToolContext({ env }) });
+	assert.equal(paused.status, "needs_approval");
+	const token = paused.requiresApproval!.resumeToken!;
+
+	const stdin = Object.assign(new PassThrough(), { isTTY: true });
+	const stdout = new PassThrough();
+	t.after(() => {
+		stdin.destroy();
+		stdout.destroy();
+	});
+	stdout.on("data", () => stdin.write("no\n"));
+	const ctx = { ...createToolContext({ env, stdin, stdout }), mode: "human" as const };
+	const advanced = await advanceWorkflowRun({ runId: paused.runId!, ctx });
+	assert.equal(advanced.status, "cancelled");
+	assert.equal(advanced.reason, "Not approved");
+
+	const store = await openStoreSession({ env, readOnly: true });
+	try {
+		const run = await store.getRunState(paused.runId!);
+		const statuses = Object.values(run!.waits).map((wait) => wait.status);
+		assert.equal(statuses.length, 1);
+		assert.notEqual(statuses[0], "pending");
+	} finally {
+		await store.close();
+	}
+	const late = await resumeToolRequest({ token, approved: true, ctx: { env } });
+	assert.equal(late.ok, false);
+});
+
+test("a rejection sent with resume carries its reason", async (t) => {
+	const directory = await fs.mkdtemp(path.join(os.tmpdir(), "lobster-resume-no-"));
+	t.after(() => fs.rm(directory, { recursive: true, force: true }));
+	const filePath = path.join(directory, "root.lobster");
+	await fs.writeFile(
+		filePath,
+		JSON.stringify({ steps: [{ id: "ship", approval: { prompt: "Ship?" } }] }),
+	);
+	const env = { ...process.env, LOBSTER_STATE_DIR: path.join(directory, "state") };
+	const paused = await runWorkflowFile({ filePath, ctx: createToolContext({ env }) });
+	const token = paused.requiresApproval!.resumeToken!;
+	const answered = await resumeToolRequest({ token, approved: false, ctx: { env } });
+	assert.equal(answered.status, "cancelled");
+	const store = await openStoreSession({ env, readOnly: true });
+	try {
+		assert.equal((await store.getRunState(paused.runId!))!.execution!.error, "Not approved");
+	} finally {
+		await store.close();
+	}
+});
