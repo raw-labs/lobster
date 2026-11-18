@@ -30,7 +30,7 @@ export async function runGithubPrMonitorWorkflow({ args, ctx }) {
 		key,
 		value: current,
 		signal: ctx.signal,
-		atomicWriteOptions: { assertInvocationCurrent: ctx.assertInvocationCurrent },
+		assertInvocationCurrent: ctx.assertInvocationCurrent,
 	});
 
 	if (changesOnly && !changed) {
@@ -44,7 +44,7 @@ export async function runGithubPrMonitorWorkflow({ args, ctx }) {
 		};
 	}
 
-	const summary = buildPrChangeSummary(before, current);
+	const summary = buildPrChangeSummary(before as Record<string, unknown>, current);
 
 	if (summaryOnly) {
 		return {

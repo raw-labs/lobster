@@ -103,7 +103,8 @@ export async function sdkInputItems(input: unknown): Promise<unknown[]> {
 }
 
 /**
- * Re-export for compatibility with CLI runtime
+ * Run a parsed pipeline once, without saving it as a run: part of the SDK's public API
+ * (`@clawdbot/lobster` exports it). `Lobster` instances run pipelines as saved runs.
  */
 export async function runPipeline({
 	pipeline,

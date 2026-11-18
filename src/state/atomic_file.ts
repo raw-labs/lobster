@@ -9,12 +9,6 @@ export type AtomicWriteOptions = {
 	assertInvocationCurrent?: () => void;
 };
 
-export type AtomicExclusiveWriteOptions = {
-	linkFile?: typeof fsp.link;
-	syncParentDir?: (filePath: string) => Promise<void>;
-	assertInvocationCurrent?: () => void;
-};
-
 type PublishedAtomicWriteError = NodeJS.ErrnoException & {
 	atomicWritePublished?: true;
 };
@@ -108,14 +102,6 @@ export async function ensureDirectory(dir: string) {
 	if (created) await syncCreatedDirectoryChain(created, dir);
 }
 
-function isLinkUnsupportedError(err: any): boolean {
-	return ["ENOSYS", "ENOTSUP", "EOPNOTSUPP", "EPERM", "EXDEV"].includes(err?.code);
-}
-
-export function isAtomicExclusiveUnsupportedError(err: any): boolean {
-	return err?.code === "ENOTSUP" && err?.cause && isLinkUnsupportedError(err.cause);
-}
-
 /**
  * Write a file atomically: stage to a sibling temp file, fsync, then rename
  * over the target. `rename(2)` is atomic on a single filesystem, so a reader
@@ -165,52 +151,5 @@ export async function writeFileAtomic(filePath, data, options: AtomicWriteOption
 	} finally {
 		if (handle) await handle.close().catch(() => {});
 		if (cleanup) await fsp.rm(tmpPath, { force: true }).catch(() => {});
-	}
-}
-
-export async function writeFileAtomicExclusive(
-	filePath,
-	data,
-	options: AtomicExclusiveWriteOptions = {},
-) {
-	const linkFile = options.linkFile ?? fsp.link;
-	const syncDir = options.syncParentDir ?? syncParentDir;
-	const dir = path.dirname(filePath);
-	const tmpPath = path.join(
-		dir,
-		`.${path.basename(filePath)}.${randomBytes(6).toString("hex")}.tmp`,
-	);
-	let handle;
-	try {
-		options.assertInvocationCurrent?.();
-		handle = await fsp.open(tmpPath, "wx", 0o600);
-		await handle.writeFile(data, "utf8");
-		await handle.chmod(0o600);
-		await handle.sync();
-		await handle.close();
-		handle = undefined;
-		try {
-			options.assertInvocationCurrent?.();
-			await linkFile(tmpPath, filePath);
-		} catch (err) {
-			if (!isLinkUnsupportedError(err)) throw err;
-			const unsupported = new Error(
-				"Atomic exclusive file creation requires hard-link support on this filesystem",
-			);
-			(unsupported as NodeJS.ErrnoException).code = "ENOTSUP";
-			(unsupported as Error).cause = err;
-			throw unsupported;
-		}
-		try {
-			await fsp.unlink(tmpPath);
-			await syncDir(filePath);
-		} catch (err) {
-			await fsp.unlink(filePath).catch(() => {});
-			await syncDir(filePath).catch(() => {});
-			throw err;
-		}
-	} finally {
-		if (handle) await handle.close().catch(() => {});
-		await fsp.rm(tmpPath, { force: true }).catch(() => {});
 	}
 }

@@ -1,5 +1,6 @@
 import { runAbortableProcess } from "../../process/abortable_process.js";
 import { defineCommand } from "../../commands/define.js";
+import { streamOf } from "../../io/terminal.js";
 
 const OPENCLAW_AGENT_MAX_OUTPUT_BYTES = 10 * 1024 * 1024;
 
@@ -163,8 +164,4 @@ function optionalString(value: unknown): string | undefined {
 
 function pushOption(argv: string[], name: string, value: string | undefined): void {
 	if (value !== undefined) argv.push(name, value);
-}
-
-async function* streamOf(items: unknown[]) {
-	for (const item of items) yield item;
 }

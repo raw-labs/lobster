@@ -1,4 +1,3 @@
-import { getRun, getWait } from "../core/runs.js";
 import type { RunView, WaitView } from "./waits.js";
 import type { ExecutionRecorder, StoreSession } from "./session.js";
 import type { RunMetadata } from "./model.js";
@@ -33,31 +32,9 @@ export type PersistenceOptions = {
 
 const handles = new WeakMap<StoreHandle, StoreSession>();
 
-export function exposeStoreSession(session: StoreSession): PublicStoreSession {
-	const handle: PublicStoreSession = Object.freeze({
-		directory: session.directory,
-		history: session.history,
-		trackRuns: session.trackRuns,
-		readOnly: session.readOnly,
-		listRuns: session.listRuns.bind(session),
-		getRun: (runId: string, scope: RunScope = {}) =>
-			getRun({
-				runId,
-				ctx: { storeSession: handle, runMetadata: scope },
-			}),
-		getWait: (waitId: string, scope: RunScope = {}) =>
-			getWait({
-				waitId,
-				ctx: { storeSession: handle, runMetadata: scope },
-			}),
-		inspect: session.inspect.bind(session),
-		retain: session.retain.bind(session),
-		reconcile: session.reconcile.bind(session),
-		acknowledge: session.acknowledge.bind(session),
-		close: session.close.bind(session),
-	});
+/** Let `handle` (a host's view of `session`) stand for it wherever a store session is taken. */
+export function registerHandle(handle: StoreHandle, session: StoreSession) {
 	handles.set(handle, session);
-	return handle;
 }
 
 export function resolveStoreSession(handle: StoreHandle): StoreSession {

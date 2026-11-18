@@ -32,11 +32,6 @@ export type WaitRequest =
 			since: number;
 	  } & WaitDeadline);
 
-/** When a waiting activation is due: a timer's time, or a question's deadline. */
-export function waitDueAt(wait: WaitRequest): number | undefined {
-	return wait.kind === "timer" ? wait.until : wait.deadline;
-}
-
 export type WaitSummary = {
 	id: string;
 	runId: string;

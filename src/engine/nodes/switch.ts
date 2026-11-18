@@ -24,7 +24,6 @@ export async function switchStep(machine: Machine, step: WorkflowStep, key: stri
 		else if (config.else) frame.case = "else";
 		else throw new Error(`Workflow step ${step.id} switch: no case matched and there is no else`);
 		// Deterministic from saved results; written with the case's first save.
-		machine.defer();
 	}
 	const chosen = frame.case;
 	const steps = chosen === "else" ? config.else! : config.cases[chosen - 1].steps;

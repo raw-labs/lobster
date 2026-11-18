@@ -1,5 +1,5 @@
 // This is the only module that loads node:sqlite.
-import { WaitConflictError } from "./backend.js";
+import { STATE_EXISTS, WaitConflictError } from "./backend.js";
 import { assertSqliteRuntime } from "./sqlite-support.js";
 import { DatabaseSync } from "node:sqlite";
 import { parentPort, workerData } from "node:worker_threads";
@@ -393,7 +393,7 @@ function handle(request: WorkerRequest): WorkerResult<WorkerMethod> {
 				}
 
 				if (args.exclusive && prepare("SELECT key FROM state WHERE key=?").get(args.key)) {
-					throw Object.assign(new Error("State already exists"), { code: "EEXIST" });
+					throw Object.assign(new Error("State already exists"), { code: STATE_EXISTS });
 				}
 				if (args.text === null) {
 					prepare("DELETE FROM state WHERE key=?").run(args.key);

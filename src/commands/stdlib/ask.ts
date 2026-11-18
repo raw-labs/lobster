@@ -1,9 +1,6 @@
 import { defineCommand } from "../define.js";
 import { prepareSchema, schemaValidationMessage } from "../../util/validation.js";
-
-function isInteractive(stdin) {
-	return Boolean(stdin.isTTY);
-}
+import { isInteractive, PREVIEW_CHARS, streamOf } from "../../io/terminal.js";
 
 function compileAskValidator(schema) {
 	try {
@@ -123,7 +120,7 @@ export const askCommand = defineCommand({
 			const preview = items
 				.map((item) => (typeof item === "string" ? item : JSON.stringify(item)))
 				.join("\n")
-				.slice(0, 2000);
+				.slice(0, PREVIEW_CHARS);
 			subject = { text: preview };
 		}
 
@@ -136,7 +133,7 @@ export const askCommand = defineCommand({
 					suspendedState: { type: "ask", ...(subject ? { subject } : null) },
 				});
 				return {
-					output: asStream([response]),
+					output: streamOf([response]),
 				};
 			}
 			return {
@@ -174,7 +171,3 @@ export const askCommand = defineCommand({
 		throw lastError ?? new Error("ask response failed schema validation");
 	},
 });
-
-async function* asStream(items) {
-	for (const item of items) yield item;
-}

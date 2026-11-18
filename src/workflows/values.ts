@@ -96,15 +96,6 @@ export function resolveInputValue(
 	return stdin;
 }
 
-export function resolveShellStdin(
-	stdin: unknown,
-	args: Record<string, unknown>,
-	results: Record<string, WorkflowStepResult>,
-) {
-	const value = resolveInputValue(stdin, args, results);
-	return encodeShellInput(value);
-}
-
 export function resolveWorkflowStepArgs(
 	workflowArgs: Record<string, unknown> | undefined,
 	parentArgs: Record<string, unknown>,

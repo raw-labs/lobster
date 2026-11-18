@@ -1,5 +1,6 @@
-import { stableStringify } from "../state/serialization.js";
+import { stableStringify } from "../util/serialization.js";
 import { prepareSchema, schemaValidationMessage } from "../util/validation.js";
+import { isInteractive } from "../io/terminal.js";
 
 export type RequestInputParams = {
 	prompt: string;
@@ -39,7 +40,6 @@ export type CommandInputResume = {
 	state: CommandInputState;
 	response: unknown;
 	consumed?: boolean;
-	onConsumed?: () => void | Promise<void>;
 };
 
 export type PipelineCommandInputRequest = {
@@ -226,7 +226,6 @@ export function createStageRequestInput({
 			const response = snapshotJson(resume.response, "requestInput response");
 			validateRequestInputResponse(metadata.responseSchema, response, "requestInput");
 			const historyResponse = snapshotJson(response, "requestInput response");
-			await resume.onConsumed?.();
 			resume.consumed = true;
 			history.push({
 				requestIndex,
@@ -489,10 +488,6 @@ async function requestInputInteractively(ctx: any, metadata: RequestInputMetadat
 	}
 	validateRequestInputResponse(metadata.responseSchema, response, "requestInput");
 	return snapshotJson(response, "requestInput response");
-}
-
-function isInteractive(stdin: any) {
-	return Boolean(stdin?.isTTY);
 }
 
 async function closeIterator(

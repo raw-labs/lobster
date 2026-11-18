@@ -12,12 +12,11 @@ import {
 	keyToPath,
 	withFileLock,
 	ensureDirectory,
-	stripExtendedLengthPrefix,
 	writeStateJson,
 	readStateJsonWithLock as readStateJson,
 	writeFileAtomic,
-	writeFileAtomicExclusive,
 } from "../src/state/store.js";
+import { stripExtendedLengthPrefix } from "../src/state/atomic_file.js";
 import { openStoreSession } from "../src/persistence/session.js";
 import { SqliteBackend } from "../src/persistence/sqlite.js";
 
@@ -299,88 +298,6 @@ test("readStateJson surfaces malformed authoritative state", async () => {
 	await storeRaw(tmp, "resume", '{"partial"');
 
 	await assert.rejects(() => readStateJson({ env, key: "resume" }), SyntaxError);
-});
-
-test("writeFileAtomicExclusive creates private files without replacing existing targets", async () => {
-	const tmp = mkdtempSync(path.join(os.tmpdir(), "lobster-atomic-exclusive-"));
-	const target = path.join(tmp, "approval_deadbeef.json");
-
-	await writeFileAtomicExclusive(target, '{"stateKey":"original"}\n');
-	assert.equal((await fsp.stat(target)).mode & 0o777, 0o600);
-
-	await assert.rejects(
-		() => writeFileAtomicExclusive(target, '{"stateKey":"replacement"}\n'),
-		(err: NodeJS.ErrnoException) => err?.code === "EEXIST",
-	);
-	assert.equal(await fsp.readFile(target, "utf8"), '{"stateKey":"original"}\n');
-
-	const leftovers = (await fsp.readdir(tmp)).filter((f) => f.includes(".tmp"));
-	assert.deepEqual(leftovers, []);
-});
-
-test("writeFileAtomicExclusive removes temp link before final directory sync", async () => {
-	const tmp = mkdtempSync(path.join(os.tmpdir(), "lobster-atomic-exclusive-sync-order-"));
-	const target = path.join(tmp, "approval_deadbeef.json");
-	let filesAtSync: string[] = [];
-
-	await writeFileAtomicExclusive(target, '{"stateKey":"original"}\n', {
-		async syncParentDir() {
-			filesAtSync = await fsp.readdir(tmp);
-		},
-	});
-
-	assert.equal(await fsp.readFile(target, "utf8"), '{"stateKey":"original"}\n');
-	assert.ok(filesAtSync.includes("approval_deadbeef.json"));
-	assert.deepEqual(
-		filesAtSync.filter((file) => file.includes(".tmp")),
-		[],
-	);
-});
-
-test("writeFileAtomicExclusive rejects unsupported hard links without a partial target", async () => {
-	const tmp = mkdtempSync(path.join(os.tmpdir(), "lobster-atomic-exclusive-unsupported-"));
-	const target = path.join(tmp, "approval_deadbeef.json");
-	const unsupported = Object.assign(new Error("operation not supported"), { code: "ENOTSUP" });
-	const options = {
-		async linkFile() {
-			throw unsupported;
-		},
-	};
-
-	await assert.rejects(
-		() => writeFileAtomicExclusive(target, '{"stateKey":"original"}\n', options),
-		(err: NodeJS.ErrnoException) => err?.code === "ENOTSUP",
-	);
-	await assert.rejects(
-		() => fsp.stat(target),
-		(err: NodeJS.ErrnoException) => err?.code === "ENOENT",
-	);
-
-	const leftovers = (await fsp.readdir(tmp)).filter((f) => f.includes(".tmp"));
-	assert.deepEqual(leftovers, []);
-});
-
-test("writeFileAtomicExclusive removes published target when parent directory sync fails", async () => {
-	const tmp = mkdtempSync(path.join(os.tmpdir(), "lobster-atomic-exclusive-dir-sync-"));
-	const target = path.join(tmp, "approval_deadbeef.json");
-	const fault = Object.assign(new Error("dir sync failed"), { code: "EIO" });
-
-	await assert.rejects(
-		() =>
-			writeFileAtomicExclusive(target, '{"stateKey":"original"}\n', {
-				async syncParentDir() {
-					throw fault;
-				},
-			}),
-		(err: NodeJS.ErrnoException) => err?.code === "EIO",
-	);
-	await assert.rejects(
-		() => fsp.stat(target),
-		(err: NodeJS.ErrnoException) => err?.code === "ENOENT",
-	);
-
-	const leftovers = (await fsp.readdir(tmp)).filter((f) => f.includes(".tmp"));
-	assert.deepEqual(leftovers, []);
 });
 
 test("diffAndStore treats corrupt previous state as a miss and rewrites atomically (#112)", async () => {

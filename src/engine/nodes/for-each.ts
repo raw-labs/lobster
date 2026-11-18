@@ -35,7 +35,6 @@ export async function forEach(machine: Machine, step: WorkflowStep, key: string,
 		}
 		machine.putRecord(itemsKey, items);
 		frame.count = items.length;
-		machine.defer();
 	}
 	if (frame.cursor! < frame.count)
 		items ??= (await machine.readRecords(itemsKey)).get(itemsKey) as unknown[] | undefined;
@@ -105,7 +104,6 @@ export async function forEach(machine: Machine, step: WorkflowStep, key: string,
 				frame.cursor!++;
 				delete frame.pausedFor;
 			});
-			machine.defer();
 		}
 	} else {
 		await runAtOnce(concurrency, frame, runItem, (error) => machine.fatal(error));

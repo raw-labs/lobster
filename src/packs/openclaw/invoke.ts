@@ -1,5 +1,6 @@
 import { defineCommand } from "../../commands/define.js";
 import { httpResponseLimitFromEnv, readResponseTextCapped } from "../../io/read_response_text.js";
+import { streamOf } from "../../io/terminal.js";
 
 export const openclawInvokeCommand = defineCommand({
 	name: "openclaw.invoke",
@@ -147,7 +148,7 @@ export const openclawInvokeCommand = defineCommand({
 				// no-op
 			}
 			const items = await invokeOnce(toolArgs);
-			return { output: asStream(items) };
+			return { output: streamOf(items) };
 		}
 
 		const out: any[] = [];
@@ -157,13 +158,9 @@ export const openclawInvokeCommand = defineCommand({
 			out.push(...items);
 		}
 
-		return { output: asStream(out) };
+		return { output: streamOf(out) };
 	},
 });
-
-async function* asStream(items: any[]) {
-	for (const item of items) yield item;
-}
 
 function isLocalOpenClawOrigin(url: URL): boolean {
 	const hostname = url.hostname.toLowerCase();

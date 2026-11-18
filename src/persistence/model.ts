@@ -1,4 +1,4 @@
-import { waitDueAt } from "./waits.js";
+import type { WaitRequest } from "./waits.js";
 import type { ExecutionState, ExecutionLease } from "../engine/state.js";
 import { createHash } from "node:crypto";
 
@@ -211,6 +211,11 @@ export function capture(value: unknown): unknown {
 		return JSON.parse(text);
 	}
 	return { truncated: true, bytes: Buffer.byteLength(text) };
+}
+
+/** When a waiting activation is due: a timer's time, or a question's deadline. */
+export function waitDueAt(wait: WaitRequest): number | undefined {
+	return wait.kind === "timer" ? wait.until : wait.deadline;
 }
 
 export function applyTransition(

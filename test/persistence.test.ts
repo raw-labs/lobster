@@ -42,7 +42,9 @@ for (const backend of ["sqlite"] as const) {
 				signalAbortedAfterCommit: false,
 			};
 			assert.deepEqual(await store.write("fixture", "42"), stateCommit);
-			await assert.rejects(store.write("fixture", "99", { exclusive: true }), { code: "EEXIST" });
+			await assert.rejects(store.write("fixture", "99", { exclusive: true }), {
+				code: "LOBSTER_STATE_EXISTS",
+			});
 			assert.equal((await store.read("fixture")).text, "42");
 			assert.deepEqual(await store.write("fixture", null), stateCommit);
 			assert.equal((await store.read("fixture")).text, null);
@@ -207,11 +209,6 @@ test("SQLite sessions keep filesystem publication functions out of worker messag
 			env: bindStoreSession(process.env, store),
 			key: "fixture",
 			value: 42,
-			atomicWriteOptions: {
-				async renameFile() {
-					assert.fail("SQLite must not call filesystem publication hooks");
-				},
-			},
 		});
 		assert.deepEqual(result, { signalAbortedAfterCommit: false });
 		assert.equal(JSON.parse((await store.read("fixture")).text), 42);

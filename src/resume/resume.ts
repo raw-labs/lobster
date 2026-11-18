@@ -1,6 +1,7 @@
 import { decodeToken, encodeToken } from "./token.js";
 import { decodeWorkflowResumePayload, type WorkflowResumePayload } from "../workflows/file.js";
 import { findStateKeyByApprovalId } from "../state/store.js";
+import { parseBoolLike } from "../util/bool.js";
 
 const APPROVAL_ID = /^[0-9a-f]{8}$/;
 const WAIT_ID = /^[0-9a-f-]{36}\.[0-9a-f]{64}$/;
@@ -75,8 +76,8 @@ export function parseResumeArgs(argv) {
 		if (tok === "--cancel") {
 			const next = argv[i + 1];
 			if (typeof next === "string" && !next.startsWith("--")) {
-				const parsed = parseBooleanArg(next);
-				if (parsed !== null) {
+				const parsed = parseBoolLike(next);
+				if (parsed !== undefined) {
 					args.cancel = parsed;
 					i++;
 					continue;
@@ -86,8 +87,8 @@ export function parseResumeArgs(argv) {
 			continue;
 		}
 		if (tok.startsWith("--cancel=")) {
-			const parsed = parseBooleanArg(tok.slice("--cancel=".length));
-			if (parsed === null) throw new Error("resume --cancel must be true or false");
+			const parsed = parseBoolLike(tok.slice("--cancel=".length));
+			if (parsed === undefined) throw new Error("resume --cancel must be true or false");
 			args.cancel = parsed;
 			continue;
 		}
@@ -153,15 +154,6 @@ export function parseResumeArgs(argv) {
 	if (!["yes", "y", "no", "n"].includes(decision))
 		throw new Error("resume --approve must be yes or no");
 	return { ...base, approved: decision === "yes" || decision === "y" };
-}
-
-function parseBooleanArg(value: string): boolean | null {
-	const raw = String(value ?? "")
-		.trim()
-		.toLowerCase();
-	if (["1", "true", "yes", "y"].includes(raw)) return true;
-	if (["0", "false", "no", "n"].includes(raw)) return false;
-	return null;
 }
 
 /** Resolve an approval ID to a resume token by looking up the state key. */

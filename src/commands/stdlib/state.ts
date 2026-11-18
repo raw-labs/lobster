@@ -3,16 +3,16 @@ import { carryLlmProvenance } from "../../llm/accounting.js";
 import {
 	defaultStateDir,
 	keyToPath,
-	withFileLock,
 	writeStateJson,
-	readStateText,
+	readStateTextWithLock,
 } from "../../state/store.js";
+import { streamOf } from "../../io/terminal.js";
 
-// What this process last wrote to each state file. A value read straight back is the same value
+// What this process last wrote to each state key. A value read straight back is the same value
 // rebuilt from its own JSON, and the marks a command attached in-process are not in that JSON:
 // without this, `llm.invoke | state.set k | state.get k` turns a replay that cost nothing into an
-// item indistinguishable from one that was paid for. The remembered text has to match the file
-// byte for byte, so nothing written by anything else can pick up marks it was never given.
+// item indistinguishable from one that was paid for. The remembered text has to match the stored
+// text byte for byte, so nothing written by anything else can pick up marks it was never given.
 const lastWritten = new Map<string, { text: string; value: unknown }>();
 const MAX_REMEMBERED_WRITES = 64;
 
@@ -25,29 +25,12 @@ function rememberWrite(filePath: string, text: string, value: unknown) {
 }
 
 async function readRememberedState({ env, key, signal }) {
-	const filePath = keyToPath(defaultStateDir(env), key);
-	const read = async () => {
-		try {
-			const text = await readStateText({ env, key });
-			if (text === null) {
-				return null;
-			}
-			const value = JSON.parse(text);
-			const written = lastWritten.get(filePath);
-			if (written?.text === text) carryLlmProvenance(written.value, value);
-			return value;
-		} catch (err: any) {
-			if (err?.code === "ENOENT") return null;
-			throw err;
-		}
-	};
-
-	try {
-		return await withFileLock({ filePath, signal, task: read });
-	} catch (err: any) {
-		if (["EACCES", "EPERM", "EROFS"].includes(err?.code)) return read();
-		throw err;
-	}
+	const text = await readStateTextWithLock({ env, key, signal });
+	if (text === null) return null;
+	const value = JSON.parse(text);
+	const written = lastWritten.get(keyToPath(defaultStateDir(env), key));
+	if (written?.text === text) carryLlmProvenance(written.value, value);
+	return value;
 }
 
 export const stateGetCommand = defineCommand({
@@ -73,7 +56,7 @@ export const stateGetCommand = defineCommand({
 
 		const value = await readRememberedState({ env: ctx.env, key, signal: ctx.signal });
 
-		return { output: asStream([value]) };
+		return { output: streamOf([value]) };
 	},
 });
 
@@ -109,15 +92,11 @@ export const stateSetCommand = defineCommand({
 			key,
 			value,
 			signal: ctx.signal,
-			atomicWriteOptions: { assertInvocationCurrent: ctx.assertInvocationCurrent },
+			assertInvocationCurrent: ctx.assertInvocationCurrent,
 		});
 		const filePath = keyToPath(defaultStateDir(ctx.env), key);
 		rememberWrite(filePath, text, value);
 
-		return { output: asStream([value]) };
+		return { output: streamOf([value]) };
 	},
 });
-
-async function* asStream(items) {
-	for (const item of items) yield item;
-}

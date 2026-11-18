@@ -22,7 +22,8 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { CheckContext, CheckSchema, Errors, Meta, NextStack, Resolve, Stack } from "typebox/schema";
 
-import { stableStringify } from "../state/serialization.js";
+import { stableStringify } from "./serialization.js";
+import { isPlainObject } from "./objects.js";
 
 /** One way a value does not match its schema. `path` is a JSON pointer, "/" for the value itself. */
 export type SchemaError = { path: string; message: string };
@@ -186,7 +187,7 @@ const ownCache = new BoundedCache<SchemaValidator>(CACHE_SIZE);
 
 function prepareOwn(schema: unknown): SchemaValidator {
 	if (typeof schema === "boolean") return engineValidator(schema);
-	if (!isObject(schema)) throw new InvalidSchemaError("schema must be an object or boolean");
+	if (!isPlainObject(schema)) throw new InvalidSchemaError("schema must be an object or boolean");
 	const declared = schema.$schema;
 	if (declared !== undefined && declared !== DRAFT_7 && declared !== DRAFT_7.slice(0, -1)) {
 		throw new InvalidSchemaError(`no schema with key or ref "${String(declared)}"`);
@@ -289,12 +290,12 @@ function asDraft7(schema: unknown, inDefinitions = false): unknown {
 		// The engine resolves a `$ref` only to an object schema.
 		return inDefinitions ? (schema ? {} : { not: {} }) : schema;
 	}
-	if (!isObject(schema)) return schema;
+	if (!isPlainObject(schema)) return schema;
 	const result: Record<string, unknown> = { ...schema };
 	delete result.format;
 	// The engine compiles patterns while checking values: refuse a bad one now.
 	if (typeof result.pattern === "string") assertPattern(result.pattern);
-	if (isObject(result.patternProperties))
+	if (isPlainObject(result.patternProperties))
 		Object.keys(result.patternProperties).forEach(assertPattern);
 	for (const keyword of LATER_DRAFT_KEYWORDS) delete result[keyword];
 	if (result.nullable === true && result.type !== undefined) {
@@ -316,13 +317,13 @@ function asDraft7(schema: unknown, inDefinitions = false): unknown {
 	}
 	for (const keyword of SUBSCHEMA_MAP) {
 		const map = result[keyword];
-		if (!isObject(map)) continue;
+		if (!isPlainObject(map)) continue;
 		const definitions = keyword === "$defs" || keyword === "definitions";
 		result[keyword] = Object.fromEntries(
 			Object.entries(map).map(([name, s]) => [name, asDraft7(s, definitions)]),
 		);
 	}
-	if (isObject(result.dependencies)) {
+	if (isPlainObject(result.dependencies)) {
 		result.dependencies = Object.fromEntries(
 			Object.entries(result.dependencies).map(([name, d]) => [
 				name,
@@ -336,7 +337,7 @@ function asDraft7(schema: unknown, inDefinitions = false): unknown {
 /** Every `$ref` must point inside the schema: nothing else is registered. */
 function assertReferencesResolve(schema: Record<string, unknown>) {
 	const visit = (node: unknown, parent: ReturnType<typeof Stack>) => {
-		if (!isObject(node)) return;
+		if (!isPlainObject(node)) return;
 		const stack = NextStack(parent, node);
 		if (typeof node.$ref === "string" && Resolve.Ref(stack, node as any).schema === undefined) {
 			throw new InvalidSchemaError(`can't resolve reference ${node.$ref}`);
@@ -351,7 +352,7 @@ function assertReferencesResolve(schema: Record<string, unknown>) {
 		}
 		for (const keyword of [...SUBSCHEMA_MAP, "dependencies"]) {
 			const map = node[keyword];
-			if (isObject(map)) for (const child of Object.values(map)) visit(child, stack);
+			if (isPlainObject(map)) for (const child of Object.values(map)) visit(child, stack);
 		}
 	};
 	visit(schema, Stack({}, schema));
@@ -365,10 +366,6 @@ function assertPattern(pattern: string) {
 			`schema is invalid: pattern ${JSON.stringify(pattern)}: ${(error as Error).message}`,
 		);
 	}
-}
-
-function isObject(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 /** The draft-07 metaschema, checked without `format` like every other schema. */

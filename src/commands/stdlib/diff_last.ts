@@ -32,7 +32,7 @@ export const diffLastCommand = defineCommand({
 			key,
 			value: after,
 			signal: ctx.signal,
-			atomicWriteOptions: { assertInvocationCurrent: ctx.assertInvocationCurrent },
+			assertInvocationCurrent: ctx.assertInvocationCurrent,
 		});
 
 		return {

@@ -21,7 +21,7 @@ import { encodeToken } from "../resume/token.js";
 import { enter } from "./nodes/condition.js";
 import { switchStep } from "./nodes/switch.js";
 import { repeat } from "./nodes/repeat.js";
-import { isApprovalStep } from "../workflows/load.js";
+import { isApprovalStep } from "../workflows/steps.js";
 import {
 	activation,
 	nodeKind,
@@ -61,6 +61,7 @@ import {
 	enforceApprovalIdentity,
 	approvalIdentityFromRequest,
 } from "./gates.js";
+import { MAX_TIMER_MS } from "../util/duration.js";
 
 export type Scope = {
 	definition: Definition;
@@ -124,14 +125,6 @@ export class Machine {
 		this.ledger.restoreSettled(state.llmBilled);
 		restoreLlmProvenance(state.activations, state.llmBilled);
 	}
-
-	/**
-	 * Record bookkeeping that is recomputed from saved results after a restart
-	 * (cursors, completion markers, evaluated conditions). It is written with the
-	 * next save. Saves guarding an effect (before dispatch, results, waits) stay
-	 * immediate; each save writes the whole snapshot, so nothing is lost.
-	 */
-	defer() {}
 
 	/**
 	 * A completed or cancelled run never runs again, so its step records (every intermediate
@@ -199,6 +192,12 @@ export class Machine {
 			}
 	}
 
+	/**
+	 * Save the checkpoint. Bookkeeping that is recomputed from saved results after a restart
+	 * (cursors, completion markers, evaluated conditions) is not saved on its own: it is
+	 * written with the next save, which writes the whole snapshot. Saves that guard an effect
+	 * (before dispatch, results, waits) are made at once.
+	 */
 	save(extras: Parameters<ExecutionStore["save"]>[1] = {}) {
 		this.state.cost = this.cost.hasUsage() ? this.cost.getSummary() : undefined;
 		this.state.llmSpend = this.ledger.outstanding();
@@ -389,7 +388,7 @@ export class Machine {
 					signal?.removeEventListener("abort", aborted);
 					resolve();
 				};
-				const timer = setTimeout(done, Math.min(until - Date.now(), 2147483647));
+				const timer = setTimeout(done, Math.min(until - Date.now(), MAX_TIMER_MS));
 				const aborted = () => {
 					clearTimeout(timer);
 					reject(signal!.reason);
@@ -503,7 +502,6 @@ export class Machine {
 					frame.result = result;
 					frame.phase = "completed";
 					this.forgetBelow(key, false, frame);
-					this.defer();
 					return result;
 				}
 				switch (nodeKind(step)) {
@@ -576,7 +574,6 @@ export class Machine {
 				frame.result = result;
 				frame.phase = "completed";
 				this.forgetBelow(key, false, frame);
-				this.defer();
 				return result;
 			} catch (error) {
 				this.checkAuthority(scope.ctx);
@@ -588,11 +585,8 @@ export class Machine {
 				);
 				settleUnbilledCharges(this.cost, scope.ledger);
 				this.checkCost(scope);
-				if (
-					!nonRetryable &&
-					frame.attempt < config.max &&
-					!/halted (for approval inside|before completion at) pipeline/.test(error?.message ?? "")
-				) {
+				// A pipeline that halted (WorkflowPipelineHaltError) is fatal and rethrown above.
+				if (!nonRetryable && frame.attempt < config.max) {
 					const delay = computeDelay(config, frame.attempt - 1);
 					scope.ctx.stderr.write(
 						`[RETRY] Step '${step.id}' failed (attempt ${frame.attempt}/${config.max}): ${error?.message ?? String(error)}. Retrying in ${delay}ms...\n`,
@@ -612,7 +606,6 @@ export class Machine {
 				frame.result = { id: step.id, error: true, errorMessage: frame.error };
 				frame.phase = "completed";
 				this.forgetBelow(key, false, frame);
-				this.defer();
 				return frame.result;
 			} finally {
 				if (timer) clearTimeout(timer);

@@ -1,4 +1,5 @@
 import { defineCommand } from "../../commands/define.js";
+import { streamOf } from "../../io/terminal.js";
 type EmailLike = {
 	id?: string;
 	threadId?: string;
@@ -348,7 +349,3 @@ export const emailTriageCommand = defineCommand({
 		return { output: streamOf([report]) };
 	},
 });
-
-async function* streamOf(items: any[]) {
-	for (const item of items) yield item;
-}

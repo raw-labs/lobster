@@ -16,3 +16,6 @@ export function parseDuration(value: unknown, what = "duration"): number {
 		);
 	return Math.round(ms);
 }
+
+/** The longest delay a timer can wait; beyond it, setTimeout fires at once (about 24.8 days). */
+export const MAX_TIMER_MS = 2_147_483_647;

@@ -16,7 +16,7 @@ import {
 } from "../engine/state.js";
 import type { WaitRequest } from "../persistence/waits.js";
 import { resolveTemplate } from "./expressions.js";
-import { getStepExecution, isApprovalStep, isInputStep } from "./load.js";
+import { getStepExecution, isApprovalStep, isInputStep } from "./steps.js";
 import { createRecord, mergeEnv, resolveCwd, resolveInputValue } from "./values.js";
 import type { WorkflowStepResult } from "./types.js";
 

@@ -10,6 +10,9 @@ import type {
 import { prepareSchema, schemaValidationMessage } from "../util/validation.js";
 import { serializeValueForStdout } from "./values.js";
 import { resolveInputValue } from "../workflows/values.js";
+import { parseBoolLike } from "../util/bool.js";
+import { MAX_TIMER_MS } from "../util/duration.js";
+import { PREVIEW_CHARS, approvalInputTimeoutMs } from "../io/terminal.js";
 
 export class WorkflowResumeArgumentError extends Error {
 	constructor(message: string) {
@@ -183,26 +186,6 @@ export function enforceApprovalIdentity({
 	}
 }
 
-export function parseBoolLike(value: unknown): boolean | undefined {
-	if (typeof value === "boolean") return value;
-	if (value === undefined || value === null) return undefined;
-	const normalized = String(value).trim().toLowerCase();
-	if (["1", "true", "yes", "y"].includes(normalized)) return true;
-	if (["0", "false", "no", "n"].includes(normalized)) return false;
-	return undefined;
-}
-
-export function isInteractive(stdin: NodeJS.ReadableStream) {
-	return Boolean((stdin as NodeJS.ReadStream).isTTY);
-}
-
-export function parseApprovalTimeoutMs(env: Record<string, string | undefined>) {
-	const raw = env?.LOBSTER_APPROVAL_INPUT_TIMEOUT_MS;
-	const value = Number(raw);
-	if (!Number.isFinite(value) || value <= 0) return 0;
-	return Math.floor(value);
-}
-
 const MAX_NEEDS_INPUT_SUBJECT_BYTES = 192_000;
 const DEFAULT_TOOL_ENVELOPE_MAX_BYTES = 512_000;
 const RESUME_TOKEN_PLACEHOLDER = "x".repeat(220);
@@ -261,7 +244,7 @@ export function maybeTruncateInputSubject(subject: unknown): unknown {
 	return {
 		truncated: true,
 		bytes: byteLength,
-		preview: serialized.slice(0, 2000),
+		preview: serialized.slice(0, PREVIEW_CHARS),
 	};
 }
 
@@ -399,8 +382,9 @@ export function normalizeApprovalItems(value: unknown) {
 }
 
 export function buildResultPreview(result: WorkflowStepResult) {
-	if (result.stdout) return result.stdout.trim().slice(0, 2000);
-	if (result.json !== undefined) return serializeValueForStdout(result.json).trim().slice(0, 2000);
+	if (result.stdout) return result.stdout.trim().slice(0, PREVIEW_CHARS);
+	if (result.json !== undefined)
+		return serializeValueForStdout(result.json).trim().slice(0, PREVIEW_CHARS);
 	return undefined;
 }
 
@@ -434,7 +418,7 @@ export async function readAnswer(
 	const arm = () => {
 		const left = deadline! - Date.now();
 		if (left <= 0) expiry.abort();
-		else timer = setTimeout(arm, Math.min(left, 2_147_483_647));
+		else timer = setTimeout(arm, Math.min(left, MAX_TIMER_MS));
 	};
 	if (deadline !== undefined) arm();
 	// Waiting for a person is not a hung step: keep a heartbeat limit from expiring meanwhile.
@@ -442,7 +426,7 @@ export async function readAnswer(
 	scope.ctx._heartbeat?.();
 	try {
 		const answer = await readLineFromStream(scope.ctx.stdin, {
-			timeoutMs: parseApprovalTimeoutMs(scope.ctx.env),
+			timeoutMs: approvalInputTimeoutMs(scope.ctx.env),
 			signal: combineSignals(scope.ctx.signal, expiry.signal),
 		});
 		return { answer };

@@ -1,9 +1,6 @@
 import { defineCommand } from "../define.js";
 import { readLineFromStream } from "../../io/read_line.js";
-
-function isInteractive(stdin) {
-	return Boolean(stdin.isTTY);
-}
+import { approvalInputTimeoutMs, isInteractive, streamOf } from "../../io/terminal.js";
 
 export const approveCommand = defineCommand({
 	name: "approve",
@@ -63,7 +60,7 @@ export const approveCommand = defineCommand({
 
 		ctx.stdout.write(`${prompt} [y/N] `);
 		const answer = await readLineFromStream(ctx.stdin, {
-			timeoutMs: parseApprovalTimeoutMs(ctx.env),
+			timeoutMs: approvalInputTimeoutMs(ctx.env),
 			signal: ctx.signal,
 		});
 
@@ -71,7 +68,7 @@ export const approveCommand = defineCommand({
 			throw new Error("Not approved");
 		}
 
-		return { output: asStream(items) };
+		return { output: streamOf(items) };
 	},
 });
 
@@ -81,15 +78,4 @@ function buildPreview(items) {
 		return items.join("\n");
 	}
 	return JSON.stringify(items, null, 2);
-}
-
-function parseApprovalTimeoutMs(env) {
-	const raw = env?.LOBSTER_APPROVAL_INPUT_TIMEOUT_MS;
-	const value = Number(raw);
-	if (!Number.isFinite(value) || value <= 0) return 0;
-	return Math.floor(value);
-}
-
-async function* asStream(items) {
-	for (const item of items) yield item;
 }

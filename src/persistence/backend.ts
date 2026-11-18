@@ -10,6 +10,12 @@ import type {
 	TransitionResult,
 } from "./model.js";
 
+/**
+ * The code of the error an exclusive write gets when its key already holds a value. Errors
+ * cross the worker thread as a message and a code, so a code (not a class) says what happened.
+ */
+export const STATE_EXISTS = "LOBSTER_STATE_EXISTS";
+
 export type BackendKind = "sqlite";
 
 export type StateWriteOptions = {

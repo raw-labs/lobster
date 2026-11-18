@@ -8,6 +8,7 @@ import type { CostSummary } from "../llm/cost_tracker.js";
 import type { LlmOutstandingCharge } from "../llm/accounting.js";
 import type { WorkflowPipelineInputResumeState } from "./activities/pipeline.js";
 import type { WaitRequest } from "../persistence/waits.js";
+import { stepKind } from "../workflows/steps.js";
 
 export type Definition = {
 	filePath: string;
@@ -124,16 +125,25 @@ export function occurrence(parent: string, id: string): string {
 	return parent + "/" + encodeURIComponent(id);
 }
 
+/** The engine node that runs a step (see engine/nodes). */
 export function nodeKind(step: WorkflowStep) {
-	if (step.for_each !== undefined) return "for-each";
-	if (step.parallel) return "parallel";
-	if (step.workflow) return "child-workflow";
-	if (step.switch) return "switch";
-	if (step.repeat) return "repeat";
-	if (step.input) return "input";
-	if (step.sleep !== undefined) return "sleep";
-	if (step.wait) return "event";
-	return "activity";
+	const kind = stepKind(step);
+	switch (kind) {
+		case "for_each":
+			return "for-each";
+		case "workflow":
+			return "child-workflow";
+		case "wait":
+			return "event";
+		case "parallel":
+		case "switch":
+		case "repeat":
+		case "input":
+		case "sleep":
+			return kind;
+		default:
+			return "activity";
+	}
 }
 
 /** A gate (approval, input, timer or event deadline) cancelled the run; already saved. */

@@ -50,7 +50,6 @@ export {
 	sessionFromEnv,
 	type StoreEnvironment,
 } from "./context.js";
-export { normalizeStateKey as normalizedKey } from "../state/paths.js";
 
 export type StoreOptions = {
 	directory?: string;

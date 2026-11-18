@@ -227,7 +227,7 @@ test("approval index writes never overwrite an existing approval ID mapping", as
 				stateKey: "workflow_resume_replacement",
 				approvalId: "deadbeef",
 			}),
-		(err: NodeJS.ErrnoException) => err?.code === "EEXIST",
+		(err: NodeJS.ErrnoException) => err?.code === "LOBSTER_STATE_EXISTS",
 	);
 
 	const resolved = await findStateKeyByApprovalId({ env, approvalId: "deadbeef" });

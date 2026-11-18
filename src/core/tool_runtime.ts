@@ -1,6 +1,5 @@
 import type { WorkflowRunResult, WorkflowWaitingFor } from "../workflows/types.js";
 import type { ResumeDecision, ResumeTarget } from "../resume/options.js";
-import path from "node:path";
 import { Writable } from "node:stream";
 import { createDefaultRegistry } from "../commands/registry.js";
 import { parsePipeline } from "../pipeline/parser.js";
@@ -20,6 +19,7 @@ import {
 	runIdOf,
 } from "../workflows/file.js";
 import { savedByOlderVersion } from "../workflows/upgrade.js";
+import { resolveWorkflowFile } from "../workflows/load.js";
 
 export type ToolRunContext = PersistenceOptions & {
 	_resumeSignalAborted?: boolean;
@@ -385,16 +385,4 @@ function errorEnvelope(type: string, error: unknown): ToolEnvelope {
 		error: runtimeErrorDetails(error, type),
 		...(runId ? { runId } : {}),
 	};
-}
-
-async function resolveWorkflowFile(candidate: string, cwd: string) {
-	const { stat } = await import("node:fs/promises");
-	const resolved = path.isAbsolute(candidate) ? candidate : path.resolve(cwd, candidate);
-	const fileStat = await stat(resolved);
-	if (!fileStat.isFile()) throw new Error("Workflow path is not a file");
-	const ext = path.extname(resolved).toLowerCase();
-	if (![".lobster", ".yaml", ".yml", ".json"].includes(ext)) {
-		throw new Error("Workflow file must end in .lobster, .yaml, .yml, or .json");
-	}
-	return resolved;
 }

@@ -1,302 +1,289 @@
-import { stableStringify } from "./serialization.js";
+import { stableStringify } from "../util/serialization.js";
 import { randomBytes } from "node:crypto";
 import { sessionFromEnv } from "../persistence/context.js";
 import { withStoreContext } from "../persistence/execution.js";
-import { atomicWriteWasPublished, isAtomicExclusiveUnsupportedError } from "./atomic_file.js";
-import type { AtomicWriteOptions, AtomicExclusiveWriteOptions } from "./atomic_file.js";
+import { STATE_EXISTS } from "../persistence/backend.js";
+import type { StoreSession } from "../persistence/session.js";
 import { withFileLock } from "./file_lock.js";
 import { keyToPath, resolveStateDirectory } from "./paths.js";
 
 export { withFileLock } from "./file_lock.js";
 export { keyToPath } from "./paths.js";
+export { atomicWriteWasPublished, ensureDirectory, writeFileAtomic } from "./atomic_file.js";
+export { stableStringify } from "../util/serialization.js";
 
-export {
-	atomicWriteWasPublished,
-	ensureDirectory,
-	isAtomicExclusiveUnsupportedError,
-	writeFileAtomic,
-	writeFileAtomicExclusive,
-	stripExtendedLengthPrefix,
-} from "./atomic_file.js";
+type Env = Record<string, string | undefined>;
 
-export function defaultStateDir(env: Record<string, string | undefined>): string {
+export function defaultStateDir(env: Env): string {
 	return sessionFromEnv(env)?.directory ?? resolveStateDirectory(env);
 }
 
-/** Every state operation runs inside a store session (see withStoreContext). */
-function storeOf(env: Record<string, string | undefined>) {
-	const session = sessionFromEnv(env);
-	if (!session) throw new Error("State access requires a store session");
-	return session;
-}
-
-export { stableStringify } from "./serialization.js";
-
-export function isJsonSyntaxError(err) {
-	return err instanceof SyntaxError;
-}
-
-async function withStateKeyLock<T>({
-	env,
-	key,
-	signal,
-	task,
-}: {
-	env: Record<string, string | undefined>;
-	key: string;
-	signal?: AbortSignal;
-	task: () => Promise<T>;
-}): Promise<T> {
-	const stateDir = defaultStateDir(env);
-	return withFileLock({
-		filePath: keyToPath(stateDir, key),
-		signal,
-		task,
+/**
+ * Run `task` with the store session of `env`, opening one when the caller has none: every
+ * state operation is a store operation.
+ */
+function inStore<T>(
+	env: Env,
+	options: { readOnly?: boolean; signal?: AbortSignal },
+	task: (session: StoreSession, env: Env) => Promise<T>,
+): Promise<T> {
+	return withStoreContext({ env, ...options }, (ctx) => {
+		const session = sessionFromEnv(ctx.env);
+		if (!session) throw new Error("State access requires a store session");
+		return task(session, ctx.env);
 	});
-}
-
-function isOptionalApprovalIndexPersistenceError(err: any): boolean {
-	return (
-		isAtomicExclusiveUnsupportedError(err) ||
-		["EACCES", "EDQUOT", "EIO", "ENOSPC", "EPERM", "EROFS"].includes(err?.code)
-	);
-}
-
-/** Backend-neutral committed bytes, used to retain trusted in-process provenance. */
-async function readStateTextInternal({
-	env,
-	key,
-}: {
-	env: Record<string, string | undefined>;
-	key: string;
-}): Promise<string | null> {
-	return (await storeOf(env).read(key)).text;
-}
-
-async function readStateJsonInternal({
-	env,
-	key,
-	signal = undefined,
-}: {
-	env: Record<string, string | undefined>;
-	key: string;
-	signal?: AbortSignal;
-}) {
-	signal?.throwIfAborted();
-
-	try {
-		const text = await readStateText({ env, key });
-		if (text === null) {
-			return null;
-		}
-		const value = JSON.parse(text);
-		signal?.throwIfAborted();
-		return value;
-	} catch (err) {
-		if (err?.code === "ENOENT") return null;
-		throw err;
-	}
 }
 
 /**
- * Read a state record only after any in-progress publish-or-rollback transition
- * for the same key has settled. Callers that compose state with another durable
- * resource use this to avoid observing a value that cancellation may undo.
+ * Hold the lock of `key` while `task` runs. Reads and writes of one value are single store
+ * transactions; this lock is for what spans several (diffAndStore reads, writes, publishes
+ * something else and may roll back), across processes.
  */
-async function readStateJsonWithLockInternal({
+function withStateKeyLock<T>(
+	env: Env,
+	key: string,
+	signal: AbortSignal | undefined,
+	task: () => Promise<T>,
+) {
+	return withFileLock({ filePath: keyToPath(defaultStateDir(env), key), signal, task });
+}
+
+export function isJsonSyntaxError(err: unknown) {
+	return err instanceof SyntaxError;
+}
+
+/** The stored text of `key`, or null. */
+export function readStateText({ env, key }: { env: Env; key: string }): Promise<string | null> {
+	return inStore(env, { readOnly: true }, async (session) => (await session.read(key)).text);
+}
+
+async function readJson(session: StoreSession, key: string, signal?: AbortSignal) {
+	signal?.throwIfAborted();
+	const text = (await session.read(key)).text;
+	if (text === null) return null;
+	const value = JSON.parse(text);
+	signal?.throwIfAborted();
+	return value;
+}
+
+export function readStateJson({
 	env,
 	key,
-	signal = undefined,
+	signal,
 }: {
-	env: Record<string, string | undefined>;
+	env: Env;
 	key: string;
 	signal?: AbortSignal;
 }) {
-	try {
-		return await withStateKeyLock({ env, key, signal, task: () => readStateJson({ env, key }) });
-	} catch (err: any) {
-		// A readable state directory can deliberately be mounted read-only. In that
-		// case no writer can begin a paired publish-or-rollback transition, so use
-		// the non-mutating JSON read instead of requiring creation of a lock path.
-		if (["EACCES", "EPERM", "EROFS"].includes(err?.code)) {
-			return readStateJson({ env, key, signal });
+	return inStore(env, { readOnly: true, signal }, (session) => readJson(session, key, signal));
+}
+
+/**
+ * Read under the lock of `key`: only after any composite change of it in progress (see
+ * withStateKeyLock) has settled, so a value that cancellation may still roll back is never seen.
+ */
+function readLocked<T>(
+	env: Env,
+	key: string,
+	signal: AbortSignal | undefined,
+	read: (session: StoreSession) => Promise<T>,
+) {
+	return inStore(env, { readOnly: true, signal }, async (session, env) => {
+		try {
+			return await withStateKeyLock(env, key, signal, () => read(session));
+		} catch (err: any) {
+			// A state directory mounted read-only cannot hold a lock file; nothing can be
+			// changing the value there either, so read it directly.
+			if (["EACCES", "EPERM", "EROFS"].includes(err?.code)) return read(session);
+			throw err;
 		}
-		throw err;
-	}
+	});
 }
 
-async function writeStateJsonUnlocked({
+export function readStateJsonWithLock({
 	env,
 	key,
-	value,
-	signal = undefined,
-	atomicWriteOptions = undefined,
+	signal,
 }: {
-	env: Record<string, string | undefined>;
+	env: Env;
+	key: string;
+	signal?: AbortSignal;
+}) {
+	return readLocked(env, key, signal, (session) => readJson(session, key, signal));
+}
+
+/** The stored text of `key` (or null), read under its lock like readStateJsonWithLock. */
+export function readStateTextWithLock({
+	env,
+	key,
+	signal,
+}: {
+	env: Env;
+	key: string;
+	signal?: AbortSignal;
+}): Promise<string | null> {
+	return readLocked(env, key, signal, async (session) => (await session.read(key)).text);
+}
+
+type WriteOptions = {
+	env: Env;
 	key: string;
 	value: unknown;
 	signal?: AbortSignal;
-	atomicWriteOptions?: Omit<AtomicWriteOptions, "signal">;
-}) {
-	const result = await storeOf(env).write(key, JSON.stringify(value, null, 2) + "\n", {
-		signal,
-		assertInvocationCurrent: atomicWriteOptions?.assertInvocationCurrent,
-	});
-	return { signalAbortedAfterCommit: result.signalAbortedAfterCommit };
-}
+	/** Refuse the write once this caller no longer owns the work (see host authority). */
+	assertInvocationCurrent?: () => void;
+};
 
-async function writeStateJsonInternal({
-	env,
-	key,
-	value,
-	signal = undefined,
-	atomicWriteOptions = undefined,
-}: {
-	env: Record<string, string | undefined>;
-	key: string;
-	value: unknown;
-	signal?: AbortSignal;
-	atomicWriteOptions?: Omit<AtomicWriteOptions, "signal">;
-}) {
-	return withStateKeyLock({
-		env,
-		key,
+function writeJson(
+	session: StoreSession,
+	{ key, value, signal, assertInvocationCurrent }: WriteOptions,
+) {
+	return session.write(key, JSON.stringify(value, null, 2) + "\n", {
 		signal,
-		task: () => writeStateJsonUnlocked({ env, key, value, signal, atomicWriteOptions }),
+		assertInvocationCurrent,
 	});
 }
 
-async function stateJsonExistsInternal({
-	env,
-	key,
-}: {
-	env: Record<string, string | undefined>;
-	key: string;
-}) {
-	return (await storeOf(env).read(key)).text !== null;
-}
-
-async function deleteStateJsonUnlocked({ env, key }) {
-	await storeOf(env).write(key, null);
-}
-
-async function deleteStateJsonInternal({
-	env,
-	key,
-	signal = undefined,
-}: {
-	env: Record<string, string | undefined>;
-	key: string;
-	signal?: AbortSignal;
-}) {
-	return withStateKeyLock({
-		env,
-		key,
-		signal,
-		task: () => deleteStateJsonUnlocked({ env, key }),
+export function writeStateJson(options: WriteOptions) {
+	return inStore(options.env, { signal: options.signal }, async (session, env) => {
+		const result = await withStateKeyLock(env, options.key, options.signal, () =>
+			writeJson(session, options),
+		);
+		return { signalAbortedAfterCommit: result.signalAbortedAfterCommit };
 	});
 }
+
+/**
+ * Store `value` under `key` and report whether it changed. `afterStore` may publish something
+ * that depends on it; if that fails, or the caller is cancelled, the previous value is put back
+ * before the lock is released, so no reader ever sees a value that was rolled back.
+ */
+export function diffAndStore(
+	options: WriteOptions & {
+		afterStore?: (snapshot: { before: unknown; after: unknown; changed: boolean }) => Promise<void>;
+	},
+) {
+	const { env, key, value, signal, afterStore } = options;
+	return inStore(env, { signal }, (session, env) =>
+		withStateKeyLock(env, key, signal, async () => {
+			const beforeText = (await session.read(key)).text;
+			let before: unknown = null;
+			if (beforeText !== null) {
+				try {
+					before = JSON.parse(beforeText);
+				} catch (err) {
+					if (!isJsonSyntaxError(err)) throw err;
+				}
+			}
+			const changed = stableStringify(before) !== stableStringify(value);
+			const snapshot = { before, after: value, changed };
+			let stored = false;
+			try {
+				signal?.throwIfAborted();
+				await writeJson(session, options);
+				stored = true;
+				signal?.throwIfAborted();
+				await afterStore?.(snapshot);
+			} catch (err) {
+				if (stored && (signal?.aborted || afterStore)) {
+					if (beforeText === null) await session.write(key, null);
+					else await writeJson(session, { ...options, value: before, signal: undefined });
+				}
+				throw err;
+			}
+			return snapshot;
+		}),
+	);
+}
+
+// ---------------------------------------------------------------------------------------
+// Short approval IDs: `approval_<id>` maps an 8-hex-character ID to a resume state key.
 
 function sanitizeApprovalId(approvalId: string): string {
 	return approvalId.replace(/[^a-f0-9]/g, "");
 }
 
-/**
- * Generate a short, human-friendly approval ID (8 hex chars).
- * These are easy to copy/paste in chat interfaces where full
- * base64url resume tokens are unwieldy.
- */
+/** A short, human-friendly approval ID (8 hex chars), easy to copy in a chat. */
 export function generateApprovalId(): string {
 	return randomBytes(4).toString("hex");
 }
 
-/**
- * Write a reverse-index file that maps approvalId → stateKey.
- * Call this after writeStateJson to enable short-ID resume.
- */
-async function writeApprovalIndexInternal({
+/** Map `approvalId` to `stateKey`; never overwrites an existing mapping. */
+export function writeApprovalIndex({
 	env,
 	stateKey,
 	approvalId,
-	options,
+	assertInvocationCurrent,
 }: {
-	env: Record<string, string | undefined>;
+	env: Env;
 	stateKey: string;
 	approvalId: string;
-	options?: AtomicExclusiveWriteOptions;
+	assertInvocationCurrent?: () => void;
 }) {
 	const safe = sanitizeApprovalId(approvalId);
-	if (!safe) return;
-	await storeOf(env).write(
-		`approval_${safe}`,
-		JSON.stringify({ stateKey, createdAt: new Date().toISOString() }) + "\n",
-		{ exclusive: true, assertInvocationCurrent: options?.assertInvocationCurrent },
-	);
+	return inStore(env, {}, async (session) => {
+		if (!safe) return;
+		await session.write(
+			`approval_${safe}`,
+			JSON.stringify({ stateKey, createdAt: new Date().toISOString() }) + "\n",
+			{ exclusive: true, assertInvocationCurrent },
+		);
+	});
 }
 
-/**
- * Create a unique approval ID index without ever overwriting an existing mapping.
- */
-async function createApprovalIndexInternal({
-	env,
-	stateKey,
-	options,
-}: {
-	env: Record<string, string | undefined>;
+/** Give `stateKey` a new short approval ID. */
+export function createApprovalIndex(options: {
+	env: Env;
 	stateKey: string;
-	options?: AtomicExclusiveWriteOptions;
-}): Promise<string | null> {
-	for (let attempt = 0; attempt < 16; attempt++) {
-		const approvalId = generateApprovalId();
-		try {
-			await writeApprovalIndex({ env, stateKey, approvalId, options });
-			return approvalId;
-		} catch (err: any) {
-			if (err?.code === "EEXIST") continue;
-			if (isOptionalApprovalIndexPersistenceError(err)) return null;
-			throw err;
+	assertInvocationCurrent?: () => void;
+}): Promise<string> {
+	return inStore(options.env, {}, async (_session, env) => {
+		for (let attempt = 0; attempt < 16; attempt++) {
+			const approvalId = generateApprovalId();
+			try {
+				await writeApprovalIndex({ ...options, env, approvalId });
+				return approvalId;
+			} catch (err: any) {
+				if (err?.code === STATE_EXISTS) continue;
+				throw err;
+			}
 		}
-	}
-	throw new Error("Could not allocate a unique approval ID");
+		throw new Error("Could not allocate a unique approval ID");
+	});
 }
 
-/**
- * Look up a state key by short approval ID.
- * Returns the stateKey string or null if not found.
- */
-async function findStateKeyByApprovalIdInternal({
+/** The state key a short approval ID stands for, or null. */
+export function findStateKeyByApprovalId({
 	env,
 	approvalId,
 }: {
-	env: Record<string, string | undefined>;
+	env: Env;
 	approvalId: string;
 }): Promise<string | null> {
 	const safe = sanitizeApprovalId(approvalId);
-	if (!safe) return null;
-	try {
-		const text = await readStateText({ env, key: `approval_${safe}` });
-		if (text === null) {
-			return null;
+	return inStore(env, { readOnly: true }, async (session) => {
+		if (!safe) return null;
+		const text = (await session.read(`approval_${safe}`)).text;
+		if (text === null) return null;
+		try {
+			const data = JSON.parse(text);
+			return typeof data?.stateKey === "string" ? data.stateKey : null;
+		} catch (err) {
+			if (isJsonSyntaxError(err)) return null;
+			throw err;
 		}
-		const data = JSON.parse(text);
-		return typeof data?.stateKey === "string" ? data.stateKey : null;
-	} catch (err: any) {
-		if (err?.code === "ENOENT") return null;
-		if (isJsonSyntaxError(err)) return null;
-		throw err;
-	}
+	});
 }
 
-/** Locate the short ID through the selected store before retiring its index. */
-export async function findApprovalIdByStateKey({
+/** The short approval ID of `stateKey`, or null. */
+export function findApprovalIdByStateKey({
 	env,
 	stateKey,
 }: {
-	env: Record<string, string | undefined>;
+	env: Env;
 	stateKey: string;
 }): Promise<string | null> {
-	return withStoreContext({ env, readOnly: true }, async (ctx) => {
-		const session = storeOf(ctx.env);
+	return inStore(env, { readOnly: true }, async (session) => {
 		for (const [key, text] of Object.entries(await session.backend.listState("approval_"))) {
 			const match = /^approval_([a-f0-9]+)$/.exec(key);
 			if (!match) continue;
@@ -310,39 +297,18 @@ export async function findApprovalIdByStateKey({
 	});
 }
 
-/**
- * Delete the approval ID index file (cleanup after resume or cancel).
- */
-async function deleteApprovalIdInternal({
-	env,
-	approvalId,
-}: {
-	env: Record<string, string | undefined>;
-	approvalId: string;
-}) {
+/** Retire a short approval ID (after its question was answered or cancelled). */
+export function deleteApprovalId({ env, approvalId }: { env: Env; approvalId: string }) {
 	const safe = sanitizeApprovalId(approvalId);
-	if (!safe) return;
-	await storeOf(env).write(`approval_${safe}`, null);
+	return inStore(env, {}, async (session) => {
+		if (safe) await session.write(`approval_${safe}`, null);
+	});
 }
 
-/**
- * Clean up any approval index file that points to the given stateKey.
- * Used when resuming via --token (where we don't know the approvalId).
- * Scans index files in the state dir — O(n) but n is tiny in practice.
- */
-async function cleanupApprovalIndexByStateKeyInternal({
-	env,
-	stateKey,
-}: {
-	env: Record<string, string | undefined>;
-	stateKey: string;
-}) {
-	const session = storeOf(env);
-	{
+/** Retire the short approval ID that points to `stateKey`, if there is one. */
+export function cleanupApprovalIndexByStateKey({ env, stateKey }: { env: Env; stateKey: string }) {
+	return inStore(env, {}, async (session) => {
 		for (const [key, text] of Object.entries(await session.backend.listState("approval_"))) {
-			if (!key.startsWith("approval_")) {
-				continue;
-			}
 			let data: { stateKey?: string } | null;
 			try {
 				data = JSON.parse(text);
@@ -354,154 +320,5 @@ async function cleanupApprovalIndexByStateKeyInternal({
 				return;
 			}
 		}
-	}
-}
-
-async function diffAndStoreInternal({
-	env,
-	key,
-	value,
-	signal = undefined,
-	atomicWriteOptions = undefined,
-	afterStore = undefined,
-}: {
-	env: Record<string, string | undefined>;
-	key: string;
-	value: unknown;
-	signal?: AbortSignal;
-	atomicWriteOptions?: Omit<AtomicWriteOptions, "signal">;
-	afterStore?: (snapshot: { before: unknown; after: unknown; changed: boolean }) => Promise<void>;
-}) {
-	return withStateKeyLock({
-		env,
-		key,
-		signal,
-		task: async () => {
-			const beforeExists = await stateJsonExists({ env, key });
-			const before = await readStateJson({ env, key }).catch((err) => {
-				if (isJsonSyntaxError(err)) return null;
-				throw err;
-			});
-			const changed = stableStringify(before) !== stableStringify(value);
-			const snapshot = { before, after: value, changed };
-			let stored = false;
-			try {
-				signal?.throwIfAborted();
-				await writeStateJsonUnlocked({ env, key, value, signal, atomicWriteOptions });
-				stored = true;
-				signal?.throwIfAborted();
-				await afterStore?.(snapshot);
-			} catch (err) {
-				// A caller can publish another resource while this state lock is held.
-				// If that coordinated publication fails, restore the state snapshot before
-				// releasing the lock so readers never reuse a cancelled result.
-				const stateWasPublished = stored || atomicWriteWasPublished(err);
-				if (stateWasPublished && (signal?.aborted || afterStore || atomicWriteWasPublished(err))) {
-					if (!beforeExists) {
-						await deleteStateJsonUnlocked({ env, key });
-					} else {
-						await writeStateJsonUnlocked({ env, key, value: before });
-					}
-				}
-				throw err;
-			}
-			return snapshot;
-		},
 	});
-}
-
-export async function readStateText(
-	options: Parameters<typeof readStateTextInternal>[0],
-): ReturnType<typeof readStateTextInternal> {
-	return withStoreContext({ env: options.env, readOnly: true }, (ctx) =>
-		readStateTextInternal({ ...options, env: ctx.env }),
-	);
-}
-
-export async function readStateJson(
-	options: Parameters<typeof readStateJsonInternal>[0],
-): ReturnType<typeof readStateJsonInternal> {
-	return withStoreContext({ env: options.env, readOnly: true, signal: options.signal }, (ctx) =>
-		readStateJsonInternal({ ...options, env: ctx.env }),
-	);
-}
-
-export async function readStateJsonWithLock(
-	options: Parameters<typeof readStateJsonWithLockInternal>[0],
-): ReturnType<typeof readStateJsonWithLockInternal> {
-	return withStoreContext({ env: options.env, readOnly: true, signal: options.signal }, (ctx) =>
-		readStateJsonWithLockInternal({ ...options, env: ctx.env }),
-	);
-}
-
-export async function writeStateJson(
-	options: Parameters<typeof writeStateJsonInternal>[0],
-): ReturnType<typeof writeStateJsonInternal> {
-	return withStoreContext({ env: options.env, signal: options.signal }, (ctx) =>
-		writeStateJsonInternal({ ...options, env: ctx.env }),
-	);
-}
-
-export async function stateJsonExists(
-	options: Parameters<typeof stateJsonExistsInternal>[0],
-): ReturnType<typeof stateJsonExistsInternal> {
-	return withStoreContext({ env: options.env, readOnly: true }, (ctx) =>
-		stateJsonExistsInternal({ ...options, env: ctx.env }),
-	);
-}
-
-export async function deleteStateJson(
-	options: Parameters<typeof deleteStateJsonInternal>[0],
-): ReturnType<typeof deleteStateJsonInternal> {
-	return withStoreContext({ env: options.env, signal: options.signal }, (ctx) =>
-		deleteStateJsonInternal({ ...options, env: ctx.env }),
-	);
-}
-
-export async function writeApprovalIndex(
-	options: Parameters<typeof writeApprovalIndexInternal>[0],
-): ReturnType<typeof writeApprovalIndexInternal> {
-	return withStoreContext({ env: options.env }, (ctx) =>
-		writeApprovalIndexInternal({ ...options, env: ctx.env }),
-	);
-}
-
-export async function createApprovalIndex(
-	options: Parameters<typeof createApprovalIndexInternal>[0],
-): ReturnType<typeof createApprovalIndexInternal> {
-	return withStoreContext({ env: options.env }, (ctx) =>
-		createApprovalIndexInternal({ ...options, env: ctx.env }),
-	);
-}
-
-export async function findStateKeyByApprovalId(
-	options: Parameters<typeof findStateKeyByApprovalIdInternal>[0],
-): ReturnType<typeof findStateKeyByApprovalIdInternal> {
-	return withStoreContext({ env: options.env, readOnly: true }, (ctx) =>
-		findStateKeyByApprovalIdInternal({ ...options, env: ctx.env }),
-	);
-}
-
-export async function deleteApprovalId(
-	options: Parameters<typeof deleteApprovalIdInternal>[0],
-): ReturnType<typeof deleteApprovalIdInternal> {
-	return withStoreContext({ env: options.env }, (ctx) =>
-		deleteApprovalIdInternal({ ...options, env: ctx.env }),
-	);
-}
-
-export async function cleanupApprovalIndexByStateKey(
-	options: Parameters<typeof cleanupApprovalIndexByStateKeyInternal>[0],
-): ReturnType<typeof cleanupApprovalIndexByStateKeyInternal> {
-	return withStoreContext({ env: options.env }, (ctx) =>
-		cleanupApprovalIndexByStateKeyInternal({ ...options, env: ctx.env }),
-	);
-}
-
-export async function diffAndStore(
-	options: Parameters<typeof diffAndStoreInternal>[0],
-): ReturnType<typeof diffAndStoreInternal> {
-	return withStoreContext({ env: options.env, signal: options.signal }, (ctx) =>
-		diffAndStoreInternal({ ...options, env: ctx.env }),
-	);
 }

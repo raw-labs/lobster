@@ -5,11 +5,11 @@ import type { WaitRequest } from "../../persistence/waits.js";
 import {
 	resolveInputSubject,
 	validateInputResponse,
-	isInteractive,
 	parseResponseJson,
 	questionDeadline,
 	readAnswer,
 } from "../gates.js";
+import { isInteractive } from "../../io/terminal.js";
 
 export async function input(
 	machine: Machine,

@@ -32,7 +32,6 @@ export async function sequence(machine: Machine, steps: WorkflowStep[], key: str
 		if (result.error && step.on_error === "skip_rest") frame.cursor = steps.length;
 		// The cursor is past this step and its result is kept above: one copy is enough.
 		machine.forgetBelow(childKey, true, frame);
-		machine.defer();
 	}
 	frame.phase = "completed";
 	return frame.lastStepId !== undefined

@@ -62,7 +62,6 @@ export async function repeat(machine: Machine, step: WorkflowStep, key: string, 
 		frame.cursor = round;
 		// The round's results are kept above; its records are not needed to recover.
 		machine.forgetBelow(bodyKey, true, frame);
-		machine.defer();
 	}
 	const result: WorkflowStepResult = { id: step.id, rounds: frame.cursor };
 	const last = frame.lastStepId !== undefined ? frame.results[frame.lastStepId] : undefined;

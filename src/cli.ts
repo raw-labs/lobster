@@ -1,4 +1,6 @@
 import path from "node:path";
+import { readFile } from "node:fs/promises";
+import { fileURLToPath } from "node:url";
 import { listRuns, getRun, getWait } from "./core/runs.js";
 import { forceTerminateAbortableProcesses } from "./process/abortable_process.js";
 import { createDefaultRegistry } from "./commands/registry.js";
@@ -27,6 +29,7 @@ import {
 import { renderWorkflowGraph } from "./workflows/graph.js";
 import { parseWorkflowArgsJson } from "./workflows/values.js";
 import type { WorkflowGraphFormat } from "./workflows/graph.js";
+import { resolveWorkflowFile, WORKFLOW_FILE_EXTENSIONS } from "./workflows/load.js";
 
 // CLI commands without help of their own show the usage, which covers all of them.
 const USAGE_TOPICS = new Set([
@@ -820,28 +823,11 @@ async function detectWorkflowFile(rest) {
 	}
 }
 
-const WORKFLOW_FILE_EXTENSIONS = [".lobster", ".yaml", ".yml", ".json"];
-
 // Command names never contain a path separator or end in a workflow extension.
 function isWorkflowPathLike(token: string) {
 	if (/[\s|]/.test(token) || token.startsWith("-")) return false;
 	const lower = token.toLowerCase();
 	return /[\\/]/.test(token) || WORKFLOW_FILE_EXTENSIONS.some((ext) => lower.endsWith(ext));
-}
-
-async function resolveWorkflowFile(candidate) {
-	const { promises: fsp } = await import("node:fs");
-	const { resolve, extname, isAbsolute } = await import("node:path");
-	const resolved = isAbsolute(candidate) ? candidate : resolve(process.cwd(), candidate);
-	const stat = await fsp.stat(resolved);
-	if (!stat.isFile()) throw new Error("Workflow path is not a file");
-
-	const ext = extname(resolved).toLowerCase();
-	if (!WORKFLOW_FILE_EXTENSIONS.includes(ext)) {
-		throw new Error("Workflow file must end in .lobster, .yaml, .yml, or .json");
-	}
-
-	return resolved;
 }
 
 async function handleResume({
@@ -910,13 +896,8 @@ async function handleResume({
 }
 
 async function readVersion() {
-	const { readFile } = await import("node:fs/promises");
-	const { fileURLToPath } = await import("node:url");
-	const { dirname, join } = await import("node:path");
-
-	const here = dirname(fileURLToPath(import.meta.url));
-	const pkgPath = join(here, "..", "..", "package.json");
-	const pkg = JSON.parse(await readFile(pkgPath, "utf8"));
+	const here = path.dirname(fileURLToPath(import.meta.url));
+	const pkg = JSON.parse(await readFile(path.join(here, "..", "..", "package.json"), "utf8"));
 	return pkg.version ?? "0.0.0";
 }
 

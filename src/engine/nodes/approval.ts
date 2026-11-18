@@ -5,10 +5,10 @@ import {
 	extractApprovalRequest,
 	approvalIdentityFromRequest,
 	enforceApprovalIdentity,
-	isInteractive,
 	questionDeadline,
 	readAnswer,
 } from "../gates.js";
+import { isInteractive } from "../../io/terminal.js";
 
 export async function approval(
 	machine: Machine,

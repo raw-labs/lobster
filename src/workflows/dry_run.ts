@@ -3,7 +3,7 @@ import { resolveRetryConfig, type RetryConfig } from "../engine/retry.js";
 import { resolveArgsTemplate } from "./expressions.js";
 import { checkConditionSyntax, conditionRefs, evaluateCondition } from "./conditions.js";
 import { createRecord, resolveInputValue } from "./values.js";
-import { getStepExecution, isApprovalStep, isInputStep } from "./load.js";
+import { getStepExecution, isApprovalStep, isInputStep } from "./steps.js";
 import type { WorkflowStep, WorkflowStepResult, WorkflowRunResult } from "./types.js";
 
 function dryRunStdinNote(stdin: unknown): string | null {

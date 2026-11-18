@@ -22,6 +22,7 @@ import {
 	type SchemaValidator,
 } from "../../util/validation.js";
 import { httpResponseLimitFromEnv, readResponseTextCapped } from "../../io/read_response_text.js";
+import { streamOf } from "../../io/terminal.js";
 
 const artifactSchema = {
 	type: "object",
@@ -203,7 +204,6 @@ export type CommandConfig = {
 	helpConfig: string[];
 	helpExamples: string[];
 	sourceForProvider?: (provider: SupportedProvider) => string;
-	legacyEnvCompat?: boolean;
 };
 
 type Adapter = {
@@ -263,7 +263,6 @@ export const llmInvokeCommand = createLlmInvokeCommand({
 	sourceForProvider(provider) {
 		return provider;
 	},
-	legacyEnvCompat: true,
 });
 
 export function createLlmInvokeCommand(config: CommandConfig) {
@@ -357,10 +356,10 @@ async function runLlmInvoke({
 	const prompt = extractPrompt(args);
 	if (!prompt) throw new Error(`${config.name} requires --prompt or positional text`);
 
-	const model = resolveModel(args, env, config.legacyEnvCompat);
+	const model = resolveModel(args, env);
 	const schemaVersion = resolveEnvString(
 		args["schema-version"],
-		["LOBSTER_LLM_SCHEMA_VERSION", ...(config.legacyEnvCompat ? ["LLM_TASK_SCHEMA_VERSION"] : [])],
+		["LOBSTER_LLM_SCHEMA_VERSION", "LLM_TASK_SCHEMA_VERSION"],
 		env,
 		"v1",
 	);
@@ -374,10 +373,7 @@ async function runLlmInvoke({
 	const userOutputSchema = parseJsonObject(args["output-schema"], `${config.name} --output-schema`);
 	const maxValidationRetriesRaw =
 		args["max-validation-retries"] ??
-		getFirstEnv(env, [
-			"LOBSTER_LLM_VALIDATION_RETRIES",
-			...(config.legacyEnvCompat ? ["LLM_TASK_VALIDATION_RETRIES"] : []),
-		]);
+		getFirstEnv(env, ["LOBSTER_LLM_VALIDATION_RETRIES", "LLM_TASK_VALIDATION_RETRIES"]);
 	const maxValidationRetries = userOutputSchema
 		? Math.max(
 				0,
@@ -388,11 +384,7 @@ async function runLlmInvoke({
 		: 0;
 	const disableCache = flag(args["disable-cache"]);
 	const forceRefresh = flag(
-		args.refresh ??
-			getFirstEnv(env, [
-				"LOBSTER_LLM_FORCE_REFRESH",
-				...(config.legacyEnvCompat ? ["LLM_TASK_FORCE_REFRESH"] : []),
-			]),
+		args.refresh ?? getFirstEnv(env, ["LOBSTER_LLM_FORCE_REFRESH", "LLM_TASK_FORCE_REFRESH"]),
 	);
 	const stateKey = String(args["state-key"] ?? env.LOBSTER_RUN_STATE_KEY ?? "").trim() || null;
 
@@ -930,13 +922,8 @@ async function invokeHttpAdapter({
 	return { ok: true, result: parsed } as LlmResponseEnvelope;
 }
 
-function resolveModel(args: any, env: any, legacyEnvCompat: boolean | undefined) {
-	return resolveEnvString(
-		args.model,
-		["LOBSTER_LLM_MODEL", ...(legacyEnvCompat ? ["LLM_TASK_MODEL"] : [])],
-		env,
-		"",
-	);
+function resolveModel(args: any, env: any) {
+	return resolveEnvString(args.model, ["LOBSTER_LLM_MODEL", "LLM_TASK_MODEL"], env, "");
 }
 
 function resolveEnvString(raw: any, envKeys: string[], env: any, fallback: string) {
@@ -1143,7 +1130,7 @@ async function persistOutputs({
 		key: stateKey,
 		value: record,
 		signal,
-		atomicWriteOptions: { assertInvocationCurrent },
+		assertInvocationCurrent,
 		afterStore: afterStore ? () => afterStore() : undefined,
 	});
 }
@@ -1258,8 +1245,4 @@ async function writeCacheEntry(
 function getCacheDir(env: any) {
 	if (env?.LOBSTER_CACHE_DIR) return String(env.LOBSTER_CACHE_DIR);
 	return path.join(process.cwd(), ".lobster-cache");
-}
-
-async function* streamOf(items: any[]) {
-	for (const item of items) yield item;
 }

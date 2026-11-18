@@ -83,7 +83,6 @@ export async function runPipelineStep({
 	resume?: {
 		pipelineInput: WorkflowPipelineInputResumeState;
 		response: unknown;
-		onConsumed?: () => Promise<void>;
 	};
 	requestInputEnabled?: boolean;
 	/** Why the pipeline cannot pause here, for the error when it tries to. */
@@ -155,7 +154,6 @@ export async function runPipelineStep({
 				? {
 						state: resume.pipelineInput.commandInput!,
 						response: resume.response,
-						onConsumed: resume.onConsumed,
 					}
 				: undefined,
 		onExecutionStart,

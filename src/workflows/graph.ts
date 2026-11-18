@@ -1,5 +1,6 @@
 import { resolveArgsTemplate } from "./expressions.js";
 import type { WorkflowFile, WorkflowStep } from "./types.js";
+import { isApprovalStep, isInputStep, stepKind } from "./steps.js";
 
 export type WorkflowGraphFormat = "mermaid" | "dot" | "ascii";
 
@@ -21,33 +22,6 @@ type RenderGraphParams = {
 	format: WorkflowGraphFormat;
 	args?: Record<string, unknown>;
 };
-
-function isApprovalStep(step: WorkflowStep) {
-	if (step.approval === true) return true;
-	if (typeof step.approval === "string" && step.approval.trim().length > 0) return true;
-	if (step.approval && typeof step.approval === "object" && !Array.isArray(step.approval))
-		return true;
-	return false;
-}
-
-function isInputStep(step: WorkflowStep) {
-	return Boolean(step.input && typeof step.input === "object" && !Array.isArray(step.input));
-}
-
-function stepType(step: WorkflowStep) {
-	if (step.parallel) return "parallel";
-	if (step.switch) return "switch";
-	if (step.repeat) return "repeat";
-	if (typeof step.for_each === "string") return "for_each";
-	if (typeof step.workflow === "string" && step.workflow.trim()) return "workflow";
-	if (typeof step.pipeline === "string" && step.pipeline.trim()) return "pipeline";
-	if (typeof step.run === "string" || typeof step.command === "string") return "run";
-	if (step.sleep !== undefined) return "sleep";
-	if (step.wait) return "wait";
-	if (isApprovalStep(step)) return "approval";
-	if (isInputStep(step)) return "input";
-	return "step";
-}
 
 function stepDetails(step: WorkflowStep, args: Record<string, unknown>) {
 	if (step.switch) {
@@ -76,8 +50,8 @@ function stepDetails(step: WorkflowStep, args: Record<string, unknown>) {
 	}
 	if (step.sleep !== undefined) return `sleep: ${step.sleep}`;
 	if (step.wait) return `wait for event: ${step.wait.event}`;
-	if (isApprovalStep(step)) return "approval gate";
-	if (isInputStep(step)) return "input request";
+	if (isApprovalStep(step.approval)) return "approval gate";
+	if (isInputStep(step.input)) return "input request";
 	return "";
 }
 
@@ -148,14 +122,14 @@ function collectGraph(workflow: WorkflowFile, args: Record<string, unknown>) {
 	 */
 	const visit = (steps: WorkflowStep[], incoming: Omit<GraphEdge, "to">[]) => {
 		for (const step of steps) {
-			const type = stepType(step);
+			const type = stepKind(step);
 			const details = stepDetails(step, args);
 			const label = details ? `${step.id}\\n${truncate(details)}` : step.id;
 			nodes.push({
 				id: step.id,
 				type,
 				label,
-				shape: isApprovalStep(step) || step.switch ? "diamond" : "box",
+				shape: isApprovalStep(step.approval) || step.switch ? "diamond" : "box",
 			});
 			for (const edge of incoming) addEdge({ ...edge, to: step.id });
 

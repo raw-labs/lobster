@@ -1,5 +1,6 @@
 import { defineCommand } from "../define.js";
 import { runAbortableProcess } from "../../process/abortable_process.js";
+import { streamOf } from "../../io/terminal.js";
 
 export const execCommand = defineCommand({
 	name: "exec",
@@ -87,12 +88,12 @@ export const execCommand = defineCommand({
 			}
 
 			return {
-				output: asStream(Array.isArray(parsed) ? parsed : [parsed]),
+				output: streamOf(Array.isArray(parsed) ? parsed : [parsed]),
 			};
 		}
 
 		const lines = result.stdout.split(/\r?\n/).filter(Boolean);
-		return { output: asStream(lines) };
+		return { output: streamOf(lines) };
 	},
 });
 
@@ -144,8 +145,4 @@ function encodeStdin(items, mode) {
 		return items.map((item) => (typeof item === "string" ? item : JSON.stringify(item))).join("\n");
 	}
 	throw new Error(`exec --stdin must be raw, json, or jsonl (got ${mode})`);
-}
-
-async function* asStream(items) {
-	for (const item of items) yield item;
 }

@@ -1,5 +1,8 @@
 import { checkCondition } from "./conditions.js";
-import { parseDuration } from "../util/duration.js";
+import { isApprovalStep, isInputStep } from "./steps.js";
+import { isPlainObject } from "../util/objects.js";
+export { getStepExecution, isApprovalStep, isInputStep } from "./steps.js";
+import { MAX_TIMER_MS, parseDuration } from "../util/duration.js";
 import { closestMatch } from "../util/suggest.js";
 import { promises as fsp } from "node:fs";
 import path from "node:path";
@@ -13,8 +16,16 @@ import type {
 	SwitchConfig,
 } from "./types.js";
 
-/** The longest delay a timer can wait; beyond it, setTimeout fires at once (about 24.8 days). */
-const MAX_TIMER_MS = 2_147_483_647;
+export const WORKFLOW_FILE_EXTENSIONS = [".lobster", ".yaml", ".yml", ".json"];
+
+/** The absolute path of a workflow file named on a command line or in a tool request. */
+export async function resolveWorkflowFile(candidate: string, cwd = process.cwd()) {
+	const resolved = path.resolve(cwd, candidate);
+	if (!(await fsp.stat(resolved)).isFile()) throw new Error("Workflow path is not a file");
+	if (!WORKFLOW_FILE_EXTENSIONS.includes(path.extname(resolved).toLowerCase()))
+		throw new Error("Workflow file must end in .lobster, .yaml, .yml, or .json");
+	return resolved;
+}
 
 export async function loadWorkflowFile(filePath: string): Promise<WorkflowFile> {
 	const text = await fsp.readFile(filePath, "utf8");
@@ -43,7 +54,7 @@ export async function loadWorkflowFile(filePath: string): Promise<WorkflowFile> 
 
 	const costLimit = (parsed as WorkflowFile).cost_limit;
 	if (costLimit !== undefined) {
-		if (!costLimit || typeof costLimit !== "object" || Array.isArray(costLimit)) {
+		if (!isPlainObject(costLimit)) {
 			throw new Error("Workflow cost_limit must be an object");
 		}
 		if (!Number.isFinite(Number(costLimit.max_usd)) || Number(costLimit.max_usd) < 0) {
@@ -86,23 +97,14 @@ function validateSteps(steps: WorkflowStep[], seen: Set<string>, known: Set<stri
 			if (typeof step[key] === "string" && step[key].includes("\0"))
 				throw new Error(`Workflow step ${step.id} ${key} cannot contain a NUL character`);
 		if (step.workflow_args !== undefined) {
-			if (
-				!step.workflow_args ||
-				typeof step.workflow_args !== "object" ||
-				Array.isArray(step.workflow_args)
-			) {
+			if (!isPlainObject(step.workflow_args)) {
 				throw new Error(`Workflow step ${step.id} workflow_args must be a plain object`);
 			}
 		}
-		if (
-			step.parallel !== undefined &&
-			(!step.parallel || typeof step.parallel !== "object" || Array.isArray(step.parallel))
-		) {
+		if (step.parallel !== undefined && !isPlainObject(step.parallel)) {
 			throw new Error(`Workflow step ${step.id} parallel must be an object`);
 		}
-		const isParallel = Boolean(
-			step.parallel && typeof step.parallel === "object" && !Array.isArray(step.parallel),
-		);
+		const isParallel = Boolean(isPlainObject(step.parallel));
 		if (isParallel) {
 			const parallel = step.parallel as ParallelConfig;
 			if (!Array.isArray(parallel.branches) || parallel.branches.length === 0) {
@@ -120,7 +122,7 @@ function validateSteps(steps: WorkflowStep[], seen: Set<string>, known: Set<stri
 					parallel.timeout_ms > MAX_TIMER_MS)
 			) {
 				throw new Error(
-					`Workflow step ${step.id} parallel timeout_ms must be a positive integer between 1 and 2147483647`,
+					`Workflow step ${step.id} parallel timeout_ms must be a positive integer between 1 and ${MAX_TIMER_MS}`,
 				);
 			}
 
@@ -408,7 +410,7 @@ function validateSteps(steps: WorkflowStep[], seen: Set<string>, known: Set<stri
 		if (typeof step.approval === "string" && !step.approval.trim()) {
 			throw new Error(`Workflow step ${step.id} approval prompt cannot be blank`);
 		}
-		if (step.approval && typeof step.approval === "object" && !Array.isArray(step.approval)) {
+		if (isPlainObject(step.approval)) {
 			const approval = step.approval as Record<string, unknown>;
 			for (const key of ["prompt", "preview"])
 				if (approval[key] !== undefined && typeof approval[key] !== "string")
@@ -577,38 +579,6 @@ function containsGate(steps: WorkflowStep[]): boolean {
 	);
 }
 
-export function isApprovalStep(approval: WorkflowStep["approval"]) {
-	if (approval === true) return true;
-	if (typeof approval === "string" && approval.trim().length > 0) return true;
-	if (approval && typeof approval === "object" && !Array.isArray(approval)) return true;
-	return false;
-}
-
-export function isInputStep(input: WorkflowStep["input"]) {
-	return Boolean(input && typeof input === "object" && !Array.isArray(input));
-}
-
-export function getStepExecution(step: WorkflowStep) {
-	if (step.parallel && typeof step.parallel === "object" && !Array.isArray(step.parallel)) {
-		return { kind: "parallel" as const, value: step.parallel };
-	}
-
-	if (typeof step.workflow === "string" && step.workflow.trim()) {
-		return { kind: "workflow" as const, value: step.workflow };
-	}
-
-	if (typeof step.pipeline === "string" && step.pipeline.trim()) {
-		return { kind: "pipeline" as const, value: step.pipeline };
-	}
-
-	const shellCommand = typeof step.run === "string" ? step.run : step.command;
-	if (typeof shellCommand === "string" && shellCommand.trim()) {
-		return { kind: "shell" as const, value: shellCommand };
-	}
-
-	return { kind: "none" as const };
-}
-
 // Options every step accepts, wherever it is nested.
 function validateStepOptions(step: WorkflowStep, name: string, known: ReadonlySet<string>) {
 	if (
@@ -619,7 +589,7 @@ function validateStepOptions(step: WorkflowStep, name: string, known: ReadonlySe
 			step.timeout_ms < 1 ||
 			step.timeout_ms > MAX_TIMER_MS)
 	) {
-		throw new Error(`${name} timeout_ms must be a positive integer between 1 and 2147483647`);
+		throw new Error(`${name} timeout_ms must be a positive integer between 1 and ${MAX_TIMER_MS}`);
 	}
 	if (
 		step.on_error !== undefined &&
@@ -630,7 +600,7 @@ function validateStepOptions(step: WorkflowStep, name: string, known: ReadonlySe
 		throw new Error(`${name} on_error must be "stop", "continue", or "skip_rest"`);
 	}
 	if (step.retry !== undefined) {
-		if (!step.retry || typeof step.retry !== "object" || Array.isArray(step.retry)) {
+		if (!isPlainObject(step.retry)) {
 			throw new Error(`${name} retry must be an object`);
 		}
 		const r = step.retry;
@@ -673,7 +643,7 @@ function validateStepOptions(step: WorkflowStep, name: string, known: ReadonlySe
 			step.heartbeat_timeout_ms > MAX_TIMER_MS)
 	) {
 		throw new Error(
-			`${name} heartbeat_timeout_ms must be a positive integer between 1 and 2147483647`,
+			`${name} heartbeat_timeout_ms must be a positive integer between 1 and ${MAX_TIMER_MS}`,
 		);
 	}
 	validateCondition(step, name, known);
@@ -832,8 +802,4 @@ function checkKeys(value: unknown, allowed: string[], where: string) {
 			`${where} has unknown key "${key}"${near ? ` (did you mean "${near}"?)` : ""}. Allowed: ${allowed.join(", ")}`,
 		);
 	}
-}
-
-function isPlainObject(value: unknown): value is Record<string, unknown> {
-	return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }

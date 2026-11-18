@@ -25,5 +25,4 @@ export const llmTaskInvokeCommand = createLlmInvokeCommand({
 	sourceForProvider() {
 		return "clawd";
 	},
-	legacyEnvCompat: true,
 });
