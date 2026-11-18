@@ -300,6 +300,10 @@ export class SqliteBackend implements Backend {
 		return this.request("findEvents", { name, since, owner });
 	}
 
+	readRecords(runId: string, prefix: string): Promise<Array<{ key: string; text: string }>> {
+		return this.request("readRecords", { runId, prefix });
+	}
+
 	async close(): Promise<void> {
 		if (this.closing) {
 			return;

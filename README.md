@@ -127,7 +127,7 @@ lobster runs list [--status waiting|blocked|failed]
 lobster runs show <runId>
 lobster runs advance <runId>       # continue or retry a run
 lobster runs advance --due         # wake every run whose time has come (cron, launchd, systemd)
-                                   #   --concurrency N wakes up to N runs at once
+                                   #   (4 at once; --concurrency N to change)
 lobster signal <event> --data '{…}'
 lobster runs abandon <runId>       # stop a run for good
 ```

@@ -85,6 +85,12 @@ export type Scope = {
 	startTimeout?: () => void;
 };
 
+/** Step outputs larger than this (in JSON characters) are kept beside the checkpoint. */
+const OUTLINE_BYTES = 1024;
+const OUTLINED_FIELDS = ["json", "stdout", "response"] as const;
+/** How a checkpoint refers to an output kept beside it. */
+const RECORD_REF = "$lobster.record";
+
 export class Suspension extends Error {
 	constructor(
 		readonly key: string,
@@ -197,11 +203,140 @@ export class Machine {
 		this.state.cost = this.cost.hasUsage() ? this.cost.getSummary() : undefined;
 		this.state.llmSpend = this.ledger.outstanding();
 		this.state.llmBilled = this.ledger.settled();
+		// Records changed since the last save go with this one, in the same transaction.
+		const records = this.#records;
+		if (records.drop.size || records.put.size) {
+			extras = {
+				...extras,
+				records: { drop: [...records.drop], put: Object.fromEntries(records.put) },
+			};
+			this.#records = { drop: new Set(), put: new Map() };
+		}
 		return this.store.save(
 			this.state,
 			extras,
 			extras.publish || extras.consume ? () => this.checkAuthority() : undefined,
+			(state) => this.#outline(state),
 		);
+	}
+
+	#records = { drop: new Set<string>(), put: new Map<string, string>() };
+
+	// Large step outputs live beside the checkpoint, written once, and the checkpoint refers to
+	// them: otherwise every save rewrites every large output of every step before it, and a
+	// loop over a big list costs the square of its length. The key of each value saved so far:
+	#outlined = new WeakMap<object, string | false>();
+	#outlinedText = new Map<string, string>();
+
+	/** The checkpoint to write for `state`: step outputs over OUTLINE_BYTES as references. */
+	#outline(state: ExecutionState) {
+		// A finished run keeps no records (and few activations): its checkpoint stays whole.
+		if (state.status === "completed" || state.status === "cancelled") return { execution: state };
+		const put: Record<string, string> = {};
+		const outlineValue = (value: unknown) => {
+			if (typeof value === "string") {
+				if (value.length <= OUTLINE_BYTES) return value;
+				let key = this.#outlinedText.get(value);
+				if (!key) {
+					key = "value/" + randomUUID();
+					this.#outlinedText.set(value, key);
+					put[key] = JSON.stringify(value);
+				}
+				return { [RECORD_REF]: key };
+			}
+			if (!value || typeof value !== "object") return value;
+			let key = this.#outlined.get(value);
+			if (key === undefined) {
+				const text = JSON.stringify(value);
+				key = text.length > OUTLINE_BYTES ? "value/" + randomUUID() : false;
+				if (key) put[key] = text;
+				this.#outlined.set(value, key);
+			}
+			return key ? { [RECORD_REF]: key } : value;
+		};
+		const outlineResult = (result: WorkflowStepResult | undefined) => {
+			if (!result) return result;
+			let copy: WorkflowStepResult | undefined;
+			for (const field of OUTLINED_FIELDS) {
+				if (result[field] === undefined) continue;
+				const outlined = outlineValue(result[field]);
+				if (outlined !== result[field]) (copy ??= { ...result })[field] = outlined as never;
+			}
+			return copy ?? result;
+		};
+		const activations: ExecutionState["activations"] = {};
+		for (const [path, frame] of Object.entries(state.activations)) {
+			let copy: Activation | undefined;
+			const result = outlineResult(frame.result);
+			if (result !== frame.result) (copy ??= { ...frame }).result = result;
+			if (frame.results) {
+				let results: Record<string, WorkflowStepResult> | undefined;
+				for (const [id, entry] of Object.entries(frame.results)) {
+					const outlined = outlineResult(entry);
+					if (outlined !== entry) (results ??= { ...frame.results })[id] = outlined!;
+				}
+				if (results) (copy ??= { ...frame }).results = results;
+			}
+			activations[path] = copy ?? frame;
+		}
+		return { execution: { ...state, activations }, put };
+	}
+
+	/** Put the outputs a checkpoint refers to back in place; done before the run continues. */
+	async hydrate() {
+		const refs: Array<[WorkflowStepResult, (typeof OUTLINED_FIELDS)[number]]> = [];
+		const collect = (result: WorkflowStepResult | undefined) => {
+			if (!result) return;
+			for (const field of OUTLINED_FIELDS) {
+				const value = result[field] as any;
+				if (value && typeof value === "object" && typeof value[RECORD_REF] === "string")
+					refs.push([result, field]);
+			}
+		};
+		for (const frame of Object.values(this.state.activations)) {
+			collect(frame.result);
+			for (const entry of Object.values(frame.results ?? {})) collect(entry);
+		}
+		if (!refs.length) return;
+		const values = await this.readRecords("value/");
+		for (const [result, field] of refs) {
+			const key = (result[field] as any)[RECORD_REF] as string;
+			if (!values.has(key)) throw new Error(`Saved step output ${key} is missing`);
+			const value = values.get(key);
+			result[field] = value as never;
+			// Saved already: the next save refers to it again instead of writing it again.
+			if (typeof value === "string") this.#outlinedText.set(value, key);
+			else if (value && typeof value === "object") this.#outlined.set(value, key);
+		}
+	}
+
+	/**
+	 * Keep `value` beside the checkpoint under `key` (a loop's items, one item's output): it is
+	 * written once, with the next save, instead of with every save. Keys start with the
+	 * activation's path, so a node's records are found and dropped by that prefix.
+	 */
+	putRecord(key: string, value: unknown) {
+		this.#records.put.set(key, JSON.stringify(value));
+	}
+
+	/** Forget every record under `prefix`, with the next save. */
+	dropRecords(prefix: string) {
+		for (const key of this.#records.put.keys())
+			if (key.startsWith(prefix)) this.#records.put.delete(key);
+		this.#records.drop.add(prefix);
+	}
+
+	/** The records under `prefix`, as saved and as changed since, by key. */
+	async readRecords(prefix: string): Promise<Map<string, unknown>> {
+		const found = new Map<string, unknown>();
+		const dropped = [...this.#records.drop].some((drop) => prefix.startsWith(drop));
+		if (!dropped)
+			for (const row of await this.store.session.readRecords(this.store.runId, prefix))
+				if (![...this.#records.drop].some((drop) => row.key.startsWith(drop)))
+					found.set(row.key, JSON.parse(row.text));
+		for (const [key, text] of this.#records.put)
+			if (key.startsWith(prefix)) found.set(key, JSON.parse(text));
+		return found;
 	}
 
 	checkAuthority(ctx = this.ctx) {
@@ -742,6 +877,7 @@ export class Machine {
 		this.state.status = "running";
 		delete this.state.error;
 		try {
+			await this.hydrate();
 			const result = await sequence(this, this.state.definition.workflow.steps, "root", {
 				definition: this.state.definition,
 				args: this.state.args,

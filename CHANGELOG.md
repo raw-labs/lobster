@@ -4,7 +4,8 @@ All notable changes to Lobster will be documented in this file.
 
 ## Unreleased
 
-- Add `lobster runs advance --due --concurrency N` (`advanceDueRuns({ concurrency })`): advance up to N due runs at once instead of one after another. Each run keeps its own lease; the default stays 1.
+- Saves no longer grow with a run: a `for_each` loop's items and each item's output, and any step output over 1 KB, are kept beside the checkpoint as records written once, in the same transaction as the save that first needs them. A loop's saves used to rewrite every item and every finished output, so time and bytes grew with the square of its length (3,200 items wrote 630 MB and took 49 s; 8,000 items now take under 6 s). Records go when a run completes or is cancelled, stay with a failed run for its retry, and are included in `storage export`.
+- `lobster runs advance --due` advances up to 4 due runs at once instead of one after another, so a slow run no longer delays the others; `--concurrency N` (`advanceDueRuns({ concurrency })`) changes it, and `--concurrency 1` restores the old behaviour. Each run keeps its own lease.
 - A stop (Ctrl-C, a host abort, a lost lease) between a step being marked started and its command starting no longer leaves the run blocked: the step goes back to ready, since nothing ran. Shell steps count as started only once their process is spawned.
 - Conditions nested more than 64 levels deep, or with a tree more than 256 levels deep (a very long `&&` chain), are refused with a message instead of overflowing the stack.
 - Workflow files: `steps:` on a step other than `for_each` or `repeat` is refused (it used to crash with a TypeError when the run started); a NUL character in a `workflow` or `cwd` path is refused; a file that is not valid YAML or JSON says so, with its path.

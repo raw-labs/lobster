@@ -262,12 +262,12 @@ async function advanceReporting(runId: string, ctx: RunContext, leaseMs?: number
 export async function advanceDueRuns(options: {
 	ctx: RunContext;
 	limit?: number;
-	/** How many runs to advance at once (default 1). Each is a separate run with its own lease. */
+	/** How many runs to advance at once (default 4). Each is a separate run with its own lease. */
 	concurrency?: number;
 	dryRun?: boolean;
 	leaseMs?: number;
 }): Promise<{ due: string[]; advanced: DueRunOutcome[] }> {
-	const concurrency = options.concurrency ?? 1;
+	const concurrency = options.concurrency ?? 4;
 	if (!Number.isSafeInteger(concurrency) || concurrency < 1)
 		throw new Error("concurrency must be a positive integer");
 	return withStoreContext({ ...options.ctx, trackRuns: true }, async (ctx) => {

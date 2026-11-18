@@ -13,6 +13,7 @@ import {
 	type Attempt,
 	type LogicalArchive,
 	type OperationReceipt,
+	type RecordChanges,
 	type RunEvent,
 	type RunRecord,
 	type Transition,
@@ -105,6 +106,12 @@ if (!workerData.readOnly) {
 			key TEXT PRIMARY KEY,
 			value TEXT NOT NULL
 		);
+		CREATE TABLE IF NOT EXISTS execution_records (
+			run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+			key TEXT NOT NULL,
+			text TEXT NOT NULL,
+			PRIMARY KEY(run_id, key)
+		);
 		CREATE TABLE IF NOT EXISTS receipts (
 			run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
 			operation_id TEXT NOT NULL,
@@ -159,7 +166,35 @@ function getRun(id: string): RunRecord | null {
 	for (const row of states) {
 		run.states[row.key] = row.text;
 	}
+
+	const records = readRecords(id, "");
+	if (records.length) run.records = Object.fromEntries(records.map((row) => [row.key, row.text]));
 	return run;
+}
+
+function readRecords(runId: string, prefix: string) {
+	return prepare(
+		"SELECT key,text FROM execution_records WHERE run_id=? AND substr(key,1,length(?))=? ORDER BY key",
+	).all(runId, prefix, prefix) as Array<{ key: string; text: string }>;
+}
+
+/** Apply the record changes of a committed checkpoint save, in its transaction. */
+function applyRecords(runId: string, changes: RecordChanges | undefined, status: string) {
+	// A run that is over never runs again: nothing it kept beside its checkpoint is needed.
+	if (status === "completed" || status === "cancelled") {
+		prepare("DELETE FROM execution_records WHERE run_id=?").run(runId);
+		return;
+	}
+	for (const prefix of changes?.drop ?? [])
+		prepare("DELETE FROM execution_records WHERE run_id=? AND substr(key,1,length(?))=?").run(
+			runId,
+			prefix,
+			prefix,
+		);
+	for (const [key, text] of Object.entries(changes?.put ?? {}))
+		prepare(
+			"INSERT INTO execution_records(run_id,key,text) VALUES(?,?,?) ON CONFLICT(run_id,key) DO UPDATE SET text=excluded.text",
+		).run(runId, key, text);
 }
 
 function listRuns(): RunRecord[] {
@@ -193,7 +228,7 @@ function transaction<T>(task: () => T, write = true): T {
 }
 
 function saveRun(run: RunRecord): void {
-	const { attempts, waits, events, receipts, states, ...record } = run;
+	const { attempts, waits, events, receipts, states, records, ...record } = run;
 	prepare(
 		"INSERT INTO runs(id,record) VALUES(?,?) ON CONFLICT(id) DO UPDATE SET record=excluded.record",
 	).run(run.id, JSON.stringify(record));
@@ -223,6 +258,11 @@ function saveRun(run: RunRecord): void {
 			"INSERT INTO state(key,text,run_id) VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET text=excluded.text,run_id=excluded.run_id",
 		).run(key, text, run.id);
 	}
+	// Only an import carries records; a checkpoint save changes them through applyRecords.
+	for (const [key, text] of Object.entries(records ?? {}))
+		prepare(
+			"INSERT INTO execution_records(run_id,key,text) VALUES(?,?,?) ON CONFLICT(run_id,key) DO UPDATE SET text=excluded.text",
+		).run(run.id, key, text);
 }
 
 function transition(request: Transition): TransitionResult {
@@ -289,6 +329,8 @@ function transition(request: Transition): TransitionResult {
 	const applied = applyTransition(current, request, { previousAttempts });
 	if (applied.status === "committed" && applied.run !== current) {
 		saveRun(applied.run);
+		if (request.action.kind === "execution-save")
+			applyRecords(applied.run.id, request.action.records, request.action.execution.status);
 	}
 	return { status: applied.status, revision: applied.revision };
 }
@@ -545,6 +587,8 @@ function handle(request: WorkerRequest): WorkerResult<WorkerMethod> {
 					at: number;
 				}[]
 			).map((row) => ({ ...row, data: JSON.parse(row.data), at: Number(row.at) }));
+		case "readRecords":
+			return readRecords(args.runId, args.prefix);
 		case "close":
 			db.close();
 			return;

@@ -42,6 +42,10 @@ type Operations = {
 	dueRuns: { args: { now: number; limit: number; callerId?: string }; result: string[] };
 	appendEvent: { args: InboxEvent; result: { inserted: boolean } };
 	findEvents: { args: { name: string; since: number; owner: string }; result: InboxEvent[] };
+	readRecords: {
+		args: { runId: string; prefix: string };
+		result: Array<{ key: string; text: string }>;
+	};
 	export: { args: Record<string, never>; result: LogicalArchive };
 	import: { args: LogicalArchive; result: void };
 	close: { args: Record<string, never>; result: void };

@@ -97,6 +97,18 @@ export type RunRecord = {
 	// Continuation payloads are executable state, not bounded history summaries.
 	states: Record<string, string | null>;
 	receipts: Record<string, OperationReceipt>;
+	/**
+	 * Large parts of a running execution kept beside its checkpoint (a loop's items and each
+	 * item's output), so a save does not rewrite them. Only in full reads and exports.
+	 */
+	records?: Record<string, string>;
+};
+
+/** Records written with a checkpoint save, in the same transaction. */
+export type RecordChanges = {
+	/** Delete every record whose key starts with one of these. Applied before `put`. */
+	drop?: string[];
+	put?: Record<string, string>;
 };
 
 export type RunAction =
@@ -111,6 +123,7 @@ export type RunAction =
 			execution: ExecutionState;
 			publish?: { key: string; text: string };
 			consume?: { key: string; expectedWaitRevision?: number };
+			records?: RecordChanges;
 	  }
 	| { kind: "create"; run: RunRecord; checkpoint?: { key: string; text: string } }
 	| { kind: "definition"; fingerprint: string }
@@ -439,6 +452,15 @@ export function validateArchive(value: unknown): asserts value is LogicalArchive
 		}
 		if (run.historyEnabled !== undefined && typeof run.historyEnabled !== "boolean") {
 			throw new Error("Invalid run history setting");
+		}
+		if (
+			run.records !== undefined &&
+			(!run.records ||
+				typeof run.records !== "object" ||
+				Array.isArray(run.records) ||
+				Object.values(run.records).some((text) => typeof text !== "string"))
+		) {
+			throw new Error("Invalid run records");
 		}
 		if (run.execution !== undefined) {
 			const execution = run.execution;

@@ -107,12 +107,16 @@ function pickKind(g: Gen, scope: Scope, depth: number) {
 	return "activity";
 }
 
-/** The value a fake returns: a number, a flag and a short list of numbers. */
+/**
+ * The value a fake returns: a number, a flag and a short list of numbers; sometimes padded
+ * past 1 KB, so it is kept beside the checkpoint instead of in it.
+ */
 function value(g: Gen) {
 	return {
 		v: g.r.int(0, 9),
 		ok: g.r.chance(0.5),
 		list: Array.from({ length: g.r.int(1, 3) }, () => g.r.int(0, 4)),
+		...(g.r.chance(0.2) ? { pad: "p".repeat(g.r.int(1100, 3000)) } : {}),
 	};
 }
 

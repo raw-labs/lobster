@@ -47,6 +47,9 @@ export type Activation = {
 	/** A switch's chosen case: its number from 1, or "else". */
 	case?: number | "else";
 	dispatchAttempts?: number;
+	/** How many items a for_each has (its items and outputs are records). */
+	count?: number;
+	/** Before records: a for_each's items and outputs in the checkpoint (moved out on entry). */
 	items?: unknown[];
 	iterations?: unknown[];
 	results?: Record<string, WorkflowStepResult>;

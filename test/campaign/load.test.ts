@@ -118,14 +118,14 @@ test(
 								{
 									id: "each",
 									for_each: "$items.json",
-									steps: [{ id: "w", pipeline: "fake --name w" }],
+									steps: [{ id: "w", pipeline: "head --n 1" }],
 								},
 							]
 						: [
 								{
 									id: "loop",
 									repeat: { until: "false", max: n, on_max: "continue" },
-									steps: [{ id: "w", pipeline: "fake --name w" }],
+									steps: [{ id: "w", pipeline: "head --n 1" }],
 								},
 							],
 			});
@@ -135,25 +135,20 @@ test(
 			return Date.now() - started;
 		};
 		for (const kind of ["repeat", "for_each"] as const) {
-			// Known: every save rewrites the whole checkpoint, and a for_each keeps its items and every
-			// finished item's output in it, so its saves grow with the loop (quadratic in total). It
-			// is fixed with the parallel for_each, which keeps each item's output in its own record.
-			await t.test(
-				kind,
-				{ todo: kind === "for_each" && "for_each checkpoints grow with the loop" },
-				async (t) => {
-					const small = await timeLoop(kind, size);
-					const large = await timeLoop(kind, size * 4);
-					t.diagnostic(
-						`${kind}: ${size} in ${small} ms, ${size * 4} in ${large} ms (${Math.round((size * 4 * 1000) / large)}/s)`,
-					);
-					// Linear would be 4x.
-					assert.ok(
-						large < small * 6,
-						`${kind}: ${size} took ${small} ms, ${size * 4} took ${large} ms`,
-					);
-				},
-			);
+			// A for_each keeps its items and outputs beside the checkpoint, and so are large step
+			// outputs (the list it loops over), so a save does not grow with the loop.
+			await t.test(kind, async (t) => {
+				const small = await timeLoop(kind, size);
+				const large = await timeLoop(kind, size * 4);
+				t.diagnostic(
+					`${kind}: ${size} in ${small} ms, ${size * 4} in ${large} ms (${Math.round((size * 4 * 1000) / large)}/s)`,
+				);
+				// Linear would be 4x.
+				assert.ok(
+					large < small * 6,
+					`${kind}: ${size} took ${small} ms, ${size * 4} took ${large} ms`,
+				);
+			});
 		}
 	},
 );

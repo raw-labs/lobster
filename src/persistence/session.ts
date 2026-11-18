@@ -287,6 +287,10 @@ export class StoreSession {
 		return this.request(() => this.backend.findEvents(name, since, owner));
 	}
 
+	async readRecords(runId: string, prefix: string): Promise<Array<{ key: string; text: string }>> {
+		return this.request(() => this.backend.readRecords(runId, prefix));
+	}
+
 	async listRuns({
 		limit = 20,
 		after = "",

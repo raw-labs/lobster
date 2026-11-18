@@ -372,7 +372,7 @@ steps:
 Something outside continues these runs:
 
 ```sh
-lobster runs advance --due [--limit 100] [--concurrency 1] [--dry-run]   # every run whose time has come
+lobster runs advance --due [--limit 100] [--concurrency 4] [--dry-run]   # every run whose time has come
 lobster signal email.reply --data '{"thread":"t-42"}' [--id <delivery id>]
 ```
 
@@ -387,12 +387,12 @@ for it; a run that reaches its `wait:` later still finds it. Embedded hosts use
 `advanceDueRuns({ ctx, concurrency })` and `signalEvent({ name, data, id, ctx })` from
 `@clawdbot/lobster/core`.
 
-By default one call advances due runs one after another, so a slow step in one run
-delays the rest. `--concurrency N` advances up to N runs at once (each run's own steps
-still run in order, and each run keeps its own lease). It is opt-in because the runs'
-commands then overlap: two runs of the same workflow may call the same API, or write the
-same file, at the same time. In the load tests, waking 1,000 runs whose next step takes
-50 ms went from 15 runs/s at 1 to 59/s at 4 and 185/s at 16.
+One call advances up to 4 due runs at once (`--concurrency N` to change it); each run's
+own steps still run in order, and each run keeps its own lease, so a slow step in one run
+delays only that run. The runs' commands do overlap: two runs of the same workflow may
+call the same API, or write the same file, at the same time. `--concurrency 1` advances
+them one after another. In the load tests, waking 1,000 runs whose next step takes 50 ms
+went from 15 runs/s at 1 to 59/s at 4 and 185/s at 16.
 
 Who calls `runs advance --due` is the caller's choice: a long-running host such as
 the OpenClaw gateway every minute or so, or the operating system:
@@ -561,8 +561,14 @@ store exports and backups privately. Continuations retain their existing full
 payloads and existing output limits; history capture adds no execution truncation.
 
 SQLite commits continuation transitions and their events together in indexed
-tables. Execution checkpoints currently replace the full execution snapshot,
-stored with its run metadata. New tracked tokens require this runtime; older
+tables. Each execution checkpoint replaces the previous one, stored with its run
+metadata. Large values are kept beside it as records, written once in the same
+transaction as the save that first needs them: a `for_each` loop's items and each
+item's output, and any step output over 1 KB (the checkpoint refers to it). A save
+therefore costs the same however long a loop is or however much a run has produced; a
+loop of 8,000 items runs in a few seconds. A run that completes or is cancelled drops
+its records; a failed run keeps them for a retry until retention deletes it, and
+`storage export` includes them. New tracked tokens require this runtime; older
 binaries cannot understand the new execution state. State saved by older
 versions as loose JSON files needs `lobster upgrade` once (see
 [Upgrading from an older version](#upgrading-from-an-older-version)). History enables run tracking. To track

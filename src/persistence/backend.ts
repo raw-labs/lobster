@@ -64,6 +64,8 @@ export interface Backend {
 	appendEvent(event: InboxEvent): Promise<{ inserted: boolean }>;
 	/** Events with this name received at or after `since` that `owner` may see, oldest first. */
 	findEvents(name: string, since: number, owner: string): Promise<InboxEvent[]>;
+	/** A run's records (see RunRecord.records) whose keys start with `prefix`, by key. */
+	readRecords(runId: string, prefix: string): Promise<Array<{ key: string; text: string }>>;
 
 	export(): Promise<LogicalArchive>;
 	import(data: LogicalArchive): Promise<void>;

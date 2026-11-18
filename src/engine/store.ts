@@ -4,7 +4,10 @@ import type { RunAction } from "../persistence/model.js";
 import { PersistenceError } from "../persistence/backend.js";
 import { ExecutionConflictError, InvocationRetiredError, type ExecutionState } from "./state.js";
 
-type SaveExtras = Pick<Extract<RunAction, { kind: "execution-save" }>, "publish" | "consume">;
+type SaveExtras = Pick<
+	Extract<RunAction, { kind: "execution-save" }>,
+	"publish" | "consume" | "records"
+>;
 
 /** Serialize branch checkpoints; ownership is checked inside the backend transaction. */
 export class ExecutionStore {
@@ -81,10 +84,28 @@ export class ExecutionStore {
 		return next;
 	}
 
-	save(state: ExecutionState, extras: SaveExtras = {}, assertCurrent?: () => void) {
+	/**
+	 * Save `state` after every save queued before it. `prepare`, called when this save's turn
+	 * comes, may give a smaller checkpoint to write instead, plus records to write with it.
+	 */
+	save(
+		state: ExecutionState,
+		extras: SaveExtras = {},
+		assertCurrent?: () => void,
+		prepare?: (state: ExecutionState) => {
+			execution: ExecutionState;
+			put?: Record<string, string>;
+		},
+	) {
 		return this.enqueue(async () => {
-			const next = structuredClone(state);
+			const prepared = prepare?.(state);
+			const next = structuredClone(prepared?.execution ?? state);
 			next.revision = state.revision + 1;
+			const put = { ...extras.records?.put, ...prepared?.put };
+			const records =
+				extras.records?.drop?.length || Object.keys(put).length
+					? { records: { drop: extras.records?.drop ?? [], put } }
+					: {};
 			await this.transition(
 				{
 					kind: "execution-save",
@@ -93,6 +114,7 @@ export class ExecutionStore {
 					expectedVersion: state.revision,
 					execution: next,
 					...extras,
+					...records,
 				},
 				assertCurrent,
 			);
