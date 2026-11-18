@@ -4,6 +4,7 @@ All notable changes to Lobster will be documented in this file.
 
 ## Unreleased
 
+- Document recipes for deciding with a classifier (and asking a person when it is unsure), reminding an approver, waiting for whichever outcome comes first, and undoing earlier steps when a later one fails.
 - Loops can pause: approvals, input, sleeps, waits, switches and child workflows may be steps of a `for_each`. A question inside a loop is asked once per item. A loop with `retry` cannot contain them, since a retry would ask again; that is refused when the file loads.
 - Add `repeat` steps: `repeat: { until: <condition>, max: N }` runs its steps in rounds until the condition holds after one (for polling: check, sleep, check again). `max` is required; reaching it fails the step, or ends it with `on_max: continue`. Later steps see the last round's results and `$step.rounds`.
 - Add `on_reject: continue` to approvals: a "no" completes the step with `approved: false` instead of cancelling the run, so a loop can skip one item. Identity rules apply to such a rejection too.

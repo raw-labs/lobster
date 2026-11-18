@@ -7,6 +7,7 @@ The full reference for Lobster. Start with the [README](../README.md) for what L
     - [Conditions](#conditions)
     - [Switch](#switch)
     - [Loops](#loops)
+    - [Recipes](#recipes)
     - [Retries after external dispatch](#retries-after-external-dispatch)
     - [Command-level input requests](#command-level-input-requests)
   - [Waiting for time and events](#waiting-for-time-and-events)
@@ -180,6 +181,126 @@ steps:
 - **`repeat`:** `until` is checked after each round, so the steps run at least once. `max` is required: after that many rounds the step fails, or ends with `on_max: continue`. A round sees the results of the round before it (`$check.json` in round 2 is round 1's until `check` runs again). Only the last round's results are kept, so a long loop does not grow the saved run. Afterwards later steps see the last round's steps, and `$ci.rounds` says how many rounds ran; `$ci.json` is the output of the last step that ran.
 - A loop with `retry` cannot contain approvals, input, sleeps or waits, nor a pipeline that asks: a retry runs the loop again from its start, so it would ask again. This is refused when the file loads, or, for a pipeline, when it asks.
 - A step's `timeout_ms` covers its work, not pauses: when a run pauses inside a loop, a switch or any step that encloses the pause, those steps get a fresh budget when the run continues.
+
+### Recipes
+
+Patterns for things other engines build in, written with the steps above.
+
+**Decide with a classifier, and ask a person when it is unsure.** The output schema keeps the model to the options, the answer is saved (a resume does not call the model again), and a low confidence goes to a person. Both paths end in a step whose `json` has `label`, so `$label.json.label` is the decision either way:
+
+```yaml
+steps:
+  - id: email
+    run: mail show --json ${email_id}
+  - id: triage
+    pipeline: >
+      llm.invoke --prompt "Classify this email"
+      --output-schema '{"type":"object","properties":{"label":{"enum":["refund","spam","other"]},"confidence":{"type":"number"}},"required":["label","confidence"]}'
+    stdin: $email.json
+  - id: label
+    switch:
+      cases:
+        - when: $triage.json.confidence < 0.8
+          steps:
+            - id: ask
+              input:
+                prompt: Which kind of email is this?
+                responseSchema:
+                  type: object
+                  properties: { label: { enum: [refund, spam, other] } }
+                  required: [label]
+            - id: answered
+              run: cat
+              stdin: $ask.response
+      else:
+        - id: model
+          run: cat
+          stdin: $triage.json
+  - id: route
+    switch:
+      cases:
+        - when: $label.json.label == refund
+          steps:
+            - id: refund
+              run: billing refund --email ${email_id}
+        - when: $label.json.label == spam
+          steps:
+            - id: drop
+              run: mail archive ${email_id}
+      else:
+        - id: ticket
+          run: tickets create --queue support
+```
+
+**Remind an approver who does not answer.** Each round asks; if a day passes, it sends a reminder and asks again. The loop ends on an answer, and fails after five days without one:
+
+```yaml
+steps:
+  - id: chase
+    repeat: { until: $ok.approved || !$ok.timedOut, max: 5 }
+    steps:
+      - id: ok
+        approval: { prompt: Approve the refund?, timeout: 1d, on_timeout: continue }
+      - id: remind
+        run: notify-approver --about refund
+        when: $ok.timedOut
+  - id: refund
+    run: billing refund --order ${order}
+    when: $ok.approved
+```
+
+**Wait for whichever outcome comes first.** A `wait:` takes one event name, so let the sender use one name with a field that says what happened, and branch on it; the timeout is the third outcome:
+
+```yaml
+steps:
+  - id: outcome
+    wait: { event: order.update, match: { order: "${order}" }, timeout: 3d, on_timeout: continue }
+  - id: route
+    switch:
+      cases:
+        - when: $outcome.timedOut
+          steps:
+            - id: chase
+              run: notify-sales --order ${order}
+        - when: $outcome.json.status == paid
+          steps:
+            - id: ship
+              run: shipping create --order ${order}
+        - when: $outcome.json.status == cancelled
+          steps:
+            - id: release
+              run: inventory release --order ${order}
+      else:
+        - id: unknown
+          run: tickets create --queue orders
+```
+
+`lobster signal order.update --data '{"order":"o-1","status":"paid"}'` delivers one.
+
+**Undo earlier steps when a later one fails.** Let the risky step fail without stopping the run, undo what came before it, then fail the run so it does not go on and shows why:
+
+```yaml
+steps:
+  - id: reserve
+    run: inventory reserve --order ${order}
+  - id: charge
+    run: billing charge --order ${order}
+    on_error: continue
+  - id: undo
+    switch:
+      cases:
+        - when: $charge.error == true
+          steps:
+            - id: release
+              run: inventory release --order ${order}
+            - id: stop
+              run: echo "charge failed; reservation released" >&2; exit 1
+      else: []
+  - id: ship
+    run: shipping create --order ${order}
+```
+
+Undo steps are ordinary steps: give them `retry`, and make them safe to run twice, since a crash can repeat one.
 
 ### Retries after external dispatch
 
