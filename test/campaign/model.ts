@@ -11,7 +11,7 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { openStoreSession } from "../../src/persistence/session.js";
 import { ExecutionConflictError } from "../../src/engine/state.js";
-import { advanceWorkflowRun, runWorkflowFile, signalEvent } from "../../src/workflows/file.js";
+import { advanceWorkflowRun, runWorkflowFile, signalEvent } from "../../src/engine/runner.js";
 import { decodeToken } from "../../src/resume/token.js";
 import type { WorkflowStep } from "../../src/workflows/types.js";
 import type { ExecutionState } from "../../src/engine/state.js";

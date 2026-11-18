@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { promises as fs } from "node:fs";
 import path from "node:path";
-import { advanceWorkflowRun, runWorkflowFile } from "../src/workflows/file.js";
+import { advanceWorkflowRun, runWorkflowFile } from "../src/engine/runner.js";
 import { crashAndRecover } from "./helpers/crash_recovery.js";
 import { workflowFixture } from "./helpers/workflow_runner.js";
 

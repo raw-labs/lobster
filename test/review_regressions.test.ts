@@ -3,7 +3,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { PassThrough } from "node:stream";
 import { evaluateCondition } from "../src/workflows/conditions.js";
-import { runIdOf, runWorkflowFile } from "../src/workflows/file.js";
+import { runIdOf, runWorkflowFile } from "../src/engine/runner.js";
 import { workflowFixture } from "./helpers/workflow_runner.js";
 
 test("a backslash in a quoted pattern means what it means in a regular expression", () => {

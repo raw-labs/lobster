@@ -4,7 +4,7 @@ import { promises as fsp } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { runWorkflowFile } from "../src/workflows/file.js";
+import { runWorkflowFile } from "../src/engine/runner.js";
 
 async function runWorkflow(workflow: unknown) {
 	const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-cond-"));

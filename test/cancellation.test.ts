@@ -17,7 +17,7 @@ import { runPipeline } from "../src/pipeline/runtime.js";
 import { openStoreSession } from "../src/persistence/session.js";
 import { keyToPath } from "../src/state/store.js";
 import { encodeToken } from "../src/resume/token.js";
-import { advanceWorkflowRun } from "../src/workflows/file.js";
+import { advanceWorkflowRun } from "../src/engine/runner.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);

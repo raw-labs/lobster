@@ -13,7 +13,7 @@ import {
 	advanceWorkflowRun,
 	runWorkflowFile,
 	signalEvent,
-} from "../src/workflows/file.js";
+} from "../src/engine/runner.js";
 import { openStoreSession } from "../src/persistence/session.js";
 import { decodeToken } from "../src/resume/token.js";
 import { createDefaultRegistry } from "../src/commands/registry.js";

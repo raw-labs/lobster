@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { abandonWorkflowRun, advanceWorkflowRun, runWorkflowFile } from "../src/workflows/file.js";
+import { abandonWorkflowRun, advanceWorkflowRun, runWorkflowFile } from "../src/engine/runner.js";
 import { createToolContext, resumeToolRequest, runToolRequest } from "../src/core/tool_runtime.js";
 import { listRuns } from "../src/core/runs.js";
 import { openStoreSession } from "../src/persistence/session.js";

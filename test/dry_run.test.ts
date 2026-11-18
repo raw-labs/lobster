@@ -6,7 +6,7 @@ import os from "node:os";
 import { spawnSync } from "node:child_process";
 
 import { createDefaultRegistry } from "../src/commands/registry.js";
-import { runWorkflowFile } from "../src/workflows/file.js";
+import { runWorkflowFile } from "../src/engine/runner.js";
 import { PassThrough } from "node:stream";
 
 function runLobster(args: string[], opts?: { env?: Record<string, string | undefined> }) {

@@ -17,7 +17,7 @@ import {
 	runWorkflowFile,
 	runPipelineText,
 	runIdOf,
-} from "../workflows/file.js";
+} from "../engine/runner.js";
 import { savedByOlderVersion } from "../workflows/upgrade.js";
 import { resolveWorkflowFile } from "../workflows/load.js";
 

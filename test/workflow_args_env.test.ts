@@ -4,7 +4,7 @@ import { promises as fsp } from "node:fs";
 import path from "node:path";
 import os from "node:os";
 
-import { runWorkflowFile } from "../src/workflows/file.js";
+import { runWorkflowFile } from "../src/engine/runner.js";
 
 test("workflow file exposes args as LOBSTER_ARG_* env vars (safe for quotes)", async () => {
 	const workflow = {

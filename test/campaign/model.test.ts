@@ -11,7 +11,7 @@
 import test, { type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { workflowFixture } from "../helpers/workflow_runner.js";
-import { abandonWorkflowRun } from "../../src/workflows/file.js";
+import { abandonWorkflowRun } from "../../src/engine/runner.js";
 import { BASE_SEED, cases, random } from "./settings.js";
 import { drive, generate, normalize, type Generated } from "./model.js";
 

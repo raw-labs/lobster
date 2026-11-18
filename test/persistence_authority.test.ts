@@ -1,4 +1,4 @@
-import { advanceWorkflowRun } from "../src/workflows/file.js";
+import { advanceWorkflowRun } from "../src/engine/runner.js";
 import { openStoreSession } from "../src/persistence/session.js";
 import assert from "node:assert/strict";
 import { promises as fs } from "node:fs";

@@ -5,7 +5,7 @@ import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { PassThrough } from "node:stream";
-import { advanceWorkflowRun, runWorkflowFile, signalEvent } from "../../src/workflows/file.js";
+import { advanceWorkflowRun, runWorkflowFile, signalEvent } from "../../src/engine/runner.js";
 import { openStoreSession } from "../../src/persistence/session.js";
 import { decodeToken } from "../../src/resume/token.js";
 import type { WorkflowRunResult } from "../../src/workflows/types.js";

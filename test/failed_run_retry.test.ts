@@ -8,7 +8,7 @@ import { fileURLToPath } from "node:url";
 import { createDefaultRegistry, resumeToolRequest, runToolRequest } from "../src/core/index.js";
 import { defineCommand } from "../src/commands/define.js";
 import { Lobster } from "../src/sdk/Lobster.js";
-import { advanceWorkflowRun } from "../src/workflows/file.js";
+import { advanceWorkflowRun } from "../src/engine/runner.js";
 import { openStoreSession } from "../src/persistence/session.js";
 
 const repoRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "..");

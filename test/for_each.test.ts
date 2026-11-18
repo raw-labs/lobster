@@ -6,7 +6,7 @@ import path from "node:path";
 import { PassThrough } from "node:stream";
 
 import { createDefaultRegistry } from "../src/commands/registry.js";
-import { loadWorkflowFile, runWorkflowFile } from "../src/workflows/file.js";
+import { loadWorkflowFile, runWorkflowFile } from "../src/engine/runner.js";
 
 async function runWorkflow(workflow: unknown) {
 	const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-foreach-"));

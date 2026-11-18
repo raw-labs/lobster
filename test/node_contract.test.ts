@@ -16,7 +16,7 @@ import test, { type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { readdirSync } from "node:fs";
 import { setTimeout as sleep } from "node:timers/promises";
-import { loadWorkflowFile } from "../src/workflows/file.js";
+import { loadWorkflowFile } from "../src/engine/runner.js";
 import { snapshotDefinition } from "../src/workflows/definition.js";
 import { renderWorkflowGraph } from "../src/workflows/graph.js";
 import {
@@ -24,7 +24,7 @@ import {
 	advanceDueRuns,
 	advanceWorkflowRun,
 	signalEvent,
-} from "../src/workflows/file.js";
+} from "../src/engine/runner.js";
 import type { WorkflowStep } from "../src/workflows/types.js";
 import { fakeResult, type FakeBehavior } from "./helpers/fake_command.js";
 import {

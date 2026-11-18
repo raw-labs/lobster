@@ -5,7 +5,7 @@ import path from "node:path";
 import os from "node:os";
 import { PassThrough } from "node:stream";
 
-import { runWorkflowFile, loadWorkflowFile } from "../src/workflows/file.js";
+import { runWorkflowFile, loadWorkflowFile } from "../src/engine/runner.js";
 import { withRetry, resolveRetryConfig } from "../src/engine/retry.js";
 
 // --- Retry utility unit tests ---

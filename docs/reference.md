@@ -1152,7 +1152,7 @@ The source is one TypeScript package; only `src/cli.ts` sits at the top of `src`
 | `src/packs` | The `openclaw`, `google` and `github` packs |
 | `src/pipeline` | Pipeline parsing, the stage runtime, input requests and pipeline resume state |
 | `src/workflows` | Workflow loading, expressions, definition snapshots, dry runs, graphs and `lobster upgrade` |
-| `src/engine` | Saved execution, node handlers, activities and the retry policy |
+| `src/engine` | Saved execution, node handlers, activities, the retry policy, and the run API (`runner.ts`: start, resume, advance, abandon, due runs, events) |
 | `src/persistence` | The SQLite run store, sessions, history and waits |
 | `src/state` | State keys, file locks and atomic writes |
 | `src/resume` | Resume arguments, options and tokens |

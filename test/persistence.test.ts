@@ -1,4 +1,4 @@
-import { advanceWorkflowRun } from "../src/workflows/file.js";
+import { advanceWorkflowRun } from "../src/engine/runner.js";
 import assert from "node:assert/strict";
 import { execFile, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";

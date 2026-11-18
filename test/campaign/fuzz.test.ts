@@ -15,7 +15,7 @@ import {
 } from "../../src/workflows/conditions.js";
 import { loadWorkflowFile } from "../../src/workflows/load.js";
 import { snapshotDefinition } from "../../src/workflows/definition.js";
-import { runWorkflowFile } from "../../src/workflows/file.js";
+import { runWorkflowFile } from "../../src/engine/runner.js";
 import { parsePipeline } from "../../src/pipeline/parser.js";
 import { createDefaultRegistry } from "../../src/commands/registry.js";
 import { workflowFixture } from "../helpers/workflow_runner.js";

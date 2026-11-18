@@ -6,7 +6,7 @@ import path from "node:path";
 import { PassThrough } from "node:stream";
 
 import { resumeToolRequest, runToolRequest } from "../src/core/index.js";
-import { runWorkflowFile } from "../src/workflows/file.js";
+import { runWorkflowFile } from "../src/engine/runner.js";
 
 async function setup(t: test.TestContext, workflow: unknown) {
 	const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-switch-"));

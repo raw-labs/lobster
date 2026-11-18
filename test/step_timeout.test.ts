@@ -6,7 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import { PassThrough } from "node:stream";
 
-import { loadWorkflowFile, runWorkflowFile } from "../src/workflows/file.js";
+import { loadWorkflowFile, runWorkflowFile } from "../src/engine/runner.js";
 import { createDefaultRegistry } from "../src/commands/registry.js";
 import { decodeResumeToken } from "../src/resume/resume.js";
 

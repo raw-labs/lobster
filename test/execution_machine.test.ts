@@ -8,11 +8,11 @@ import { once } from "node:events";
 import { pathToFileURL } from "node:url";
 import { runToolRequest, resumeToolRequest, createToolContext } from "../src/core/tool_runtime.js";
 import { openStoreSession } from "../src/persistence/session.js";
-import { advanceWorkflowRun } from "../src/workflows/file.js";
+import { advanceWorkflowRun } from "../src/engine/runner.js";
 import { ExecutionStore } from "../src/engine/store.js";
 
 const coreUrl = pathToFileURL(path.resolve("dist/src/core/tool_runtime.js")).href;
-const fileUrl = pathToFileURL(path.resolve("dist/src/workflows/file.js")).href;
+const fileUrl = pathToFileURL(path.resolve("dist/src/engine/runner.js")).href;
 const sessionUrl = pathToFileURL(path.resolve("dist/src/persistence/session.js")).href;
 const contextUrl = pathToFileURL(path.resolve("dist/src/persistence/context.js")).href;
 

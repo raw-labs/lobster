@@ -12,7 +12,7 @@ Replace the workflow-file executor with a saved-state interpreter. Keep YAML, co
 - `engine/machine.ts`: shared attempt/retry/accounting lifecycle and run advancement.
 - `engine/nodes/`: sequence, condition, activity, loop, parallel, child workflow, approval, input, sleep and event-wait handlers.
 - `engine/activities/`: subprocess and pipeline execution; `engine/retry.ts`: the retry policy. No separate persistence engine.
-- `workflows/file.ts`: public start/resume/advance facade. The previous executor is removed.
+- `engine/runner.ts`: the run API: start, resume, advance, abandon, advance due runs, signal events. Workflow definitions (`workflows/`) sit below the engine; the runner sits above it. The previous executor is removed.
 - `persistence/`: atomic transitions, storage receipts, history and the SQLite store.
 - `commands/`, `packs/`: the command contract (`defineCommand`), the pack registry, `stdlib` and the integration packs; `repeatable: false` commands are never re-run on crash recovery.
 

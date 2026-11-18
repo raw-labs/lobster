@@ -13,7 +13,7 @@ import path from "node:path";
 import { openStoreSession } from "../../src/persistence/session.js";
 import { createFakeCommand } from "./fake_command.js";
 
-const fileUrl = new URL("../../src/workflows/file.js", import.meta.url).href;
+const fileUrl = new URL("../../src/engine/runner.js", import.meta.url).href;
 const sessionUrl = new URL("../../src/persistence/session.js", import.meta.url).href;
 const coreUrl = new URL("../../src/core/tool_runtime.js", import.meta.url).href;
 const fakeUrl = new URL("./fake_command.js", import.meta.url).href;

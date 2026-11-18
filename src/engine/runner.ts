@@ -6,21 +6,21 @@ import {
 	readStateJsonWithLock as readStateJson,
 	cleanupApprovalIndexByStateKey,
 } from "../state/store.js";
-import { loadWorkflowFile } from "./load.js";
-import { dryRunWorkflow } from "./dry_run.js";
-import { resolveWorkflowArgs } from "./args.js";
-import { pipelineDefinition, snapshotDefinition } from "./definition.js";
-import { ExecutionStore } from "../engine/store.js";
-import { Machine, matchesEvent } from "../engine/machine.js";
-import type { RunContext } from "../engine/context.js";
-import { ExecutionConflictError, type Definition, type ExecutionState } from "../engine/state.js";
-import type { WorkflowRunResult } from "./types.js";
+import { loadWorkflowFile } from "../workflows/load.js";
+import { dryRunWorkflow } from "../workflows/dry_run.js";
+import { resolveWorkflowArgs } from "../workflows/args.js";
+import { pipelineDefinition, snapshotDefinition } from "../workflows/definition.js";
+import { ExecutionStore } from "./store.js";
+import { Machine, matchesEvent } from "./machine.js";
+import type { RunContext } from "./context.js";
+import { ExecutionConflictError, type Definition, type ExecutionState } from "./state.js";
+import type { WorkflowRunResult } from "../workflows/types.js";
 import { visibleTo, callerId } from "../persistence/waits.js";
 
-export { loadWorkflowFile } from "./load.js";
-export { resolveWorkflowArgs } from "./args.js";
-export { WorkflowResumeArgumentError, ResumeRefusedError } from "../engine/gates.js";
-import { ResumeRefusedError } from "../engine/gates.js";
+export { loadWorkflowFile } from "../workflows/load.js";
+export { resolveWorkflowArgs } from "../workflows/args.js";
+export { WorkflowResumeArgumentError, ResumeRefusedError } from "./gates.js";
+import { ResumeRefusedError } from "./gates.js";
 export type {
 	WorkflowFile,
 	ParallelBranch,
@@ -30,7 +30,7 @@ export type {
 	WorkflowInputRequest,
 	WorkflowStepResult,
 	WorkflowRunResult,
-} from "./types.js";
+} from "../workflows/types.js";
 
 /** A pause saved by an older Lobster. `lobster upgrade` converts it in place. */
 export class UpgradeRequiredError extends Error {

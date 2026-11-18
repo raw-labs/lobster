@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { PassThrough } from "node:stream";
 import { createToolContext } from "../src/core/tool_runtime.js";
-import { runWorkflowFile } from "../src/workflows/file.js";
+import { runWorkflowFile } from "../src/engine/runner.js";
 
 for (const backend of ["sqlite"]) {
 	test(`machine ${backend}: parent budget stops further child and parent effects`, async (t) => {

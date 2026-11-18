@@ -14,7 +14,7 @@ import {
 	restoreLlmProvenance,
 } from "../src/llm/accounting.js";
 import type { LlmOutstandingCharge } from "../src/llm/accounting.js";
-import { runWorkflowFile } from "../src/workflows/file.js";
+import { runWorkflowFile } from "../src/engine/runner.js";
 import { decodeToken } from "../src/resume/token.js";
 import { openStoreSession } from "../src/persistence/session.js";
 

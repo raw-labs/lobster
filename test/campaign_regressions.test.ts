@@ -2,7 +2,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { openStoreSession } from "../src/persistence/session.js";
-import { advanceWorkflowRun, runWorkflowFile } from "../src/workflows/file.js";
+import { advanceWorkflowRun, runWorkflowFile } from "../src/engine/runner.js";
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import { spawnSync } from "node:child_process";

@@ -20,7 +20,7 @@ import {
 	WorkflowResumeArgumentError,
 	runIdOf,
 	type WorkflowRunResult,
-} from "../workflows/file.js";
+} from "../engine/runner.js";
 import {
 	savedByOlderVersion,
 	waitingPipelineRun,

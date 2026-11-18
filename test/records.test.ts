@@ -7,7 +7,7 @@ import assert from "node:assert/strict";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { openStoreSession } from "../src/persistence/session.js";
-import { advanceWorkflowRun, runWorkflowFile } from "../src/workflows/file.js";
+import { advanceWorkflowRun, runWorkflowFile } from "../src/engine/runner.js";
 import { crashAndRecover } from "./helpers/crash_recovery.js";
 import { workflowFixture, type WorkflowFixture } from "./helpers/workflow_runner.js";
 

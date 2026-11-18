@@ -25,7 +25,7 @@ import {
 	advanceDueRuns,
 	signalEvent,
 	runPipelineText,
-} from "./workflows/file.js";
+} from "./engine/runner.js";
 import { renderWorkflowGraph } from "./workflows/graph.js";
 import { parseWorkflowArgsJson } from "./workflows/values.js";
 import type { WorkflowGraphFormat } from "./workflows/graph.js";

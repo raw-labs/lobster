@@ -16,7 +16,7 @@ export {
 	advanceDueRuns,
 	signalEvent,
 	type DueRunOutcome,
-} from "../workflows/file.js";
+} from "../engine/runner.js";
 export { decodeResumeToken } from "../resume/resume.js";
 export { runToolRequest, resumeToolRequest, createToolContext } from "./tool_runtime.js";
 // Hosts that bring their own JSON Schema validator (OpenClaw's Lobster plugin) keep it.
@@ -54,4 +54,4 @@ export type {
 } from "../persistence/model.js";
 
 export { InterruptedActivityError, ExecutionConflictError } from "../engine/state.js";
-export type { WorkflowRunOptions } from "../workflows/file.js";
+export type { WorkflowRunOptions } from "../engine/runner.js";
