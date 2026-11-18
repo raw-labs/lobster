@@ -131,7 +131,8 @@ export async function activity(machine: Machine, step: WorkflowStep, key: string
 				llmSpendLedger: scope.ledger,
 				env,
 				cwd: saved.cwd,
-				requestInputEnabled: !scope.nested,
+				requestInputEnabled: !scope.gatesRefused,
+				gatesRefused: scope.gatesRefused,
 				resume: record.pipelineInput
 					? { pipelineInput: record.pipelineInput, response: record.response }
 					: undefined,

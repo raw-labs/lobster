@@ -20,6 +20,7 @@ import { combineSignals } from "../process/owner_signal.js";
 import { encodeToken } from "../resume/token.js";
 import { enter } from "./nodes/condition.js";
 import { switchStep } from "./nodes/switch.js";
+import { repeat } from "./nodes/repeat.js";
 import { isApprovalStep } from "../workflows/load.js";
 import {
 	activation,
@@ -77,7 +78,8 @@ export type Scope = {
 	ledger: LlmSpendLedger;
 	costPrefix: string;
 	accountAs?: string;
-	nested?: boolean;
+	/** Why steps here cannot pause (inside a child workflow, a parallel branch, a retried loop). */
+	gatesRefused?: string;
 	timeoutSignal?: AbortSignal;
 	/** Start the enclosing step's timeout; activities call it right before dispatch. */
 	startTimeout?: () => void;
@@ -269,12 +271,10 @@ export class Machine {
 		if (await enter(this, step, frame, scope)) return frame.result!;
 		// Refused before dispatch: the command of a gated step must not run when nobody can be asked.
 		if (
-			scope.nested &&
+			scope.gatesRefused &&
 			(isApprovalStep(step.approval) || ["input", "sleep", "event"].includes(nodeKind(step)))
 		)
-			throw new Error(
-				"Sub-workflow approval/input gates are not supported in composition (nor sleep or wait steps).",
-			);
+			throw new Error(`Workflow step ${step.id}: ${scope.gatesRefused}`);
 		const config = resolveRetryConfig(step.retry);
 		while (true) {
 			if (frame.retryAt) {
@@ -346,7 +346,7 @@ export class Machine {
 				},
 			};
 			// Control nodes are timed as a whole. Gates wait for people, time or events, not work.
-			if (["for-each", "parallel", "child-workflow", "switch"].includes(nodeKind(step)))
+			if (["for-each", "repeat", "parallel", "child-workflow", "switch"].includes(nodeKind(step)))
 				startTimeout();
 			let decidingApproval = false;
 			try {
@@ -354,7 +354,7 @@ export class Machine {
 				// Once the approval gate exists the node has finished and been charged; its
 				// result is the gate's subject. Never dispatch the node again to ask.
 				const gate = this.state.activations[attemptKey + "/approval"];
-				if (gate && isApprovalStep(step.approval) && !scope.nested) {
+				if (gate && isApprovalStep(step.approval) && !scope.gatesRefused) {
 					decidingApproval = true;
 					result = await approval(this, step, attemptKey, scope, gate.result!);
 					frame.result = result;
@@ -379,6 +379,11 @@ export class Machine {
 						// Its case's steps, and those that did not run as skipped, for later steps.
 						frame.results = activation(this.state, attemptKey).results;
 						break;
+					case "repeat":
+						result = await repeat(this, step, attemptKey, local);
+						// The last round's steps, for later steps.
+						frame.results = activation(this.state, attemptKey).results;
+						break;
 					case "input":
 						result = await input(this, step, attemptKey, local);
 						break;
@@ -391,12 +396,11 @@ export class Machine {
 					default:
 						result = await activity(this, step, attemptKey, local);
 				}
-				// A child workflow's and a switch's steps were charged as they ran.
+				// The steps of a child workflow, a switch and a repeat were charged as they ran.
 				if (
 					account &&
 					!frame.accounted &&
-					nodeKind(step) !== "child-workflow" &&
-					nodeKind(step) !== "switch"
+					!["child-workflow", "switch", "repeat"].includes(nodeKind(step))
 				) {
 					const deferred: DeferredCharge[] = [];
 					if (frame.results)
@@ -512,6 +516,10 @@ export class Machine {
 	}
 
 	async suspend(key: string, frame: Activation): Promise<never> {
+		// A step's timeout covers its work, not a pause for a person, a time or an event: the
+		// steps enclosing this wait get a fresh budget when the run continues.
+		for (const [ancestor, item] of Object.entries(this.state.activations))
+			if (key.startsWith(ancestor + "/")) delete item.deadline;
 		const fresh = await this.publishWait(key, frame);
 		this.ctx.signal?.throwIfAborted();
 		throw new Suspension(key, frame, fresh);
@@ -602,21 +610,31 @@ export class Machine {
 		// the steps enclosing this gate get a fresh budget when it is answered.
 		for (const [ancestor, item] of Object.entries(this.state.activations))
 			if (path.startsWith(ancestor + "/")) delete item.deadline;
-		if (decision.cancel || (wait.kind === "approval" && decision.approved === false))
+		const rejectionContinues =
+			wait.kind === "approval" && decision.approved === false && wait.onReject === "continue";
+		if (
+			decision.cancel ||
+			(wait.kind === "approval" && decision.approved === false && !rejectionContinues)
+		)
 			this.finish("cancelled");
 		else if (wait.kind === "approval") {
-			if (decision.approved !== true || decision.response !== undefined)
+			if (typeof decision.approved !== "boolean" || decision.response !== undefined)
 				throw new WorkflowResumeArgumentError(
 					"Workflow resume requires --approve yes|no for approval requests",
 				);
 			const approvedBy =
 				String(this.ctx.env.LOBSTER_APPROVAL_APPROVED_BY ?? "").trim() || undefined;
+			// A rejection that lets the run go on is a decision too: only an allowed approver makes it.
 			enforceApprovalIdentity({
 				stepId: path,
 				identity: approvalIdentityFromRequest(frame.approval),
 				approvedBy,
 			});
-			frame.result = { ...frame.result!, approved: true, ...(approvedBy ? { approvedBy } : {}) };
+			frame.result = {
+				...frame.result!,
+				approved: decision.approved,
+				...(approvedBy ? { approvedBy } : {}),
+			};
 			frame.phase = "completed";
 			this.state.status = "running";
 		} else {

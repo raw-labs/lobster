@@ -51,6 +51,7 @@ const CONCERNS = [
 	"recovery: repeat",
 	"recovery: manual",
 	"nested in for_each",
+	"nested in repeat",
 	"nested in child workflow",
 	"pruned when finished",
 ] as const;
@@ -89,7 +90,7 @@ type NodeExample = {
 	/** Extra condition (on the last saved checkpoint) before a crash test may kill. */
 	crashReady?: (saved: string) => boolean;
 	/** Where the node may not be nested: the error that rejects it. */
-	rejectedIn?: { forEach?: RegExp; child?: RegExp };
+	rejectedIn?: { child?: RegExp };
 	cells: Partial<Record<Concern, Cell>>;
 };
 
@@ -163,10 +164,7 @@ const NODES: NodeExample[] = [
 			["approval.items as a string", (step) => ({ ...step, approval: { items: "all" } })],
 			["unknown approval key", (step) => ({ ...step, approval: { promt: "Ship?" } })],
 		],
-		rejectedIn: {
-			forEach: /cannot (define|contain) approval/,
-			child: /approval\/input gates are not supported in composition/,
-		},
+		rejectedIn: { child: /are not supported inside a child workflow/ },
 		cells: {
 			...all("generic"),
 			"on_error: continue": async (t, fx, node) => {
@@ -215,10 +213,7 @@ const NODES: NodeExample[] = [
 			["unknown input key", (step) => ({ ...step, input: { ...step.input, promt: "?" } })],
 			["input with a command", (step) => ({ ...step, run: "true" })],
 		],
-		rejectedIn: {
-			forEach: /cannot (define|contain) (approval or )?input/,
-			child: /approval\/input gates are not supported in composition/,
-		},
+		rejectedIn: { child: /are not supported inside a child workflow/ },
 		cells: {
 			...all("generic"),
 			"on_error: stop": (t) => badAnswerIsRefused(t, "stop"),
@@ -275,7 +270,7 @@ const NODES: NodeExample[] = [
 		dryRun: [
 			/\d\. n {2}\[for_each\]/,
 			/for_each: \$items\.json/,
-			/1\. w {2}\[pipeline\] pipeline: fake --name w/,
+			/1\. w {2}\[pipeline\]\n\s+pipeline: fake --name w/,
 		],
 		graph: { type: "for_each" },
 		invalid: [
@@ -284,7 +279,6 @@ const NODES: NodeExample[] = [
 			["empty steps", (step) => ({ ...step, steps: [] })],
 			["unknown sub-step key", (step) => ({ ...step, steps: [{ ...step.steps[0], wehn: true }] })],
 		],
-		rejectedIn: { forEach: /cannot define workflow, parallel, for_each, or switch/ },
 		cells: all("generic"),
 	},
 	...(["all", "any"] as const).map((wait): NodeExample => ({
@@ -343,7 +337,6 @@ const NODES: NodeExample[] = [
 		],
 		// The completed branch must be saved before the crash, or recovery would rightly repeat it.
 		crashReady: wait === "all" ? (saved) => saved.includes("result-of-other") : undefined,
-		rejectedIn: { forEach: /cannot define workflow, parallel, for_each, or switch/ },
 		cells: all("generic"),
 	})),
 	{
@@ -363,7 +356,6 @@ const NODES: NodeExample[] = [
 			["workflow_args as a list", (step) => ({ ...step, workflow_args: ["x"] })],
 			["missing child file", (step) => ({ ...step, workflow: "missing.lobster" })],
 		],
-		rejectedIn: { forEach: /cannot define workflow, parallel, for_each, or switch/ },
 		cells: {
 			...all("generic"),
 			validation: async (t, fx, node) => {
@@ -431,7 +423,49 @@ const NODES: NodeExample[] = [
 			["switch with run", (step) => ({ ...step, run: "echo x" })],
 			["switch with approval", (step) => ({ ...step, approval: true })],
 		],
-		rejectedIn: { forEach: /cannot define workflow, parallel, for_each, or switch/ },
+		cells: all("generic"),
+	},
+	{
+		name: "repeat",
+		engine: ["repeat", "activity", "condition", "sequence"],
+		build: async (_fx, o = {}) => ({
+			id: "n",
+			// Exactly two rounds wherever it runs: the fake's call count is shared by every round.
+			repeat: { until: "$w.json.call == 0", max: 2, on_max: "continue" },
+			steps: [{ id: "w", pipeline: "fake --name w", ...rec(o.recovery) }],
+		}),
+		workCalls: 2,
+		reference: { expr: "$n.json", expected: fakeResult("w", 2) },
+		dryRun: [
+			/\d\. n {2}\[repeat\]/,
+			/until: \$w\.json\.call == 0 {2}\[at most 2 rounds, then continue\]/,
+			/each round:\n\s+1\. w {2}\[pipeline\]/,
+		],
+		graph: { type: "repeat" },
+		invalid: [
+			["repeat as a list", (step) => ({ ...step, repeat: [] })],
+			["no max", (step) => ({ ...step, repeat: { until: step.repeat.until } })],
+			["max of 0", (step) => ({ ...step, repeat: { ...step.repeat, max: 0 } })],
+			["no until", (step) => ({ ...step, repeat: { max: 3 } })],
+			["until as a number", (step) => ({ ...step, repeat: { ...step.repeat, until: 1 } })],
+			[
+				"until reading a step that does not run",
+				(step) => ({ ...step, repeat: { ...step.repeat, until: "$zz.json.ok" } }),
+			],
+			["unknown on_max", (step) => ({ ...step, repeat: { ...step.repeat, on_max: "stop" } })],
+			["unknown repeat key", (step) => ({ ...step, repeat: { ...step.repeat, unitl: true } })],
+			["empty steps", (step) => ({ ...step, steps: [] })],
+			["repeat with run", (step) => ({ ...step, run: "echo x" })],
+			["repeat with approval", (step) => ({ ...step, approval: true })],
+			[
+				"retry around a gate",
+				(step) => ({
+					...step,
+					retry: { max: 2 },
+					steps: [...step.steps, { id: "ask", approval: "Again?" }],
+				}),
+			],
+		],
 		cells: all("generic"),
 	},
 	{
@@ -449,10 +483,7 @@ const NODES: NodeExample[] = [
 			["sleep with a command", (step) => ({ ...step, run: "true" })],
 			["sleep with an approval", (step) => ({ ...step, approval: "Ok?" })],
 		],
-		rejectedIn: {
-			forEach: /cannot contain approval or input steps \(nor sleep or wait steps\)/,
-			child: /not supported in composition \(nor sleep or wait steps\)/,
-		},
+		rejectedIn: { child: /are not supported inside a child workflow/ },
 		cells: {
 			...all("generic"),
 			...NO_WORK("a sleep does no work that can fail"),
@@ -482,10 +513,7 @@ const NODES: NodeExample[] = [
 			],
 			["wait with a command", (step) => ({ ...step, run: "true" })],
 		],
-		rejectedIn: {
-			forEach: /cannot contain approval or input steps \(nor sleep or wait steps\)/,
-			child: /not supported in composition \(nor sleep or wait steps\)/,
-		},
+		rejectedIn: { child: /are not supported inside a child workflow/ },
 		cells: {
 			...all("generic"),
 			...NO_WORK("an event wait does no work that can fail"),
@@ -687,13 +715,6 @@ const GENERIC: Record<Concern, Custom> = {
 				{ id: "loop", for_each: "$rows.json", steps: [edit(await node.build(fx))] },
 			],
 		});
-		if (node.rejectedIn?.forEach) {
-			await assert.rejects(
-				snapshotDefinition(await fx.write("flow.lobster", await steps()), {}),
-				node.rejectedIn.forEach,
-			);
-			return;
-		}
 		const result = await fx.drive(await steps(), node.answers ?? APPROVE);
 		assert.equal(result.status, "ok");
 		assert.equal(fx.fake.calls("w"), node.workCalls * 2);
@@ -705,6 +726,34 @@ const GENERIC: Record<Concern, Custom> = {
 			accepted,
 			[],
 			`${node.name} inside for_each: these invalid edits must be rejected`,
+		);
+	},
+
+	async "nested in repeat"(_t, fx, node) {
+		fx.fake.script(node.script ?? {});
+		// Two rounds: the node runs, and its gates are answered, once per round.
+		const loop = async (edit: (s: any) => any = (s) => s) => ({
+			steps: [
+				...(node.setup ?? []),
+				{
+					id: "loop",
+					repeat: { until: false, max: 2, on_max: "continue" },
+					steps: [edit(await node.build(fx))],
+				},
+				next,
+			],
+		});
+		const result = await fx.drive(await loop(), node.answers ?? APPROVE);
+		assert.equal(result.status, "ok");
+		assert.equal(fx.fake.calls("w"), node.workCalls * 2);
+		assert.equal(fx.fake.calls("next"), 1);
+		const accepted: string[] = [];
+		for (const [label, edit] of [...SHARED_INVALID, ...node.invalid])
+			if (await loads(fx, await loop(edit))) accepted.push(label);
+		assert.deepEqual(
+			accepted,
+			[],
+			`${node.name} inside repeat: these invalid edits must be rejected`,
 		);
 	},
 

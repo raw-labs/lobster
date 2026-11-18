@@ -3,6 +3,7 @@ import type { Machine, Scope } from "../machine.js";
 import type { WorkflowStep } from "../../workflows/types.js";
 import { createRecord, resolveInputValue } from "../../workflows/values.js";
 import { sequence } from "./sequence.js";
+import { loopGatesRefused } from "./repeat.js";
 
 export async function forEach(machine: Machine, step: WorkflowStep, key: string, scope: Scope) {
 	const frame = activation(machine.state, key);
@@ -39,7 +40,7 @@ export async function forEach(machine: Machine, step: WorkflowStep, key: string,
 		await sequence(machine, step.steps!, bodyKey, {
 			...scope,
 			results,
-			nested: true,
+			gatesRefused: loopGatesRefused(step, scope),
 			env: { ...scope.env, ...step.env },
 			cwd: step.cwd ?? scope.cwd,
 			costPrefix: scope.costPrefix + step.id + ".",

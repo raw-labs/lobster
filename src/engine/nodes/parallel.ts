@@ -30,7 +30,7 @@ export async function parallel(machine: Machine, step: WorkflowStep, key: string
 	void interrupted.catch(() => {});
 	const branchScope = {
 		...scope,
-		nested: true,
+		gatesRefused: "approvals, input, sleeps and waits are not supported inside a parallel branch",
 		timeoutSignal: scope.timeoutSignal
 			? AbortSignal.any([scope.timeoutSignal, timeout.signal])
 			: timeout.signal,

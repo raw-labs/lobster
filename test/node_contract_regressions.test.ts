@@ -39,14 +39,14 @@ test("a for_each sub-step's timeout_ms, retry, on_error and when are validated",
 	// A quoted timeout was added to the clock as text and expired at once.
 	await assert.rejects(
 		fx.run(loop({ timeout_ms: "5000" })),
-		/Workflow step loop for_each sub-step w timeout_ms must be a positive integer/,
+		/Workflow step w timeout_ms must be a positive integer/,
 	);
 	await assert.rejects(
 		fx.run(loop({ retry: { max: 0 } })),
-		/sub-step w retry\.max must be a positive integer/,
+		/Workflow step w retry\.max must be a positive integer/,
 	);
-	await assert.rejects(fx.run(loop({ on_error: "ignore" })), /sub-step w on_error must be/);
-	await assert.rejects(fx.run(loop({ when: 5 })), /sub-step w when must be a boolean/);
+	await assert.rejects(fx.run(loop({ on_error: "ignore" })), /Workflow step w on_error must be/);
+	await assert.rejects(fx.run(loop({ when: 5 })), /Workflow step w when must be a boolean/);
 	assert.equal(fx.fake.calls("items"), 0);
 	const result = await fx.run(loop({ timeout_ms: 5000, retry: { max: 2 }, on_error: "continue" }));
 	assert.equal(result.status, "ok");
@@ -111,10 +111,7 @@ test("dry-run does not claim a step is skipped when its condition reads a step o
 		plan,
 		/4\. loop {2}\[for_each\]\n {5}when: \$ask\.response\.go == true {2}\[depends/,
 	);
-	assert.match(
-		plan,
-		/1\. sub {2}\[pipeline\] pipeline: fake --name sub\n {10}when: \$item\.json\.ok == true/,
-	);
+	assert.match(plan, /1\. sub {2}\[pipeline\]\n {10}when: \$item\.json\.ok == true/);
 	// Gates are planned as granted, so a condition on `approved` is decided; one on any
 	// other field is not, and is shown on one line.
 	assert.match(plan, /7\. ifApproved {2}\[pipeline\]\n {5}pipeline: fake --name a\n/);
@@ -145,7 +142,7 @@ test("an approval gate in a child workflow is refused before its command runs", 
 	});
 	await assert.rejects(
 		fx.run({ steps: [{ id: "child", workflow: "child.lobster" }] }),
-		/Sub-workflow approval\/input gates are not supported in composition/,
+		/approvals, input, sleeps and waits are not supported inside a child workflow/,
 	);
 	// The command used to run, and only then was the step refused.
 	assert.equal(fx.fake.calls("deploy"), 0);

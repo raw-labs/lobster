@@ -231,7 +231,7 @@ test("dry-run plans a comparison on step output instead of failing on its placeh
 	assert.equal(result.status, "ok");
 });
 
-test("any approval or input key in a for_each sub-step is rejected, whatever its value", async () => {
+test("a malformed approval or input in a for_each sub-step is rejected, not run unguarded", async () => {
 	for (const gate of [{ approval: 1 }, { approval: [] }, { approval: "  " }, { input: "name?" }])
 		await assert.rejects(
 			runWorkflow({
@@ -240,7 +240,7 @@ test("any approval or input key in a for_each sub-step is rejected, whatever its
 					{ id: "loop", for_each: "$items.json", steps: [{ id: "s", command: "echo s", ...gate }] },
 				],
 			}),
-			/cannot contain approval or input steps/,
+			/approval must be true, a prompt string, or an object|approval prompt cannot be blank|input must be an object/,
 			JSON.stringify(gate),
 		);
 });

@@ -168,6 +168,26 @@ function planSteps(
 			continue;
 		}
 
+		if (step.repeat && Array.isArray(step.steps)) {
+			lines.push(`  ${num}. ${step.id}  [repeat]`);
+			const until = String(step.repeat.until).replace(/\s+/g, " ").trim();
+			checkConditionSyntax(step.repeat.until);
+			lines.push(
+				`     until: ${until}  [at most ${step.repeat.max} round${step.repeat.max === 1 ? "" : "s"}${step.repeat.on_max === "continue" ? ", then continue" : ""}]`,
+			);
+			lines.push(`     each round:`);
+			// Planned once; the last round's steps are what later steps see.
+			for (const line of planSteps(step.steps, resolvedArgs, results, 0, ctx, undecided))
+				lines.push(`     ${line}`);
+			if (step.timeout_ms) lines.push(`     timeout: ${step.timeout_ms}ms`);
+			if (step.on_error && step.on_error !== "stop") lines.push(`     on_error: ${step.on_error}`);
+			// How many rounds run, and what the last one produced, is known only when it runs.
+			undecided.add(step.id);
+			results[step.id] = { id: step.id };
+			noteCondition();
+			continue;
+		}
+
 		if (typeof step.for_each === "string" && Array.isArray(step.steps)) {
 			lines.push(`  ${num}. ${step.id}  [for_each]`);
 			const forEachRef = step.for_each;
@@ -190,59 +210,9 @@ function planSteps(
 			const loopScopedResults = createRecord(results);
 			loopScopedResults[dryItemVar] = { id: dryItemVar, json: { _placeholder: true } };
 			loopScopedResults[dryIndexVar] = { id: dryIndexVar, json: 0 };
-			for (let subIdx = 0; subIdx < step.steps.length; subIdx++) {
-				const sub = step.steps[subIdx];
-				const subCondition = sub.when ?? sub.condition;
-				const unknownSubCondition = dependsOnStepOutput(subCondition, undecided);
-				const subHolds = unknownSubCondition
-					? (checkConditionSyntax(subCondition), true)
-					: evaluateCondition(subCondition, loopScopedResults);
-				if (unknownSubCondition) undecided.add(sub.id);
-				if (!unknownSubCondition && !subHolds) {
-					lines.push(`       ${subIdx + 1}. ${sub.id}  [skipped — condition: false]`);
-					loopScopedResults[sub.id] = { id: sub.id, skipped: true };
-					continue;
-				}
-				if (sub.stdin !== undefined && sub.stdin !== null) {
-					try {
-						resolveInputValue(sub.stdin, resolvedArgs, loopScopedResults);
-					} catch (err: any) {
-						throw new Error(
-							`Workflow step ${step.id} for_each sub-step ${sub.id} stdin: ${err?.message ?? String(err)}`,
-						);
-					}
-				}
-				const subExec = getStepExecution(sub);
-				if (subExec.kind === "shell") {
-					const command = resolveDryRunTemplate(subExec.value, resolvedArgs, loopScopedResults);
-					lines.push(`       ${subIdx + 1}. ${sub.id}  [shell] run: ${command}`);
-				} else if (subExec.kind === "pipeline") {
-					if (!ctx.registry) {
-						throw new Error(
-							`Workflow step ${step.id} for_each sub-step ${sub.id} requires a command registry for pipeline execution`,
-						);
-					}
-					const pipelineText = resolveDryRunTemplate(
-						subExec.value,
-						resolvedArgs,
-						loopScopedResults,
-					);
-					const stages = parsePipeline(pipelineText, ctx.registry as any);
-					for (const stage of stages) {
-						if (hasDeferredDryRunStageName(stage.name)) continue;
-						if (!ctx.registry.get(stage.name)) {
-							throw new Error(
-								`Workflow step ${step.id} for_each sub-step ${sub.id} pipeline: unknown command: ${stage.name}`,
-							);
-						}
-					}
-					lines.push(`       ${subIdx + 1}. ${sub.id}  [pipeline] pipeline: ${pipelineText}`);
-				} else {
-					lines.push(`       ${subIdx + 1}. ${sub.id}  [no-op]`);
-				}
-				if (unknownSubCondition) lines.push(`          ${conditionNote(subCondition)}`);
-				loopScopedResults[sub.id] = { id: sub.id };
-			}
+			// The body is planned once, for an item the plan does not know.
+			for (const line of planSteps(step.steps, resolvedArgs, loopScopedResults, 0, ctx, undecided))
+				lines.push(`     ${line}`);
 			if (step.timeout_ms) lines.push(`     timeout: ${step.timeout_ms}ms`);
 			if (step.on_error && step.on_error !== "stop") lines.push(`     on_error: ${step.on_error}`);
 			if (step.retry && typeof step.retry === "object") {
@@ -446,6 +416,7 @@ function stepIds(steps: WorkflowStep[]): string[] {
 	return steps.flatMap((step) => [
 		step.id,
 		...(step.parallel?.branches ?? []).map((branch) => branch.id),
+		...(step.repeat ? stepIds(step.steps ?? []) : []),
 		...(step.switch
 			? [
 					...step.switch.cases.flatMap((entry) => stepIds(entry.steps)),

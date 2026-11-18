@@ -5,7 +5,13 @@ import { promises as fsp } from "node:fs";
 import path from "node:path";
 import { parse as parseYaml } from "yaml";
 import { prepareSchema } from "../util/validation.js";
-import type { WorkflowFile, WorkflowStep, ParallelConfig, SwitchConfig } from "./types.js";
+import type {
+	WorkflowFile,
+	WorkflowStep,
+	ParallelConfig,
+	RepeatConfig,
+	SwitchConfig,
+} from "./types.js";
 
 export async function loadWorkflowFile(filePath: string): Promise<WorkflowFile> {
 	const text = await fsp.readFile(filePath, "utf8");
@@ -177,12 +183,12 @@ function validateSteps(steps: WorkflowStep[], seen: Set<string>, known: Set<stri
 			}
 			if (isApprovalStep(step.approval)) {
 				throw new Error(
-					`Workflow step ${step.id} for_each steps cannot define approval (use a separate step after the loop)`,
+					`Workflow step ${step.id} for_each steps cannot define approval (put it on a step inside the loop, or after it)`,
 				);
 			}
 			if (isInputStep(step.input)) {
 				throw new Error(
-					`Workflow step ${step.id} for_each steps cannot define input (use a separate step after the loop)`,
+					`Workflow step ${step.id} for_each steps cannot define input (put it on a step inside the loop, or after it)`,
 				);
 			}
 			if (step.stdin !== undefined && step.stdin !== null) {
@@ -197,10 +203,11 @@ function validateSteps(steps: WorkflowStep[], seen: Set<string>, known: Set<stri
 				loopPipeline ||
 				step.workflow ||
 				step.parallel ||
+				step.repeat !== undefined ||
 				step.switch !== undefined
 			) {
 				throw new Error(
-					`Workflow step ${step.id} for_each cannot also define run, command, pipeline, workflow, parallel, or switch`,
+					`Workflow step ${step.id} for_each cannot also define run, command, pipeline, workflow, parallel, repeat, or switch`,
 				);
 			}
 			if (step.item_var !== undefined && typeof step.item_var !== "string") {
@@ -219,12 +226,6 @@ function validateSteps(steps: WorkflowStep[], seen: Set<string>, known: Set<stri
 				if (!sub || typeof sub !== "object" || !sub.id || typeof sub.id !== "string") {
 					throw new Error(`Workflow step ${step.id} for_each sub-step requires an id`);
 				}
-				validateRecovery(sub);
-				validateStepOptions(
-					sub,
-					`Workflow step ${step.id} for_each sub-step ${sub.id}`,
-					new Set([...known, loopItemVar, loopIndexVar, ...subStepIds]),
-				);
 				if (sub.id === loopItemVar || sub.id === loopIndexVar) {
 					throw new Error(
 						`Workflow step ${step.id} for_each sub-step id '${sub.id}' conflicts with loop variable`,
@@ -234,56 +235,11 @@ function validateSteps(steps: WorkflowStep[], seen: Set<string>, known: Set<stri
 					throw new Error(`Workflow step ${step.id} duplicate for_each sub-step id: ${sub.id}`);
 				}
 				subStepIds.add(sub.id);
-				// Any value counts: a malformed gate must not load as "no gate" and run unguarded.
-				if (
-					sub.approval !== undefined ||
-					sub.input !== undefined ||
-					sub.sleep !== undefined ||
-					sub.wait !== undefined
-				) {
-					throw new Error(
-						`Workflow step ${step.id} for_each sub-steps cannot contain approval or input steps (nor sleep or wait steps)`,
-					);
-				}
-				if (sub.run !== undefined && typeof sub.run !== "string") {
-					throw new Error(
-						`Workflow step ${step.id} for_each sub-step ${sub.id} run must be a string`,
-					);
-				}
-				if (sub.command !== undefined && typeof sub.command !== "string") {
-					throw new Error(
-						`Workflow step ${step.id} for_each sub-step ${sub.id} command must be a string`,
-					);
-				}
-				if (sub.pipeline !== undefined && typeof sub.pipeline !== "string") {
-					throw new Error(
-						`Workflow step ${step.id} for_each sub-step ${sub.id} pipeline must be a string`,
-					);
-				}
-				if (sub.workflow || sub.parallel || sub.for_each || sub.switch !== undefined) {
-					throw new Error(
-						`Workflow step ${step.id} for_each sub-step ${sub.id} cannot define workflow, parallel, for_each, or switch`,
-					);
-				}
-				const subShell =
-					typeof sub.run === "string" && sub.run.trim()
-						? sub.run
-						: typeof sub.command === "string" && sub.command.trim()
-							? sub.command
-							: undefined;
-				const subPipeline =
-					typeof sub.pipeline === "string" && sub.pipeline.trim() ? sub.pipeline : undefined;
-				if (!subShell && !subPipeline) {
-					throw new Error(
-						`Workflow step ${step.id} for_each sub-step ${sub.id} requires run, command, or pipeline`,
-					);
-				}
-				if (Number(Boolean(subShell)) + Number(Boolean(subPipeline)) > 1) {
-					throw new Error(
-						`Workflow step ${step.id} for_each sub-step ${sub.id} can only define one of run, command, or pipeline`,
-					);
-				}
 			}
+			// The body is steps like any other. Its ids are its own: each item's results are
+			// gone after the item, and the loop's result carries what later steps can read.
+			validateSteps(step.steps, new Set<string>(), new Set([...known, loopItemVar, loopIndexVar]));
+			refuseGatesUnderRetry(step, "for_each");
 		}
 		const shellCommand = typeof step.run === "string" ? step.run : step.command;
 		const pipeline = typeof step.pipeline === "string" ? step.pipeline : undefined;
@@ -292,6 +248,7 @@ function validateSteps(steps: WorkflowStep[], seen: Set<string>, known: Set<stri
 		const isSleep = step.sleep !== undefined;
 		const isWait = step.wait !== undefined;
 		const isSwitch = step.switch !== undefined;
+		const isRepeat = step.repeat !== undefined;
 		const executionCount =
 			Number(Boolean(shellCommand)) +
 			Number(Boolean(pipeline)) +
@@ -299,26 +256,37 @@ function validateSteps(steps: WorkflowStep[], seen: Set<string>, known: Set<stri
 			Number(isParallel) +
 			Number(isForEach) +
 			Number(isSwitch) +
+			Number(isRepeat) +
 			Number(isSleep) +
 			Number(isWait);
 		if (executionCount === 0 && !isApprovalStep(step.approval) && !isInputStep(step.input)) {
 			throw new Error(
-				`Workflow step ${step.id} requires run, command, pipeline, workflow, parallel, for_each, switch, sleep, wait, approval, or input`,
+				`Workflow step ${step.id} requires run, command, pipeline, workflow, parallel, for_each, repeat, switch, sleep, wait, approval, or input`,
 			);
 		}
 		if (executionCount > 1) {
 			throw new Error(
-				`Workflow step ${step.id} can only define one of run, command, pipeline, workflow, parallel, for_each, switch, sleep, or wait`,
+				`Workflow step ${step.id} can only define one of run, command, pipeline, workflow, parallel, for_each, repeat, switch, sleep, or wait`,
 			);
 		}
 		if (executionCount > 0 && isInputStep(step.input)) {
 			throw new Error(
-				`Workflow step ${step.id} input steps cannot define run, command, pipeline, workflow, parallel, for_each, switch, sleep, or wait`,
+				`Workflow step ${step.id} input steps cannot define run, command, pipeline, workflow, parallel, for_each, repeat, switch, sleep, or wait`,
 			);
 		}
 		if (isSwitch && isApprovalStep(step.approval)) {
 			throw new Error(
 				`Workflow step ${step.id} switch steps cannot define approval (put it on a step in a case)`,
+			);
+		}
+		if (isRepeat && isApprovalStep(step.approval)) {
+			throw new Error(
+				`Workflow step ${step.id} repeat steps cannot define approval (put it on a step inside)`,
+			);
+		}
+		if (isRepeat && step.stdin !== undefined && step.stdin !== null) {
+			throw new Error(
+				`Workflow step ${step.id} repeat steps cannot define stdin (give it to the steps inside)`,
 			);
 		}
 		if (isSwitch && step.stdin !== undefined && step.stdin !== null) {
@@ -428,6 +396,14 @@ function validateSteps(steps: WorkflowStep[], seen: Set<string>, known: Set<stri
 					`Workflow step ${step.id} approval.requireDifferentApprover must be a boolean`,
 				);
 			}
+			if (
+				approval.on_reject !== undefined &&
+				approval.on_reject !== "cancel" &&
+				approval.on_reject !== "continue"
+			)
+				throw new Error(
+					`Workflow step ${step.id} approval.on_reject must be "cancel" or "continue"`,
+				);
 		}
 		validateStepOptions(step, `Workflow step ${step.id}`, known);
 		if (seen.has(step.id)) {
@@ -437,6 +413,11 @@ function validateSteps(steps: WorkflowStep[], seen: Set<string>, known: Set<stri
 			// Validated after the switch's own condition: its cases run after that.
 			const before = new Set(seen);
 			validateSwitch(step, seen, known);
+			for (const id of seen) if (!before.has(id)) known.add(id);
+		}
+		if (isRepeat) {
+			const before = new Set(seen);
+			validateRepeat(step, seen, known);
 			for (const id of seen) if (!before.has(id)) known.add(id);
 		}
 		if (isParallel) {
@@ -480,6 +461,62 @@ function validateSwitch(step: WorkflowStep, seen: Set<string>, known: Set<string
 			throw new Error(`${name} else must be a list of steps (empty for none)`);
 		validateSteps(config.else, seen, new Set(known));
 	}
+}
+
+/**
+ * A repeat runs its steps in rounds until `until` holds after one. Its steps are known after
+ * it (the last round's results), and `until` reads them.
+ */
+function validateRepeat(step: WorkflowStep, seen: Set<string>, known: Set<string>) {
+	const name = `Workflow step ${step.id} repeat`;
+	const config = step.repeat as RepeatConfig;
+	if (!isPlainObject(config)) throw new Error(`${name} must be an object with until and max`);
+	if (!Array.isArray(step.steps) || step.steps.length === 0)
+		throw new Error(`${name} requires a non-empty steps array`);
+	if (
+		typeof config.max !== "number" ||
+		!Number.isInteger(config.max) ||
+		config.max < 1 ||
+		config.max > 100_000
+	)
+		throw new Error(`${name} requires max: the most rounds it may run, from 1 to 100000`);
+	if (config.on_max !== undefined && config.on_max !== "fail" && config.on_max !== "continue")
+		throw new Error(`${name} on_max must be "fail" or "continue"`);
+	if (typeof config.until !== "string" && typeof config.until !== "boolean")
+		throw new Error(`${name} requires until: a condition that ends the loop`);
+	const inside = new Set(known);
+	validateSteps(step.steps, seen, inside);
+	try {
+		checkCondition(config.until, inside);
+	} catch (error: any) {
+		throw new Error(`${name} until is not a valid condition: ${error?.message ?? error}`);
+	}
+	refuseGatesUnderRetry(step, "repeat");
+}
+
+/** A retry runs a loop again from the start, so it would ask its questions again. */
+function refuseGatesUnderRetry(step: WorkflowStep, kind: string) {
+	if ((step.retry?.max ?? 1) > 1 && containsGate(step.steps ?? []))
+		throw new Error(
+			`Workflow step ${step.id} ${kind} with retry cannot contain approval, input, sleep or wait steps: a retry would run the loop again and ask again`,
+		);
+}
+
+/** Whether any of these steps, or a step inside them, pauses the run. */
+function containsGate(steps: WorkflowStep[]): boolean {
+	return steps.some(
+		(step) =>
+			isApprovalStep(step.approval) ||
+			isInputStep(step.input) ||
+			step.sleep !== undefined ||
+			step.wait !== undefined ||
+			(Array.isArray(step.steps) && containsGate(step.steps)) ||
+			Boolean(
+				step.switch &&
+				(step.switch.cases.some((entry) => containsGate(entry.steps)) ||
+					containsGate(step.switch.else ?? [])),
+			),
+	);
 }
 
 export function isApprovalStep(approval: WorkflowStep["approval"]) {
@@ -646,6 +683,7 @@ const STEP_KEYS = [
 	"parallel",
 	"for_each",
 	"switch",
+	"repeat",
 	"item_var",
 	"index_var",
 	"batch_size",
@@ -662,6 +700,7 @@ const WAIT_KEYS = ["event", "match", "timeout", "on_timeout"];
 const BRANCH_KEYS = ["id", "recovery", "run", "command", "pipeline", "env", "cwd", "stdin"];
 const PARALLEL_KEYS = ["wait", "timeout_ms", "branches"];
 const SWITCH_KEYS = ["cases", "else"];
+const REPEAT_KEYS = ["until", "max", "on_max"];
 const CASE_KEYS = ["when", "steps"];
 const RETRY_KEYS = ["max", "backoff", "delay_ms", "max_delay_ms", "jitter"];
 const COST_LIMIT_KEYS = ["max_usd", "action"];
@@ -678,6 +717,7 @@ const APPROVAL_KEYS = [
 	"requireDifferentApprover",
 	"timeout",
 	"on_timeout",
+	"on_reject",
 ];
 
 function rejectUnknownKeys(workflow: Record<string, unknown>) {
@@ -691,6 +731,7 @@ function rejectUnknownKeys(workflow: Record<string, unknown>) {
 		checkKeys(step.input, INPUT_KEYS, `${name} input`);
 		checkKeys(step.approval, APPROVAL_KEYS, `${name} approval`);
 		checkKeys(step.wait, WAIT_KEYS, `${name} wait`);
+		checkKeys(step.repeat, REPEAT_KEYS, `${name} repeat`);
 		if (isPlainObject(step.parallel)) {
 			checkKeys(step.parallel, PARALLEL_KEYS, `${name} parallel`);
 			if (Array.isArray(step.parallel.branches)) {

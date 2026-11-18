@@ -4,6 +4,10 @@ All notable changes to Lobster will be documented in this file.
 
 ## Unreleased
 
+- Loops can pause: approvals, input, sleeps, waits, switches and child workflows may be steps of a `for_each`. A question inside a loop is asked once per item. A loop with `retry` cannot contain them, since a retry would ask again; that is refused when the file loads.
+- Add `repeat` steps: `repeat: { until: <condition>, max: N }` runs its steps in rounds until the condition holds after one (for polling: check, sleep, check again). `max` is required; reaching it fails the step, or ends it with `on_max: continue`. Later steps see the last round's results and `$step.rounds`.
+- Add `on_reject: continue` to approvals: a "no" completes the step with `approved: false` instead of cancelling the run, so a loop can skip one item. Identity rules apply to such a rejection too.
+- A step's `timeout_ms` no longer counts the time a run spends paused inside it (a sleep, a wait or a question in a loop or a switch): enclosing steps get a fresh budget when the run continues. Before, a pause longer than an enclosing step's timeout failed that step on resume, except for answered questions.
 - Split the README into a one-page guide (what Lobster is, five ideas, a first workflow, tool mode, operating runs) and a full reference in `docs/reference.md`, which keeps every section of the old README, grouped by topic. The package now ships the reference.
 - Add `switch` steps: the first case whose `when` holds runs its steps (any kind of step, approvals and nested switches included), or `else`. The choice is saved, `$switch.json` is the output of the case that ran, `$switch.case` says which, and steps of other cases count as skipped. A switch with no matching case and no `else` fails.
 - Conditions gain `in`, `contains` (list membership or substring), `matches` (a quoted regular expression) and list literals such as `[refund, spam]`. Every syntax error gives a character position.

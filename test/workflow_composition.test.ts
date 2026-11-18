@@ -122,7 +122,7 @@ test("workflow validation rejects workflow combined with run", async () => {
 	);
 	await assert.rejects(
 		() => loadWorkflowFile(filePath),
-		/can only define one of run, command, pipeline, workflow, parallel, for_each, switch, sleep, or wait/,
+		/can only define one of run, command, pipeline, workflow, parallel, for_each, repeat, switch, sleep, or wait/,
 	);
 });
 
@@ -138,7 +138,7 @@ test("workflow validation rejects workflow combined with pipeline", async () => 
 	);
 	await assert.rejects(
 		() => loadWorkflowFile(filePath),
-		/can only define one of run, command, pipeline, workflow, parallel, for_each, switch, sleep, or wait/,
+		/can only define one of run, command, pipeline, workflow, parallel, for_each, repeat, switch, sleep, or wait/,
 	);
 });
 
@@ -294,6 +294,6 @@ test("sub-workflow approval gates are rejected in composition", async () => {
 
 	await assert.rejects(
 		() => runWorkflow(paths["parent.lobster"], stateDir),
-		/Sub-workflow approval\/input gates are not supported in composition/,
+		/approvals, input, sleeps and waits are not supported inside a child workflow/,
 	);
 });

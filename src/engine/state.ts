@@ -122,6 +122,7 @@ export function nodeKind(step: WorkflowStep) {
 	if (step.parallel) return "parallel";
 	if (step.workflow) return "child-workflow";
 	if (step.switch) return "switch";
+	if (step.repeat) return "repeat";
 	if (step.input) return "input";
 	if (step.sleep !== undefined) return "sleep";
 	if (step.wait) return "event";

@@ -6,6 +6,7 @@ The full reference for Lobster. Start with the [README](../README.md) for what L
   - [Workflow files](#workflow-files)
     - [Conditions](#conditions)
     - [Switch](#switch)
+    - [Loops](#loops)
     - [Retries after external dispatch](#retries-after-external-dispatch)
     - [Command-level input requests](#command-level-input-requests)
   - [Waiting for time and events](#waiting-for-time-and-events)
@@ -85,13 +86,14 @@ Notes:
 - Unknown keys are rejected when the file loads, with a suggestion for likely typos, so a misspelled `when:` cannot make a step run unconditionally.
 - `<`, `<=`, `>` and `>=` compare numbers (numeric strings such as `"0.9"` count). Comparing anything else, including a missing value or `null`, fails the step with an error rather than evaluating to false. Guard optional values with `&&` or `||`, which skip the right side when the left decides the result; compared with the literal `null` (also in parentheses), a missing field counts as null; two fields never match on "no value": `$score.json.value != null && $score.json.value > 0.8`.
 - Use `retry`, `timeout_ms`, and `on_error` per step to control transient-failure behavior and recovery.
-- On `for_each`, these policies cover the entire loop: each attempt gets one timeout budget (including batch pauses), and retry restarts at the first item. Previously completed children may run again, so only enable loop retries for work that is safe to repeat. A `cost_limit` stop or an attempted OpenClaw dispatch prevents retries; paid LLM usage is checked even when a later pipeline command fails. `on_error: continue` records `$loop.error` and proceeds to the next workflow step; `skip_rest` skips the remaining workflow steps.
+- On `for_each` and `repeat`, these policies cover the entire loop: each attempt gets one timeout budget (including batch pauses), and retry restarts at the first item or round. Previously completed children may run again, so only enable loop retries for work that is safe to repeat. A `cost_limit` stop or an attempted OpenClaw dispatch prevents retries; paid LLM usage is checked even when a later pipeline command fails. `on_error: continue` records `$loop.error` and proceeds to the next workflow step; `skip_rest` skips the remaining workflow steps.
 - Approval steps can optionally enforce identity constraints:
   - `approval.required_approver` (or `requiredApprover`) requires an exact approver id.
   - `approval.require_different_approver` (or `requireDifferentApprover`) requires approver id to differ from initiator.
   - `approval.initiated_by` (or `initiatedBy`) sets the initiator id for comparison.
   - `LOBSTER_APPROVAL_INITIATED_BY` can provide a default initiator id at run time.
   - `LOBSTER_APPROVAL_APPROVED_BY` is used at resume/approval time for identity checks.
+- A rejected approval cancels the run. With `approval: { prompt: ..., on_reject: continue }`, a "no" completes the step with `approved: false` and the run goes on, so later steps can check `when: $step.approved`. Such a rejection is a decision like an approval: the identity rules above apply to it.
 
 ### Conditions
 
@@ -140,7 +142,44 @@ steps:
 - `$route.json` is the output of the last step that ran in the chosen case ("whichever branch ran"), and `$route.case` is the case's number from 1, or `"else"`.
 - Steps of the cases that did not run count as skipped (`$drop.skipped`), so later steps can read any of them. A case cannot read the steps of another case.
 - With no matching case and no `else`, the step fails; `else: []` means "nothing".
-- A switch takes `when`, `timeout_ms`, `on_error` and `retry` like any step; a retry runs the chosen case again, so only retry work that is safe to repeat. A switch cannot be a `for_each` sub-step.
+- A switch takes `when`, `timeout_ms`, `on_error` and `retry` like any step; a retry runs the chosen case again, so only retry work that is safe to repeat.
+
+### Loops
+
+`for_each` runs its steps once per item of a list; `repeat` runs them in rounds until a condition holds:
+
+```yaml
+steps:
+  - id: drafts
+    pipeline: llm.invoke --prompt "Draft a reply to each email" --output-schema '{"type":"array"}'
+
+  - id: each
+    for_each: $drafts.json          # item_var (default item), index_var (default index)
+    steps:
+      - id: confirm
+        approval: { prompt: Send this reply?, on_reject: continue }
+        run: cat
+        stdin: $item.json
+      - id: send
+        pipeline: gog.gmail.send
+        stdin: $item.json
+        when: $confirm.approved
+
+  - id: ci
+    repeat: { until: $check.json.state != running, max: 60 }
+    steps:
+      - id: check
+        run: ci status --json
+      - id: pause
+        sleep: 1m
+        when: $check.json.state == running
+```
+
+- The steps inside a loop are steps like any other: approvals, input, sleeps, waits, switches, child workflows and loops. A question inside a loop is asked once per item or round, and the run pauses until it is answered.
+- **`for_each`:** inside, `$item` and `$index` are the current item and its position. `$each.json` is a list with one entry per item: the item, its index and the output of each step. The steps' own ids are visible only inside the loop.
+- **`repeat`:** `until` is checked after each round, so the steps run at least once. `max` is required: after that many rounds the step fails, or ends with `on_max: continue`. A round sees the results of the round before it (`$check.json` in round 2 is round 1's until `check` runs again). Only the last round's results are kept, so a long loop does not grow the saved run. Afterwards later steps see the last round's steps, and `$ci.rounds` says how many rounds ran; `$ci.json` is the output of the last step that ran.
+- A loop with `retry` cannot contain approvals, input, sleeps or waits, nor a pipeline that asks: a retry runs the loop again from its start, so it would ask again. This is refused when the file loads, or, for a pipeline, when it asks.
+- A step's `timeout_ms` covers its work, not pauses: when a run pauses inside a loop, a switch or any step that encloses the pause, those steps get a fresh budget when the run continues.
 
 ### Retries after external dispatch
 
@@ -205,8 +244,9 @@ steps:
 - Events are scoped like runs: an event signalled by a caller with a `callerId`
   reaches only that caller's runs, and its delivery `--id` cannot collide with
   another caller's. An unscoped caller (the CLI, a trusted host) reaches any run.
-- Sleeps, waits and deadlines are gates: like approvals they are not allowed inside
-  `for_each`, `parallel` branches or child workflows.
+- Sleeps, waits and deadlines are gates: like approvals they are allowed inside
+  `switch` cases and loops, but not inside `parallel` branches, child workflows or a loop
+  with `retry`.
 
 Something outside continues these runs:
 

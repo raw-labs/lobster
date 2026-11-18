@@ -69,6 +69,7 @@ export async function runPipelineStep({
 	cwd,
 	resume,
 	requestInputEnabled = true,
+	gatesRefused,
 	onExecutionStart,
 	standalone = false,
 }: {
@@ -85,6 +86,8 @@ export async function runPipelineStep({
 		onConsumed?: () => Promise<void>;
 	};
 	requestInputEnabled?: boolean;
+	/** Why the pipeline cannot pause here, for the error when it tries to. */
+	gatesRefused?: string;
 	onExecutionStart?: () => void | Promise<void>;
 	/** A standalone pipeline: render to the terminal in human mode and keep its items. */
 	standalone?: boolean;
@@ -191,7 +194,7 @@ export async function runPipelineStep({
 		}
 		if (item?.type === "approval_request") {
 			throw new WorkflowPipelineHaltError(
-				`Workflow step ${stepId} halted for approval inside pipeline stage ${haltedName}; approvals are not supported in child workflows.`,
+				`Workflow step ${stepId} halted for approval inside pipeline stage ${haltedName}; ${gatesRefused ?? "approvals are not supported here"}.`,
 			);
 		}
 		const request = item?.type === "input_request" ? item : null;

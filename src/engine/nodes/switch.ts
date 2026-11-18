@@ -56,5 +56,6 @@ function markSkipped(steps: WorkflowStep[], into: Record<string, WorkflowStepRes
 			for (const entry of step.switch.cases) markSkipped(entry.steps, into);
 			markSkipped(step.switch.else ?? [], into);
 		}
+		if (step.repeat) markSkipped(step.steps ?? [], into);
 	}
 }

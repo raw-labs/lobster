@@ -14,7 +14,14 @@ export type WaitRequest =
 			defaults?: unknown;
 			subject?: unknown;
 	  } & WaitDeadline)
-	| ({ kind: "approval"; prompt: string; items: unknown[]; preview?: string } & WaitDeadline)
+	| ({
+			kind: "approval";
+			prompt: string;
+			items: unknown[];
+			preview?: string;
+			/** A rejection completes the step (`approved: false`) instead of cancelling the run. */
+			onReject?: "continue";
+	  } & WaitDeadline)
 	/** A `sleep:` step: due at `until` (epoch ms). */
 	| { kind: "timer"; until: number }
 	/** A `wait:` step: the oldest matching event received at or after `since`. */

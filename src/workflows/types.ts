@@ -24,6 +24,9 @@ export type SwitchCase = { when: string | boolean; steps: WorkflowStep[] };
 
 export type SwitchConfig = { cases: SwitchCase[]; else?: WorkflowStep[] };
 
+/** Run `steps` in rounds until `until` holds after one, at most `max` rounds. */
+export type RepeatConfig = { until: string | boolean; max: number; on_max?: "fail" | "continue" };
+
 export type ParallelConfig = {
 	wait?: "all" | "any";
 	timeout_ms?: number;
@@ -49,6 +52,8 @@ export type WorkflowStep = {
 	for_each?: string;
 	/** Run the steps of the first case whose `when` holds, or `else`. */
 	switch?: SwitchConfig;
+	/** Run `steps` again and again until a condition holds. */
+	repeat?: RepeatConfig;
 	item_var?: string;
 	index_var?: string;
 	batch_size?: number;
@@ -97,6 +102,8 @@ export type WorkflowApproval =
 			requiredApprover?: string;
 			require_different_approver?: boolean;
 			requireDifferentApprover?: boolean;
+			/** `continue`: a rejection completes the step with `approved: false` instead of cancelling the run. */
+			on_reject?: "cancel" | "continue";
 	  } & WorkflowWaitTimeout);
 
 export type WorkflowApprovalIdentity = {
@@ -123,6 +130,8 @@ export type WorkflowStepResult = {
 	skipped?: boolean;
 	/** For a switch: the case that ran, from 1, or "else". */
 	case?: number | "else";
+	/** How many rounds a repeat step ran. */
+	rounds?: number;
 	/** A question or event wait reached its timeout with `on_timeout: continue`. */
 	timedOut?: boolean;
 	/** A standalone pipeline's items as they are, and whether a renderer already showed them. */

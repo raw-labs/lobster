@@ -83,25 +83,24 @@ test("for_each supports custom item_var and index_var", async () => {
 	]);
 });
 
-test("for_each pipeline sub-steps reject command-level requestInput", async () => {
+test("a pipeline that asks inside a for_each pauses the run for that item", async () => {
+	const loop = (extra: object = {}) => ({
+		steps: [
+			{ id: "vals", command: 'node -e "process.stdout.write(JSON.stringify([1]))"' },
+			{
+				id: "loop",
+				for_each: "$vals.json",
+				...extra,
+				steps: [{ id: "review", pipeline: "ask --prompt 'Review?'" }],
+			},
+		],
+	});
+	const paused = await runWorkflow(loop());
+	assert.equal(paused.status, "needs_input");
+	// A retry would run the loop again and ask again, so a retried loop cannot ask.
 	await assert.rejects(
-		() =>
-			runWorkflow({
-				steps: [
-					{ id: "vals", command: 'node -e "process.stdout.write(JSON.stringify([1]))"' },
-					{
-						id: "loop",
-						for_each: "$vals.json",
-						steps: [
-							{
-								id: "review",
-								pipeline: "ask --prompt 'Review?'",
-							},
-						],
-					},
-				],
-			}),
-		/requestInput is not supported in this pipeline context/,
+		() => runWorkflow(loop({ retry: { max: 2 } })),
+		/halted for approval inside pipeline|requestInput is not supported in this pipeline context/,
 	);
 });
 
@@ -153,11 +152,11 @@ test("for_each validation rejects run/command/pipeline/workflow/parallel on loop
 	);
 	await assert.rejects(
 		() => loadWorkflowFile(filePath),
-		/for_each cannot also define run, command, pipeline, workflow, parallel, or switch/,
+		/for_each cannot also define run, command, pipeline, workflow, parallel, repeat, or switch/,
 	);
 });
 
-test("for_each validation rejects approval/input in sub-steps", async () => {
+test("for_each validation rejects a retry around an approval in its sub-steps", async () => {
 	const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-foreach-"));
 	const filePath = path.join(tmpDir, "bad.lobster");
 	await fsp.writeFile(
@@ -167,13 +166,17 @@ test("for_each validation rejects approval/input in sub-steps", async () => {
 				{
 					id: "loop",
 					for_each: "$x.json",
+					retry: { max: 2 },
 					steps: [{ id: "s", command: "echo hi", approval: true }],
 				},
 			],
 		}),
 		"utf8",
 	);
-	await assert.rejects(() => loadWorkflowFile(filePath), /cannot contain approval or input/);
+	await assert.rejects(
+		() => loadWorkflowFile(filePath),
+		/for_each with retry cannot contain approval, input, sleep or wait steps: a retry would run the loop again and ask again/,
+	);
 });
 
 test("for_each validation rejects duplicate sub-step ids", async () => {

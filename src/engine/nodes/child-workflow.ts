@@ -40,7 +40,7 @@ export async function childWorkflow(
 	}
 	const result = await sequence(machine, frame.child.workflow.steps, key + "/child", {
 		...scope,
-		nested: true,
+		gatesRefused: "approvals, input, sleeps and waits are not supported inside a child workflow",
 		accountAs: scope.accountAs ?? scope.costPrefix + step.id,
 		definition: frame.child,
 		definitionPath: "",

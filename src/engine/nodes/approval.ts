@@ -31,6 +31,9 @@ export async function approval(
 			typeof step.approval === "object" ? step.approval : undefined,
 			`Step ${step.id} approval`,
 		),
+		...(typeof step.approval === "object" && step.approval.on_reject === "continue"
+			? { onReject: "continue" as const }
+			: {}),
 	};
 	return ask(machine, step.id, key + "/approval", frame, scope);
 }
@@ -70,8 +73,11 @@ async function ask(machine: Machine, stepId: string, key: string, frame: Activat
 	scope.ctx.stdout.write(approval.prompt + " [y/N] ");
 	const read = await readAnswer(scope, deadline);
 	if ("expired" in read) return machine.timeOut(key, frame, frame.result!);
-	if (!/^y(es)?$/i.test(String(read.answer).trim())) throw new Error("Not approved");
+	const approved = /^y(es)?$/i.test(String(read.answer).trim());
+	const continues = frame.wait?.kind === "approval" && frame.wait.onReject === "continue";
+	if (!approved && !continues) throw new Error("Not approved");
 	const approvedBy = String(scope.ctx.env.LOBSTER_APPROVAL_APPROVED_BY ?? "").trim() || undefined;
+	// A rejection that lets the run go on is a decision too: only an allowed approver makes it.
 	enforceApprovalIdentity({
 		stepId,
 		identity: approvalIdentityFromRequest(approval),
@@ -80,7 +86,7 @@ async function ask(machine: Machine, stepId: string, key: string, frame: Activat
 	// Through resolveWait: a question published earlier (in tool mode) is consumed with it.
 	return machine.resolveWait(key, frame, {
 		...frame.result,
-		approved: true,
+		approved,
 		...(approvedBy ? { approvedBy } : {}),
 	});
 }

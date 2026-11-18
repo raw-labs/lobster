@@ -37,6 +37,7 @@ function isInputStep(step: WorkflowStep) {
 function stepType(step: WorkflowStep) {
 	if (step.parallel) return "parallel";
 	if (step.switch) return "switch";
+	if (step.repeat) return "repeat";
 	if (typeof step.for_each === "string") return "for_each";
 	if (typeof step.workflow === "string" && step.workflow.trim()) return "workflow";
 	if (typeof step.pipeline === "string" && step.pipeline.trim()) return "pipeline";
@@ -52,6 +53,9 @@ function stepDetails(step: WorkflowStep, args: Record<string, unknown>) {
 	if (step.switch) {
 		const cases = step.switch.cases.length;
 		return `switch (${cases} case${cases === 1 ? "" : "s"}${step.switch.else ? " + else" : ""})`;
+	}
+	if (step.repeat) {
+		return `repeat until ${String(step.repeat.until).trim()} (at most ${step.repeat.max})`;
 	}
 	if (step.parallel) {
 		return `parallel (${step.parallel.wait ?? "all"})`;

@@ -35,8 +35,8 @@ node ./bin/lobster.js --help
 2. **Gates.** `approval:` asks a yes/no and `input:` asks for structured data. The run
    pauses, and the agent or host shows the question and resumes with the answer.
 3. **Flow.** `when:` runs a step only if a condition holds, and `switch:` picks one of
-   several cases. `for_each:` loops over a list, `parallel:` runs commands at once, and
-   `workflow:` calls another workflow file.
+   several cases. `for_each:` loops over a list, `repeat:` loops until a condition holds,
+   `parallel:` runs commands at once, and `workflow:` calls another workflow file.
 4. **Waits.** `sleep: 3d` and `wait: { event: … }` pause a run until a time or an event.
    Nothing keeps running meanwhile. Something outside, such as cron or the OpenClaw
    gateway, calls `lobster runs advance --due` or `lobster signal`.
@@ -136,7 +136,7 @@ older version needs `lobster upgrade` once.
 
 ## Read more
 
-- [Workflow files](docs/reference.md#workflow-files): every step key, [conditions](docs/reference.md#conditions), [switch](docs/reference.md#switch), retries and errors.
+- [Workflow files](docs/reference.md#workflow-files): every step key, [conditions](docs/reference.md#conditions), [switch](docs/reference.md#switch), [loops](docs/reference.md#loops), retries and errors.
 - [Waiting for time and events](docs/reference.md#waiting-for-time-and-events): `sleep`, `wait`, deadlines and heartbeats.
 - [Restarting runs](docs/reference.md#restarting-workflow-file-runs): crashes, `blocked` runs and `recovery: repeat`.
 - [Persistence and run history](docs/reference.md#persistence-and-run-history): the store, the run API, upgrading and the SDK.
