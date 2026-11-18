@@ -178,6 +178,7 @@ steps:
 
 - The steps inside a loop are steps like any other: approvals, input, sleeps, waits, switches, child workflows and loops. A question inside a loop is asked once per item or round, and the run pauses until it is answered.
 - **`for_each`:** inside, `$item` and `$index` are the current item and its position. `$each.json` is a list with one entry per item: the item, its index and the output of each step. The steps' own ids are visible only inside the loop.
+- **`concurrency: N`** on a `for_each` runs up to N items at once (default 1; at most 1000). `$each.json` keeps item order whichever finishes first. If an item fails, no new item starts, the items already running finish, and then the loop fails; their outputs are kept, so a retry (`lobster runs advance`) runs only the items that did not finish. A loop that runs items at once cannot contain approvals, input, sleeps or waits (several items would wait at once), and cannot use `pause_ms`/`batch_size`, which pace items one at a time. Loops nest: `concurrency: 4` inside `concurrency: 4` can run 16 items at once.
 - **`repeat`:** `until` is checked after each round, so the steps run at least once. `max` is required: after that many rounds the step fails, or ends with `on_max: continue`. A round sees the results of the round before it (`$check.json` in round 2 is round 1's until `check` runs again). Only the last round's results are kept, so a long loop does not grow the saved run. Afterwards later steps see the last round's steps, and `$ci.rounds` says how many rounds ran; `$ci.json` is the output of the last step that ran.
 - A loop with `retry` cannot contain approvals, input, sleeps or waits, nor a pipeline that asks: a retry runs the loop again from its start, so it would ask again. This is refused when the file loads, or, for a pipeline, when it asks.
 - A step's `timeout_ms` covers its work, not pauses: when a run pauses inside a loop, a switch or any step that encloses the pause, those steps get a fresh budget when the run continues.
@@ -540,7 +541,11 @@ Upgrade the runtime or selected SQLite library if qualification rejects it.
 See the [SQLite fix](https://sqlite.org/wal.html#walreset).
 A worker owns the SQLite connection, prepared statements, and short transactions;
 embedded hosts receive promises. The database uses WAL, a 5-second busy timeout,
-and FULL durability. A session admits at most 256 outstanding worker requests
+and FULL durability. Writes are short transactions, so processes rarely wait on each
+other; but a process that is frozen (a debugger, `SIGSTOP`, a suspended laptop) while
+inside one keeps the write lock, and other processes then fail with "database is locked"
+after 5 seconds until it goes on. Nothing is lost: the next attempt, or the frozen
+process once it resumes, carries on. A session admits at most 256 outstanding worker requests
 (configurable through `maxPending`); overflow fails before dispatch.
 
 A tracked execution keeps one run ID through approvals and structured-input

@@ -194,6 +194,23 @@ function validateSteps(steps: WorkflowStep[], seen: Set<string>, known: Set<stri
 			) {
 				throw new Error(`Workflow step ${step.id} pause_ms must be a finite non-negative number`);
 			}
+			if (
+				step.concurrency !== undefined &&
+				(typeof step.concurrency !== "number" ||
+					!Number.isInteger(step.concurrency) ||
+					step.concurrency < 1 ||
+					step.concurrency > 1000)
+			) {
+				throw new Error(`Workflow step ${step.id} concurrency must be an integer from 1 to 1000`);
+			}
+			if (
+				(step.concurrency ?? 1) > 1 &&
+				(step.pause_ms !== undefined || step.batch_size !== undefined)
+			) {
+				throw new Error(
+					`Workflow step ${step.id} for_each cannot combine concurrency with pause_ms or batch_size (they pace items one at a time)`,
+				);
+			}
 			if (isApprovalStep(step.approval)) {
 				throw new Error(
 					`Workflow step ${step.id} for_each steps cannot define approval (put it on a step inside the loop, or after it)`,
@@ -253,6 +270,10 @@ function validateSteps(steps: WorkflowStep[], seen: Set<string>, known: Set<stri
 			// gone after the item, and the loop's result carries what later steps can read.
 			validateSteps(step.steps, new Set<string>(), new Set([...known, loopItemVar, loopIndexVar]));
 			refuseGatesUnderRetry(step, "for_each");
+			if ((step.concurrency ?? 1) > 1 && containsGate(step.steps))
+				throw new Error(
+					`Workflow step ${step.id} for_each with concurrency cannot contain approval, input, sleep or wait steps: several items would wait at once`,
+				);
 		}
 		const shellCommand = typeof step.run === "string" ? step.run : step.command;
 		const pipeline = typeof step.pipeline === "string" ? step.pipeline : undefined;
@@ -276,6 +297,9 @@ function validateSteps(steps: WorkflowStep[], seen: Set<string>, known: Set<stri
 			throw new Error(
 				`Workflow step ${step.id} requires run, command, pipeline, workflow, parallel, for_each, repeat, switch, sleep, wait, approval, or input`,
 			);
+		}
+		if (step.concurrency !== undefined && !isForEach) {
+			throw new Error(`Workflow step ${step.id} concurrency applies only to for_each`);
 		}
 		if (step.steps !== undefined && !isForEach && !isRepeat) {
 			throw new Error(
@@ -702,6 +726,7 @@ const STEP_KEYS = [
 	"for_each",
 	"switch",
 	"repeat",
+	"concurrency",
 	"item_var",
 	"index_var",
 	"batch_size",

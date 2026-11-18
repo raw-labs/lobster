@@ -281,6 +281,33 @@ const NODES: NodeExample[] = [
 		],
 		cells: all("generic"),
 	},
+	{
+		name: "for_each (concurrency)",
+		engine: ["for-each", "activity", "condition", "sequence"],
+		setup: [{ id: "items", pipeline: "fake --name items" }],
+		script: { items: [{ output: ["a", "b", "c"] }] },
+		build: async (_fx, o = {}) => ({
+			id: "n",
+			for_each: "$items.json",
+			concurrency: 2,
+			steps: [{ id: "w", pipeline: "fake --name w", ...rec(o.recovery) }],
+		}),
+		workCalls: 3,
+		// Which item gets which call depends on timing; the order of the output does not.
+		reference: { expr: "$n.json.2.item", expected: "c" },
+		dryRun: [/\d\. n {2}\[for_each\]/, /concurrency: 2 at once/, /1\. w {2}\[pipeline\]/],
+		graph: { type: "for_each" },
+		invalid: [
+			["concurrency of 0", (step) => ({ ...step, concurrency: 0 })],
+			["concurrency as a string", (step) => ({ ...step, concurrency: "2" })],
+			["concurrency with pause_ms", (step) => ({ ...step, pause_ms: 10 })],
+			[
+				"a gate inside",
+				(step) => ({ ...step, steps: [...step.steps, { id: "ask", approval: "Ok?" }] }),
+			],
+		],
+		cells: all("generic"),
+	},
 	...(["all", "any"] as const).map((wait): NodeExample => ({
 		name: `parallel (wait ${wait})`,
 		engine: ["parallel", "activity", "condition", "sequence"],

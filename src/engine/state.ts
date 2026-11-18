@@ -49,6 +49,8 @@ export type Activation = {
 	dispatchAttempts?: number;
 	/** How many items a for_each has (its items and outputs are records). */
 	count?: number;
+	/** A for_each running items at once: items past `cursor` that already finished. */
+	finished?: number[];
 	/** Before records: a for_each's items and outputs in the checkpoint (moved out on entry). */
 	items?: unknown[];
 	iterations?: unknown[];

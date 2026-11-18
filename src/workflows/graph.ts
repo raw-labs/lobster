@@ -61,7 +61,8 @@ function stepDetails(step: WorkflowStep, args: Record<string, unknown>) {
 		return `parallel (${step.parallel.wait ?? "all"})`;
 	}
 	if (typeof step.for_each === "string") {
-		return `for_each: ${resolveArgsTemplate(step.for_each, args)}`;
+		const atOnce = (step.concurrency ?? 1) > 1 ? ` (${step.concurrency} at once)` : "";
+		return `for_each: ${resolveArgsTemplate(step.for_each, args)}${atOnce}`;
 	}
 	if (typeof step.workflow === "string" && step.workflow.trim()) {
 		return `workflow: ${resolveArgsTemplate(step.workflow, args)}`;

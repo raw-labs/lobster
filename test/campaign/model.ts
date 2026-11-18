@@ -30,6 +30,11 @@ export type Generated = {
 	scripts: Record<string, FakeBehavior[]>;
 	/** Fakes on steps with `recovery: repeat` (they may legitimately run again after a crash). */
 	repeatable: Set<string>;
+	/**
+	 * How many copies of each fake's step can run at once (the product of the concurrency of
+	 * the loops around it): one interruption can cut that many short, and each runs again.
+	 */
+	inFlight: Record<string, number>;
 	/** Node kinds used, for coverage reports. */
 	kinds: Set<string>;
 };
@@ -44,6 +49,13 @@ type Scope = {
 	/** Where gates are refused (parallel branches and child workflows have none). */
 	noGates?: boolean;
 	inLoop?: boolean;
+	/**
+	 * Inside a for_each that runs items at once: a step that always fails may not stop the
+	 * loop, since how many other items had started by then depends on timing.
+	 */
+	noStop?: boolean;
+	/** The product of the concurrency of the for_each loops around these steps. */
+	atOnce?: number;
 };
 
 type Gen = Generated & { r: Random; n: number; shell: (name: string) => string };
@@ -75,6 +87,7 @@ export function generate(
 		children: {},
 		scripts: {},
 		repeatable: new Set(),
+		inFlight: {},
 		kinds: new Set(),
 	};
 	g.workflow.steps = steps(
@@ -150,7 +163,9 @@ function work(g: Gen, scope: Scope, prefix = "a"): WorkflowStep {
 	if (roll < 0.08) {
 		// Always fails: on_error decides what happens.
 		script = ["fail"];
-		step.on_error = g.r.pick(["stop", "continue", "skip_rest"] as const);
+		step.on_error = scope.noStop
+			? g.r.pick(["continue", "skip_rest"] as const)
+			: g.r.pick(["stop", "continue", "skip_rest"] as const);
 	} else if (roll < 0.16 && !scope.inLoop) {
 		// Fails once, then a retry succeeds.
 		script = ["fail", { output }];
@@ -160,6 +175,7 @@ function work(g: Gen, scope: Scope, prefix = "a"): WorkflowStep {
 		step.recovery = "repeat";
 		g.repeatable.add(id);
 	}
+	g.inFlight[id] = scope.atOnce ?? 1;
 	g.scripts[id] = script;
 	return step;
 }
@@ -240,8 +256,29 @@ function step(g: Gen, scope: Scope, depth: number): WorkflowStep[] {
 			delete source.retry;
 			g.scripts[source.id] = [{ output: value(g) }];
 			const id = `fe${++g.n}`;
-			const body = steps(g, { ...scope, item: true, inLoop: true }, depth + 1, g.r.int(1, 3));
-			return [source, withWhen({ id, for_each: `$${source.id}.json.list`, steps: body })];
+			const concurrent = g.r.chance(0.4);
+			if (concurrent) g.kinds.add("for_each (concurrency)");
+			const body = steps(
+				g,
+				{
+					...scope,
+					item: true,
+					inLoop: true,
+					...(concurrent ? { noGates: true, noStop: true } : {}),
+					atOnce: (scope.atOnce ?? 1) * (concurrent ? 3 : 1),
+				},
+				depth + 1,
+				g.r.int(1, 3),
+			);
+			return [
+				source,
+				withWhen({
+					id,
+					for_each: `$${source.id}.json.list`,
+					...(concurrent ? { concurrency: g.r.int(2, 3) } : {}),
+					steps: body,
+				}),
+			];
 		}
 		case "repeat": {
 			const id = `rp${++g.n}`;
@@ -280,7 +317,12 @@ function step(g: Gen, scope: Scope, depth: number): WorkflowStep[] {
 			const id = `c${++g.n}`;
 			const file = `child-${id}.lobster`;
 			g.children[file] = {
-				steps: steps(g, { values: [], gates: [], noGates: true }, depth + 1, g.r.int(1, 3)),
+				steps: steps(
+					g,
+					{ values: [], gates: [], noGates: true, atOnce: scope.atOnce },
+					depth + 1,
+					g.r.int(1, 3),
+				),
 			};
 			return [withWhen({ id, workflow: file })];
 		}

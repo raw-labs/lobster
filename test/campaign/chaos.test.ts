@@ -47,7 +47,10 @@ for (let i = 0; i < KILLS; i++) {
 		if (run.status === "blocked") {
 			assert.ok(killed, `blocked without a kill${where}`);
 			for (const name of Object.keys(g.scripts))
-				assert.ok(fx.fake.calls(name) <= reference.fake.calls(name) + 1, `${name}${where}`);
+				assert.ok(
+					fx.fake.calls(name) <= reference.fake.calls(name) + crashed.inFlight[name],
+					`${name}${where}`,
+				);
 			return;
 		}
 		assert.equal(run.status, expected.status, `ended differently${where}`);
@@ -57,7 +60,10 @@ for (let i = 0; i < KILLS; i++) {
 			const ran = fx.fake.calls(name);
 			const ref = reference.fake.calls(name);
 			if (g.repeatable.has(name))
-				assert.ok(ran >= ref && ran <= ref + 1, `${name} ran ${ran}, reference ${ref}${where}`);
+				assert.ok(
+					ran >= ref && ran <= ref + crashed.inFlight[name],
+					`${name} ran ${ran}, reference ${ref}${where}`,
+				);
 			else assert.equal(ran, ref, `${name} (may not repeat) ran ${ran}, reference ${ref}${where}`);
 		}
 	});
@@ -162,6 +168,17 @@ test("chaos: a process frozen past its lease cannot write when it wakes, and sta
 	await new Promise((resolve) => setTimeout(resolve, 600));
 	const second = await startWorker(t, fx, { RUN_ID: first.runId! }, 400);
 	await second.exited;
+	if (/database is locked/.test(second.stderr)) {
+		// Frozen inside a write transaction: SQLite's lock is held until the process goes on,
+		// so no one else can write meanwhile. The second process failed cleanly; once the first
+		// wakes, it finishes the run itself (its lease was never taken), running nothing twice.
+		first.child.kill("SIGCONT");
+		await first.exited;
+		assert.equal(first.result?.status, "ok", first.stderr);
+		assert.equal((await runState(fx, first.runId!))?.execution?.status, "completed");
+		for (let i = 0; i < 6; i++) assert.equal(fx.fake.calls(`s${i}`), 1, `s${i}`);
+		return;
+	}
 	assert.equal(second.result?.status, "ok", second.stderr);
 	const finished = await runState(fx, first.runId!);
 	assert.equal(finished?.execution?.status, "completed");

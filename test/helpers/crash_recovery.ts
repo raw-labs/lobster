@@ -154,25 +154,29 @@ export async function crashAndRecover(
 		leaseMs?: number;
 		/**
 		 * false: stop once the lease has lapsed and leave recovery to the caller.
-		 * "if-killed": recover only a worker that was killed (advancing a run that finished
-		 * failed would retry it).
+		 * "if-killed": recover only a worker that was killed before its run ended (advancing a
+		 * run that finished failed would retry it).
 		 */
 		recover?: boolean | "if-killed";
 	},
 ) {
 	const leaseMs = options.leaseMs ?? 1000;
 	const first = await runWorker(t, { ...options, leaseMs });
+	let finished = false;
 	if (first.killed) {
 		const session = await openStoreSession({ env: options.env });
 		try {
-			const lease = (await session.getRunState(first.runId))?.executionLease;
+			const run = await session.getRunState(first.runId);
+			// Killed after its last save: the run had already ended, and nothing is left to recover.
+			finished = ["completed", "failed", "cancelled"].includes(run?.execution?.status ?? "");
+			const lease = run?.executionLease;
 			const due = lease ? lease.expiresAt - Date.now() + 5 : 0;
 			if (due > 0) await new Promise((resolve) => setTimeout(resolve, due));
 		} finally {
 			await session.close();
 		}
 	}
-	if (options.recover === false || (options.recover === "if-killed" && !first.killed))
+	if (options.recover === false || (options.recover === "if-killed" && (!first.killed || finished)))
 		return { runId: first.runId, killed: first.killed, first: first.outcome, recovered: undefined };
 	const recovered = await runWorker(t, {
 		...options,

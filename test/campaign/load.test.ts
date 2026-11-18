@@ -197,3 +197,38 @@ test(
 		assert.ok(last.heapMb <= Math.max(first.heapMb * 2, first.heapMb + 64), "memory keeps growing");
 	},
 );
+
+test(
+	"load: a for_each with concurrency finishes its items that much sooner",
+	{ timeout: 600_000 },
+	async (t) => {
+		const fx = await workflowFixture(t, "lobster-load-concurrency-");
+		const items = cases(40, 400);
+		const timings: Record<number, number> = {};
+		for (const concurrency of [1, 8]) {
+			const flow = await fx.write(`c-${concurrency}.lobster`, {
+				steps: [
+					{
+						id: "items",
+						run: `node -e 'console.log(JSON.stringify([...Array(${items}).keys()]))'`,
+					},
+					{
+						id: "each",
+						for_each: "$items.json",
+						concurrency,
+						steps: [{ id: "w", run: "sleep 0.05; echo '{}'" }],
+					},
+				],
+			});
+			const started = Date.now();
+			const result = await runWorkflowFile({ filePath: flow, ctx: fx.ctx() as any });
+			timings[concurrency] = Date.now() - started;
+			assert.equal(result.status, "ok");
+			assert.equal((result.output as unknown[]).length, items);
+		}
+		t.diagnostic(
+			`${items} items of 50 ms: ${timings[1]} ms one at a time, ${timings[8]} ms eight at a time`,
+		);
+		assert.ok(timings[8] < timings[1] / 3, JSON.stringify(timings));
+	},
+);

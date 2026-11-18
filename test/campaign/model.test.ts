@@ -72,7 +72,8 @@ for (let i = 0; i < CASES; i++) {
 			);
 			for (const name of names(chaos.g))
 				assert.ok(
-					calls(chaos.fx, name) <= calls(reference.fx, name) + actual.interruptions,
+					calls(chaos.fx, name) <=
+						calls(reference.fx, name) + actual.interruptions * chaos.g.inFlight[name],
 					`${name} ran ${calls(chaos.fx, name)} times, reference ${calls(reference.fx, name)}${where}`,
 				);
 			// The operator's way out: abandoning closes the run and withdraws its questions.
@@ -100,7 +101,7 @@ for (let i = 0; i < CASES; i++) {
 			const ref = calls(reference.fx, name);
 			if (chaos.g.repeatable.has(name))
 				assert.ok(
-					ran >= ref && ran <= ref + actual.interruptions,
+					ran >= ref && ran <= ref + actual.interruptions * chaos.g.inFlight[name],
 					`repeatable ${name} ran ${ran} times, reference ${ref}${where}`,
 				);
 			else
@@ -129,6 +130,7 @@ test("model: every node kind was generated", { skip: CASES < 20 && "too few case
 		"wait",
 		"switch",
 		"for_each",
+		"for_each (concurrency)",
 		"repeat",
 		"parallel",
 		"child",

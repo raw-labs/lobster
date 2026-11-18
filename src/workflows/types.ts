@@ -54,6 +54,8 @@ export type WorkflowStep = {
 	switch?: SwitchConfig;
 	/** Run `steps` again and again until a condition holds. */
 	repeat?: RepeatConfig;
+	/** How many items of a for_each run at once (default 1). */
+	concurrency?: number;
 	item_var?: string;
 	index_var?: string;
 	batch_size?: number;

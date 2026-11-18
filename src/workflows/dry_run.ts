@@ -203,6 +203,7 @@ function planSteps(
 			const dryItemVar = step.item_var ?? "item";
 			const dryIndexVar = step.index_var ?? "index";
 			lines.push(`     item_var: ${dryItemVar}, index_var: ${dryIndexVar}`);
+			if ((step.concurrency ?? 1) > 1) lines.push(`     concurrency: ${step.concurrency} at once`);
 			if (step.batch_size) lines.push(`     batch_size: ${step.batch_size}`);
 			if (step.pause_ms) lines.push(`     pause_ms: ${step.pause_ms}`);
 			lines.push(`     sub-steps: ${step.steps.length}`);

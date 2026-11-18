@@ -4,6 +4,7 @@ import type { WorkflowStep } from "../../workflows/types.js";
 import { createRecord, resolveInputValue } from "../../workflows/values.js";
 import { sequence } from "./sequence.js";
 import { loopGatesRefused } from "./repeat.js";
+import type { Activation } from "../state.js";
 
 /**
  * Runs its steps once per item. The items, and each item's output, are kept beside the
@@ -42,15 +43,15 @@ export async function forEach(machine: Machine, step: WorkflowStep, key: string,
 		throw new Error(`Workflow step ${step.id} for_each: its saved items are missing`);
 	const itemVar = step.item_var ?? "item",
 		indexVar = step.index_var ?? "index";
-	while (frame.cursor! < frame.count) {
-		const index = frame.cursor!;
+	const concurrency = step.concurrency ?? 1;
+	const gatesRefused =
+		concurrency > 1
+			? (scope.gatesRefused ??
+				"approvals, input, sleeps and waits are not supported inside a for_each with concurrency: several items would wait at once")
+			: loopGatesRefused(step, scope);
+	/** Run one item's steps; its output is saved with the next save. */
+	const runItem = async (index: number) => {
 		const item = items![index];
-		if (step.pause_ms && index > 0 && index % (step.batch_size ?? 1) === 0) {
-			frame.retryAt ??= Date.now() + step.pause_ms;
-			await machine.save();
-			await machine.delay(frame.retryAt, scope.ctx.signal);
-			delete frame.retryAt;
-		}
 		const results = createRecord(scope.results);
 		results[itemVar] = {
 			id: itemVar,
@@ -62,7 +63,7 @@ export async function forEach(machine: Machine, step: WorkflowStep, key: string,
 		await sequence(machine, step.steps!, bodyKey, {
 			...scope,
 			results,
-			gatesRefused: loopGatesRefused(step, scope),
+			gatesRefused,
 			env: { ...scope.env, ...step.env },
 			cwd: step.cwd ?? scope.cwd,
 			costPrefix: scope.costPrefix + step.id + ".",
@@ -74,12 +75,26 @@ export async function forEach(machine: Machine, step: WorkflowStep, key: string,
 			if (result && !result.skipped)
 				output[child.id] = result.json !== undefined ? result.json : result.stdout;
 		}
-		// The output and the position move together, in the next save.
 		machine.putRecord(outputKey(index), output);
-		frame.cursor!++;
 		// The iteration's output is kept above; its body is not needed to recover.
 		machine.forgetBelow(bodyKey, true, frame);
-		machine.defer();
+	};
+	if (concurrency <= 1) {
+		while (frame.cursor! < frame.count) {
+			const index = frame.cursor!;
+			if (step.pause_ms && index > 0 && index % (step.batch_size ?? 1) === 0) {
+				frame.retryAt ??= Date.now() + step.pause_ms;
+				await machine.save();
+				await machine.delay(frame.retryAt, scope.ctx.signal);
+				delete frame.retryAt;
+			}
+			await runItem(index);
+			// The output and the position move together, in the next save.
+			frame.cursor!++;
+			machine.defer();
+		}
+	} else {
+		await runAtOnce(concurrency, frame, runItem);
 	}
 	const outputs = await machine.readRecords(key + "/output/");
 	const iterations = [...outputs.keys()].sort().map((name) => outputs.get(name));
@@ -88,4 +103,48 @@ export async function forEach(machine: Machine, step: WorkflowStep, key: string,
 	// The result carries them from here; the records go with the save that completes the step.
 	machine.dropRecords(key + "/");
 	return { id: step.id, json: iterations, stdout: JSON.stringify(iterations) };
+}
+
+/**
+ * Run the items from `frame.cursor` on, up to `limit` at once. `cursor` moves past every item
+ * finished in order; items finished ahead of it are in `frame.finished` (fewer than `limit`).
+ * Recovery starts again from there: an item already under way resumes where it was.
+ *
+ * When an item fails, no new item starts; the items already running finish (their outputs
+ * are kept, so a retry runs only what did not finish), and then the loop fails. Stopping
+ * them midway would leave commands whose outcome nobody knows.
+ */
+async function runAtOnce(
+	limit: number,
+	frame: Activation,
+	runItem: (index: number) => Promise<void>,
+) {
+	const finished = new Set(frame.finished ?? []);
+	const running = new Set<Promise<void>>();
+	let next = frame.cursor!;
+	let failure: { error: unknown } | undefined;
+	const start = (index: number) => {
+		const task = runItem(index).then(
+			() => {
+				finished.add(index);
+				while (finished.has(frame.cursor!)) finished.delete(frame.cursor!++);
+				frame.finished = [...finished].sort((a, b) => a - b);
+				if (!frame.finished.length) delete frame.finished;
+			},
+			(error) => {
+				failure ??= { error };
+			},
+		);
+		const tracked = task.finally(() => running.delete(tracked));
+		running.add(tracked);
+	};
+	for (;;) {
+		while (!failure && running.size < limit && next < frame.count!) {
+			const index = next++;
+			if (!finished.has(index)) start(index);
+		}
+		if (!running.size) break;
+		await Promise.race(running);
+	}
+	if (failure) throw failure.error;
 }
