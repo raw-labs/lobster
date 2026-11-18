@@ -372,7 +372,7 @@ steps:
 Something outside continues these runs:
 
 ```sh
-lobster runs advance --due [--limit 100] [--dry-run]   # every run whose time has come
+lobster runs advance --due [--limit 100] [--concurrency 1] [--dry-run]   # every run whose time has come
 lobster signal email.reply --data '{"thread":"t-42"}' [--id <delivery id>]
 ```
 
@@ -384,8 +384,15 @@ callers skip runs another process holds. Timers fire at or after their time,
 never early; how late depends on how often this is called. `lobster signal`
 stores the event (a repeated `--id` is ignored), then advances the runs waiting
 for it; a run that reaches its `wait:` later still finds it. Embedded hosts use
-`advanceDueRuns({ ctx })` and `signalEvent({ name, data, id, ctx })` from
+`advanceDueRuns({ ctx, concurrency })` and `signalEvent({ name, data, id, ctx })` from
 `@clawdbot/lobster/core`.
+
+By default one call advances due runs one after another, so a slow step in one run
+delays the rest. `--concurrency N` advances up to N runs at once (each run's own steps
+still run in order, and each run keeps its own lease). It is opt-in because the runs'
+commands then overlap: two runs of the same workflow may call the same API, or write the
+same file, at the same time. In the load tests, waking 1,000 runs whose next step takes
+50 ms went from 15 runs/s at 1 to 59/s at 4 and 185/s at 16.
 
 Who calls `runs advance --due` is the caller's choice: a long-running host such as
 the OpenClaw gateway every minute or so, or the operating system:
@@ -1141,6 +1148,15 @@ The source is one TypeScript package; only `src/cli.ts` sits at the top of `src`
 | `src/llm` | LLM spend accounting and cost tracking |
 | `src/process`, `src/io`, `src/util` | Child processes, stream and HTTP reads, small shared helpers |
 
-Run `pnpm test`, `pnpm typecheck`, and `pnpm lint` before submitting changes. Tests compile into `dist/test` and use Node's test runner; platform-specific process tests run only where their OS primitives exist. Dependencies observe the two-day release-age policy in `pnpm-workspace.yaml`.
+Run `pnpm test`, `pnpm typecheck`, and `pnpm lint` before submitting changes.
+
+`pnpm test:campaign` runs the testing campaign in `test/campaign`, which is too slow for every push and runs nightly in CI (`.github/workflows/campaign.yml`):
+
+- **Randomized:** random workflows from every node type, run once undisturbed and once interrupted at random checkpoints (Ctrl-C, a crash before a save, a failed write), with answers replayed and timers advanced twice at once. Both runs must end the same way, and nothing that may not be repeated may run twice.
+- **Chaos:** worker processes killed with SIGKILL at random checkpoints, frozen with SIGSTOP past their lease, given a clock that is wrong, and a database locked by another process.
+- **Fuzzing:** random and broken conditions, workflow files, pipelines and command lines must be refused with a message, never a crash.
+- **Load and soak:** many runs woken by `runs advance --due` at several concurrencies, long loops, and (nightly) a steady stream of runs for ten minutes.
+
+`LOBSTER_CAMPAIGN_SCALE=nightly` runs many cases instead of a few. Every failure names its seed; `LOBSTER_CAMPAIGN_SEED=<seed> LOBSTER_CAMPAIGN_CASES=1` with the test's name pattern reruns that case exactly. Tests compile into `dist/test` and use Node's test runner; platform-specific process tests run only where their OS primitives exist. Dependencies observe the two-day release-age policy in `pnpm-workspace.yaml`.
 
 To validate release packaging from the current `main` without publishing, run `gh workflow run lobster-npm-release.yml --ref main -f tag=v$(node -p "require('./package.json').version") -F dry_run=true`. This builds the selected commit and skips publishing, promotion, and uploading a promotable artifact. The existing `preflight_only` mode still builds the requested release tag for later promotion.

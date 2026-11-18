@@ -262,9 +262,14 @@ async function advanceReporting(runId: string, ctx: RunContext, leaseMs?: number
 export async function advanceDueRuns(options: {
 	ctx: RunContext;
 	limit?: number;
+	/** How many runs to advance at once (default 1). Each is a separate run with its own lease. */
+	concurrency?: number;
 	dryRun?: boolean;
 	leaseMs?: number;
 }): Promise<{ due: string[]; advanced: DueRunOutcome[] }> {
+	const concurrency = options.concurrency ?? 1;
+	if (!Number.isSafeInteger(concurrency) || concurrency < 1)
+		throw new Error("concurrency must be a positive integer");
 	return withStoreContext({ ...options.ctx, trackRuns: true }, async (ctx) => {
 		const session = sessionFromEnv(ctx.env)!;
 		const due = await session.dueRuns({
@@ -272,8 +277,17 @@ export async function advanceDueRuns(options: {
 			callerId: callerId(ctx.runMetadata),
 		});
 		if (options.dryRun) return { due, advanced: [] };
-		const advanced: DueRunOutcome[] = [];
-		for (const runId of due) advanced.push(await advanceReporting(runId, ctx, options.leaseMs));
+		// Runs share nothing but the store, whose writes are serialized: a slow run no longer
+		// delays the others beyond the number of runs advanced at once.
+		const advanced: DueRunOutcome[] = Array.from({ length: due.length });
+		let next = 0;
+		const worker = async () => {
+			while (next < due.length) {
+				const index = next++;
+				advanced[index] = await advanceReporting(due[index], ctx, options.leaseMs);
+			}
+		};
+		await Promise.all(Array.from({ length: Math.min(concurrency, due.length) }, worker));
 		return { due, advanced };
 	});
 }

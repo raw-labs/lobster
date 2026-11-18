@@ -16,7 +16,14 @@ import type {
 export async function loadWorkflowFile(filePath: string): Promise<WorkflowFile> {
 	const text = await fsp.readFile(filePath, "utf8");
 	const ext = path.extname(filePath).toLowerCase();
-	const parsed = ext === ".json" ? JSON.parse(text) : parseYaml(text);
+	let parsed: unknown;
+	try {
+		parsed = ext === ".json" ? JSON.parse(text) : parseYaml(text);
+	} catch (error: any) {
+		throw new Error(
+			`Workflow file ${filePath} is not valid ${ext === ".json" ? "JSON" : "YAML"}: ${error?.message ?? error}`,
+		);
+	}
 
 	if (!parsed || typeof parsed !== "object") {
 		throw new Error("Workflow file must be a JSON/YAML object");
@@ -27,6 +34,9 @@ export async function loadWorkflowFile(filePath: string): Promise<WorkflowFile> 
 		throw new Error("Workflow file requires a non-empty steps array");
 	}
 	rejectUnknownKeys(parsed as Record<string, unknown>);
+	const cwd = (parsed as WorkflowFile).cwd;
+	if (typeof cwd === "string" && cwd.includes("\0"))
+		throw new Error("Workflow cwd cannot contain a NUL character");
 
 	const costLimit = (parsed as WorkflowFile).cost_limit;
 	if (costLimit !== undefined) {
@@ -69,6 +79,9 @@ function validateSteps(steps: WorkflowStep[], seen: Set<string>, known: Set<stri
 		if (typeof step.workflow === "string" && !step.workflow.trim()) {
 			throw new Error(`Workflow step ${step.id} workflow path cannot be blank`);
 		}
+		for (const key of ["workflow", "cwd"] as const)
+			if (typeof step[key] === "string" && step[key].includes("\0"))
+				throw new Error(`Workflow step ${step.id} ${key} cannot contain a NUL character`);
 		if (step.workflow_args !== undefined) {
 			if (
 				!step.workflow_args ||
@@ -262,6 +275,11 @@ function validateSteps(steps: WorkflowStep[], seen: Set<string>, known: Set<stri
 		if (executionCount === 0 && !isApprovalStep(step.approval) && !isInputStep(step.input)) {
 			throw new Error(
 				`Workflow step ${step.id} requires run, command, pipeline, workflow, parallel, for_each, repeat, switch, sleep, wait, approval, or input`,
+			);
+		}
+		if (step.steps !== undefined && !isForEach && !isRepeat) {
+			throw new Error(
+				`Workflow step ${step.id} has steps, which only for_each and repeat take (group steps with switch cases or a child workflow)`,
 			);
 		}
 		if (executionCount > 1) {

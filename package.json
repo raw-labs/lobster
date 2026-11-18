@@ -65,6 +65,7 @@
 		"lint": "pnpm format:check && oxlint --tsconfig tsconfig.json bin src test",
 		"fmt": "pnpm format",
 		"test": "pnpm clean && tsc -p tsconfig.json && node -e \"if (!require('fs').existsSync('dist/test')) process.exit(1)\" && node --import ./dist/test/helpers/isolate_state.js --test dist/test/*.test.js",
+		"test:campaign": "pnpm clean && tsc -p tsconfig.json && node --import ./dist/test/helpers/isolate_state.js --test --test-concurrency=1 dist/test/campaign/*.test.js",
 		"check:changed": "pnpm run test",
 		"test:changed": "pnpm run test",
 		"crabbox:hydrate": "crabbox actions hydrate",

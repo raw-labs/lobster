@@ -160,13 +160,37 @@ type Token =
 	| { type: "literal"; at: number; value: string | number | boolean | null }
 	| { type: "word"; at: number; value: string };
 
+/** The depth of a tree, without recursion (a long chain must not overflow the stack here). */
+function treeDepth(root: ConditionNode) {
+	let deepest = 0;
+	const stack: Array<[ConditionNode, number]> = [[root, 1]];
+	while (stack.length) {
+		const [node, depth] = stack.pop()!;
+		deepest = Math.max(deepest, depth);
+		if (node.kind === "not") stack.push([node.operand, depth + 1]);
+		else if (node.kind === "list") for (const item of node.items) stack.push([item, depth + 1]);
+		else if (node.kind === "and" || node.kind === "or" || node.kind === "compare")
+			stack.push([node.left, depth + 1], [node.right, depth + 1]);
+	}
+	return deepest;
+}
+
 const COMPARISONS: ComparisonOperator[] = ["==", "!=", "<=", ">=", "<", ">"];
 const WORD_OPERATORS: ComparisonOperator[] = ["in", "contains", "matches"];
 const SYMBOLS: Symbol[] = ["&&", "||", ...COMPARISONS, "!", "(", ")", "[", "]", ","];
 
+/**
+ * How deeply a condition may nest (parentheses, lists, `!`), and how deep its tree may be
+ * (a chain of `&&` grows it by one per term). Far beyond any real condition; it keeps a
+ * pathological one from overflowing the stack when it is parsed, checked or evaluated.
+ */
+const MAX_NESTING = 64;
+const MAX_TREE_DEPTH = 256;
+
 class Parser {
 	#tokens: Token[];
 	#index = 0;
+	#nesting = 0;
 
 	constructor(readonly source: string) {
 		this.#tokens = tokenize(source, (reason) => this.#fail(reason));
@@ -175,6 +199,8 @@ class Parser {
 	parse(): ConditionNode {
 		if (this.#tokens.length === 0) this.#fail("it is empty");
 		const root = this.#or();
+		if (treeDepth(root) > MAX_TREE_DEPTH)
+			this.#fail(`it is too long or nested too deeply (more than ${MAX_TREE_DEPTH} levels)`);
 		const extra = this.#tokens[this.#index];
 		if (extra) {
 			this.#fail(
@@ -233,8 +259,21 @@ class Parser {
 
 	#unary(wordAllowed: boolean): ConditionNode {
 		const at = this.#tokens[this.#index]?.at;
-		if (this.#take("!")) return { kind: "not", at: at!, operand: this.#unary(wordAllowed) };
+		if (this.#take("!")) {
+			this.#enter(at!);
+			const operand = this.#unary(wordAllowed);
+			this.#nesting--;
+			return { kind: "not", at: at!, operand };
+		}
 		return this.#primary(wordAllowed);
+	}
+
+	/** One level deeper; refused past MAX_NESTING. */
+	#enter(at: number) {
+		if (++this.#nesting > MAX_NESTING)
+			this.#fail(
+				`it is nested too deeply (more than ${MAX_NESTING} levels at character ${at + 1})`,
+			);
 	}
 
 	#primary(wordAllowed: boolean): ConditionNode {
@@ -244,17 +283,21 @@ class Parser {
 		this.#index += 1;
 		switch (token.type) {
 			case "(": {
+				this.#enter(token.at);
 				const inner = this.#or();
 				this.#close(")", token);
+				this.#nesting--;
 				return inner;
 			}
 			case "[": {
+				this.#enter(token.at);
 				const items: ConditionNode[] = [];
 				if (!this.#take("]")) {
 					do items.push(this.#primary(wordAllowed));
 					while (this.#take(","));
 					this.#close("]", token);
 				}
+				this.#nesting--;
 				return { kind: "list", at: token.at, items };
 			}
 			case "ref":

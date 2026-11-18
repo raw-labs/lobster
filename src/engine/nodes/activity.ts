@@ -81,14 +81,15 @@ export async function activity(machine: Machine, step: WorkflowStep, key: string
 	const historyId = await history?.start("activity", step.id);
 	record.phase = "started";
 	await machine.save();
-	scope.startTimeout?.();
-	scope.ctx.signal?.throwIfAborted();
-	machine.checkAuthority(scope.ctx);
-	await scope.ctx._onExecutionStarted?.();
 	let result;
-	// Whether a command may have started. Until then, stopping leaves nothing to inspect.
-	let dispatched = saved.kind === "shell";
+	// Whether a command may have started. Until then, stopping leaves nothing to inspect: a
+	// stop between the save above and the dispatch puts the step back to ready (below).
+	let dispatched = false;
 	try {
+		scope.startTimeout?.();
+		scope.ctx.signal?.throwIfAborted();
+		machine.checkAuthority(scope.ctx);
+		await scope.ctx._onExecutionStarted?.();
 		const ctx = {
 			...scope.ctx,
 			_onNonRetryableSideEffect: () => {
@@ -106,6 +107,7 @@ export async function activity(machine: Machine, step: WorkflowStep, key: string
 		};
 		const env = history ? bindRecorder(baseEnv, history) : baseEnv;
 		if (saved.kind === "shell") {
+			dispatched = true;
 			const { stdout } = await runShellCommand({
 				command: saved.text!,
 				stdin: encodeShellInput(saved.input),

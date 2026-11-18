@@ -43,10 +43,20 @@ const USAGE_TOPICS = new Set([
 	"help",
 ]);
 
+/** A command line Lobster does not understand: reported with exit code 2, like other parse errors. */
+class UsageError extends Error {}
+
 export async function runCli(argv) {
 	const cancellation = createCliCancellation();
 	try {
 		await runCliWithSignal(argv, cancellation.signal, cancellation.signal);
+	} catch (error) {
+		// Whatever reaches here is reported as one line, not a stack trace; LOBSTER_DEBUG shows it.
+		if (cancellation.signal.aborted) throw error;
+		process.stderr.write(
+			`${process.env.LOBSTER_DEBUG ? (error?.stack ?? error) : `Error: ${error?.message ?? String(error)}`}\n`,
+		);
+		process.exitCode = error instanceof UsageError ? 2 : 1;
 	} finally {
 		if (cancellation.exitCode !== undefined) {
 			process.exitCode = cancellation.exitCode;
@@ -119,16 +129,21 @@ async function runCliWithSignal(
 		try {
 			const options = argv.slice(2).filter((arg) => arg !== "--due");
 			let limit: number | undefined;
+			let concurrency: number | undefined;
 			let dryRun = false;
 			for (let i = 0; i < options.length; i++) {
 				if (options[i] === "--dry-run") dryRun = true;
 				else if (options[i] === "--limit" && /^\d+$/.test(options[i + 1] ?? ""))
 					limit = Number(options[++i]);
-				else throw new Error("runs advance --due [--limit <n>] [--dry-run]");
+				else if (options[i] === "--concurrency" && /^[1-9]\d*$/.test(options[i + 1] ?? ""))
+					concurrency = Number(options[++i]);
+				else
+					throw new UsageError("runs advance --due [--limit <n>] [--concurrency <n>] [--dry-run]");
 			}
 			const result = await advanceDueRuns({
 				ctx: createToolContext({ signal, forceTerminationSignal }),
 				limit,
+				concurrency,
 				dryRun,
 			});
 			process.stdout.write(JSON.stringify(result) + "\n");
@@ -143,21 +158,21 @@ async function runCliWithSignal(
 		try {
 			const [name, ...options] = argv.slice(1);
 			if (!name || name.startsWith("--"))
-				throw new Error("signal <event> [--data '{...}'] [--id <id>]");
+				throw new UsageError("signal <event> [--data '{...}'] [--id <id>]");
 			let data: unknown = null;
 			let id: string | undefined;
 			for (let i = 0; i < options.length; i++) {
 				const [flag, inline] = options[i].split(/=(.*)/s, 2);
 				const value = inline ?? options[++i];
-				if (value === undefined) throw new Error(`Missing value for ${flag}`);
+				if (value === undefined) throw new UsageError(`Missing value for ${flag}`);
 				if (flag === "--data") {
 					try {
 						data = JSON.parse(value);
 					} catch {
-						throw new Error("signal --data must be valid JSON");
+						throw new UsageError("signal --data must be valid JSON");
 					}
 				} else if (flag === "--id") id = value;
-				else throw new Error(`signal has no flag ${flag}`);
+				else throw new UsageError(`signal has no flag ${flag}`);
 			}
 			const result = await signalEvent({
 				name,
@@ -175,7 +190,7 @@ async function runCliWithSignal(
 
 	if (argv[0] === "runs" && argv[1] === "advance") {
 		try {
-			if (!argv[2] || argv.length !== 3) throw new Error("runs advance requires a run ID");
+			if (!argv[2] || argv.length !== 3) throw new UsageError("runs advance requires a run ID");
 			const result = await advanceWorkflowRun({
 				runId: argv[2],
 				ctx: createToolContext({ signal, forceTerminationSignal }),
@@ -205,7 +220,7 @@ async function runCliWithSignal(
 
 	if (argv[0] === "runs" && argv[1] === "abandon") {
 		try {
-			if (!argv[2] || argv.length !== 3) throw new Error("runs abandon requires a run ID");
+			if (!argv[2] || argv.length !== 3) throw new UsageError("runs abandon requires a run ID");
 			const result = await abandonWorkflowRun({
 				runId: argv[2],
 				ctx: createToolContext({ signal, forceTerminationSignal }),
@@ -986,7 +1001,7 @@ function helpText(registry: CommandRegistry) {
 		`  lobster runs list [--status waiting] [--limit 20] [--after <cursor>]\n` +
 		`  lobster runs show <runId>\n` +
 		`  lobster runs advance <runId>                       continue after a crash\n` +
-		`  lobster runs advance --due [--limit n] [--dry-run]  advance every run that is due\n` +
+		`  lobster runs advance --due [--limit n] [--concurrency n] [--dry-run]  advance every run that is due\n` +
 		`  lobster runs abandon <runId>                       stop a run for good\n` +
 		`  lobster waits show <waitId>\n\n` +
 		`Diagnostics:\n` +
@@ -1040,7 +1055,7 @@ async function handlePersistence(argv: string[]) {
 		} else if (argv[0] === "storage" && argv[1] === "export") {
 			result = await session.backend.export();
 		} else {
-			throw new Error(
+			throw new UsageError(
 				"history list|show <runId> [afterSequence]|prune <before> [--apply]; storage export",
 			);
 		}
@@ -1058,7 +1073,7 @@ async function handleRuns(argv: string[], signal: AbortSignal) {
 		const options: Parameters<typeof listRuns>[0] = { ctx };
 		for (let i = 0; i < rest.length; i += 2) {
 			const value = rest[i + 1];
-			if (!value) throw new Error(`Missing value for ${rest[i]}`);
+			if (!value) throw new UsageError(`Missing value for ${rest[i]}`);
 			switch (rest[i]) {
 				case "--status":
 					options.status = value as NonNullable<typeof options.status>;
@@ -1070,7 +1085,7 @@ async function handleRuns(argv: string[], signal: AbortSignal) {
 					options.after = value;
 					break;
 				default:
-					throw new Error(`Unknown runs option: ${rest[i]}`);
+					throw new UsageError(`Unknown runs option: ${rest[i]}`);
 			}
 		}
 		result = await listRuns(options);
@@ -1079,8 +1094,14 @@ async function handleRuns(argv: string[], signal: AbortSignal) {
 			command === "runs"
 				? await getRun({ runId: rest[0], ctx })
 				: await getWait({ waitId: rest[0], ctx });
+		if (result === null)
+			throw new Error(
+				command === "runs"
+					? `Run ${rest[0]} not found`
+					: `Wait ${rest[0]} not found (or no longer pending)`,
+			);
 	} else {
-		throw new Error(
+		throw new UsageError(
 			"runs list [--status <status>] [--limit <limit>] [--after <cursor>]; runs show <runId>; waits show <waitId>",
 		);
 	}

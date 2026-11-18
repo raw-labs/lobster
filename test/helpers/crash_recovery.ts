@@ -26,14 +26,21 @@ export type WorkerOutcome = Record<string, any> & {
 
 export type KillPoint = (progress: {
 	calls: (name: string) => number;
+	/** How many checkpoints the worker has saved. */
+	saves: number;
 	/** The last checkpoint the worker saved, as JSON text. */
 	saved: string;
 }) => boolean;
 
-function workerSource() {
+export function workerSource() {
 	return `
+// CLOCK_OFFSET_MS shifts this process's clock, as on a machine whose clock is wrong.
+if (process.env.CLOCK_OFFSET_MS) {
+  const real = Date.now;
+  Date.now = () => real() + Number(process.env.CLOCK_OFFSET_MS);
+}
 import { createToolContext } from ${JSON.stringify(coreUrl)};
-import { runWorkflowFile, advanceWorkflowRun } from ${JSON.stringify(fileUrl)};
+import { runWorkflowFile, advanceWorkflowRun, advanceDueRuns } from ${JSON.stringify(fileUrl)};
 import { openStoreSession } from ${JSON.stringify(sessionUrl)};
 import { createFakeCommand } from ${JSON.stringify(fakeUrl)};
 const store = await openStoreSession({ env: process.env });
@@ -49,9 +56,11 @@ store.backend.transition = async (...args) => {
 };
 const leaseMs = Number(process.env.LEASE_MS);
 try {
-  const result = process.env.RUN_ID
-    ? await advanceWorkflowRun({ runId: process.env.RUN_ID, ctx, leaseMs })
-    : await runWorkflowFile({ filePath: process.env.FLOW, ctx, leaseMs });
+  const result = process.env.DUE
+    ? await advanceDueRuns({ ctx, leaseMs })
+    : process.env.RUN_ID
+      ? await advanceWorkflowRun({ runId: process.env.RUN_ID, ctx, leaseMs })
+      : await runWorkflowFile({ filePath: process.env.FLOW, ctx, leaseMs });
   process.stdout.write("RESULT " + JSON.stringify(result) + "\\n");
 } catch (error) {
   process.stdout.write("RESULT " + JSON.stringify({ error: { code: error.code, message: error.message } }) + "\\n");
@@ -90,6 +99,7 @@ async function runWorker(
 	let stdout = "",
 		stderr = "",
 		saved = "",
+		saves = 0,
 		runId = options.runId,
 		outcome: WorkerOutcome | undefined,
 		killed = false;
@@ -104,6 +114,7 @@ async function runWorker(
 				const event = JSON.parse(line.slice(6));
 				runId ??= event.runId;
 				saved = JSON.stringify(event.execution);
+				saves++;
 			} else if (line.startsWith("RESULT ")) outcome = JSON.parse(line.slice(7));
 		}
 	});
@@ -111,7 +122,7 @@ async function runWorker(
 	if (killWhen) {
 		const deadline = Date.now() + 20000;
 		while (child.exitCode === null) {
-			if (killWhen({ calls: (name) => fake.calls(name), saved })) {
+			if (killWhen({ calls: (name) => fake.calls(name), saved, saves })) {
 				child.kill("SIGKILL");
 				killed = true;
 				break;
@@ -141,8 +152,12 @@ export async function crashAndRecover(
 		flowPath: string;
 		killWhen?: KillPoint;
 		leaseMs?: number;
-		/** false: stop once the lease has lapsed and leave recovery to the caller. */
-		recover?: boolean;
+		/**
+		 * false: stop once the lease has lapsed and leave recovery to the caller.
+		 * "if-killed": recover only a worker that was killed (advancing a run that finished
+		 * failed would retry it).
+		 */
+		recover?: boolean | "if-killed";
 	},
 ) {
 	const leaseMs = options.leaseMs ?? 1000;
@@ -157,7 +172,7 @@ export async function crashAndRecover(
 			await session.close();
 		}
 	}
-	if (options.recover === false)
+	if (options.recover === false || (options.recover === "if-killed" && !first.killed))
 		return { runId: first.runId, killed: first.killed, first: first.outcome, recovered: undefined };
 	const recovered = await runWorker(t, {
 		...options,

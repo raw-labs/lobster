@@ -4,6 +4,12 @@ All notable changes to Lobster will be documented in this file.
 
 ## Unreleased
 
+- Add `lobster runs advance --due --concurrency N` (`advanceDueRuns({ concurrency })`): advance up to N due runs at once instead of one after another. Each run keeps its own lease; the default stays 1.
+- A stop (Ctrl-C, a host abort, a lost lease) between a step being marked started and its command starting no longer leaves the run blocked: the step goes back to ready, since nothing ran. Shell steps count as started only once their process is spawned.
+- Conditions nested more than 64 levels deep, or with a tree more than 256 levels deep (a very long `&&` chain), are refused with a message instead of overflowing the stack.
+- Workflow files: `steps:` on a step other than `for_each` or `repeat` is refused (it used to crash with a TypeError when the run started); a NUL character in a `workflow` or `cwd` path is refused; a file that is not valid YAML or JSON says so, with its path.
+- The CLI reports an error as one line instead of a stack trace (`LOBSTER_DEBUG=1` shows it): exit code 2 for a command line it does not understand, 1 otherwise. `lobster runs show` and `waits show` of an unknown ID fail with "not found" instead of printing `null`.
+- Add the testing campaign (`pnpm test:campaign`, nightly in CI): randomized workflows run with and without interruptions, process chaos (SIGKILL, SIGSTOP past the lease, wrong clocks, a locked database), fuzzing of conditions, workflow files, pipelines and the CLI, and load and soak tests.
 - Document recipes for deciding with a classifier (and asking a person when it is unsure), reminding an approver, waiting for whichever outcome comes first, and undoing earlier steps when a later one fails.
 - Loops can pause: approvals, input, sleeps, waits, switches and child workflows may be steps of a `for_each`. A question inside a loop is asked once per item. A loop with `retry` cannot contain them, since a retry would ask again; that is refused when the file loads.
 - Add `repeat` steps: `repeat: { until: <condition>, max: N }` runs its steps in rounds until the condition holds after one (for polling: check, sleep, check again). `max` is required; reaching it fails the step, or ends it with `on_max: continue`. Later steps see the last round's results and `$step.rounds`.
