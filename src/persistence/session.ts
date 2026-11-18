@@ -35,6 +35,14 @@ import {
 	type TransitionResult,
 } from "./model.js";
 
+/** A checkpoint key that already belongs to a run (created by an earlier conversion). */
+export class CheckpointTakenError extends Error {
+	constructor() {
+		super("Checkpoint already belongs to a run");
+		this.name = "CheckpointTakenError";
+	}
+}
+
 export {
 	bindRecorder,
 	bindStoreSession,
@@ -232,25 +240,38 @@ export class StoreSession {
 	 * Upgrade only: register a converted workflow or pipeline pause as a run, with its execution
 	 * state and continuation, in one transition. The key keeps its old token valid.
 	 */
+	/**
+	 * Create a run waiting at `key`. With `once`, a key that marks the conversion done for good
+	 * is checked and written under the same lock, just before the run: a second conversion waits
+	 * for the first and finds it, and one that already happened is never repeated.
+	 * Returns undefined when `once` was already written.
+	 */
 	async createWaitingRun({
 		id,
 		kind = "workflow",
 		key,
 		execution,
 		continuation,
+		once,
 	}: {
 		id: string;
 		kind?: string;
 		key: string;
 		execution: ExecutionState;
 		continuation: (runId: string) => string;
-	}): Promise<string> {
+		once?: string;
+	}): Promise<string | undefined> {
 		this.assertOpen(true);
 		key = normalizeStateKey(key);
 		return withFileLock({
 			filePath: path.join(this.directory, `${key}.json`),
 			task: async () => {
-				if ((await this.read(key)).runId) throw new Error("Checkpoint already belongs to a run");
+				if (once && (await this.read(once)).text !== null) return undefined;
+				if ((await this.read(key)).runId) throw new CheckpointTakenError();
+				if (once)
+					await this.write(once, JSON.stringify({ usedAt: new Date().toISOString() }) + "\n", {
+						exclusive: true,
+					});
 				const recorder = await this.createRecorder({
 					id,
 					kind,

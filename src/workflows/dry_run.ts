@@ -118,9 +118,11 @@ function planSteps(
 		const holds = unknownCondition
 			? (checkConditionSyntax(condition), true)
 			: evaluateCondition(condition, results);
-		if (unknownCondition) undecided.add(step.id);
+		// Whether it runs is not known, so neither is anything inside it.
+		if (unknownCondition) for (const id of stepIds([step])) undecided.add(id);
 		if (!unknownCondition && !holds) {
-			results[step.id] = { id: step.id, skipped: true };
+			// Skipped with everything inside it, as a run skips them.
+			for (const id of stepIds([step])) results[id] = { id, skipped: true };
 			lines.push(`  ${num}. ${step.id}  [skipped — condition: false]`);
 			continue;
 		}
@@ -161,7 +163,7 @@ function planSteps(
 
 		if (step.switch) {
 			lines.push(`  ${num}. ${step.id}  [switch]`);
-			planSwitch(step, resolvedArgs, results, ctx, undecided, lines);
+			planSwitch(step, resolvedArgs, results, ctx, undecided, lines, unknownCondition);
 			if (step.timeout_ms) lines.push(`     timeout: ${step.timeout_ms}ms`);
 			if (step.on_error && step.on_error !== "stop") lines.push(`     on_error: ${step.on_error}`);
 			noteCondition();
@@ -373,6 +375,8 @@ function planSwitch(
 	ctx: PlanContext,
 	undecided: Set<string>,
 	lines: string[],
+	/** The switch itself may not run: its own `when` depends on step output. */
+	mayNotRun = false,
 ) {
 	const config = step.switch!;
 	let chosen = false;
@@ -405,7 +409,7 @@ function planSwitch(
 	});
 	if (config.else) {
 		branch("else", config.else, chosen ? "not reached" : open ? MAY_RUN : "runs");
-	} else if (!chosen && !open) {
+	} else if (!chosen && !open && !mayNotRun) {
 		throw new Error(`Workflow step ${step.id} switch: no case matched and there is no else`);
 	}
 	if (open) undecided.add(step.id);

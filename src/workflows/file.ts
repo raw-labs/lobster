@@ -113,73 +113,76 @@ export async function runWorkflowFile(
 			ctx: options.ctx,
 		});
 	}
-	return withStoreContext({ ...options.ctx, trackRuns: true }, async (ctx) => {
-		const session = sessionFromEnv(ctx.env)!;
-		let recorder = recorderFromEnv(ctx.env);
-		let runId: string;
-		// Load and validate first: a workflow that cannot start leaves no run behind.
-		let fresh: Pick<ExecutionState, "definition" | "args"> | undefined;
-		if (!options.resume) {
-			if (!options.filePath && !options.definition) throw new Error("Workflow file path required");
-			const definition =
-				options.definition ?? (await snapshotDefinition(options.filePath!, options.args ?? {}));
-			fresh = { definition, args: resolveWorkflowArgs(definition.workflow.args, options.args) };
-		}
-		if (options.resume) {
-			if (!options.resume.stateKey)
-				throw new Error(
-					"This resume token is from a Lobster version that kept workflow state inside the token; it cannot be resumed",
-				);
-			const state = (await readStateJson({
-				env: ctx.env,
-				key: options.resume.stateKey,
-				signal: ctx.signal,
-			})) as { machineVersion?: number; runId?: string; type?: string } | null;
-			// A token an older Lobster already used left this marker behind.
-			if (!state || state.type === "lobster.consumed-resume-state.v1")
-				throw new ResumeRefusedError();
-			if (state.machineVersion !== 1 || !state.runId) throw new UpgradeRequiredError();
-			runId = state.runId;
-			ctx._onResumeStateResolved?.(options.resume.stateKey);
-		} else {
-			recorder ??= await session.createRun(options.kind ?? "workflow", ctx.runMetadata);
-			runId = recorder.runId;
-		}
-		const run = await session.getRunState(runId);
-		if (!run || !visibleTo(run, callerId(ctx.runMetadata)))
-			throw new Error("Workflow run not found");
-		assertRunnableHere(run.kind, options.sdk);
-		recorder ??= await session.recorderForState(options.resume!.stateKey!);
-		const bound = { ...ctx, env: recorder ? bindRecorder(ctx.env, recorder) : ctx.env };
-		const store = new ExecutionStore(session, runId, options.leaseMs);
-		try {
-			let state = await store.claim();
-			if (!state) {
-				if (!fresh) throw new UpgradeRequiredError();
-				state = {
-					version: 1,
-					revision: 0,
-					...fresh,
-					cwd: path.resolve(ctx.cwd ?? process.cwd()),
-					activations: {},
-					status: "running",
-					startedAt: Date.now(),
-				};
+	return ownFailure((label) =>
+		withStoreContext({ ...options.ctx, trackRuns: true }, async (ctx) => {
+			const session = sessionFromEnv(ctx.env)!;
+			let recorder = recorderFromEnv(ctx.env);
+			let runId: string;
+			// Load and validate first: a workflow that cannot start leaves no run behind.
+			let fresh: Pick<ExecutionState, "definition" | "args"> | undefined;
+			if (!options.resume) {
+				if (!options.filePath && !options.definition)
+					throw new Error("Workflow file path required");
+				const definition =
+					options.definition ?? (await snapshotDefinition(options.filePath!, options.args ?? {}));
+				fresh = { definition, args: resolveWorkflowArgs(definition.workflow.args, options.args) };
 			}
-			if (state.version !== 1) throw new Error("Unsupported workflow execution version");
-			if (options.sdk) assertSdkPipeline(state, options.sdk);
-			const machine = new Machine(state, store, bound);
-			if (!state.revision) await machine.save();
 			if (options.resume) {
-				await machine.answer(options.resume.stateKey!, options);
+				if (!options.resume.stateKey)
+					throw new Error(
+						"This resume token is from a Lobster version that kept workflow state inside the token; it cannot be resumed",
+					);
+				const state = (await readStateJson({
+					env: ctx.env,
+					key: options.resume.stateKey,
+					signal: ctx.signal,
+				})) as { machineVersion?: number; runId?: string; type?: string } | null;
+				// A token an older Lobster already used left this marker behind.
+				if (!state || state.type === "lobster.consumed-resume-state.v1")
+					throw new ResumeRefusedError();
+				if (state.machineVersion !== 1 || !state.runId) throw new UpgradeRequiredError();
+				runId = state.runId;
+				ctx._onResumeStateResolved?.(options.resume.stateKey);
+			} else {
+				recorder ??= await session.createRun(options.kind ?? "workflow", ctx.runMetadata);
+				runId = recorder.runId;
 			}
-			return { ...(await machine.run()), runId };
-		} catch (error) {
-			throw withRunId(error, runId);
-		} finally {
-			await store.close();
-		}
-	});
+			const run = await session.getRunState(runId);
+			if (!run || !visibleTo(run, callerId(ctx.runMetadata)))
+				throw new Error("Workflow run not found");
+			assertRunnableHere(run.kind, options.sdk);
+			recorder ??= await session.recorderForState(options.resume!.stateKey!);
+			const bound = { ...ctx, env: recorder ? bindRecorder(ctx.env, recorder) : ctx.env };
+			const store = new ExecutionStore(session, runId, options.leaseMs);
+			try {
+				let state = await store.claim();
+				if (!state) {
+					if (!fresh) throw new UpgradeRequiredError();
+					state = {
+						version: 1,
+						revision: 0,
+						...fresh,
+						cwd: path.resolve(ctx.cwd ?? process.cwd()),
+						activations: {},
+						status: "running",
+						startedAt: Date.now(),
+					};
+				}
+				if (state.version !== 1) throw new Error("Unsupported workflow execution version");
+				if (options.sdk) assertSdkPipeline(state, options.sdk);
+				const machine = new Machine(state, store, bound);
+				if (!state.revision) await machine.save();
+				if (options.resume) {
+					await machine.answer(options.resume.stateKey!, options);
+				}
+				return { ...(await machine.run()), runId };
+			} catch (error) {
+				throw label(error, runId);
+			} finally {
+				await store.close();
+			}
+		}),
+	);
 }
 
 /**
@@ -193,35 +196,40 @@ export async function advanceWorkflowRun(options: {
 	/** Set by the Lobster SDK for its own runs (see `WorkflowRunOptions.sdk`). */
 	sdk?: { pipeline: string };
 }): Promise<WorkflowRunResult & { runId: string }> {
-	return withStoreContext({ ...options.ctx, trackRuns: true }, async (ctx) => {
-		const session = sessionFromEnv(ctx.env)!;
-		const run = await session.getRunState(options.runId);
-		if (!run || !visibleTo(run, callerId(ctx.runMetadata)))
-			throw new Error("Workflow run not found");
-		if (!run.execution)
-			throw new Error(
-				"Run has no restartable workflow checkpoint; migration or inspection required",
-			);
-		assertRunnableHere(run.kind, options.sdk);
-		const store = new ExecutionStore(session, run.id, options.leaseMs);
-		try {
-			const state = await store.claim();
-			if (state!.version !== 1) throw new Error("Unsupported workflow execution version");
-			if (options.sdk) assertSdkPipeline(state!, options.sdk);
-			const { ExecutionRecorder } = await import("../persistence/session.js");
-			const recorder = new ExecutionRecorder(session, run.id, "", run.historyEnabled !== false);
-			const machine = new Machine(state!, store, { ...ctx, env: bindRecorder(ctx.env, recorder) });
-			if (state!.status === "failed") {
-				machine.retryFailed();
-				await machine.save();
+	return ownFailure((label) =>
+		withStoreContext({ ...options.ctx, trackRuns: true }, async (ctx) => {
+			const session = sessionFromEnv(ctx.env)!;
+			const run = await session.getRunState(options.runId);
+			if (!run || !visibleTo(run, callerId(ctx.runMetadata)))
+				throw new Error("Workflow run not found");
+			if (!run.execution)
+				throw new Error(
+					"Run has no restartable workflow checkpoint; migration or inspection required",
+				);
+			assertRunnableHere(run.kind, options.sdk);
+			const store = new ExecutionStore(session, run.id, options.leaseMs);
+			try {
+				const state = await store.claim();
+				if (state!.version !== 1) throw new Error("Unsupported workflow execution version");
+				if (options.sdk) assertSdkPipeline(state!, options.sdk);
+				const { ExecutionRecorder } = await import("../persistence/session.js");
+				const recorder = new ExecutionRecorder(session, run.id, "", run.historyEnabled !== false);
+				const machine = new Machine(state!, store, {
+					...ctx,
+					env: bindRecorder(ctx.env, recorder),
+				});
+				if (state!.status === "failed") {
+					machine.retryFailed();
+					await machine.save();
+				}
+				return { ...(await machine.run()), runId: run.id };
+			} catch (error) {
+				throw label(error, run.id);
+			} finally {
+				await store.close();
 			}
-			return { ...(await machine.run()), runId: run.id };
-		} catch (error) {
-			throw withRunId(error, run.id);
-		} finally {
-			await store.close();
-		}
-	});
+		}),
+	);
 }
 
 export type DueRunOutcome = {
@@ -244,7 +252,8 @@ async function advanceReporting(runId: string, ctx: RunContext, leaseMs?: number
 		// Another process holds the run's lease: it is being advanced right now.
 		if (error instanceof ExecutionConflictError) return { runId, status: "busy" } as DueRunOutcome;
 		const session = sessionFromEnv(ctx.env);
-		const run = session ? await session.getRunState(runId) : null;
+		// Reporting must not fail the batch: the other runs' outcomes would be lost.
+		const run = session ? await session.getRunState(runId).catch(() => null) : null;
 		return {
 			runId,
 			status: run?.execution?.status === "blocked" ? "blocked" : "failed",
@@ -436,10 +445,26 @@ function assertSdkPipeline(state: ExecutionState, sdk: { pipeline: string }) {
 /** The run each failure belongs to, set only here so a command cannot claim another run. */
 const failedRuns = new WeakMap<object, string>();
 
-function withRunId(error: unknown, runId: string) {
-	// The innermost run keeps the error: a later, outer frame does not relabel it.
-	if (error && typeof error === "object" && !failedRuns.has(error)) failedRuns.set(error, runId);
-	return error;
+/**
+ * Run `task`, so that a failure names this call's run and no other: the run it labelled, or
+ * none when it failed before a run existed. The same error object can come from several runs
+ * (a shared abort signal's reason, say, or a run a step inside this one started), so the label
+ * is set, or cleared, by each call as the error leaves it.
+ */
+async function ownFailure<T>(
+	task: (label: (error: unknown, runId: string) => unknown) => Promise<T>,
+): Promise<T> {
+	let labelled = false;
+	try {
+		return await task((error, runId) => {
+			labelled = true;
+			if (error && typeof error === "object") failedRuns.set(error, runId);
+			return error;
+		});
+	} catch (error) {
+		if (!labelled && error && typeof error === "object") failedRuns.delete(error);
+		throw error;
+	}
 }
 
 /** The run a failure from `runWorkflowFile` or `advanceWorkflowRun` belongs to. */

@@ -51,6 +51,8 @@ export type Activation = {
 	count?: number;
 	/** A for_each running items at once: items past `cursor` that already finished. */
 	finished?: number[];
+	/** A for_each with pause_ms: the item it has already paused before. */
+	pausedFor?: number;
 	/** Before records: a for_each's items and outputs in the checkpoint (moved out on entry). */
 	items?: unknown[];
 	iterations?: unknown[];

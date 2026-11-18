@@ -373,10 +373,10 @@ function tokenize(source: string, fail: (reason: string) => never): Token[] {
 			let value = "";
 			let i = 1;
 			for (; i < rest.length && rest[i] !== quote; i++) {
-				if (rest[i] === "\\") {
-					if (i + 1 >= rest.length) break;
-					i += 1;
-				}
+				// Only a quote or a backslash is escaped. Any other backslash is kept as written,
+				// so a pattern like "^\d+$" or "a\.b" means what a regular expression means.
+				if (rest[i] === "\\" && (rest[i + 1] === quote || rest[i + 1] === "\\")) i += 1;
+				else if (rest[i] === "\\" && i + 1 >= rest.length) break;
 				value += rest[i];
 			}
 			if (rest[i] !== quote) fail(`a string at character ${at + 1} is not closed`);

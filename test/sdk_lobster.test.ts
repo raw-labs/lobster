@@ -386,3 +386,40 @@ test("an SDK input pause saved by an older version continues the same stage once
 	await assert.rejects(() => choose().resume(token, { response: { choice: "red" } }), /not found/);
 	assert.equal(runs, 1);
 });
+
+test("an older SDK token refused by the wrong instance still resumes on the right one", async (t) => {
+	const stateDir = await sdkStateDir(t);
+	const sent: unknown[] = [];
+	const token = encodeToken({
+		protocolVersion: 1,
+		v: 1,
+		stageIndex: 1,
+		resumeAtIndex: 2,
+		items: [{ to: "c@example.com" }],
+		prompt: "Send?",
+	});
+	// One stage short: refused, and the token is not used up by the refusal.
+	const short = new Lobster({ stateDir }).pipe(() => []);
+	await assert.rejects(() => short.resume(token, { approved: true }), /stages/);
+	const approved = await approvalPipeline(stateDir, sent).resume(token, { approved: true });
+	assert.equal(approved.status, "ok", JSON.stringify(approved));
+	assert.deepEqual(sent, [{ to: "c@example.com" }]);
+	// Two resumes at once: one runs it, the other is refused, never both.
+	const twice = encodeToken({
+		protocolVersion: 1,
+		v: 1,
+		stageIndex: 1,
+		resumeAtIndex: 2,
+		items: [{ to: "d@example.com" }],
+		prompt: "Send?",
+	});
+	const outcomes = await Promise.allSettled([
+		approvalPipeline(stateDir, sent).resume(twice, { approved: true }),
+		approvalPipeline(stateDir, sent).resume(twice, { approved: true }),
+	]);
+	assert.equal(sent.filter((item: any) => item.to === "d@example.com").length, 1);
+	assert.equal(
+		outcomes.filter((o) => o.status === "fulfilled" && o.value.status === "ok").length,
+		1,
+	);
+});

@@ -8,9 +8,12 @@ import { sequence } from "./sequence.js";
 import { attachPipelineSourceItems, pipelineSourceItems } from "../accounting.js";
 
 const LOOP_RETRY =
-	"approvals, input, sleeps and waits are not supported inside a for_each or repeat with retry: a retry would run the loop again and ask again";
+	"approvals, input, sleeps and waits are not supported inside a for_each, repeat or switch with retry: a retry would run it again and ask again";
 
-/** Why the body of a loop cannot pause: its enclosing scope's reason, or a retry of the loop. */
+/**
+ * Why the steps inside a loop or a switch cannot pause: its enclosing scope's reason, or a
+ * retry of the step, which would run them again and ask again.
+ */
 export function loopGatesRefused(step: WorkflowStep, scope: Scope) {
 	if (scope.gatesRefused) return scope.gatesRefused;
 	return resolveRetryConfig(step.retry).max > 1 ? LOOP_RETRY : undefined;

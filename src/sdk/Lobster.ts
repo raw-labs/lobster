@@ -16,11 +16,17 @@ import {
 	advanceWorkflowRun,
 	runWorkflowFile,
 	ResumeRefusedError,
+	UpgradeRequiredError,
 	WorkflowResumeArgumentError,
 	runIdOf,
 	type WorkflowRunResult,
 } from "../workflows/file.js";
-import { waitingPipelineRun, type PausedPipeline } from "../workflows/upgrade.js";
+import {
+	savedByOlderVersion,
+	waitingPipelineRun,
+	type PausedPipeline,
+} from "../workflows/upgrade.js";
+import { CheckpointTakenError } from "../persistence/session.js";
 import { sdkInputItems, sdkPipelineText, sdkStageRegistry } from "./runtime.js";
 import { stateEnv } from "./state_env.js";
 
@@ -223,13 +229,20 @@ export class Lobster {
 		if (!session) throw new Error("SDK resume requires a persistence session");
 		let key: string;
 		let pause: PausedPipeline;
+		let once: string | undefined;
 		if (legacy.resumeMode === "same_stage") {
 			// The state lives under its key; once a run owns the key, it is that run's.
 			key = legacy.stateKey!;
 			const record = await session.read(key);
 			if (record.runId) return key;
-			if (record.text === null) throw new ResumeRefusedError();
+			if (record.text === null) {
+				// Still in a file an older Lobster wrote: it has to be imported first.
+				if (await savedByOlderVersion(session.directory, key)) throw new UpgradeRequiredError();
+				throw new ResumeRefusedError();
+			}
 			const state = JSON.parse(record.text);
+			// Answered before, by an older Lobster.
+			if (state?.type === "lobster.consumed-resume-state.v1") throw new ResumeRefusedError();
 			if (
 				!Number.isSafeInteger(state?.resumeAtIndex) ||
 				state.resumeAtIndex < 0 ||
@@ -245,19 +258,14 @@ export class Lobster {
 				commandInput: validateCommandInputState(state.commandInput) as any,
 			};
 		} else {
-			// Older tokens carried their whole state, so nothing marked them used: mark it now,
-			// for good, before the run exists. A token marked earlier is never converted again.
+			// Older tokens carried their whole state, so nothing marked them used: they are marked
+			// for good together with the run they become (see createWaitingRun), and only once
+			// everything that could refuse them has been checked. A marked token is never
+			// converted again.
 			const hash = createHash("sha256").update(token).digest("hex");
 			key = `sdk_resume_${hash.slice(0, 32)}`;
-			const marker = `sdk_token_${hash}`;
-			if ((await session.read(marker)).text !== null) return key;
-			try {
-				await session.write(marker, JSON.stringify({ usedAt: new Date().toISOString() }) + "\n", {
-					exclusive: true,
-				});
-			} catch {
-				return key;
-			}
+			once = `sdk_token_${hash}`;
+			if ((await session.read(once)).text !== null) return key;
 			pause =
 				legacy.inputSchema !== undefined
 					? {
@@ -292,10 +300,10 @@ export class Lobster {
 			pause,
 		);
 		await session
-			.createWaitingRun({ id: randomUUID(), kind: "sdk", key, execution, continuation })
+			.createWaitingRun({ id: randomUUID(), kind: "sdk", key, execution, continuation, once })
 			.catch((error) => {
 				// Another resume converted it first: resume that run.
-				if (!/already belongs to a run/.test(error?.message)) throw error;
+				if (!(error instanceof CheckpointTakenError)) throw error;
 			});
 		return key;
 	}

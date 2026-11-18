@@ -148,6 +148,7 @@ async function runCliWithSignal(
 			});
 			process.stdout.write(JSON.stringify(result) + "\n");
 		} catch (error) {
+			if (error instanceof UsageError) throw error;
 			process.stderr.write(`runs advance --due: ${error?.message ?? String(error)}\n`);
 			process.exitCode = 1;
 		}
@@ -182,6 +183,7 @@ async function runCliWithSignal(
 			});
 			process.stdout.write(JSON.stringify(result) + "\n");
 		} catch (error) {
+			if (error instanceof UsageError) throw error;
 			process.stderr.write(`signal: ${error?.message ?? String(error)}\n`);
 			process.exitCode = 1;
 		}
@@ -205,6 +207,8 @@ async function runCliWithSignal(
 				runId: result.runId,
 			});
 		} catch (error) {
+			// A command line it does not understand is reported like any other (exit code 2).
+			if (error instanceof UsageError) throw error;
 			writeToolEnvelope({
 				ok: false,
 				status: "error",
@@ -227,6 +231,7 @@ async function runCliWithSignal(
 			});
 			process.stdout.write(JSON.stringify(result) + "\n");
 		} catch (error) {
+			if (error instanceof UsageError) throw error;
 			process.stderr.write(`runs abandon: ${error?.message ?? String(error)}\n`);
 			process.exitCode = 1;
 		}

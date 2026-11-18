@@ -162,7 +162,7 @@ test("retry validation rejects invalid backoff", async () => {
 test("retry validation rejects negative delay_ms", async () => {
 	await assert.rejects(
 		loadWorkflow({ name: "bad", steps: [{ id: "x", command: "echo", retry: { delay_ms: -1 } }] }),
-		/retry.delay_ms must be a finite non-negative number/,
+		/retry.delay_ms must be a number from 0 to 2147483647/,
 	);
 });
 

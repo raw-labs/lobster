@@ -6,6 +6,7 @@ import { advanceWorkflowRun, runWorkflowFile } from "../src/workflows/file.js";
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
+import { DatabaseSync } from "node:sqlite";
 import { checkConditionSyntax } from "../src/workflows/conditions.js";
 import { workflowFixture } from "./helpers/workflow_runner.js";
 
@@ -94,4 +95,46 @@ test("CLI usage mistakes are one line with exit code 2; a missing run is exit co
 	const missing = cli("runs", "show", "no-such-run");
 	assert.equal(missing.status, 1);
 	assert.equal(missing.stderr, "Error: Run no-such-run not found\n");
+});
+
+test("every CLI usage mistake exits 2 with one line, including signal, runs advance and abandon", async (t) => {
+	const fx = await workflowFixture(t);
+	const bin = new URL("../../bin/lobster.js", import.meta.url).pathname;
+	for (const args of [
+		["signal"],
+		["signal", "x", "--bogus", "1"],
+		["signal", "x", "--data", "{"],
+		["runs", "advance"],
+		["runs", "advance", "--due", "--limit", "abc"],
+		["runs", "abandon"],
+	]) {
+		const run = spawnSync(process.execPath, [bin, ...args], {
+			env: fx.env as any,
+			encoding: "utf8",
+		});
+		assert.equal(run.status, 2, `lobster ${args.join(" ")}: ${run.stderr}`);
+		assert.match(run.stderr, /^Error: [^\n]+\n$/, args.join(" "));
+		assert.equal(run.stdout, "", args.join(" "));
+	}
+});
+
+test("read-only commands work on a database made before records existed", async (t) => {
+	const fx = await workflowFixture(t);
+	await fx.run({ steps: [{ id: "w", pipeline: "fake --name w" }] });
+	const runId = await fx.runId();
+	const db = new DatabaseSync(path.join(fx.env.LOBSTER_STATE_DIR!, "lobster.sqlite"));
+	db.exec("DROP TABLE execution_records");
+	db.close();
+	const bin = new URL("../../bin/lobster.js", import.meta.url).pathname;
+	for (const args of [
+		["runs", "show", runId],
+		["storage", "export"],
+		["history", "list"],
+	]) {
+		const run = spawnSync(process.execPath, [bin, ...args], {
+			env: fx.env as any,
+			encoding: "utf8",
+		});
+		assert.equal(run.status, 0, `lobster ${args.join(" ")}: ${run.stderr}`);
+	}
 });

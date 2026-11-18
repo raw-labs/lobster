@@ -4,6 +4,7 @@ import type { WorkflowStep, WorkflowStepResult } from "../../workflows/types.js"
 import { evaluateCondition } from "../../workflows/conditions.js";
 import { createRecord } from "../../workflows/values.js";
 import { sequence } from "./sequence.js";
+import { loopGatesRefused } from "./repeat.js";
 import { attachPipelineSourceItems, pipelineSourceItems } from "../accounting.js";
 
 /**
@@ -28,7 +29,10 @@ export async function switchStep(machine: Machine, step: WorkflowStep, key: stri
 	const chosen = frame.case;
 	const steps = chosen === "else" ? config.else! : config.cases[chosen - 1].steps;
 	const bodyKey = occurrence(key, chosen === "else" ? "else" : `case-${chosen}`);
-	const last = await sequence(machine, steps, bodyKey, scope);
+	const last = await sequence(machine, steps, bodyKey, {
+		...scope,
+		gatesRefused: loopGatesRefused(step, scope),
+	});
 	const body = activation(machine.state, bodyKey);
 	const results: Record<string, WorkflowStepResult> = createRecord();
 	const branches = [...config.cases.map((entry) => entry.steps), config.else ?? []];
@@ -47,7 +51,7 @@ export async function switchStep(machine: Machine, step: WorkflowStep, key: stri
 }
 
 /** Every step a case could have run, nested switches included, as skipped. */
-function markSkipped(steps: WorkflowStep[], into: Record<string, WorkflowStepResult>) {
+export function markSkipped(steps: WorkflowStep[], into: Record<string, WorkflowStepResult>) {
 	for (const step of steps) {
 		into[step.id] = { id: step.id, skipped: true };
 		for (const branch of step.parallel?.branches ?? [])

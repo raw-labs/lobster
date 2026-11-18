@@ -49,8 +49,12 @@ export async function forEach(machine: Machine, step: WorkflowStep, key: string,
 			? (scope.gatesRefused ??
 				"approvals, input, sleeps and waits are not supported inside a for_each with concurrency: several items would wait at once")
 			: loopGatesRefused(step, scope);
-	/** Run one item's steps; its output is saved with the next save. */
-	const runItem = async (index: number) => {
+	/**
+	 * Run one item's steps. `done` marks it finished in the same synchronous step that keeps its
+	 * output and forgets its body: a save taken in between would see the body gone and the item
+	 * not finished, and recovery would run it again.
+	 */
+	const runItem = async (index: number, done: () => void) => {
 		const item = items![index];
 		const results = createRecord(scope.results);
 		results[itemVar] = {
@@ -78,23 +82,33 @@ export async function forEach(machine: Machine, step: WorkflowStep, key: string,
 		machine.putRecord(outputKey(index), output);
 		// The iteration's output is kept above; its body is not needed to recover.
 		machine.forgetBelow(bodyKey, true, frame);
+		done();
 	};
 	if (concurrency <= 1) {
 		while (frame.cursor! < frame.count) {
 			const index = frame.cursor!;
-			if (step.pause_ms && index > 0 && index % (step.batch_size ?? 1) === 0) {
+			// Paced once per batch: `pausedFor` keeps a recovered run from pausing again.
+			if (
+				step.pause_ms &&
+				index > 0 &&
+				index % (step.batch_size ?? 1) === 0 &&
+				frame.pausedFor !== index
+			) {
 				frame.retryAt ??= Date.now() + step.pause_ms;
 				await machine.save();
 				await machine.delay(frame.retryAt, scope.ctx.signal);
 				delete frame.retryAt;
+				frame.pausedFor = index;
 			}
-			await runItem(index);
 			// The output and the position move together, in the next save.
-			frame.cursor!++;
+			await runItem(index, () => {
+				frame.cursor!++;
+				delete frame.pausedFor;
+			});
 			machine.defer();
 		}
 	} else {
-		await runAtOnce(concurrency, frame, runItem);
+		await runAtOnce(concurrency, frame, runItem, (error) => machine.fatal(error));
 	}
 	const outputs = await machine.readRecords(key + "/output/");
 	const iterations = [...outputs.keys()].sort().map((name) => outputs.get(name));
@@ -107,39 +121,46 @@ export async function forEach(machine: Machine, step: WorkflowStep, key: string,
 
 /**
  * Run the items from `frame.cursor` on, up to `limit` at once. `cursor` moves past every item
- * finished in order; items finished ahead of it are in `frame.finished` (fewer than `limit`).
- * Recovery starts again from there: an item already under way resumes where it was.
+ * finished in order; items finished ahead of it are in `frame.finished`. Recovery starts again
+ * from there: an item already under way resumes where it was. No item starts more than
+ * `window(limit)` places past `cursor`, so a slow item does not let `finished` (saved with every
+ * checkpoint) grow with the loop.
  *
  * When an item fails, no new item starts; the items already running finish (their outputs
  * are kept, so a retry runs only what did not finish), and then the loop fails. Stopping
- * them midway would leave commands whose outcome nobody knows.
+ * them midway would leave commands whose outcome nobody knows. A fatal error (a stopped run,
+ * a lost lease) wins over an ordinary one, so the run ends as it must.
  */
 async function runAtOnce(
 	limit: number,
 	frame: Activation,
-	runItem: (index: number) => Promise<void>,
+	runItem: (index: number, done: () => void) => Promise<void>,
+	fatal: (error: unknown) => boolean,
 ) {
 	const finished = new Set(frame.finished ?? []);
 	const running = new Set<Promise<void>>();
+	const ahead = window(limit);
 	let next = frame.cursor!;
 	let failure: { error: unknown } | undefined;
 	const start = (index: number) => {
-		const task = runItem(index).then(
-			() => {
-				finished.add(index);
-				while (finished.has(frame.cursor!)) finished.delete(frame.cursor!++);
-				frame.finished = [...finished].sort((a, b) => a - b);
-				if (!frame.finished.length) delete frame.finished;
-			},
-			(error) => {
-				failure ??= { error };
-			},
-		);
+		const task = runItem(index, () => {
+			finished.add(index);
+			while (finished.has(frame.cursor!)) finished.delete(frame.cursor!++);
+			frame.finished = [...finished].sort((a, b) => a - b);
+			if (!frame.finished.length) delete frame.finished;
+		}).catch((error) => {
+			if (!failure || (fatal(error) && !fatal(failure.error))) failure = { error };
+		});
 		const tracked = task.finally(() => running.delete(tracked));
 		running.add(tracked);
 	};
 	for (;;) {
-		while (!failure && running.size < limit && next < frame.count!) {
+		while (
+			!failure &&
+			running.size < limit &&
+			next < frame.count! &&
+			next < frame.cursor! + ahead
+		) {
 			const index = next++;
 			if (!finished.has(index)) start(index);
 		}
@@ -147,4 +168,9 @@ async function runAtOnce(
 		await Promise.race(running);
 	}
 	if (failure) throw failure.error;
+}
+
+/** How far past the first unfinished item a loop with `limit` at once may start items. */
+function window(limit: number) {
+	return Math.max(limit * 8, 64);
 }

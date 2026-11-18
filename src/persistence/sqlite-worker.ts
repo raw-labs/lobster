@@ -172,7 +172,16 @@ function getRun(id: string): RunRecord | null {
 	return run;
 }
 
+// A database made before records existed has no table until a write session opens it; a
+// read-only session reads "no records" instead of failing.
+const hasRecords = Boolean(
+	prepare(
+		"SELECT 1 AS ok FROM sqlite_master WHERE type='table' AND name='execution_records'",
+	).get(),
+);
+
 function readRecords(runId: string, prefix: string) {
+	if (!hasRecords) return [];
 	return prepare(
 		"SELECT key,text FROM execution_records WHERE run_id=? AND substr(key,1,length(?))=? ORDER BY key",
 	).all(runId, prefix, prefix) as Array<{ key: string; text: string }>;

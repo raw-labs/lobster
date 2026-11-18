@@ -95,6 +95,7 @@ export class ExecutionStore {
 		prepare?: (state: ExecutionState) => {
 			execution: ExecutionState;
 			put?: Record<string, string>;
+			drop?: string[];
 		},
 	) {
 		return this.enqueue(async () => {
@@ -102,10 +103,8 @@ export class ExecutionStore {
 			const next = structuredClone(prepared?.execution ?? state);
 			next.revision = state.revision + 1;
 			const put = { ...extras.records?.put, ...prepared?.put };
-			const records =
-				extras.records?.drop?.length || Object.keys(put).length
-					? { records: { drop: extras.records?.drop ?? [], put } }
-					: {};
+			const drop = [...(extras.records?.drop ?? []), ...(prepared?.drop ?? [])];
+			const records = drop.length || Object.keys(put).length ? { records: { drop, put } } : {};
 			await this.transition(
 				{
 					kind: "execution-save",

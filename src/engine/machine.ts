@@ -203,20 +203,23 @@ export class Machine {
 		this.state.cost = this.cost.hasUsage() ? this.cost.getSummary() : undefined;
 		this.state.llmSpend = this.ledger.outstanding();
 		this.state.llmBilled = this.ledger.settled();
-		// Records changed since the last save go with this one, in the same transaction.
-		const records = this.#records;
-		if (records.drop.size || records.put.size) {
-			extras = {
-				...extras,
-				records: { drop: [...records.drop], put: Object.fromEntries(records.put) },
-			};
-			this.#records = { drop: new Set(), put: new Map() };
-		}
 		return this.store.save(
 			this.state,
 			extras,
 			extras.publish || extras.consume ? () => this.checkAuthority() : undefined,
-			(state) => this.#outline(state),
+			// Taken when this save's turn comes, together with the checkpoint: records changed
+			// since the last save go with the state they belong to, even while other items of a
+			// loop keep running between the call and the turn.
+			(state) => {
+				const records = this.#records;
+				this.#records = { drop: new Set(), put: new Map() };
+				const outlined = this.#outline(state);
+				return {
+					execution: outlined.execution,
+					put: { ...Object.fromEntries(records.put), ...outlined.put },
+					drop: [...records.drop],
+				};
+			},
 		);
 	}
 
@@ -298,7 +301,12 @@ export class Machine {
 			for (const entry of Object.values(frame.results ?? {})) collect(entry);
 		}
 		if (!refs.length) return;
-		const values = await this.readRecords("value/");
+		// Only the outputs referred to: a long run may have saved many that it no longer needs.
+		const values = new Map<string, unknown>();
+		for (const key of new Set(refs.map(([result, field]) => (result[field] as any)[RECORD_REF]))) {
+			const found = await this.readRecords(key as string);
+			if (found.has(key as string)) values.set(key as string, found.get(key as string));
+		}
 		for (const [result, field] of refs) {
 			const key = (result[field] as any)[RECORD_REF] as string;
 			if (!values.has(key)) throw new Error(`Saved step output ${key} is missing`);

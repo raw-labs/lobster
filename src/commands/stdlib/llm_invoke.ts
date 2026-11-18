@@ -1101,12 +1101,8 @@ function normalizeResult({
 		diagnostics: (result.diagnostics ?? null) as any,
 		createdAt: new Date().toISOString(),
 		source,
-		cached:
-			source !== "remote" &&
-			source !== "openclaw" &&
-			source !== "clawd" &&
-			source !== "pi" &&
-			source !== "http",
+		// A fresh answer from the adapter; replays from the cache or the run mark themselves.
+		cached: false,
 		attemptCount: attempt,
 	};
 	return [item];

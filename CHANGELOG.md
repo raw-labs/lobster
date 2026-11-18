@@ -4,6 +4,15 @@ All notable changes to Lobster will be documented in this file.
 
 ## Unreleased
 
+- Fixes from a review of this release's engine, loader and SDK work:
+  - A for_each running items at once saves each item's output and its progress in the same save (they could be split across two saves, and a crash between them made the loop fail for good, or run an item again), and keeps how far it may run ahead bounded.
+  - In conditions, a backslash in a quoted string is kept unless it escapes a quote or a backslash, so `matches "^\d+$"` means digits (it used to mean the letter d).
+  - The steps inside a skipped `switch`, `repeat` or `parallel` count as skipped, so later conditions can read them (they failed with "Unknown step reference"); dry-run plans them the same way.
+  - A `switch` with `retry` cannot contain approvals, input, sleeps or waits, like loops; `pause_ms`, `batch_size`, `item_var` and `index_var` are refused outside `for_each`; `pause_ms` and retry delays are capped like `timeout_ms`.
+  - A failed run's envelope names that run, never an earlier run that failed with the same error object.
+  - An SDK token from an older version is marked used only together with the run it becomes, after everything that could refuse it: a refusal (too few stages) no longer uses it up, and two resumes at once no longer get a spurious refusal. An older SDK pause not yet imported asks for `lobster upgrade`.
+  - CLI usage mistakes in `signal`, `runs advance` and `runs abandon` exit 2 like the others; read-only commands work on a database made before records existed.
+  - `llm.invoke` reported a live answer through an injected adapter as `cached: true`.
 - Add `concurrency: N` to `for_each`: up to N items run at once, with outputs in item order. A failed item stops new items from starting, lets running ones finish, then fails the loop; a retry runs only the items that did not finish. Such a loop cannot contain approvals, input, sleeps or waits, or use `pause_ms`. Forty 50 ms items take 0.4 s at `concurrency: 8` instead of 3 s.
 - Saves no longer grow with a run: a `for_each` loop's items and each item's output, and any step output over 1 KB, are kept beside the checkpoint as records written once, in the same transaction as the save that first needs them. A loop's saves used to rewrite every item and every finished output, so time and bytes grew with the square of its length (3,200 items wrote 630 MB and took 49 s; 8,000 items now take under 6 s). Records go when a run completes or is cancelled, stay with a failed run for its retry, and are included in `storage export`.
 - `lobster runs advance --due` advances up to 4 due runs at once instead of one after another, so a slow run no longer delays the others; `--concurrency N` (`advanceDueRuns({ concurrency })`) changes it, and `--concurrency 1` restores the old behaviour. Each run keeps its own lease.

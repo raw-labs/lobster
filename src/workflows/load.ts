@@ -13,6 +13,9 @@ import type {
 	SwitchConfig,
 } from "./types.js";
 
+/** The longest delay a timer can wait; beyond it, setTimeout fires at once (about 24.8 days). */
+const MAX_TIMER_MS = 2_147_483_647;
+
 export async function loadWorkflowFile(filePath: string): Promise<WorkflowFile> {
 	const text = await fsp.readFile(filePath, "utf8");
 	const ext = path.extname(filePath).toLowerCase();
@@ -114,7 +117,7 @@ function validateSteps(steps: WorkflowStep[], seen: Set<string>, known: Set<stri
 					!Number.isFinite(parallel.timeout_ms) ||
 					!Number.isInteger(parallel.timeout_ms) ||
 					parallel.timeout_ms < 1 ||
-					parallel.timeout_ms > 2_147_483_647)
+					parallel.timeout_ms > MAX_TIMER_MS)
 			) {
 				throw new Error(
 					`Workflow step ${step.id} parallel timeout_ms must be a positive integer between 1 and 2147483647`,
@@ -127,6 +130,10 @@ function validateSteps(steps: WorkflowStep[], seen: Set<string>, known: Set<stri
 					throw new Error(`Workflow step ${step.id} parallel branches must be objects`);
 				}
 				validateRecovery(branch);
+				if (typeof branch.cwd === "string" && branch.cwd.includes("\0"))
+					throw new Error(
+						`Workflow step ${step.id} parallel branch ${branch.id} cwd cannot contain a NUL character`,
+					);
 				if (!branch.id || typeof branch.id !== "string") {
 					throw new Error(`Workflow step ${step.id} parallel branch requires an id`);
 				}
@@ -190,9 +197,14 @@ function validateSteps(steps: WorkflowStep[], seen: Set<string>, known: Set<stri
 			}
 			if (
 				step.pause_ms !== undefined &&
-				(typeof step.pause_ms !== "number" || !Number.isFinite(step.pause_ms) || step.pause_ms < 0)
+				(typeof step.pause_ms !== "number" ||
+					!Number.isFinite(step.pause_ms) ||
+					step.pause_ms < 0 ||
+					step.pause_ms > MAX_TIMER_MS)
 			) {
-				throw new Error(`Workflow step ${step.id} pause_ms must be a finite non-negative number`);
+				throw new Error(
+					`Workflow step ${step.id} pause_ms must be a number from 0 to ${MAX_TIMER_MS}`,
+				);
 			}
 			if (
 				step.concurrency !== undefined &&
@@ -298,9 +310,9 @@ function validateSteps(steps: WorkflowStep[], seen: Set<string>, known: Set<stri
 				`Workflow step ${step.id} requires run, command, pipeline, workflow, parallel, for_each, repeat, switch, sleep, wait, approval, or input`,
 			);
 		}
-		if (step.concurrency !== undefined && !isForEach) {
-			throw new Error(`Workflow step ${step.id} concurrency applies only to for_each`);
-		}
+		for (const key of ["concurrency", "pause_ms", "batch_size", "item_var", "index_var"] as const)
+			if (step[key] !== undefined && !isForEach)
+				throw new Error(`Workflow step ${step.id} ${key} applies only to for_each`);
 		if (step.steps !== undefined && !isForEach && !isRepeat) {
 			throw new Error(
 				`Workflow step ${step.id} has steps, which only for_each and repeat take (group steps with switch cases or a child workflow)`,
@@ -503,6 +515,10 @@ function validateSwitch(step: WorkflowStep, seen: Set<string>, known: Set<string
 			throw new Error(`${name} else must be a list of steps (empty for none)`);
 		validateSteps(config.else, seen, new Set(known));
 	}
+	refuseGatesUnderRetry(step, "switch", [
+		...config.cases.flatMap((entry) => entry.steps),
+		...(config.else ?? []),
+	]);
 }
 
 /**
@@ -537,10 +553,10 @@ function validateRepeat(step: WorkflowStep, seen: Set<string>, known: Set<string
 }
 
 /** A retry runs a loop again from the start, so it would ask its questions again. */
-function refuseGatesUnderRetry(step: WorkflowStep, kind: string) {
-	if ((step.retry?.max ?? 1) > 1 && containsGate(step.steps ?? []))
+function refuseGatesUnderRetry(step: WorkflowStep, kind: string, inside = step.steps ?? []) {
+	if ((step.retry?.max ?? 1) > 1 && containsGate(inside))
 		throw new Error(
-			`Workflow step ${step.id} ${kind} with retry cannot contain approval, input, sleep or wait steps: a retry would run the loop again and ask again`,
+			`Workflow step ${step.id} ${kind} with retry cannot contain approval, input, sleep or wait steps: a retry would run it again and ask again`,
 		);
 }
 
@@ -601,7 +617,7 @@ function validateStepOptions(step: WorkflowStep, name: string, known: ReadonlySe
 			!Number.isFinite(step.timeout_ms) ||
 			!Number.isInteger(step.timeout_ms) ||
 			step.timeout_ms < 1 ||
-			step.timeout_ms > 2_147_483_647)
+			step.timeout_ms > MAX_TIMER_MS)
 	) {
 		throw new Error(`${name} timeout_ms must be a positive integer between 1 and 2147483647`);
 	}
@@ -629,15 +645,21 @@ function validateStepOptions(step: WorkflowStep, name: string, known: ReadonlySe
 		}
 		if (
 			r.delay_ms !== undefined &&
-			(typeof r.delay_ms !== "number" || !Number.isFinite(r.delay_ms) || r.delay_ms < 0)
+			(typeof r.delay_ms !== "number" ||
+				!Number.isFinite(r.delay_ms) ||
+				r.delay_ms < 0 ||
+				r.delay_ms > MAX_TIMER_MS)
 		) {
-			throw new Error(`${name} retry.delay_ms must be a finite non-negative number`);
+			throw new Error(`${name} retry.delay_ms must be a number from 0 to ${MAX_TIMER_MS}`);
 		}
 		if (
 			r.max_delay_ms !== undefined &&
-			(typeof r.max_delay_ms !== "number" || !Number.isFinite(r.max_delay_ms) || r.max_delay_ms < 0)
+			(typeof r.max_delay_ms !== "number" ||
+				!Number.isFinite(r.max_delay_ms) ||
+				r.max_delay_ms < 0 ||
+				r.max_delay_ms > MAX_TIMER_MS)
 		) {
-			throw new Error(`${name} retry.max_delay_ms must be a finite non-negative number`);
+			throw new Error(`${name} retry.max_delay_ms must be a number from 0 to ${MAX_TIMER_MS}`);
 		}
 		if (r.jitter !== undefined && typeof r.jitter !== "boolean") {
 			throw new Error(`${name} retry.jitter must be a boolean`);
@@ -648,7 +670,7 @@ function validateStepOptions(step: WorkflowStep, name: string, known: ReadonlySe
 		(typeof step.heartbeat_timeout_ms !== "number" ||
 			!Number.isInteger(step.heartbeat_timeout_ms) ||
 			step.heartbeat_timeout_ms < 1 ||
-			step.heartbeat_timeout_ms > 2_147_483_647)
+			step.heartbeat_timeout_ms > MAX_TIMER_MS)
 	) {
 		throw new Error(
 			`${name} heartbeat_timeout_ms must be a positive integer between 1 and 2147483647`,

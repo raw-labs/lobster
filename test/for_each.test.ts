@@ -175,7 +175,7 @@ test("for_each validation rejects a retry around an approval in its sub-steps", 
 	);
 	await assert.rejects(
 		() => loadWorkflowFile(filePath),
-		/for_each with retry cannot contain approval, input, sleep or wait steps: a retry would run the loop again and ask again/,
+		/for_each with retry cannot contain approval, input, sleep or wait steps: a retry would run it again and ask again/,
 	);
 });
 
