@@ -1156,7 +1156,7 @@ The source is one TypeScript package; only `src/cli.ts` sits at the top of `src`
 | `src/persistence` | The SQLite run store, sessions, history and waits |
 | `src/state` | State keys, file locks and atomic writes |
 | `src/resume` | Resume arguments, options and tokens |
-| `src/llm` | LLM spend accounting and cost tracking |
+| `src/llm` | `llm.invoke`'s protocol, adapters, answer cache and flags; LLM spend accounting and cost tracking |
 | `src/process`, `src/io`, `src/util` | Child processes, stream and HTTP reads, small shared helpers |
 
 Run `pnpm test`, `pnpm typecheck`, and `pnpm lint` before submitting changes.

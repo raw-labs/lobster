@@ -37,7 +37,12 @@ function sourceOf(command: DefinedCommand): string {
 	];
 	const found = all.find((file) => readFileSync(file, "utf8").includes(`name: "${command.name}"`));
 	assert.ok(found, `no source file defines ${command.name}`);
-	return readFileSync(found, "utf8");
+	const source = readFileSync(found, "utf8");
+	// A command's code may live partly in src/llm (llm.invoke's adapters, cache and flags).
+	const helpers = [...source.matchAll(/from "(?:\.\.\/)+llm\/(\w+)\.js"/g)].map((m) =>
+		readFileSync(path.join(repoRoot, "src", "llm", `${m[1]}.ts`), "utf8"),
+	);
+	return [source, ...helpers].join("\n");
 }
 
 const empty = async function* () {};
