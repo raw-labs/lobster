@@ -1,4 +1,5 @@
 import { runPipeline as runCorePipeline } from "../pipeline/runtime.js";
+import type { CommandMeta } from "../commands/types.js";
 
 /**
  * SDK Runtime - Executes Lobster pipelines
@@ -14,10 +15,16 @@ import { runPipeline as runCorePipeline } from "../pipeline/runtime.js";
 export type SdkStageArgs = { input: AsyncIterable<unknown>; ctx: any };
 
 /**
- * A stage of an SDK pipeline: a function of the stage's items (a generator function gets the
- * stream instead), or an object with a command-like `run`.
+ * A stage object: a command-like `run`, and the `meta` of the command it runs, if any (the
+ * SDK's own stages set it, so a resumed run treats them as it treats the command).
  */
-export type SdkStage = ((items: any, ctx: any) => unknown) | { run(args: SdkStageArgs): unknown };
+export type SdkStageObject = { run(args: SdkStageArgs): unknown; meta?: CommandMeta };
+
+/**
+ * A stage of an SDK pipeline: a function of the stage's items (a generator function gets the
+ * stream instead), or a stage object.
+ */
+export type SdkStage = ((items: any, ctx: any) => unknown) | SdkStageObject;
 
 async function collectItems(iterable: AsyncIterable<unknown> | Iterable<unknown>) {
 	const items: unknown[] = [];
@@ -44,33 +51,43 @@ export function sdkPipelineText(count: number) {
 	return Array.from({ length: count }, (_stage, index) => `sdk.stage.${index}`).join(" | ");
 }
 
+/** The parts of a stage's meta the engine acts on (recovery and resume safety). */
+function engineMeta(meta: CommandMeta | undefined) {
+	if (!meta) return {};
+	const { sideEffects, repeatable, resumeSafeBeforeInput, resumeSafeAfterInput } = meta;
+	return { sideEffects, repeatable, resumeSafeBeforeInput, resumeSafeAfterInput };
+}
+
 /**
  * Commands named `sdk.stage.<n>` that run an SDK instance's stages. A run saves only these
  * names, so the instance that resumes it supplies the stages again.
  */
-export function sdkStageRegistry(stages: SdkStage[], runtimeCtx: Record<string, unknown> = {}) {
+export function sdkStageRegistry(stages: SdkStage[]) {
 	const commands = new Map(
 		stages.map((stage, index) => [
 			`sdk.stage.${index}`,
 			{
-				meta: { description: `SDK stage ${index}`, argsSchema: { type: "object" } },
-				async run({ input, ctx }: { input: AsyncIterable<unknown>; ctx: Record<string, unknown> }) {
-					const stageCtx = { ...runtimeCtx, ...ctx };
+				meta: {
+					...engineMeta(typeof stage === "function" ? undefined : stage?.meta),
+					description: `SDK stage ${index}`,
+					argsSchema: { type: "object" },
+				},
+				async run({ input, ctx }: SdkStageArgs) {
 					if (typeof stage === "function") {
 						const isGenerator =
 							stage.constructor?.name === "AsyncGeneratorFunction" ||
 							stage.constructor?.name === "GeneratorFunction";
 
 						if (isGenerator) {
-							return { output: normalizeSdkOutput(stage(input, stageCtx)) };
+							return { output: normalizeSdkOutput(stage(input, ctx)) };
 						}
 
 						const items = await collectItems(input);
-						return { output: normalizeSdkOutput(await stage(items, stageCtx)) };
+						return { output: normalizeSdkOutput(await stage(items, ctx)) };
 					}
 
 					if (typeof stage?.run === "function") {
-						const result: any = await stage.run({ input, ctx: stageCtx });
+						const result: any = await stage.run({ input, ctx: ctx });
 						return result && "output" in result
 							? { ...result, output: normalizeSdkOutput(result.output) }
 							: result;

@@ -9,7 +9,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { Lobster } from "../src/sdk/Lobster.js";
-import { exec, shell } from "../src/sdk/primitives/exec.js";
+import { exec } from "../src/sdk/primitives.js";
 import { approve, runPipeline } from "../src/sdk/index.js";
 
 function emptyInput() {
@@ -92,7 +92,7 @@ test("sdk shell abort signal kills a long-running child", async () => {
 		const controller = new AbortController();
 		const fixture = await nodeShellFixture(dir, longChildScript);
 		const pending = runAbortableStage(
-			shell(fixture.command, { json: false }),
+			exec(fixture.command, { shell: true, json: false }),
 			controller.signal,
 			dir,
 			fixture.env,
@@ -207,7 +207,7 @@ for (const useShell of [false, true]) {
 			assert.deepEqual(success.output, [1, 2]);
 			const failed = await run('console.error("failed");process.exit(7)');
 			assert.equal(failed.ok, false);
-			assert.match(failed.error.message, /exited with code 7: failed/);
+			assert.match(failed.error.message, /exec failed \(7\): failed/);
 			const missing = await new Lobster({
 				env: { ...process.env, LOBSTER_SHELL: "lobster-nonexistent-executable-for-test" },
 				signal: controller.signal,
@@ -219,7 +219,7 @@ for (const useShell of [false, true]) {
 				missing.error.message,
 				useShell
 					? /exec shell not found; check LOBSTER_SHELL or ComSpec/
-					: /Failed to execute .* ENOENT/,
+					: /exec command not found: lobster-nonexistent-executable-for-test/,
 			);
 			assert.equal(getEventListeners(controller.signal, "abort").length, 0);
 		} finally {
@@ -245,7 +245,7 @@ test(
 			const result = await new Lobster({
 				env: { ...process.env, ...fixture.env, LOBSTER_TEST_NODE: executable },
 			})
-				.pipe(shell(fixture.command, { cwd: dir }))
+				.pipe(exec(fixture.command, { shell: true, cwd: dir }))
 				.run();
 			assert.equal(result.ok, true);
 			assert.deepEqual(result.output, [await realpath(fixture.env.LOBSTER_TEST_SCRIPT)]);

@@ -39,64 +39,69 @@ export const execCommand = defineCommand({
 		);
 	},
 	async run({ input, args, ctx }) {
-		const cmd = args._;
-		const cwd = ctx?.cwd ?? process.cwd();
-
+		const cmd: string[] = args._;
 		const shellLine = typeof args.shell === "string" ? args.shell : null;
-		const useShell = Boolean(args.shell) || (cmd.length === 1 && /\s/.test(cmd[0]));
-		const stdinMode = typeof args.stdin === "string" ? String(args.stdin).toLowerCase() : null;
-
 		if (!cmd.length && !shellLine) throw new Error("exec requires a command");
-
-		let stdinPayload = null;
-		if (stdinMode) {
-			const items = [];
-			for await (const item of input) items.push(item);
-			stdinPayload = encodeStdin(items, stdinMode);
-		} else {
-			// Drain input to avoid dangling streams.
-			for await (const _item of input) {
-				// no-op
-			}
-		}
-
-		const result = useShell
-			? await runShellLine(shellLine ?? cmd[0] ?? "", {
-					env: ctx.env,
-					cwd,
-					stdin: stdinPayload,
-					signal: ctx.signal,
-					assertInvocationCurrent: ctx.assertInvocationCurrent,
-					forceTerminationSignal: ctx.forceTerminationSignal,
-				})
-			: await runProcess(cmd[0], cmd.slice(1), {
-					env: ctx.env,
-					cwd,
-					stdin: stdinPayload,
-					signal: ctx.signal,
-					assertInvocationCurrent: ctx.assertInvocationCurrent,
-					forceTerminationSignal: ctx.forceTerminationSignal,
-				});
-
-		if (args.json) {
-			let parsed;
-			try {
-				parsed = JSON.parse(result.stdout.trim() || "null");
-			} catch (err) {
-				throw new Error(
-					`exec --json could not parse stdout as JSON: ${err?.message ?? String(err)}`,
-				);
-			}
-
-			return {
-				output: streamOf(Array.isArray(parsed) ? parsed : [parsed]),
-			};
-		}
-
-		const lines = result.stdout.split(/\r?\n/).filter(Boolean);
-		return { output: streamOf(lines) };
+		// `exec "ls -la"` is one word with a space: it runs as a shell line, like --shell.
+		const useShell = Boolean(args.shell) || (cmd.length === 1 && /\s/.test(cmd[0]));
+		const target: ExecTarget = useShell ? { shellLine: shellLine ?? cmd[0] } : { argv: cmd };
+		return runExec(target, { json: Boolean(args.json), stdin: args.stdin }, input, ctx);
 	},
 });
+
+/** What exec runs: an executable with its arguments, or a line for the system shell. */
+export type ExecTarget = { argv: string[] } | { shellLine: string };
+
+/**
+ * Run `target` as the exec command does: pipeline input goes to stdin in the `stdin` format (or
+ * is drained), and stdout becomes items, parsed as one JSON value with `json` or else one item
+ * per line. The SDK's `exec()` runs through here too.
+ */
+export async function runExec(
+	target: ExecTarget,
+	options: { json?: boolean; stdin?: string },
+	input: AsyncIterable<unknown>,
+	ctx: any,
+) {
+	const stdinMode = typeof options.stdin === "string" ? options.stdin.toLowerCase() : null;
+	let stdinPayload = null;
+	if (stdinMode) {
+		const items = [];
+		for await (const item of input) items.push(item);
+		stdinPayload = encodeStdin(items, stdinMode);
+	} else {
+		// Drain input to avoid dangling streams.
+		for await (const _item of input) {
+			// no-op
+		}
+	}
+
+	const processContext: ProcessContext = {
+		env: ctx.env,
+		cwd: ctx.cwd ?? process.cwd(),
+		stdin: stdinPayload,
+		signal: ctx.signal,
+		assertInvocationCurrent: ctx.assertInvocationCurrent,
+		forceTerminationSignal: ctx.forceTerminationSignal,
+	};
+	const result =
+		"shellLine" in target
+			? await runShellLine(target.shellLine, processContext)
+			: await runProcess(target.argv[0], target.argv.slice(1), processContext);
+
+	if (options.json) {
+		let parsed;
+		try {
+			parsed = JSON.parse(result.stdout.trim() || "null");
+		} catch (err: any) {
+			throw new Error(`exec --json could not parse stdout as JSON: ${err?.message ?? String(err)}`);
+		}
+		return { output: streamOf(Array.isArray(parsed) ? parsed : [parsed]) };
+	}
+
+	const lines = result.stdout.split(/\r?\n/).filter(Boolean);
+	return { output: streamOf(lines) };
+}
 
 /** What a spawned command gets from the stage that runs it. */
 type ProcessContext = Pick<

@@ -5,8 +5,7 @@ import path from "node:path";
 import { mkdtempSync, promises as fsp } from "node:fs";
 import { createDefaultRegistry } from "../src/commands/registry.js";
 import { runPipeline } from "../src/pipeline/runtime.js";
-import { diffLast, diffAndStoreValue } from "../src/sdk/primitives/diff.js";
-import { stateSet, readState, writeState } from "../src/sdk/primitives/state.js";
+import { diffLast, stateSet } from "../src/sdk/primitives.js";
 import {
 	diffAndStore,
 	keyToPath,
@@ -162,7 +161,7 @@ test("ordinary state reads work when creating a coordination lock is forbidden",
 		},
 	});
 	try {
-		assert.deepEqual(await readState(key, { env }), value);
+		assert.deepEqual(await readStateJson({ env, key }), value);
 		const registry = createDefaultRegistry();
 		const output = await runPipeline({
 			pipeline: [{ name: "state.get", args: { _: [key] }, raw: `state.get ${key}` }],
@@ -468,7 +467,11 @@ test("diffAndStore serializes cancellation rollback before a concurrent snapshot
 	await cancelledSnapshotPublished;
 
 	let successfulSnapshotPublished = false;
-	const successful = writeState("snapshot", { version: "successful-B" }, { env }).then(() => {
+	const successful = writeStateJson({
+		env,
+		key: "snapshot",
+		value: { version: "successful-B" },
+	}).then(() => {
 		successfulSnapshotPublished = true;
 	});
 	await new Promise((resolve) => setTimeout(resolve, 20));
@@ -805,7 +808,7 @@ test("SDK diff primitives treat corrupt previous state as a miss (#112)", async 
 	const ctx = { env: { LOBSTER_STATE_DIR: tmp } };
 	await storeRaw(tmp, "sdk-snapshot", '{"partial"');
 
-	const direct = await diffAndStoreValue("sdk-snapshot", { next: true }, ctx);
+	const direct = await diffAndStore({ ...ctx, key: "sdk-snapshot", value: { next: true } });
 	assert.equal(direct.before, null);
 	assert.equal(direct.changed, true);
 
@@ -850,7 +853,7 @@ test("SDK stateSet/readState is atomic under concurrent reads (#109)", async () 
 	const reader = (async () => {
 		for (let i = 0; i < 500; i++) {
 			try {
-				const v = await readState(key, ctx);
+				const v = await readStateJson({ ...ctx, key });
 				if (!v || v.payload !== payload) partialReads++;
 			} catch {
 				readErrors++;

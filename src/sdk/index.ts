@@ -18,11 +18,18 @@
  */
 
 export { Lobster, type LobsterOptions } from "./Lobster.js";
-export { approve } from "./primitives/approve.js";
-export { exec } from "./primitives/exec.js";
-export { stateGet, stateSet, state } from "./primitives/state.js";
-export { diffLast } from "./primitives/diff.js";
-export { runPipeline } from "./runtime.js";
+export {
+	approve,
+	exec,
+	stateGet,
+	stateSet,
+	state,
+	diffLast,
+	type ApproveOptions,
+	type ExecOptions,
+	type DiffLastOptions,
+} from "./primitives.js";
+export { runPipeline, type SdkStage, type SdkStageObject, type SdkStageArgs } from "./runtime.js";
 
 export {
 	openStoreSession,

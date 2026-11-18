@@ -29,7 +29,12 @@ for (const stream of ["stdout", "stderr"]) {
 					.run();
 				assert.equal(result.ok, limit === "");
 				if (limit) assert.match(result.error.message, /Process output exceeded 1024 bytes/);
-				else assert.equal(result.output[0].length, stream === "stdout" ? large : 0);
+				// One item per output line: the stdout line, and nothing for stderr.
+				else
+					assert.deepEqual(
+						result.output.map((line: string) => line.length),
+						stream === "stdout" ? [large] : [],
+					);
 			}
 		} finally {
 			await rm(dir, { recursive: true, force: true });

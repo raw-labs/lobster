@@ -5,9 +5,9 @@ import { Writable } from "node:stream";
 import { validateCommandInputState } from "../pipeline/input_request.js";
 import { parsePipeline } from "../pipeline/parser.js";
 import { runtimeErrorDetails } from "../persistence/backend.js";
-import { sessionFromEnv, bindResumeGuard } from "../persistence/context.js";
+import { sessionFromEnv, bindResumeGuard, bindStoreSession } from "../persistence/context.js";
 import { withStoreContext } from "../persistence/execution.js";
-import type { PersistenceOptions } from "../persistence/context.js";
+import type { PersistenceOptions, StoreHandle } from "../persistence/context.js";
 import { resolveWait, callerId } from "../persistence/waits.js";
 import { decodeToken } from "../resume/token.js";
 import type { RunContext } from "../engine/context.js";
@@ -28,7 +28,6 @@ import {
 } from "../workflows/upgrade.js";
 import { CheckpointTakenError } from "../persistence/session.js";
 import { sdkInputItems, sdkPipelineText, sdkStageRegistry, type SdkStage } from "./runtime.js";
-import { stateEnv } from "./state_env.js";
 
 /** A token handed out by Lobster versions before SDK pipelines became runs. */
 type LegacySdkToken = {
@@ -209,7 +208,7 @@ export class Lobster {
 						stderr: discard(),
 						cwd: process.cwd(),
 						signal: this.#options.signal,
-						registry: sdkStageRegistry(this.#stages, { stateDir: this.#options.stateDir }),
+						registry: sdkStageRegistry(this.#stages),
 						runMetadata: this.#options.runMetadata,
 					}),
 				),
@@ -413,4 +412,16 @@ function discard() {
 			callback();
 		},
 	});
+}
+
+/** The environment a run of these options uses: `stateDir` and `storeSession` applied. */
+function stateEnv(options: {
+	stateDir?: string;
+	env?: NodeJS.ProcessEnv;
+	storeSession?: StoreHandle;
+}) {
+	const env = options.stateDir
+		? { ...(options.env ?? process.env), LOBSTER_STATE_DIR: options.stateDir }
+		: (options.env ?? process.env);
+	return options.storeSession ? bindStoreSession(env, options.storeSession) : env;
 }

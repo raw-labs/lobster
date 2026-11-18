@@ -656,6 +656,12 @@ process stopped, or it failed). `lobster runs advance` refuses SDK runs and
 `runs advance --due` skips them: only their host has the stages. Like every token, an
 SDK token resumes once; a token handed out by an older version is honoured once, then
 refused. Workflow-file and pipeline waits resume through `resumeToolRequest`.
+
+The SDK's ready-made stages run the built-in commands: `exec(command, options)` is `exec`
+(JSON output by default; `json: false` yields lines; `shell`, `cwd`, `stdin`),
+`approve({ prompt, preview, limit })` is `approve --emit`, `stateGet`/`stateSet` are
+`state.get`/`state.set`, and `diffLast(key, { changesOnly })` is `diff.last`. They behave
+exactly as those commands do in a pipeline, including how a resumed run treats them.
 Legacy records do not retroactively acquire history or a known caller. Imported
 older tracked waits may have `request: null` when the original question was not
 saved; discovery does not invent it by rereading a changed workflow file.

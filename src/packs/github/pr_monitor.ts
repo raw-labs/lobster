@@ -13,7 +13,7 @@ import { buildPrChangeSummary, formatPrChangeMessage } from "./snapshot.js";
  */
 
 import { Lobster } from "../../sdk/index.js";
-import { diffLast } from "../../sdk/primitives/diff.js";
+import { diffLast } from "../../sdk/primitives.js";
 import { ghPrView } from "./pr_view.js";
 
 /**
