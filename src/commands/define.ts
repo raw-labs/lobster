@@ -31,8 +31,10 @@ export function booleanFlags(command: CommandLike | undefined): string[] {
 }
 
 /**
- * Reject flags a command does not declare, so a misspelled flag fails instead of being ignored.
- * Commands without a schema (custom host commands) are not checked.
+ * Reject flags a command does not declare, so a misspelled flag fails instead of being ignored;
+ * a flag given with its alias (`aliasOf`); a number flag without a number; a value outside the
+ * flag's choices. Checked before any stage runs. Commands without a schema (custom host
+ * commands) are not checked.
  */
 export function assertKnownFlags(
 	command: CommandLike,
@@ -42,6 +44,8 @@ export function assertKnownFlags(
 	const properties = (command.meta?.argsSchema as CommandArgsSchema | undefined)?.properties;
 	if (!properties) return;
 	const allowed = Object.keys(properties).filter((key) => key !== "_");
+	// The spelling given for each flag that has aliases, by the flag it stands for.
+	const spelled = new Map<string, string>();
 	for (const [key, value] of Object.entries(args)) {
 		if (key === "_") continue;
 		if (!allowed.includes(key)) {
@@ -52,8 +56,16 @@ export function assertKnownFlags(
 				}`,
 			);
 		}
-		// A value outside the flag's declared choices is refused before any stage runs.
-		const choices = properties[key].enum;
+		if (value === undefined) continue;
+		const spec = properties[key];
+		const flag = typeof spec.aliasOf === "string" ? spec.aliasOf : key;
+		const other = spelled.get(flag);
+		if (other && other !== key)
+			throw new Error(`${invokedAs} takes --${other} or --${key}, not both`);
+		spelled.set(flag, key);
+		if (spec.type === "number" && !isNumber(value))
+			throw new Error(`${invokedAs} --${key} takes a number (got ${JSON.stringify(value)})`);
+		const choices = spec.enum;
 		if (Array.isArray(choices) && typeof value === "string" && !choices.includes(value))
 			throw new Error(
 				`${invokedAs} --${key} must be one of ${choices.join(", ")} (got "${value}")`,
@@ -61,12 +73,8 @@ export function assertKnownFlags(
 	}
 }
 
-/** The value of whichever spelling of a flag was given; two spellings at once are refused. */
-export function oneSpelling(command: string, args: Record<string, unknown>, names: string[]) {
-	const given = names.filter((name) => args[name] !== undefined);
-	if (given.length > 1)
-		throw new Error(
-			`${command} takes ${given.map((name) => `--${name}`).join(" or ")}, not more than one`,
-		);
-	return given.length ? args[given[0]] : undefined;
+/** A number, or text that reads as one (flags arrive as text). */
+function isNumber(value: unknown) {
+	if (typeof value === "number") return Number.isFinite(value);
+	return typeof value === "string" && value.trim() !== "" && Number.isFinite(Number(value));
 }

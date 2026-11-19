@@ -10,7 +10,7 @@ export const gogGmailSearchCommand = defineCommand({
 			properties: {
 				query: { type: "string", description: "Gmail search query", default: "newer_than:1d" },
 				max: { type: "number", description: "Max results", default: 20 },
-				limit: { type: "number", description: "Alias for max" },
+				limit: { type: "number", aliasOf: "max", description: "Alias for max" },
 				_: { type: "array", items: { type: "string" } },
 			},
 			required: [],

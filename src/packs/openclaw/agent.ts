@@ -26,12 +26,20 @@ export function createOpenClawAgentCommand(runCli: AgentCliRunner = runOpenClawA
 				properties: {
 					agent: { type: "string", description: "Configured OpenClaw agent id" },
 					prompt: { type: "string", description: "Message for the agent" },
-					message: { type: "string", description: "Alias for prompt" },
+					message: { type: "string", aliasOf: "prompt", description: "Alias for prompt" },
 					model: { type: "string", description: "OpenClaw model override for this turn" },
 					sessionKey: { type: "string", description: "OpenClaw session key" },
-					"session-key": { type: "string", description: "Alias for sessionKey" },
+					"session-key": {
+						type: "string",
+						aliasOf: "sessionKey",
+						description: "Alias for sessionKey",
+					},
 					sessionId: { type: "string", description: "OpenClaw session id" },
-					"session-id": { type: "string", description: "Alias for sessionId" },
+					"session-id": {
+						type: "string",
+						aliasOf: "sessionId",
+						description: "Alias for sessionId",
+					},
 					thinking: { type: "string", description: "OpenClaw thinking level" },
 					timeout: { type: "number", description: "Agent timeout in seconds" },
 					local: { type: "boolean", description: "Force OpenClaw embedded execution" },

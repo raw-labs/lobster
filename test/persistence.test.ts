@@ -211,7 +211,7 @@ test("SQLite sessions keep filesystem publication functions out of worker messag
 			key: "fixture",
 			value: 42,
 		});
-		assert.deepEqual(result, { signalAbortedAfterCommit: false });
+		assert.equal(result.signalAbortedAfterCommit, false);
 		assert.equal(JSON.parse((await store.read("fixture")).text), 42);
 	} finally {
 		await store.close();

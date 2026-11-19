@@ -114,15 +114,9 @@ async function writeJson(
 
 /** Write `value` under its key. */
 export function writeStateJson(options: WriteOptions) {
-	return inStore(options.env, { signal: options.signal }, async (session, env) => {
-		const { signalAbortedAfterCommit } = await withStateKeyLock(
-			env,
-			options.key,
-			options.signal,
-			() => writeJson(session, options),
-		);
-		return { signalAbortedAfterCommit };
-	});
+	return inStore(options.env, { signal: options.signal }, (session, env) =>
+		withStateKeyLock(env, options.key, options.signal, () => writeJson(session, options)),
+	);
 }
 
 /**

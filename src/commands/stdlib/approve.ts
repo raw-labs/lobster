@@ -1,4 +1,4 @@
-import { defineCommand, oneSpelling } from "../define.js";
+import { defineCommand } from "../define.js";
 import { readLineFromStream } from "../../io/read_line.js";
 import { approvalInputTimeoutMs, isInteractive, yesOrNoPrompt } from "../../io/terminal.js";
 import { streamOf } from "../../io/streams.js";
@@ -16,10 +16,14 @@ export const approveCommand = defineCommand({
 					type: "boolean",
 					description: "Include a preview of the input items in the request",
 				},
-				previewFromStdin: { type: "boolean", description: "Alias for preview-from-stdin" },
+				previewFromStdin: {
+					type: "boolean",
+					aliasOf: "preview-from-stdin",
+					description: "Alias for preview-from-stdin",
+				},
 				limit: { type: "number", description: "Items in the preview (default 5)" },
-				"preview-limit": { type: "number", description: "Alias for limit" },
-				previewLimit: { type: "number", description: "Alias for limit" },
+				"preview-limit": { type: "number", aliasOf: "limit", description: "Alias for limit" },
+				previewLimit: { type: "number", aliasOf: "limit", description: "Alias for limit" },
 				_: { type: "array", items: { type: "string" } },
 			},
 			required: [],
@@ -33,14 +37,9 @@ export const approveCommand = defineCommand({
 	},
 	async run({ input, args, ctx }) {
 		const prompt = args.prompt ?? "Approve?";
-		const previewFromStdin = Boolean(
-			oneSpelling("approve", args, ["preview-from-stdin", "previewFromStdin"]),
-		);
-		const previewLimitRaw = oneSpelling("approve", args, [
-			"limit",
-			"preview-limit",
-			"previewLimit",
-		]);
+		// One spelling of each at most: the others are refused with the stage's flags.
+		const previewFromStdin = Boolean(args["preview-from-stdin"] ?? args.previewFromStdin);
+		const previewLimitRaw = args.limit ?? args["preview-limit"] ?? args.previewLimit;
 		const previewLimit = Number.isFinite(Number(previewLimitRaw)) ? Number(previewLimitRaw) : 5;
 
 		const items = [];

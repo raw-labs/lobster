@@ -50,11 +50,10 @@ function toTokenCount(value: unknown): number {
 }
 
 /**
- * The token counts a usage record is billed for, under any of the spellings providers use.
- * Everything else a record carries — a `totalTokens`, a cache breakdown — costs nothing, so
- * two records agreeing on these two numbers cost the same.
+ * The token counts a usage record is priced on, under any of the spellings providers use.
+ * Everything else a record carries (a `totalTokens`, a cache breakdown) is not priced.
  */
-export function billableTokens(usage: Record<string, unknown>) {
+function billableTokens(usage: Record<string, unknown>) {
 	return {
 		inputTokens: toTokenCount(usage.inputTokens ?? usage.input_tokens ?? usage.prompt_tokens),
 		outputTokens: toTokenCount(
@@ -97,12 +96,11 @@ export class CostTracker {
 	}
 
 	/**
-	 * Seeds this tracker with spend an earlier run of the same workflow already recorded — the
-	 * steps completed before an approval or input gate paused it. A pause is not a spend reset:
-	 * without this, `_meta.cost` after a resume would report only the steps that ran after it,
-	 * and a `cost_limit` could be walked past one gate at a time. Entries are rebuilt through
-	 * the same normalization as live usage rather than trusted verbatim, so a malformed stored
-	 * record cannot poison later totals.
+	 * Seeds this tracker with the calls earlier invocations of this run recorded (before it
+	 * paused, stopped or failed). Continuing a run is not a spend reset: without this,
+	 * `_meta.cost` would report only the calls made since, and a `cost_limit` could be walked
+	 * past one pause at a time. Entries are rebuilt through the same normalization as live usage
+	 * rather than trusted verbatim, so a malformed stored record cannot poison later totals.
 	 */
 	restore(steps: readonly StepCost[] | undefined) {
 		if (!Array.isArray(steps)) return;

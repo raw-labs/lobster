@@ -26,7 +26,7 @@ export const gogGmailSendCommand = defineCommand({
 			type: "object",
 			properties: {
 				dryRun: { type: "boolean", description: "If true, do not send; echo drafts" },
-				"dry-run": { type: "boolean", description: "Alias for dryRun" },
+				"dry-run": { type: "boolean", aliasOf: "dryRun", description: "Alias for dryRun" },
 				_: { type: "array", items: { type: "string" } },
 			},
 			required: [],

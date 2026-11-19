@@ -1,4 +1,4 @@
-import { defineCommand, oneSpelling } from "../define.js";
+import { defineCommand } from "../define.js";
 import { responseChecker } from "../../util/validation.js";
 import { readLineFromStream } from "../../io/read_line.js";
 import {
@@ -27,7 +27,11 @@ export const askCommand = defineCommand({
 					type: "boolean",
 					description: "Use stdin content as the subject (preview text)",
 				},
-				subjectFromStdin: { type: "boolean", description: "Alias for subject-from-stdin" },
+				subjectFromStdin: {
+					type: "boolean",
+					aliasOf: "subject-from-stdin",
+					description: "Alias for subject-from-stdin",
+				},
 				emit: { type: "boolean", description: "Force emit mode" },
 				_: { type: "array", items: { type: "string" } },
 			},
@@ -55,9 +59,8 @@ export const askCommand = defineCommand({
 	},
 	async run({ input, args, ctx }) {
 		const prompt = typeof args.prompt === "string" ? args.prompt : "Input required";
-		const subjectFromStdin = Boolean(
-			oneSpelling("ask", args, ["subject-from-stdin", "subjectFromStdin"]),
-		);
+		// One spelling at most: two are refused with the stage's flags.
+		const subjectFromStdin = Boolean(args["subject-from-stdin"] ?? args.subjectFromStdin);
 		const schemaRaw = typeof args.schema === "string" ? args.schema : null;
 
 		const defaultSchema = {
