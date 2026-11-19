@@ -4,6 +4,13 @@ All notable changes to Lobster will be documented in this file.
 
 ## Unreleased
 
+- Every CLI command answers with one JSON envelope on stdout, `{ protocolVersion, ok, ... }` or `{ ok: false, error: { type, message } }`, with exit code 2 for a mistake in the command line and 1 otherwise; stderr carries only messages for a person. `runs`, `waits`, `signal`, `history`, `storage`, `upgrade` and `runs advance --due` printed bare JSON or text, with errors as text on stderr. `run` and `resume` are unchanged (the envelope with `--mode tool`, as before). See "CLI output" in the reference.
+- Every command accepts `--mode tool` (and `--mode human`): `resume`, `runs`, `signal` and the others refused it, though agents pass it everywhere and earlier versions ignored it.
+- `--dry-run` puts the plan in the envelope (`plan`), not only on stderr.
+- `runs advance --due` reports a run that failed or blocked: the envelope is not `ok`, the exit code is 1, and each such run is named on stderr (a scheduler that discards stdout still shows it). It exited 0 without a word.
+- `signal --id` refuses a delivery ID used before with other data or for another event; the same event again is still a retry. It dropped the event without a word.
+- Answering a question that was already answered or withdrawn, by its resume token, names the run and its status; by approval ID or wait ID, it says it was answered or withdrawn.
+- `lobster help <command>` and `<command> --help` describe that command (they printed the overview), and the overview lists every command, flag and environment variable it uses. A missing workflow file says "Workflow file not found"; a run not found names its ID; `runs list --status` lists the valid statuses; `history prune` says what date it takes; a malformed run ID is a command-line mistake (exit 2).
 - `examples/` has workflows that run as they are (approvals, a classifier that asks a person, loops, parallel steps, polling, waiting for events, calling another workflow) and an SDK example, each checked by the tests.
 - The documented classifier and loop examples take the model's answer out of `llm.invoke`'s record (`| map --unwrap output | map --unwrap data`) before reading it: they read `$classify.json.label` from the record, where it is not.
 - A child workflow's `cost_limit` counts only the model calls its own steps made: with `concurrency`, calls that other loop items made while it ran counted against it, so a child within its limit stopped the run.

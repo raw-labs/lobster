@@ -573,8 +573,8 @@ for (const backend of ["sqlite"] as const) {
 		assert.equal(first.status, "needs_input", JSON.stringify(first));
 		const page = await cli("runs", "list", "--status", "waiting");
 		assert.equal(page.runs[0].id, first.runId);
-		const run = await cli("runs", "show", first.runId);
-		const wait = await cli("waits", "show", run.pendingWaits[0].id);
+		const { run } = await cli("runs", "show", first.runId);
+		const { wait } = await cli("waits", "show", run.pendingWaits[0].id);
 		assert.equal((wait.request as { prompt: string }).prompt, "CLI question");
 		const done = await cli(
 			"resume",

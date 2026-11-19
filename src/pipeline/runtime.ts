@@ -352,10 +352,12 @@ function dryRunPipeline({ pipeline, stderr }: { pipeline: any[]; stderr: any }) 
 	}
 
 	lines.push("");
-	stderr.write(lines.join("\n"));
+	const plan = lines.join("\n");
+	stderr.write(plan);
 	// Return rendered:true so the CLI does not print an empty JSON array to stdout.
 	return {
 		items: [],
+		plan,
 		rendered: true,
 		halted: false,
 		haltedAt: null,

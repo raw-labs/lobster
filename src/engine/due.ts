@@ -2,6 +2,7 @@
 // Each is advanced like `advanceWorkflowRun` advances one, under its own lease.
 import { messageOf } from "../util/errors.js";
 import { randomUUID } from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
 import { withStoreContext } from "../persistence/execution.js";
 import { sessionFromEnv } from "../persistence/context.js";
 import { callerId } from "../persistence/waits.js";
@@ -121,13 +122,25 @@ export async function signalEvent(options: {
 		const owner = callerId(ctx.runMetadata);
 		// Scoped to the sender: its events reach only its own runs (or any run, for an unscoped
 		// trusted caller), and its delivery IDs cannot collide with another caller's.
+		const data = options.data ?? null;
 		const { inserted } = await session.appendEvent({
 			id,
 			name: options.name,
-			data: options.data ?? null,
+			data,
 			at: Date.now(),
 			owner: owner ?? "",
 		});
+		// A repeated delivery ID is the same event again (a retry): one that names another event,
+		// or other data, is a mistake that would be dropped without a word.
+		if (!inserted) {
+			const stored = (await session.findEvents(options.name, 0, owner ?? "")).find(
+				(event) => event.id === id && event.owner === (owner ?? ""),
+			);
+			if (!stored || !isDeepStrictEqual(stored.data, data))
+				throw new Error(
+					`Event ID ${id} was already delivered${stored ? " with other data" : " for another event"}: a repeated ID must repeat the same event`,
+				);
+		}
 		const waiting: string[] = [];
 		for (let after = ""; ;) {
 			const page = await session.listRuns({

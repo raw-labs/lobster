@@ -329,7 +329,7 @@ test("lobster help <cli command> shows the usage instead of failing", () => {
 			},
 		);
 		assert.equal(help.status, 0, topic);
-		assert.match(help.stdout, /Manage runs:/);
+		assert.match(help.stdout, new RegExp(`^lobster ${topic}\\b`, "m"));
 	}
 });
 

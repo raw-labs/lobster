@@ -15,9 +15,9 @@ steps:
   - id: build
     run: echo '{"artifact":"app-${version}.tar.gz","tests":"passed"}'
 
-  # The person sees the build's output with the prompt (the prompt itself is plain text: args
-  # are not filled into it). With on_reject: continue a "no" does not cancel the run: the step
-  # completes with approved: false and the steps below decide what to do.
+  # The question carries the build's output (items, and a preview in tool mode); the prompt is
+  # plain text, as args are not filled into it. With on_reject: continue a "no" does not cancel
+  # the run: the step completes with approved: false and the steps below decide what to do.
   # required_approver or require_different_approver restrict who may answer.
   - id: approve
     approval:

@@ -351,7 +351,7 @@ test("CLI: run reminds about the upgrade off a terminal; `lobster upgrade` impor
 	const upgrade = await exec(process.execPath, [bin, "upgrade", "--json"], {
 		env,
 	});
-	const report = JSON.parse(upgrade.stdout);
+	const report = JSON.parse(upgrade.stdout).upgrade;
 	assert.equal(report.converted.length + report.imported.length, 9);
 	const after = await exec(process.execPath, hello, { env });
 	assert.doesNotMatch(after.stderr, /older version/);
@@ -366,8 +366,9 @@ test("CLI: an upgrade that finds only files it already imported says where it mo
 	const name = `${saved.approval}.json`;
 	await fs.copyFile(path.join(first.backup!, name), path.join(state, name));
 	const upgrade = await exec(process.execPath, [bin, "upgrade"], { env });
-	assert.doesNotMatch(upgrade.stdout, /Nothing to upgrade/);
-	assert.match(upgrade.stdout, /The original files were moved to /);
+	const { summary } = JSON.parse(upgrade.stdout);
+	assert.doesNotMatch(summary, /Nothing to upgrade/);
+	assert.match(summary, /The original files were moved to /);
 	await assert.rejects(fs.access(path.join(state, name)));
 });
 

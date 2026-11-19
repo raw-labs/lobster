@@ -113,7 +113,8 @@ test("resume with invalid --id returns clear error", async () => {
 		ok: false,
 		error: {
 			type: "parse_error",
-			message: 'Approval ID "deadbeef" not found or expired',
+			message:
+				'Approval ID "deadbeef" not found or expired: it was answered or withdrawn, or never existed',
 		},
 	});
 });

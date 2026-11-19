@@ -15,6 +15,7 @@ The full reference for Lobster. Start with the [README](../README.md) for what L
   - [Restarting workflow-file runs](#restarting-workflow-file-runs)
   - [Visualizing workflows](#visualizing-workflows)
 - **Runs and storage**
+  - [CLI output](#cli-output)
   - [Persistence and run history](#persistence-and-run-history)
     - [Run and pending review API](#run-and-pending-review-api)
     - [Upgrading from an older version](#upgrading-from-an-older-version)
@@ -531,6 +532,37 @@ Format notes:
 
 # Runs and storage
 
+## CLI output
+
+The CLI is made for agents: every command answers with one JSON envelope on stdout,
+
+```json
+{ "protocolVersion": 1, "ok": true, ... }
+{ "protocolVersion": 1, "ok": false, "error": { "type": "parse_error", "message": "..." } }
+```
+
+with exit code 2 for a mistake in the command line (`parse_error`: an unknown flag, a bad
+value, a malformed ID) and 1 for anything else that failed. stderr carries messages for a
+person (retries, cost warnings, the upgrade reminder) and nothing a caller has to parse.
+Every command accepts `--mode tool`.
+
+- `run` and `resume` print the run's envelope: `status` (`ok`, `needs_approval`,
+  `needs_input`, `waiting`, `cancelled`), `output`, `requiresApproval` / `requiresInput`,
+  `waitingFor`, `runId`, and with `--dry-run` the `plan`. `run` prints it with `--mode tool`;
+  without it, as before, only the output (and asks at a terminal).
+- `runs list` → `runs`, `nextCursor`; `runs show` → `run`; `waits show` → `wait`;
+  `runs advance <runId>` → the run's envelope; `runs advance --due` → `due`, `advanced`
+  (not `ok`, and exit 1, when a run failed or blocked; each such run is also named on
+  stderr); `runs abandon` → `runId`, `status`, `abandoned`.
+- `signal` → `event`, `advanced`. A delivery `--id` used before is a retry and changes
+  nothing; used before with other data, or for another event, it is refused.
+- `history list` → `runs`, `nextCursor`; `history show` → `history`; `history prune` →
+  `dryRun`, `runs` (nothing is removed without `--apply`); `storage export` → `archive`.
+- `upgrade` → `upgrade` (the report) and `summary` (the report in words).
+- `graph`, `help` and `version` print text, which is their output.
+
+`lobster help <command>` (or `<command> --help`) describes one command.
+
 ## Persistence and run history
 
 Lobster keeps its state in one SQLite database, `lobster.sqlite`, in the state
@@ -710,7 +742,7 @@ Older versions kept state as loose JSON files in the state directory. After
 installing this version, stop older Lobster processes and run once:
 
 ```sh
-lobster upgrade             # or: lobster upgrade --dry-run
+lobster upgrade             # or: lobster upgrade --dry-run (the report is in the envelope)
 ```
 
 It moves everything into `lobster.sqlite` under the same keys, so resume tokens and
@@ -731,8 +763,8 @@ It refuses while an older Lobster process holds a state lock.
 
 Until then, commands that run or continue workflows (`run`, a bare pipeline, `signal`,
 `runs advance`) ask on a terminal whether to import now; `resume`, tool mode and a run
-without a terminal print a one-line reminder on stderr instead. Inspection commands
-(`runs list`/`show`/`abandon`, `waits`, `history`, `storage`, `doctor`) do not check.
+without a terminal print a one-line reminder on stderr instead. Commands that read runs or
+stop them (`runs list`/`show`/`abandon`, `waits`, `history`, `storage`, `doctor`) do not check.
 Resuming something not yet imported fails with error type `upgrade_required`. Hosts embedding Lobster can call
 `upgradeStore({ directory })` from the core or SDK entry point instead.
 

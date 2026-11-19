@@ -3,7 +3,7 @@ import { sessionFromEnv } from "../persistence/context.js";
 import { withStoreContext } from "../persistence/execution.js";
 import type { StoreSession } from "../persistence/session.js";
 import { checkRunId, isRunId, type RunStatus, type RunSummary } from "../persistence/model.js";
-import { isRunStatus } from "../engine/checkpoint.js";
+import { isRunStatus, RUN_STATUSES } from "../engine/checkpoint.js";
 import {
 	callerId,
 	findWait,
@@ -38,7 +38,9 @@ export async function listRuns({
 	limit,
 }: RunQuery = {}): Promise<RunPage> {
 	if (status !== undefined && !isRunStatus(status)) {
-		throw new Error("Invalid run status");
+		throw new Error(
+			`Invalid run status "${String(status)}": use one of ${RUN_STATUSES.join(", ")}`,
+		);
 	}
 	if (after !== undefined && (typeof after !== "string" || (after !== "" && !isRunId(after)))) {
 		throw new Error("Invalid run cursor");

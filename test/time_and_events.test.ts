@@ -201,7 +201,7 @@ test("resuming a timer or event wait points to advance and signal", async (t) =>
 			response: {},
 			ctx: fx.ctx() as any,
 		} as any),
-		/deliver it with `lobster signal x`/,
+		/deliver it with `lobster signal x --data/,
 	);
 });
 

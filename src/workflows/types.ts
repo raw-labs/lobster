@@ -151,6 +151,8 @@ export type WorkflowRunResult = {
 	reason?: string;
 	/** A standalone pipeline whose renderer (`table`, `json`) already wrote its output. */
 	rendered?: boolean;
+	/** A dry run's plan: what would run, step by step (also written to stderr). */
+	plan?: string;
 	waitingFor?: WorkflowWaitingFor;
 	requiresApproval?: {
 		type: "approval_request";

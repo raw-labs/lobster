@@ -11,13 +11,14 @@ steps:
     repeat: { until: $check.json.state != running, max: 10 }
     steps:
       # Stand-in for a real status check (gh run view --json status ...): it reports "running"
-      # twice, then "success". It counts its calls in a file named after the run.
+      # twice, then "success". It counts its calls in a temporary file named after the run, and
+      # removes it when done.
       - id: check
         run: >-
           node -e 'const fs = require("fs"), path = require("path"), os = require("os");
           const file = path.join(os.tmpdir(), "lobster-example-ci-" + process.env.LOBSTER_RUN_ID);
           const calls = (fs.existsSync(file) ? Number(fs.readFileSync(file, "utf8")) : 0) + 1;
-          fs.writeFileSync(file, String(calls));
+          if (calls < 3) fs.writeFileSync(file, String(calls)); else fs.rmSync(file, { force: true });
           console.log(JSON.stringify({ state: calls < 3 ? "running" : "success" }))'
       - id: pause
         sleep: 1s

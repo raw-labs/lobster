@@ -68,8 +68,9 @@ export function dryRunWorkflow({
 		...planSteps(steps, resolvedArgs, {}, ctx, new Set<string>()),
 		"",
 	];
-	ctx.stderr.write(lines.join("\n"));
-	return { status: "ok", output: [] };
+	const plan = lines.join("\n");
+	ctx.stderr.write(plan);
+	return { status: "ok", output: [], plan };
 }
 
 type PlanContext = Parameters<typeof dryRunWorkflow>[0]["ctx"];

@@ -13,7 +13,8 @@ steps:
     for_each: $files.json
     concurrency: 2
     steps:
-      # A failing attempt is tried again, up to three times, 200 ms apart.
+      # Stand-in for real work on the file. A failing attempt would be tried again, up to three
+      # times, 200 ms apart (this one does not fail).
       - id: count
         run: >-
           node -e 'const f = process.env.FILE; console.log(JSON.stringify({ file: f, rows: f.length * 10 }))'

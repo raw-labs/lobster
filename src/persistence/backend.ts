@@ -74,8 +74,8 @@ export interface Backend {
 export class WaitConflictError extends Error {
 	readonly code = "LOBSTER_WAIT_CONFLICT";
 
-	constructor() {
-		super("Wait changed; inspect the pending wait before answering again");
+	constructor(message = "Wait changed; inspect the pending wait before answering again") {
+		super(message);
 		this.name = "WaitConflictError";
 	}
 }

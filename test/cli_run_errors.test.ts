@@ -34,7 +34,11 @@ for (const [form, targetArgs] of Object.entries(targetForms)) {
 				assert.equal(envelope.error.type, "parse_error");
 				assert.match(
 					envelope.error.message,
-					kind === "missing" ? /ENOENT/ : kind === "directory" ? /not a file/ : /must end in/,
+					kind === "missing"
+						? /Workflow file not found/
+						: kind === "directory"
+							? /not a file/
+							: /must end in/,
 				);
 				assert.equal(result.stderr, "");
 			} finally {
@@ -54,7 +58,7 @@ test("human run reports a missing relative positional workflow as a parse error"
 		);
 		assert.equal(result.status, 2);
 		assert.equal(result.stdout, "");
-		assert.match(result.stderr, /^Parse error: .*ENOENT/);
+		assert.match(result.stderr, /^Parse error: Workflow file not found/);
 		assert.doesNotMatch(result.stderr, /Unknown command/);
 	} finally {
 		await rm(dir, { recursive: true, force: true });
@@ -115,7 +119,7 @@ test("human run reports missing workflow without an uncaught stack", async () =>
 		);
 		assert.equal(result.status, 2);
 		assert.equal(result.stdout, "");
-		assert.match(result.stderr, /^Parse error: .*ENOENT/);
+		assert.match(result.stderr, /^Parse error: Workflow file not found/);
 		assert.doesNotMatch(result.stderr, /at async|node:internal/);
 	} finally {
 		await rm(dir, { recursive: true, force: true });
@@ -152,7 +156,7 @@ for (const topic of ["run", "resume", "doctor", "version", "help"]) {
 		});
 		assert.equal(result.status, 0);
 		assert.equal(result.stderr, "");
-		assert.match(result.stdout, new RegExp(`^  lobster ${topic}\\b`, "m"));
+		assert.match(result.stdout, new RegExp(`^lobster ${topic}\\b`, "m"));
 		assert.equal(result.stdout, flagHelp.stdout);
 	});
 }
@@ -162,7 +166,7 @@ test("help with an unknown topic still fails", () => {
 		encoding: "utf8",
 	});
 	assert.equal(result.status, 2);
-	assert.equal(result.stderr, "Unknown command: nope\n");
+	assert.match(result.stderr, /^Unknown command: nope\b.*lobster help/);
 });
 
 test("human run names a run that ended in an error, so it can be looked at", async () => {
@@ -244,11 +248,14 @@ test("runs advance reads --due as a flag, and refuses --due options without it",
 
 		const off = run("--due", "false");
 		assert.equal(off.status, 2, off.stdout);
-		assert.match(off.stderr, /Usage: runs advance <runId>/);
+		assert.match(JSON.parse(off.stdout).error.message, /Usage: lobster runs advance <runId>/);
 
 		const limitWithoutDue = run("some-run", "--limit", "3");
 		assert.equal(limitWithoutDue.status, 2);
-		assert.match(limitWithoutDue.stderr, /--limit applies only with --due/);
+		assert.match(
+			JSON.parse(limitWithoutDue.stdout).error.message,
+			/--limit applies only with --due/,
+		);
 	} finally {
 		await rm(dir, { recursive: true, force: true });
 	}
@@ -272,10 +279,10 @@ test("history and storage name the command typed in a usage error", () => {
 		spawnSync(process.execPath, ["bin/lobster.js", ...args], { encoding: "utf8" });
 	const exported = run("storage", "export", "--json");
 	assert.equal(exported.status, 2);
-	assert.match(exported.stderr, /storage export has no flag --json/);
+	assert.match(JSON.parse(exported.stdout).error.message, /storage export has no flag --json/);
 	const shown = run("history", "show", "some-run", "--apply");
 	assert.equal(shown.status, 2);
-	assert.match(shown.stderr, /history show has no flag --apply/);
+	assert.match(JSON.parse(shown.stdout).error.message, /history show has no flag --apply/);
 });
 
 test("runs advance names the run in its error envelope, as run --mode tool does", async () => {
@@ -309,7 +316,7 @@ test("resume by wait ID reports an answered wait as wait_conflict, with or witho
 			spawnSync(process.execPath, ["bin/lobster.js", ...args], { encoding: "utf8", env });
 		const asked = JSON.parse(run("run", "--mode", "tool", file).stdout);
 		const shown = JSON.parse(run("runs", "show", asked.runId).stdout);
-		const waitId = shown.pendingWaits[0].id;
+		const waitId = shown.run.pendingWaits[0].id;
 		assert.equal(JSON.parse(run("resume", waitId, "--approve", "yes").stdout).ok, true);
 		for (const args of [[], ["--expected-revision", "0"]]) {
 			const again = JSON.parse(run("resume", waitId, "--approve", "yes", ...args).stdout);
@@ -458,15 +465,17 @@ test("history show and list follow the run-ID rules of runs show and runs list",
 		const env = { ...process.env, LOBSTER_STATE_DIR: join(dir, "state") };
 		const run = (...args: string[]) =>
 			spawnSync(process.execPath, ["bin/lobster.js", ...args], { encoding: "utf8", env });
+		const error = (result: { stdout: string }) => JSON.parse(result.stdout).error.message;
 		const missing = run("history", "show", "nosuchrun");
 		assert.equal(missing.status, 1);
-		assert.match(missing.stderr, /Run nosuchrun not found/);
+		assert.match(error(missing), /Run nosuchrun not found/);
+		// A malformed ID or cursor is a mistake in the command line.
 		const malformed = run("history", "show", "bad id!");
-		assert.equal(malformed.status, 1);
-		assert.match(malformed.stderr, /Invalid run ID/);
+		assert.equal(malformed.status, 2);
+		assert.match(error(malformed), /Invalid run ID/);
 		const cursor = run("history", "list", "zz!");
-		assert.equal(cursor.status, 1);
-		assert.match(cursor.stderr, /Invalid run cursor/);
+		assert.equal(cursor.status, 2);
+		assert.match(error(cursor), /Invalid run cursor/);
 	} finally {
 		await rm(dir, { recursive: true, force: true });
 	}

@@ -58,6 +58,8 @@ export type ToolEnvelope = {
 	output?: unknown[];
 	/** With `status: "waiting"`: the timer or event the run waits for. */
 	waitingFor?: WorkflowWaitingFor;
+	/** A dry run's plan: what would run (`--dry-run`); nothing ran. */
+	plan?: string;
 	/** The question a paused run asks, as the run reports it. */
 	requiresApproval?: NonNullable<WorkflowRunResult["requiresApproval"]> | null;
 	requiresInput?: NonNullable<WorkflowRunResult["requiresInput"]> | null;
@@ -145,7 +147,8 @@ export function runEnvelope(output: WorkflowRunResult & { runId?: string }): Too
 		return { ...okEnvelope("waiting", [], null, null), waitingFor: output.waitingFor, ...runId };
 	if (output.status === "cancelled")
 		return { ...okEnvelope("cancelled", [], null, null), ...runId };
-	return { ...okEnvelope("ok", output.output, null, null), ...runId };
+	const plan = output.plan !== undefined ? { plan: output.plan } : {};
+	return { ...okEnvelope("ok", output.output, null, null), ...plan, ...runId };
 }
 
 export type ResumeToolOptions = ResumeTarget & ResumeDecision & { ctx?: ToolRunContext };
@@ -182,7 +185,10 @@ export async function resumeToolRequest(
 			} else {
 				const { approvalId } = reference;
 				const notFound = () =>
-					errorEnvelope("parse_error", `Approval ID "${approvalId}" not found or expired`);
+					errorEnvelope(
+						"parse_error",
+						`Approval ID "${approvalId}" not found or expired: it was answered or withdrawn, or never existed`,
+					);
 				const found = await findStateKeyByApprovalId({ env: ctx.env, approvalId });
 				if (!found) {
 					const indexKey = approvalIndexKey(approvalId);

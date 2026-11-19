@@ -953,7 +953,7 @@ for (const backend of ["sqlite"] as const) {
 		assert.equal(envelope.status, "ok");
 		assert.ok(envelope.runId);
 		const shown = await exec(process.execPath, [bin, "history", "show", envelope.runId], { env });
-		assert.equal(JSON.parse(shown.stdout).status, "completed");
+		assert.equal(JSON.parse(shown.stdout).history.status, "completed");
 	});
 	test(`${backend}: CLI reconciles a lost terminal checkpoint reply`, async (t) => {
 		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "lobster-cli-history-fault-"));

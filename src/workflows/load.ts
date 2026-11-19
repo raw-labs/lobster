@@ -22,7 +22,11 @@ export const WORKFLOW_FILE_EXTENSIONS = [".lobster", ".yaml", ".yml", ".json"];
 /** The absolute path of a workflow file named on a command line or in a tool request. */
 export async function resolveWorkflowFile(candidate: string, cwd = process.cwd()) {
 	const resolved = path.resolve(cwd, candidate);
-	if (!(await fsp.stat(resolved)).isFile()) throw new Error("Workflow path is not a file");
+	const stat = await fsp.stat(resolved).catch((error) => {
+		if (error?.code === "ENOENT") throw new Error(`Workflow file not found: ${resolved}`);
+		throw error;
+	});
+	if (!stat.isFile()) throw new Error("Workflow path is not a file");
 	if (!WORKFLOW_FILE_EXTENSIONS.includes(path.extname(resolved).toLowerCase()))
 		throw new Error("Workflow file must end in .lobster, .yaml, .yml, or .json");
 	return resolved;

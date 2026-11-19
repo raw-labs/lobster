@@ -130,7 +130,14 @@ export type Activation = {
 };
 
 /** Every status a run can have. `blocked`: interrupted while a step was running; its outcome is unknown. */
-const RUN_STATUSES = ["running", "waiting", "blocked", "completed", "failed", "cancelled"] as const;
+export const RUN_STATUSES = [
+	"running",
+	"waiting",
+	"blocked",
+	"completed",
+	"failed",
+	"cancelled",
+] as const;
 export type RunStatus = (typeof RUN_STATUSES)[number];
 
 /** Whether `value` is a run status. */

@@ -259,14 +259,18 @@ function settled(state: ExecutionState) {
  */
 async function resumedRunId(session: StoreSession, stateKey: string, ctx: RunContext) {
 	// Continuations are written by store transitions only: a plain read sees them whole.
-	const text = (await session.read(stateKey)).text;
+	const { text, runId: owner } = await session.read(stateKey);
 	// Still in a file an older Lobster wrote: it has to be imported first.
 	if (text === null && (await savedByOlderVersion(session.directory, stateKey)))
 		throw new UpgradeRequiredError();
 	const saved = (text === null ? null : JSON.parse(text)) as { type?: string } | null;
 	// A token an older Lobster already used left this marker behind.
-	if (!saved || saved.type === "lobster.consumed-resume-state.v1")
-		throw waitGone(ctx.env, stateKey);
+	if (!saved || saved.type === "lobster.consumed-resume-state.v1") {
+		// The run that asked, if this caller may see it: an answered question names it.
+		const asked = owner ? await session.getRunState(owner) : null;
+		const visible = asked && visibleTo(asked, callerId(ctx.runMetadata));
+		throw waitGone(ctx.env, stateKey, visible ? { id: asked.id, status: asked.status } : undefined);
+	}
 	const continuation = asContinuation(saved);
 	if (!continuation) throw new UpgradeRequiredError();
 	const run = await session.getRunState(continuation.runId);
@@ -277,7 +281,7 @@ async function resumedRunId(session: StoreSession, stateKey: string, ctx: RunCon
 /** The run `runId`, if this caller may see it. */
 async function findRun(session: StoreSession, runId: string, ctx: Pick<RunContext, "runMetadata">) {
 	const run = await session.getRunState(runId);
-	if (!run || !visibleTo(run, callerId(ctx.runMetadata))) throw new Error("Workflow run not found");
+	if (!run || !visibleTo(run, callerId(ctx.runMetadata))) throw new Error(`Run ${runId} not found`);
 	return run;
 }
 

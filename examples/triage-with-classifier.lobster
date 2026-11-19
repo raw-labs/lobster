@@ -10,7 +10,9 @@
 #
 #   lobster resume <token> --response-json '{"label":"refund"}'
 name: triage-with-classifier
-# The model calls of this run may cost at most 10 cents; past that the run stops.
+# The model calls of this run may cost at most 10 cents; past that the run stops. Spend is
+# priced from a table of known models; set LOBSTER_LLM_PRICING_JSON for others (unpriced calls
+# count as zero, with a warning).
 cost_limit: { max_usd: 0.10, action: stop }
 args:
   email:
@@ -36,7 +38,9 @@ steps:
       cases:
         - when: $triage.json.confidence < 0.8
           steps:
+            # stdin is what the person is shown with the question: the email itself.
             - id: ask
+              stdin: $email.stdout
               input:
                 prompt: The model is unsure. Which kind of email is this?
                 responseSchema:

@@ -161,10 +161,18 @@ export async function askAtTerminal(
  * to another answer: the same `wait_conflict` as one refused before the race. Otherwise the
  * token or approval ID no longer names a question.
  */
-export function waitGone(env: StoreEnvironment, waitKey: string) {
-	return resumeGuardFromEnv(env)?.key === waitKey
-		? new WaitConflictError()
-		: new ResumeRefusedError();
+export function waitGone(
+	env: StoreEnvironment,
+	waitKey: string,
+	run?: { id: string; status: string },
+) {
+	if (resumeGuardFromEnv(env)?.key === waitKey) return new WaitConflictError();
+	// Said when the run is known (and the caller's): the question was there, and is not any more.
+	return new ResumeRefusedError(
+		run
+			? `Resume state not found: the question was already answered or withdrawn (run ${run.id} is ${run.status})`
+			: undefined,
+	);
 }
 
 /**
@@ -249,7 +257,7 @@ export async function answer(machine: Machine, waitKey: string, decision: Decisi
 		);
 	if (wait.kind === "event")
 		throw new InvalidAnswerError(
-			`This run waits for the event "${wait.event}"; deliver it with \`lobster signal ${wait.event}\``,
+			`This run waits for the event "${wait.event}"; deliver it with \`lobster signal ${wait.event} --data '{...}'\` (the data must contain the fields its wait matches)`,
 		);
 	if (expired(frame))
 		throw new InvalidAnswerError(

@@ -63,4 +63,4 @@ node bin/lobster.js "exec --json --shell 'echo 42' | state.set counter"
 node bin/lobster.js "state.get counter"
 ```
 
-`lobster commands.list` lists every command, and `lobster help <command>` explains one.
+`lobster help` lists every command, and `lobster help <command>` explains one.

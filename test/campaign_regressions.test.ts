@@ -83,21 +83,22 @@ test("broken workflow files are refused with a message, not a TypeError", async 
 	await assert.rejects(fx.run(yaml), /alias\.lobster is not valid YAML: /);
 });
 
-test("CLI usage mistakes are one line with exit code 2; a missing run is exit code 1", async (t) => {
+test("CLI usage mistakes are a parse_error envelope with exit code 2; a missing run is exit code 1", async (t) => {
 	const fx = await workflowFixture(t);
 	const bin = new URL("../../bin/lobster.js", import.meta.url).pathname;
 	const cli = (...args: string[]) =>
 		spawnSync(process.execPath, [bin, ...args], { env: fx.env as any, encoding: "utf8" });
 	const usage = cli("runs", "frobnicate");
 	assert.equal(usage.status, 2);
-	assert.match(usage.stderr, /^Error: runs list/);
-	assert.doesNotMatch(usage.stderr, /\n\s+at /);
+	assert.equal(JSON.parse(usage.stdout).error.type, "parse_error");
+	assert.match(JSON.parse(usage.stdout).error.message, /lobster runs list/);
+	assert.equal(usage.stderr, "");
 	const missing = cli("runs", "show", "no-such-run");
 	assert.equal(missing.status, 1);
-	assert.equal(missing.stderr, "Error: Run no-such-run not found\n");
+	assert.equal(JSON.parse(missing.stdout).error.message, "Run no-such-run not found");
 });
 
-test("every CLI usage mistake exits 2 with one line, including signal, runs advance and abandon", async (t) => {
+test("every CLI usage mistake exits 2 with a parse_error envelope, including signal, runs advance and abandon", async (t) => {
 	const fx = await workflowFixture(t);
 	const bin = new URL("../../bin/lobster.js", import.meta.url).pathname;
 	for (const args of [
@@ -112,9 +113,9 @@ test("every CLI usage mistake exits 2 with one line, including signal, runs adva
 			env: fx.env as any,
 			encoding: "utf8",
 		});
-		assert.equal(run.status, 2, `lobster ${args.join(" ")}: ${run.stderr}`);
-		assert.match(run.stderr, /^Error: [^\n]+\n$/, args.join(" "));
-		assert.equal(run.stdout, "", args.join(" "));
+		assert.equal(run.status, 2, `lobster ${args.join(" ")}: ${run.stdout}`);
+		assert.equal(JSON.parse(run.stdout).error.type, "parse_error", args.join(" "));
+		assert.equal(run.stderr, "", args.join(" "));
 	}
 });
 

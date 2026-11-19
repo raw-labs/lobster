@@ -15,7 +15,8 @@ import {
 import { checkStages, parsePipeline } from "./pipeline/parser.js";
 import { runtimeErrorDetails, WaitConflictError } from "./persistence/backend.js";
 import { withExecution } from "./persistence/execution.js";
-import { checkRunId, isRunId, type RunStatus } from "./persistence/model.js";
+import { isRunId, type RunStatus } from "./persistence/model.js";
+import { isRunStatus, RUN_STATUSES } from "./engine/checkpoint.js";
 import { openStoreSession } from "./persistence/session.js";
 import { parseResumeArgs } from "./resume/resume.js";
 import type { ResumeTarget } from "./resume/options.js";
@@ -44,8 +45,9 @@ import {
 } from "./workflows/load.js";
 import { parseArgv, UsageError } from "./util/argv.js";
 import { messageOf } from "./util/errors.js";
+import { closestMatch } from "./util/suggest.js";
 
-// CLI commands without help of their own show the usage, which covers all of them.
+// The CLI's own commands: `help <command>` and `<command> --help` show commandHelp.
 const USAGE_TOPICS = new Set([
 	"run",
 	"resume",
@@ -94,13 +96,31 @@ function cliRunContext(signal: AbortSignal) {
 async function runCliWithSignal(argv: string[], signal: AbortSignal) {
 	const registry = createDefaultRegistry();
 
+	// Every command takes `--mode tool|human`, as `run` does; only `run` reads it (the others always
+	// print an envelope, or text that is their output: graph, help, version).
+	if (DATA_COMMANDS.has(argv[0]) || argv[0] === "graph") {
+		try {
+			argv = withoutMode(argv);
+		} catch (error) {
+			writeEnvelope(errorEnvelope("parse_error", error));
+			process.exitCode = 2;
+			return;
+		}
+	}
+
 	if (argv[0] === "graph") {
 		await handleGraph({ argv: argv.slice(1) });
 		return;
 	}
 
-	if (argv.length === 0 || argv.includes("-h") || argv.includes("--help")) {
+	if (argv.length === 0) {
 		process.stdout.write(helpText(registry));
+		return;
+	}
+
+	// `<command> --help` is that command's help; anything else asking for help gets the overview.
+	if (argv.includes("-h") || argv.includes("--help")) {
+		process.stdout.write(USAGE_TOPICS.has(argv[0]) ? commandHelp(argv[0]) : helpText(registry));
 		return;
 	}
 
@@ -114,14 +134,16 @@ async function runCliWithSignal(argv: string[], signal: AbortSignal) {
 			process.stdout.write(graphHelpText());
 			return;
 		}
-		// These built-ins are documented in the top-level usage, which `<topic> --help` prints too.
 		if (USAGE_TOPICS.has(topic)) {
-			process.stdout.write(helpText(registry));
+			process.stdout.write(commandHelp(topic));
 			return;
 		}
 		const cmd = registry.get(topic);
 		if (!cmd) {
-			process.stderr.write(`Unknown command: ${topic}\n`);
+			const near = closestMatch(topic, [...USAGE_TOPICS, "graph", ...registry.list()]);
+			process.stderr.write(
+				`Unknown command: ${topic}${near ? ` (did you mean ${near}?)` : ""}. \`lobster help\` lists them.\n`,
+			);
 			process.exitCode = 2;
 			return;
 		}
@@ -135,7 +157,7 @@ async function runCliWithSignal(argv: string[], signal: AbortSignal) {
 	}
 
 	if (argv[0] === "upgrade") {
-		await handleUpgrade(argv.slice(1));
+		await answer(() => upgradeResult(argv.slice(1)));
 		return;
 	}
 
@@ -148,13 +170,13 @@ async function runCliWithSignal(argv: string[], signal: AbortSignal) {
 	}
 
 	if (argv[0] === "runs" && argv[1] === "advance") {
-		await handleAdvance(argv.slice(2), signal);
+		await answer(() => advanceResult(argv.slice(2), signal));
 		return;
 	}
 
 	if (argv[0] === "signal") {
-		try {
-			const usage = "signal <event> [--data '{...}'] [--id <id>]";
+		await answer(async () => {
+			const usage = COMMAND_USAGE.signal;
 			const { flags, positional } = parseArgv(
 				argv.slice(1),
 				{ data: { type: "string" }, id: { type: "string" } },
@@ -170,45 +192,33 @@ async function runCliWithSignal(argv: string[], signal: AbortSignal) {
 					throw new UsageError("signal --data must be valid JSON");
 				}
 			}
-			const id = flags.id as string | undefined;
-			const result = await signalEvent({
+			return signalEvent({
 				name,
 				data,
-				id,
+				id: flags.id as string | undefined,
 				ctx: cliRunContext(signal),
 			});
-			process.stdout.write(JSON.stringify(result) + "\n");
-		} catch (error) {
-			if (error instanceof UsageError) throw error;
-			process.stderr.write(`signal: ${messageOf(error)}\n`);
-			process.exitCode = 1;
-		}
+		});
 		return;
 	}
 
 	if (argv[0] === "runs" && argv[1] === "abandon") {
-		try {
-			const runId = oneId(argv.slice(2), "runs abandon <runId>");
-			const result = await abandonWorkflowRun({
-				runId,
+		await answer(async () =>
+			abandonWorkflowRun({
+				runId: runIdArg(oneId(argv.slice(2), COMMAND_USAGE["runs abandon"])),
 				ctx: cliRunContext(signal),
-			});
-			process.stdout.write(JSON.stringify(result) + "\n");
-		} catch (error) {
-			if (error instanceof UsageError) throw error;
-			process.stderr.write(`runs abandon: ${messageOf(error)}\n`);
-			process.exitCode = 1;
-		}
+			}),
+		);
 		return;
 	}
 
 	if (argv[0] === "runs" || argv[0] === "waits") {
-		await handleRuns(argv, signal);
+		await answer(() => runsResult(argv, signal));
 		return;
 	}
 
 	if (argv[0] === "history" || argv[0] === "storage") {
-		await handlePersistence(argv);
+		await answer(() => persistenceResult(argv));
 		return;
 	}
 
@@ -387,7 +397,7 @@ async function handleRun(options: RunOptions): Promise<void> {
 		);
 		// The run's ID is known only now: one that never started has been removed.
 		const runId = result.runId;
-		if (envelope) writeToolEnvelope({ ...envelope, ...(runId ? { runId } : {}) });
+		if (envelope) writeEnvelope({ ...envelope, ...(runId ? { runId } : {}) });
 	} catch (error) {
 		reportRunError(mode, "runtime_error", error);
 	}
@@ -446,8 +456,10 @@ async function runTarget({
 				dryRun,
 				haltAfterStageOnAbort: true,
 			});
-			if (mode === "tool") emit(runEnvelope({ status: "ok", output: output.items }));
-			return { status: "ok", output: output.items };
+			const plan = "plan" in output ? (output.plan as string) : undefined;
+			const planned = { status: "ok" as const, output: output.items, plan };
+			if (mode === "tool") emit(runEnvelope(planned));
+			return planned;
 		}
 		const output = await runPipelineText({ pipeline: target.text, ctx });
 		if (mode === "tool") emit(runEnvelope(output));
@@ -470,7 +482,7 @@ function printRunResult(output: WorkflowRunResult & { runId?: string }, printOut
 		process.stderr.write(
 			waiting.kind === "timer"
 				? `Run ${output.runId ?? ""} sleeps until ${waiting.until}; \`lobster runs advance --due\` continues it then.\n`
-				: `Run ${output.runId ?? ""} waits for the event "${waiting.event}"${waiting.until ? ` until ${waiting.until}` : ""}; deliver it with \`lobster signal ${waiting.event}\`.\n`,
+				: `Run ${output.runId ?? ""} waits for the event "${waiting.event}"${waiting.until ? ` until ${waiting.until}` : ""}; deliver it with \`lobster signal ${waiting.event} --data '{...}'\` (the data must contain the fields its wait matches).\n`,
 		);
 	} else if (output.status === "cancelled") {
 		reportCancelled(output);
@@ -508,7 +520,7 @@ function reportRunError(
 	type: "parse_error" | "runtime_error",
 	error: unknown,
 	prefix = type === "parse_error" ? "Parse error: " : "Error: ",
-	emit: (payload: ToolPayload) => void = writeToolEnvelope,
+	emit: (payload: ToolPayload) => void = writeEnvelope,
 ) {
 	const message = messageOf(error);
 	if (mode === "tool") {
@@ -641,7 +653,7 @@ async function handleResume({ argv, registry, signal }: RunOptions) {
 	try {
 		parsed = parseResumeArgs(argv);
 	} catch (err) {
-		writeToolEnvelope({
+		writeEnvelope({
 			ok: false,
 			error: { type: "parse_error", message: messageOf(err) },
 		});
@@ -660,7 +672,10 @@ async function handleResume({ argv, registry, signal }: RunOptions) {
 			if (expectedRevision === undefined) {
 				const wait = await getWait({ waitId: parsedTarget.waitId, ctx: { env: process.env } });
 				// Gone (answered, withdrawn) or not this caller's: the same conflict as a stale revision.
-				if (!wait) throw new WaitConflictError();
+				if (!wait)
+					throw new WaitConflictError(
+						`Wait ${parsedTarget.waitId} is not pending: it was answered or withdrawn, or is not yours`,
+					);
 				expectedRevision = wait.revision;
 			}
 			target = { waitId: parsedTarget.waitId, expectedRevision };
@@ -682,7 +697,7 @@ async function handleResume({ argv, registry, signal }: RunOptions) {
 	} catch (err) {
 		envelope = errorEnvelope("runtime_error", err);
 	}
-	writeToolEnvelope(envelope);
+	writeEnvelope(envelope);
 	if (!envelope.ok) {
 		process.exitCode = envelope.error?.type === "parse_error" ? 2 : 1;
 	}
@@ -710,12 +725,12 @@ async function handleDoctor({ argv, registry, signal }: RunOptions) {
 			haltAfterStageOnAbort: true,
 		});
 	} catch (error) {
-		writeToolEnvelope({ ok: false, error: { type: "doctor_error", message: messageOf(error) } });
+		writeEnvelope({ ok: false, error: { type: "doctor_error", message: messageOf(error) } });
 		process.exitCode = 1;
 		return;
 	}
 
-	writeToolEnvelope({
+	writeEnvelope({
 		ok: true,
 		status: "ok",
 		output: [
@@ -731,56 +746,159 @@ async function handleDoctor({ argv, registry, signal }: RunOptions) {
 	});
 }
 
-function writeToolEnvelope(payload: ToolPayload) {
-	const envelope = {
-		protocolVersion: 1,
-		...payload,
-	};
-	process.stdout.write(JSON.stringify(envelope, null, 2));
-	process.stdout.write("\n");
+/** The envelope every command answers with on stdout: `{ protocolVersion, ok, ... }`. */
+function writeEnvelope(payload: object) {
+	process.stdout.write(JSON.stringify({ protocolVersion: 1, ...payload }, null, 2) + "\n");
 }
+
+/**
+ * Run a command and answer with its result in the envelope, or with its error: a mistake in the
+ * command line is a `parse_error` (exit 2), anything else a `runtime_error` (exit 1). An error
+ * may carry `details`, what the command still has to report (the runs a batch did advance).
+ */
+async function answer(task: () => Promise<object>) {
+	try {
+		writeEnvelope({ ok: true, ...(await task()) });
+	} catch (error) {
+		const input = error instanceof UsageError;
+		const details = (error as { details?: object })?.details;
+		writeEnvelope({
+			...errorEnvelope(input ? "parse_error" : "runtime_error", error),
+			...details,
+		});
+		process.exitCode = input ? 2 : 1;
+	}
+}
+
+/** The commands that answer with an envelope whatever `--mode` says (see DATA_COMMANDS). */
+const DATA_COMMANDS = new Set([
+	"resume",
+	"signal",
+	"runs",
+	"waits",
+	"history",
+	"storage",
+	"upgrade",
+	"doctor",
+]);
+
+/** `argv` without `--mode tool|human`, which every command accepts; a bad mode is refused. */
+function withoutMode(argv: string[]) {
+	const rest: string[] = [];
+	for (let index = 0; index < argv.length; index++) {
+		const arg = argv[index];
+		if (arg === "--mode") {
+			const value = argv[++index];
+			if (value === undefined) throw new UsageError("--mode takes tool or human");
+			runMode(value);
+		} else if (arg.startsWith("--mode=")) runMode(arg.slice("--mode=".length));
+		else rest.push(arg);
+	}
+	return rest;
+}
+
+/** How each command is used: its help, and the usage its errors name. */
+const COMMAND_USAGE: Record<string, string> = {
+	run: "lobster run [--mode tool] [--dry-run] (<workflow.lobster> | --file <workflow> [--args-json '{...}'] | '<pipeline>')",
+	resume:
+		"lobster resume <token | approval ID | wait ID> (--approve yes|no | --response-json '{...}' | --cancel) [--expected-revision <n>]",
+	signal: "lobster signal <event> [--data '{...}'] [--id <delivery id>]",
+	"runs list": `lobster runs list [--status ${RUN_STATUSES.join("|")}] [--limit <n>] [--after <runId>]`,
+	"runs show": "lobster runs show <runId>",
+	"runs advance":
+		"lobster runs advance <runId> | lobster runs advance --due [--limit <n>] [--concurrency <n>] [--dry-run]",
+	"runs abandon": "lobster runs abandon <runId>",
+	"waits show": "lobster waits show <waitId>",
+	upgrade: "lobster upgrade [--dry-run]",
+};
 
 function helpText(registry: CommandRegistry) {
 	return (
-		`lobster — OpenClaw-native typed shell\n\n` +
-		`Usage:\n\n` +
+		`lobster — workflows with approvals, waits and LLM calls, for agents\n\n` +
+		`Usage: lobster <command> [options]    (lobster help <command> for one command)\n\n` +
+		`Every command prints one JSON envelope on stdout: {"protocolVersion":1,"ok":true,...} or\n` +
+		`{"ok":false,"error":{"type","message"}}, exit 2 for a mistake in the command line, 1 otherwise.\n` +
+		`\`run\` prints the envelope with --mode tool; without it, the run's output. stderr carries\n` +
+		`messages for a person (retries, warnings). \`lobster help <command>\` explains each one.\n\n` +
 		`Start and answer:\n` +
-		`  lobster '<pipeline>'                                run a pipeline\n` +
-		`  lobster run [--mode tool] '<pipeline>'\n` +
-		`  lobster run <workflow.lobster> [--args-json '{...}']  start a workflow run\n` +
-		`  lobster run --dry-run <workflow.lobster | pipeline>  show the plan only\n` +
-		`  lobster resume <ref> --approve yes|no               answer a question\n` +
-		`  lobster resume <ref> --response-json '{...}'\n` +
-		`  lobster resume <ref> --cancel\n` +
-		`      <ref> is a resume token, a short approval ID or a wait ID.\n` +
-		`  lobster signal <event> [--data '{...}'] [--id <id>]   deliver an event to waiting runs\n\n` +
-		`Manage runs:\n` +
-		`  lobster runs list [--status waiting] [--limit 20] [--after <cursor>]\n` +
-		`  lobster runs show <runId>\n` +
-		`  lobster runs advance <runId>                       continue a stopped run, or retry a failed one\n` +
-		`  lobster runs advance --due [--limit n] [--concurrency n] [--dry-run]  advance every run that is due\n` +
-		`  lobster runs abandon <runId>                       stop a run for good\n` +
-		`  lobster waits show <waitId>\n\n` +
-		`Diagnostics:\n` +
-		`  lobster graph <workflow.lobster> [--format mermaid|dot|ascii]\n` +
-		`  lobster history list | show <runId> [afterSequence] | prune <before> [--apply]\n` +
+		`  lobster run --mode tool <workflow.lobster> [--args-json '{...}']   start a workflow run\n` +
+		`  lobster run --mode tool '<pipeline>'                 run a pipeline (also: lobster '<pipeline>')\n` +
+		`  lobster run --mode tool --dry-run <workflow | pipeline>   the plan, nothing runs\n` +
+		`  lobster resume <ref> --approve yes|no | --response-json '{...}' | --cancel\n` +
+		`      <ref>: a resume token, a short approval ID or a wait ID\n` +
+		`  lobster signal <event> [--data '{...}'] [--id <delivery id>]   deliver an event\n\n` +
+		`Runs:\n` +
+		`  lobster runs list [--status <status>] [--limit <n>] [--after <runId>]\n` +
+		`  lobster runs show <runId>              a run, and the questions it waits on\n` +
+		`  lobster runs advance <runId>           continue a stopped run, or retry a failed one\n` +
+		`  lobster runs advance --due             continue every run whose time has come (cron)\n` +
+		`  lobster runs abandon <runId>           stop a run for good\n` +
+		`  lobster waits show <waitId>            a question in full\n\n` +
+		`Diagnostics and setup:\n` +
+		`  lobster history list | show <runId> | prune <date> [--apply]\n` +
 		`  lobster storage export\n` +
-		`  lobster doctor\n\n` +
-		`Setup:\n` +
-		`  lobster upgrade [--dry-run] [--json]                import state from older versions\n` +
-		`  lobster version\n` +
-		`  lobster help <command>\n\n` +
-		`Flags:\n` +
-		`  --dry-run  Validate and print the execution plan without running anything\n\n` +
-		`Modes:\n` +
-		`  - human (default): renderers can write to stdout\n` +
-		`  - tool: prints a single JSON envelope for easy integration\n\n` +
-		`Examples:\n` +
-		`  lobster 'exec --json "echo [1,2,3]" | json'\n` +
-		`  lobster run --mode tool 'exec --json "echo [1]" | approve --prompt "ok?"'\n\n` +
+		`  lobster graph <workflow.lobster> [--format mermaid|dot|ascii]   (prints the graph)\n` +
+		`  lobster upgrade [--dry-run]            import state saved by an older version\n` +
+		`  lobster doctor | version | help <command>\n\n` +
+		`Environment:\n` +
+		`  LOBSTER_STATE_DIR   where runs are saved (default ~/.lobster/state)\n` +
+		`  LOBSTER_HISTORY=1   record each step's attempts, for \`history show\`\n\n` +
+		`The commands a pipeline runs (\`lobster help <command>\` explains one):\n\n` +
 		`Commands:\n` +
 		`  ${registry.list().join(", ")}\n`
 	);
+}
+
+/** One CLI command's help: its usage, what it does, and what its envelope holds. */
+function commandHelp(topic: string) {
+	const text: Record<string, string> = {
+		run:
+			`${COMMAND_USAGE.run}\n\n` +
+			`Starts a workflow file, or runs a pipeline of Lobster commands.\n` +
+			`  --mode tool       print the envelope: status (ok, needs_approval, needs_input, waiting,\n` +
+			`                    cancelled), output, requiresApproval / requiresInput (with a resumeToken),\n` +
+			`                    waitingFor, runId. Without it, the output only.\n` +
+			`  --args-json '{}'  the workflow's args (a workflow file only)\n` +
+			`  --dry-run         check and plan without running; the plan is in "plan" (and on stderr)\n`,
+		resume:
+			`${COMMAND_USAGE.resume}\n\n` +
+			`Answers a question a run asked, then continues the run. Prints the run's envelope, as run does.\n` +
+			`  --approve yes|no          an approval\n` +
+			`  --response-json '{...}'   an input request; it must fit the question's schema\n` +
+			`  --cancel                  cancel the run instead of answering\n` +
+			`  --expected-revision <n>   with a wait ID: refuse if the question changed since revision n\n`,
+		signal:
+			`${COMMAND_USAGE.signal}\n\n` +
+			`Stores an event, then advances the runs waiting for it (a wait: step whose match it fits).\n` +
+			`Envelope: event { id, name, inserted }, advanced [{ runId, status }].\n` +
+			`  --data '{...}'   the event's data (JSON)\n` +
+			`  --id <id>        a delivery ID: the same ID again is ignored (with other data, refused)\n`,
+		runs:
+			[
+				COMMAND_USAGE["runs list"],
+				COMMAND_USAGE["runs show"],
+				COMMAND_USAGE["runs advance"],
+				COMMAND_USAGE["runs abandon"],
+			].join("\n") +
+			`\n\nlist: runs, in run-ID order, with nextCursor for --after. show: run, with its pending waits.\n` +
+			`advance: the run's envelope, as run prints it; --due: due and advanced [{ runId, status }],\n` +
+			`not ok when a run failed or blocked. abandon: runId, status, abandoned (what was withdrawn).\n`,
+		waits: `${COMMAND_USAGE["waits show"]}\n\nA pending question in full: wait { id, runId, revision, request }.\n`,
+		history:
+			`lobster history list [after] | show <runId> [afterSequence] | prune <date> [--apply]\n\n` +
+			`list: runs, as runs list. show: history, a run's events and attempts (record them with\n` +
+			`LOBSTER_HISTORY=1). prune: runs finished before <date>; without --apply nothing is removed\n` +
+			`(dryRun: true), with it they are.\n`,
+		storage: `lobster storage export\n\nThe whole store as JSON: archive { states, runs }.\n`,
+		upgrade:
+			`${COMMAND_USAGE.upgrade}\n\n` +
+			`Imports what an older Lobster saved (paused runs, approval IDs, stored values), once.\n` +
+			`Envelope: upgrade (the report) and summary (in words). --dry-run reports without changing.\n`,
+		doctor: `lobster doctor\n\nChecks that commands run, and prints the version.\n`,
+		version: `lobster version\n\nPrints the version.\n`,
+		help: `lobster help [command]\n\nThe overview, or one command's help (CLI or pipeline command).\n`,
+	};
+	return text[topic];
 }
 
 function graphHelpText() {
@@ -804,7 +922,8 @@ const PERSISTENCE_USAGE: Record<string, string> = {
 	"storage export": "storage export",
 };
 
-async function handlePersistence(argv: string[]) {
+/** `history` and `storage`: what they read (or, with `prune --apply`, removed). */
+async function persistenceResult(argv: string[]): Promise<Record<string, unknown>> {
 	const [command, action = "list"] = argv;
 	const usage =
 		PERSISTENCE_USAGE[`${command} ${action}`] ?? Object.values(PERSISTENCE_USAGE).join(" | ");
@@ -824,37 +943,40 @@ async function handlePersistence(argv: string[]) {
 		(command === "storage" && action === "export" && positional.length === 0);
 	if (!known) throw new UsageError(`Usage: ${usage}`);
 	// The same run-ID rules as `runs show` and `runs list --after`.
-	if (action === "show") checkRunId(positional[0]);
+	if (action === "show") runIdArg(positional[0]);
 	if (action === "list" && positional[0] !== undefined && !isRunId(positional[0]))
-		throw new Error("Invalid run cursor");
+		throw new UsageError(`Invalid run cursor "${positional[0]}": use a run ID from the list`);
 	const afterSequence = positional[1] === undefined ? 0 : Number(positional[1]);
 	if (!Number.isSafeInteger(afterSequence) || afterSequence < 0)
 		throw new UsageError(`history show afterSequence must be a whole number. Usage: ${usage}`);
-	const session = await openStoreSession({
-		env: process.env,
-		readOnly: !(prune && flags.apply === true),
-	});
+	if (prune && !Number.isFinite(Date.parse(positional[0])))
+		throw new UsageError(
+			`history prune takes a date or time (runs that finished before it), such as 2026-01-31; got "${positional[0]}"`,
+		);
+	const apply = prune && flags.apply === true;
+	const session = await openStoreSession({ env: process.env, readOnly: !apply });
 	try {
-		let result: unknown;
-		if (command === "storage") result = await session.backend.export();
-		else if (action === "list") result = await session.listRuns({ after: positional[0] ?? "" });
-		else if (action === "show") {
-			result = await session.inspect(positional[0], { afterSequence });
-			if (result === null) throw new Error(`Run ${positional[0]} not found`);
-		} else result = await session.retain({ before: positional[0], dryRun: flags.apply !== true });
-		process.stdout.write(JSON.stringify(result) + "\n");
+		if (command === "storage") return { archive: await session.backend.export() };
+		if (action === "list") return { ...(await session.listRuns({ after: positional[0] ?? "" })) };
+		if (action === "show") {
+			const history = await session.inspect(positional[0], { afterSequence });
+			if (history === null) throw new Error(`Run ${positional[0]} not found`);
+			return { history };
+		}
+		// Without --apply nothing is removed: the runs that would be.
+		const runs = await session.retain({ before: positional[0], dryRun: !apply });
+		return { dryRun: !apply, runs };
 	} finally {
 		await session.close();
 	}
 }
 
-async function handleRuns(argv: string[], signal: AbortSignal) {
+/** `runs list`, `runs show` and `waits show`. */
+async function runsResult(argv: string[], signal: AbortSignal): Promise<Record<string, unknown>> {
 	const [command, action, ...rest] = argv;
 	const ctx = { env: process.env, signal };
-	const usage =
-		"runs list [--status <status>] [--limit <limit>] [--after <cursor>]; runs show <runId>; waits show <waitId>";
-	let result: unknown;
 	if (command === "runs" && (!action || action === "list")) {
+		const usage = COMMAND_USAGE["runs list"];
 		const { flags, positional } = parseArgv(
 			rest,
 			{
@@ -865,28 +987,45 @@ async function handleRuns(argv: string[], signal: AbortSignal) {
 			{ usage },
 		);
 		if (positional.length) throw new UsageError(`runs list takes no arguments. Usage: ${usage}`);
-		result = await listRuns({
-			ctx,
-			...(flags.status !== undefined
-				? {
-						status: flags.status as RunStatus,
-					}
-				: {}),
-			...(flags.limit !== undefined ? { limit: flags.limit as number } : {}),
-			...(flags.after !== undefined ? { after: flags.after as string } : {}),
-		});
-	} else if (action === "show") {
-		const id = oneId(rest, command === "runs" ? "runs show <runId>" : "waits show <waitId>");
-		result =
-			command === "runs" ? await getRun({ runId: id, ctx }) : await getWait({ waitId: id, ctx });
-		if (result === null)
-			throw new Error(
-				command === "runs" ? `Run ${id} not found` : `Wait ${id} not found (or no longer pending)`,
+		const status = flags.status as string | undefined;
+		if (status !== undefined && !isRunStatus(status))
+			throw new UsageError(
+				`runs list --status takes one of ${RUN_STATUSES.join(", ")}; got "${status}"`,
 			);
-	} else {
-		throw new UsageError(usage);
+		const after = flags.after as string | undefined;
+		if (after !== undefined && !isRunId(after))
+			throw new UsageError(`Invalid run cursor "${after}": use a run ID from the list`);
+		return {
+			...(await listRuns({
+				ctx,
+				...(status !== undefined ? { status: status as RunStatus } : {}),
+				...(flags.limit !== undefined ? { limit: flags.limit as number } : {}),
+				...(after !== undefined ? { after } : {}),
+			})),
+		};
 	}
-	process.stdout.write(JSON.stringify(result) + "\n");
+	if (action === "show" && (command === "runs" || command === "waits")) {
+		const id = oneId(rest, COMMAND_USAGE[`${command} show`]);
+		if (command === "runs") {
+			runIdArg(id);
+			const run = await getRun({ runId: id, ctx });
+			if (run === null) throw new Error(`Run ${id} not found`);
+			return { run };
+		}
+		const wait = await getWait({ waitId: id, ctx });
+		if (wait === null) throw new Error(`Wait ${id} not found (or no longer pending)`);
+		return { wait };
+	}
+	throw new UsageError(
+		`Usage: ${
+			command === "waits"
+				? COMMAND_USAGE["waits show"]
+				: Object.entries(COMMAND_USAGE)
+						.filter(([name]) => name.startsWith("runs "))
+						.map(([, usage]) => usage)
+						.join(" | ")
+		}`,
+	);
 }
 
 /**
@@ -916,28 +1055,20 @@ async function offerUpgrade(argv: string[], signal: AbortSignal) {
 	}
 }
 
-async function handleUpgrade(argv: string[]) {
-	const usage = "lobster upgrade [--dry-run] [--json]";
+/** `lobster upgrade`: the report as an envelope (`--json` is accepted, as before). */
+async function upgradeResult(argv: string[]): Promise<Record<string, unknown>> {
+	const usage = COMMAND_USAGE.upgrade;
 	const { flags, positional } = parseArgv(
 		argv,
 		{ "dry-run": { type: "boolean" }, json: { type: "boolean" } },
 		{ usage },
 	);
 	if (positional.length) throw new UsageError(`Usage: ${usage}`);
-	let report: UpgradeReport;
-	try {
-		report = await upgradeStore({
-			directory: defaultStateDir(process.env),
-			dryRun: flags["dry-run"] === true,
-		});
-	} catch (error) {
-		process.stderr.write(`Upgrade failed: ${messageOf(error)}\n`);
-		process.exitCode = 1;
-		return;
-	}
-	process.stdout.write(
-		flags.json === true ? JSON.stringify(report) + "\n" : formatUpgradeReport(report),
-	);
+	const upgrade = await upgradeStore({
+		directory: defaultStateDir(process.env),
+		dryRun: flags["dry-run"] === true,
+	});
+	return { upgrade, summary: formatUpgradeReport(upgrade).trimEnd() };
 }
 
 function formatUpgradeReport(report: UpgradeReport): string {
@@ -978,9 +1109,11 @@ function formatUpgradeReport(report: UpgradeReport): string {
 }
 
 /** `runs advance <runId>` continues one run; `runs advance --due`, every run whose time has come. */
-async function handleAdvance(argv: string[], signal: AbortSignal) {
-	const usage =
-		"runs advance <runId> | runs advance --due [--limit <n>] [--concurrency <n>] [--dry-run]";
+async function advanceResult(
+	argv: string[],
+	signal: AbortSignal,
+): Promise<Record<string, unknown>> {
+	const usage = COMMAND_USAGE["runs advance"];
 	const { flags, positional } = parseArgv(
 		argv,
 		{
@@ -994,30 +1127,35 @@ async function handleAdvance(argv: string[], signal: AbortSignal) {
 	const ctx = cliRunContext(signal);
 	if (flags.due === true) {
 		if (positional.length) throw new UsageError("runs advance --due takes no run ID");
-		try {
-			const result = await advanceDueRuns({
-				ctx,
-				limit: flags.limit as number | undefined,
-				concurrency: flags.concurrency as number | undefined,
-				dryRun: flags["dry-run"] === true,
-			});
-			process.stdout.write(JSON.stringify(result) + "\n");
-		} catch (error) {
-			process.stderr.write(`runs advance --due: ${messageOf(error)}\n`);
-			process.exitCode = 1;
-		}
-		return;
+		const result = await advanceDueRuns({
+			ctx,
+			limit: flags.limit as number | undefined,
+			concurrency: flags.concurrency as number | undefined,
+			dryRun: flags["dry-run"] === true,
+		});
+		// A run that failed, or blocked, needs someone: said on stderr too (a scheduler that
+		// throws stdout away still shows it), and in the envelope and the exit code.
+		const troubled = result.advanced.filter((run) => run.error !== undefined);
+		for (const run of troubled)
+			process.stderr.write(`lobster: run ${run.runId} is ${run.status}: ${run.error}\n`);
+		if (!troubled.length) return result;
+		throw Object.assign(
+			new Error(`${troubled.length} of ${result.advanced.length} due runs did not advance`),
+			{ details: result },
+		);
 	}
 	for (const flag of ["limit", "concurrency", "dry-run"])
 		if (flags[flag] !== undefined)
 			throw new UsageError(`runs advance --${flag} applies only with --due`);
 	if (positional.length !== 1) throw new UsageError(`Usage: ${usage}`);
-	try {
-		writeToolEnvelope(runEnvelope(await advanceWorkflowRun({ runId: positional[0], ctx })));
-	} catch (error) {
-		writeToolEnvelope(errorEnvelope("runtime_error", error));
-		process.exitCode = 1;
-	}
+	return runEnvelope(await advanceWorkflowRun({ runId: runIdArg(positional[0]), ctx }));
+}
+
+/** A run ID typed on the command line; a malformed one is a mistake in the command line. */
+function runIdArg(id: string) {
+	if (!isRunId(id))
+		throw new UsageError(`Invalid run ID "${id}": use one from \`lobster runs list\``);
+	return id;
 }
 
 /** The one ID a command takes, or a UsageError naming its usage. */
