@@ -2,11 +2,8 @@ import type { WorkflowFile } from "./types.js";
 import { createRecord } from "./values.js";
 import { closestMatch } from "../util/suggest.js";
 
-/**
- * Refuse args a workflow that declares `args:` does not take, and declared args with no
- * default that are not given: either would leave `${name}` empty in its commands.
- */
-export function checkWorkflowArgs(
+/** Refuse args a workflow that declares `args:` does not take (a misspelled name, mostly). */
+export function checkArgNames(
 	argDefs: WorkflowFile["args"],
 	provided: Record<string, unknown>,
 	where: string,
@@ -20,6 +17,19 @@ export function checkWorkflowArgs(
 				`${where} takes no arg "${name}"${near ? ` (did you mean "${near}"?)` : ""}. Args: ${names.join(", ") || "none"}`,
 			);
 		}
+}
+
+/**
+ * Refuse args a workflow that declares `args:` does not take, and declared args with no
+ * default that are not given: either would leave `${name}` empty in its commands.
+ */
+export function checkWorkflowArgs(
+	argDefs: WorkflowFile["args"],
+	provided: Record<string, unknown>,
+	where: string,
+) {
+	if (!argDefs) return;
+	checkArgNames(argDefs, provided, where);
 	for (const [name, definition] of Object.entries(argDefs))
 		if (!("default" in definition) && !Object.hasOwn(provided, name))
 			throw new Error(`${where} requires arg "${name}" (it has no default)`);

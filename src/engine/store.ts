@@ -27,6 +27,7 @@ export class ExecutionStore {
 	#closed = false;
 	#heartbeat?: ReturnType<typeof setInterval>;
 	readonly lost = new AbortController();
+	#callerId = "";
 
 	constructor(
 		readonly session: StoreSession,
@@ -57,9 +58,15 @@ export class ExecutionStore {
 		}
 	}
 
+	/** The caller that owns the run ("" for an unscoped run), read when it is claimed. */
+	get callerId() {
+		return this.#callerId;
+	}
+
 	async claim() {
 		const run = await this.session.getRunState(this.runId);
 		if (!run) throw new Error("Workflow run not found");
+		this.#callerId = run.metadata?.callerId ?? "";
 		this.#epoch = (run.executionLease?.epoch ?? 0) + 1;
 		await this.#transition({
 			kind: "execution-claim",

@@ -101,11 +101,10 @@ export async function waitStep(machine: Machine, step: WorkflowStep, key: string
 
 /** The oldest inbox event matching `wait` that this run has not consumed yet. */
 async function findEvent(machine: Machine, wait: EventWait) {
-	const { session, runId } = machine.store;
+	const { session, callerId } = machine.store;
 	// Only unscoped events and events from the caller that owns this run.
-	const owner = (await session.getRunState(runId))?.metadata?.callerId ?? "";
 	const consumed = new Set(machine.state.events ?? []);
-	const events = await session.findEvents(wait.event, wait.since, owner);
+	const events = await session.findEvents(wait.event, wait.since, callerId);
 	// An event received after the deadline does not count, however late the run is advanced.
 	return events.find(
 		(event) =>

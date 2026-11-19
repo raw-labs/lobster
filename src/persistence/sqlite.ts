@@ -225,7 +225,6 @@ export class SqliteBackend implements Backend {
 				text,
 				operationId,
 				exclusive: options.exclusive,
-				expectedWaitRevision: options.expectedWaitRevision,
 				runId: options.runId,
 			},
 			options.signal,

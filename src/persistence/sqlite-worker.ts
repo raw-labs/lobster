@@ -389,7 +389,6 @@ function handle(request: WorkerRequest): WorkerResult<WorkerMethod> {
 							kind: "state",
 							key: args.key,
 							text: args.text,
-							expectedWaitRevision: args.expectedWaitRevision,
 						},
 					});
 					if (result.status === "conflict") {
@@ -489,8 +488,8 @@ function handle(request: WorkerRequest): WorkerResult<WorkerMethod> {
 							run.attempts.push(JSON.parse(row.record) as Attempt);
 						}
 					}
-					for (const key of [payload?.key, payload?.previousKey]) {
-						if (!key) continue;
+					if (payload?.key) {
+						const key = payload.key;
 						const row = prepare("SELECT record FROM waits WHERE run_id=? AND key=?").get(
 							args.id,
 							key,

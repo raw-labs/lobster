@@ -19,7 +19,6 @@ export const STATE_EXISTS = "LOBSTER_STATE_EXISTS";
 
 export type StateWriteOptions = {
 	exclusive?: boolean;
-	expectedWaitRevision?: number;
 	/** Write the key as part of this run (the run then owns it). */
 	runId?: string;
 	signal?: AbortSignal;

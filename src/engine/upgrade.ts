@@ -79,11 +79,7 @@ export async function savedByOlderVersion(directory: string, key: string): Promi
 
 async function assertNoOlderWriter(directory: string) {
 	for (const name of await fs.readdir(directory)) {
-		if (
-			name.endsWith(".lock") &&
-			name !== ".backend-selection.lock" &&
-			!(await reclaimOrphanedFileLock(path.join(directory, name)))
-		)
+		if (name.endsWith(".lock") && !(await reclaimOrphanedFileLock(path.join(directory, name))))
 			throw new Error("Stop other running Lobster processes first: state is locked");
 	}
 }

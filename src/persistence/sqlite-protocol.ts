@@ -16,7 +16,6 @@ type WriteRequest = {
 	text: string | null;
 	operationId: string;
 	exclusive?: boolean;
-	expectedWaitRevision?: number;
 	runId?: string;
 };
 

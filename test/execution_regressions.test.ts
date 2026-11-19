@@ -105,6 +105,39 @@ for (const backend of ["sqlite"]) {
 		});
 	}
 
+	for (const where of ["switch case", "loop body"]) {
+		test(`machine ${backend}: an input step first in a ${where} shows the step before it`, async (t) => {
+			const directory = await fs.mkdtemp(path.join(os.tmpdir(), "lobster-subject-regression-"));
+			t.after(() => fs.rm(directory, { recursive: true, force: true }));
+			const filePath = path.join(directory, "flow.lobster");
+			const question = {
+				id: "question",
+				input: { prompt: "Review?", responseSchema: { type: "object" } },
+			};
+			const around =
+				where === "switch case"
+					? {
+							id: "route",
+							switch: { cases: [{ when: "$data.json.value > 1", steps: [question] }] },
+						}
+					: { id: "loop", for_each: "$data.json.items", steps: [question] };
+			await fs.writeFile(
+				filePath,
+				JSON.stringify({
+					steps: [{ id: "data", run: `echo '{"value":42,"items":[1]}'` }, around],
+				}),
+			);
+			const result = await runWorkflowFile({
+				filePath,
+				ctx: createToolContext({
+					env: { ...process.env, LOBSTER_STATE_DIR: path.join(directory, "state") },
+				}),
+			});
+			assert.equal(result.status, "needs_input");
+			assert.deepEqual(result.requiresInput!.subject, { value: 42, items: [1] });
+		});
+	}
+
 	test(`machine ${backend}: child inherits resolved parent environment`, async (t) => {
 		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "lobster-env-regression-"));
 		t.after(() => fs.rm(directory, { recursive: true, force: true }));

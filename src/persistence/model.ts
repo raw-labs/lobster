@@ -104,8 +104,6 @@ export type RunEvent = {
 		id?: string;
 		path?: string;
 		key?: string;
-		/** A wait the same transition consumed, when it published another (`key`). */
-		previousKey?: string;
 		status?: AttemptStatus | RunStatus | WaitRecord["status"];
 		summary?: unknown;
 		fingerprint?: string;
@@ -176,7 +174,6 @@ export type RunAction =
 			kind: "state";
 			key: string;
 			text: string | null;
-			expectedWaitRevision?: number;
 	  };
 
 export type Transition = {
@@ -284,15 +281,6 @@ export function applyTransition(
 		return { status: "conflict", revision: current?.revision ?? 0, run: current };
 	}
 	const action = request.action;
-	if (action.kind === "state" && action.expectedWaitRevision !== undefined) {
-		if (!Number.isSafeInteger(action.expectedWaitRevision) || action.expectedWaitRevision < 0) {
-			throw new Error("Invalid expected wait revision");
-		}
-		const wait = current?.waits[action.key];
-		if (wait?.status !== "pending" || (wait.revision ?? 0) !== action.expectedWaitRevision) {
-			return { status: "conflict", revision: current?.revision ?? 0, run: current };
-		}
-	}
 	if (action.kind.startsWith("execution-") && action.kind !== "execution-claim") {
 		const owned = action as Extract<RunAction, { owner: string }>;
 		const lease = current?.executionLease;
@@ -360,15 +348,9 @@ export function applyTransition(
 		if (action.consume) setCheckpoint(run, action.consume.key, null);
 		if (action.publish) setCheckpoint(run, action.publish.key, action.publish.text);
 		run.status = action.execution.status;
-		// The waits it published or consumed, so history can show them: one save can consume a
-		// wait (`previousKey`) and publish the next (`key`).
+		// The wait it published or consumed (a save does one or the other), so history can show it.
 		const key = action.publish?.key ?? action.consume?.key;
-		if (key)
-			payload = {
-				key,
-				status: run.waits[key]?.status,
-				...(action.publish && action.consume ? { previousKey: action.consume.key } : {}),
-			};
+		if (key) payload = { key, status: run.waits[key]?.status };
 	} else if (action.kind === "create" && action.checkpoint) {
 		setCheckpoint(run, action.checkpoint.key, action.checkpoint.text);
 	} else if (action.kind === "definition") {
@@ -626,7 +608,7 @@ export function historyPage(run: RunRecord, afterSequence: number, limit: number
 	} = run;
 	const page = events.filter((event) => event.sequence > afterSequence).slice(0, limit);
 	const ids = new Set(page.map((event) => event.payload?.id));
-	const keys = new Set(page.flatMap((event) => [event.payload?.key, event.payload?.previousKey]));
+	const keys = new Set(page.map((event) => event.payload?.key));
 	return {
 		...metadata,
 		definitions: definitions.slice(-32),

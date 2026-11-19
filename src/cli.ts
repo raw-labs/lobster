@@ -32,7 +32,7 @@ import {
 	runIdOf,
 } from "./engine/runner.js";
 import { advanceDueRuns, signalEvent } from "./engine/due.js";
-import { resolveWorkflowArgs } from "./workflows/args.js";
+import { checkArgNames, resolveWorkflowArgs } from "./workflows/args.js";
 import { renderWorkflowGraph } from "./workflows/graph.js";
 import { parseWorkflowArgsJson } from "./workflows/values.js";
 import type { WorkflowGraphFormat } from "./workflows/graph.js";
@@ -304,6 +304,8 @@ async function handleGraph({ argv }: { argv: string[] }) {
 
 	try {
 		const workflow = await loadWorkflowFile(filePath);
+		// Misspelled names are refused as `run` refuses them; a graph needs no required arg.
+		checkArgNames(workflow.args, argsJson, `Workflow ${filePath}`);
 		const args = resolveWorkflowArgs(workflow.args, argsJson);
 		const graph = renderWorkflowGraph({ workflow, format: parsed.format, args });
 		process.stdout.write(graph);

@@ -4,6 +4,9 @@ All notable changes to Lobster will be documented in this file.
 
 ## Unreleased
 
+- An `input:` step first in a `switch` case, a loop body or a `repeat` round shows the step before the case or loop as its subject, as it would outside it: it showed none, so a person was asked about nothing.
+- A child workflow named at run time (`workflow: $pick.stdout`) has its pipeline steps checked when it is entered, before any of its steps acts, as a child named in the file is checked at the start: a misspelled flag in a later step failed the run after earlier steps had acted, and the child was saved with the mistake, so `runs advance` met it again after the file was fixed.
+- `lobster graph --args-json` refuses an arg the workflow does not declare (suggesting the nearest name), as `run` does; required args may still be left out of a graph.
 - A `null` written in a list matches a missing field, as `== null` does: `$a.json.v in [null, ""]` (and `[null] contains $a.json.v`) did not hold when `v` was missing.
 - `lobster graph` prefixes every Mermaid node (`s_end`), so a step named `end`, `style`, `class`, `graph` or another Mermaid keyword no longer makes a graph Mermaid refuses.
 - A response schema that cannot be used (`ask --schema` with a bad `$ref`, a command's `requestInput`) says why, as a workflow `input:` step and `llm.invoke` already did.

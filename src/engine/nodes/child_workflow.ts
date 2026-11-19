@@ -11,6 +11,7 @@ import {
 } from "../../workflows/values.js";
 import { resolveWorkflowArgs } from "../../workflows/args.js";
 import { snapshotDefinition } from "../../workflows/definition.js";
+import { checkPipelineSteps } from "../../workflows/pipeline_check.js";
 import { activation } from "../checkpoint.js";
 import type { Machine } from "../machine.js";
 import { GATES_REFUSED, type Scope } from "../scope.js";
@@ -37,12 +38,16 @@ export async function childWorkflowStep(
 		);
 		if (scope.ancestors.includes(file))
 			throw new Error(`Workflow step ${step.id} creates a cycle: ${file}`);
-		const definition =
-			scope.definition.children[scope.definitionPath!] ??
-			(await snapshotDefinition(file, args, scope.ancestors));
+		const frozen = scope.definition.children[scope.definitionPath!];
+		const definition = frozen ?? (await snapshotDefinition(file, args, scope.ancestors));
+		const childArgs = resolveWorkflowArgs(definition.workflow.args, args);
+		// A child named only now (from a step's output) is checked as a start checks a file,
+		// before any of its steps acts; one the run froze at its start was checked then.
+		if (!frozen && scope.ctx.registry)
+			checkPipelineSteps(definition, childArgs, scope.ctx.registry);
 		frame.child = {
 			definition,
-			args: resolveWorkflowArgs(definition.workflow.args, args),
+			args: childArgs,
 			env: withoutArgEnv(
 				mergeEnv(scope.baseEnv ?? {}, scope.env, step.env, scope.args, scope.results),
 				scope.args,

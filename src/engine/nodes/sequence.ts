@@ -27,7 +27,8 @@ export async function sequence(
 		const result = await machine.visit(step, childKey, {
 			...scope,
 			results,
-			lastStepId: progress.lastStepId,
+			// The first step inside a case or a loop body follows the step before the case or loop.
+			lastStepId: progress.lastStepId ?? scope.lastStepId,
 			definitionPath: (scope.definitionPath ?? "") + "/" + step.id,
 		});
 		frame.results[step.id] = results[step.id] = result;

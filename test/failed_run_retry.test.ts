@@ -509,3 +509,38 @@ test("a control step that failed on its own runs again as a new attempt: what ru
 	assert.equal(ids.length, 4);
 	assert.equal(new Set(ids).size, 4, ids.join("\n"));
 });
+
+test("a child workflow named at run time is checked before any of its steps acts", async (t) => {
+	const { dir, env, ran, advance } = await fixture(t);
+	const child = path.join(dir, "child.lobster");
+	const write = (flag: string) =>
+		fs.writeFile(
+			child,
+			JSON.stringify({
+				steps: [
+					{ id: "act", run: 'echo x >> "$RETRY_DIR/acted"' },
+					{ id: "check", pipeline: `exec ${flag} --shell 'echo 1'` },
+				],
+			}),
+		);
+	await write("--jsn");
+	const filePath = path.join(dir, "flow.lobster");
+	await fs.writeFile(
+		filePath,
+		JSON.stringify({
+			steps: [
+				{ id: "which", run: `printf %s ${JSON.stringify(child)}` },
+				{ id: "child", workflow: "$which.stdout" },
+			],
+		}),
+	);
+	const first = await runToolRequest({ filePath, ctx: { env } });
+	assert.equal(first.ok, false);
+	assert.match(first.ok ? "" : first.error.message, /no flag --jsn/);
+	assert.equal(await ran("acted"), 0, "the child's first step did not act");
+	// The child was not frozen with its typo: fixed, the run continues into it.
+	await write("--json");
+	const retried = await advance(first.runId!);
+	assert.equal(retried.status, "ok");
+	assert.equal(await ran("acted"), 1);
+});

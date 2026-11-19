@@ -111,6 +111,26 @@ test("cli graph defaults to mermaid and resolves --args-json values", async () =
 	assert.match(result.stdout, /confirm\{"confirm\\napproval gate"\}/);
 });
 
+test("cli graph refuses an arg the workflow does not declare, as run does", async () => {
+	const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-graph-args-"));
+	const filePath = path.join(tmpDir, "workflow.lobster");
+	await fsp.writeFile(
+		filePath,
+		[
+			"args:",
+			"  location:",
+			"    default: here",
+			"steps:",
+			"  - id: a",
+			"    run: echo ${location}",
+		].join("\n"),
+		"utf8",
+	);
+	const result = runCli(["graph", "--file", filePath, "--args-json", '{"locaton":"x"}']);
+	assert.equal(result.status, 1);
+	assert.match(result.stderr, /takes no arg "locaton" \(did you mean "location"\?\)/);
+});
+
 test("cli graph supports --format dot", async () => {
 	const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-graph-dot-"));
 	const filePath = path.join(tmpDir, "workflow.lobster");
