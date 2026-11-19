@@ -3,7 +3,15 @@ export type CommandArgsSchema = {
 	type: "object";
 	properties: Record<
 		string,
-		{ type?: string | string[]; description?: string; [key: string]: unknown }
+		{
+			type?: string | string[];
+			description?: string;
+			/** The values the flag accepts; others are refused before any stage runs. */
+			enum?: readonly unknown[];
+			/** Another spelling of this flag: giving both is refused before any stage runs. */
+			aliasOf?: string;
+			[key: string]: unknown;
+		}
 	>;
 	required?: string[];
 };

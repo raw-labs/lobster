@@ -18,6 +18,11 @@ export function defineCommand<T extends DefinedCommand>(command: T): T {
 	for (const key of schema.required ?? [])
 		if (!(key in schema.properties))
 			throw new Error(`${where}: required flag "${key}" is not declared`);
+	for (const [key, spec] of Object.entries(schema.properties)) {
+		const target = spec.aliasOf;
+		if (target !== undefined && (typeof target !== "string" || !(target in schema.properties)))
+			throw new Error(`${where}: flag "${key}" is an alias of undeclared flag "${target}"`);
+	}
 	return command;
 }
 
@@ -32,8 +37,8 @@ export function booleanFlags(command: CommandLike | undefined): string[] {
 
 /**
  * Reject flags a command does not declare, so a misspelled flag fails instead of being ignored;
- * a flag given with its alias (`aliasOf`); a number flag without a number; a value outside the
- * flag's choices. Checked before any stage runs. Commands without a schema (custom host
+ * a flag given with its alias (`aliasOf`); a string or number flag given no value (a bare
+ * `--flag` reads as true); a number flag without a number; a value outside the flag's choices. Checked before any stage runs. Commands without a schema (custom host
  * commands) are not checked.
  */
 export function assertKnownFlags(
@@ -58,14 +63,18 @@ export function assertKnownFlags(
 		}
 		if (value === undefined) continue;
 		const spec = properties[key];
-		const flag = typeof spec.aliasOf === "string" ? spec.aliasOf : key;
+		const flag = spec.aliasOf ?? key;
 		const other = spelled.get(flag);
 		if (other && other !== key)
 			throw new Error(`${invokedAs} takes --${other} or --${key}, not both`);
 		spelled.set(flag, key);
+		const choices = spec.enum;
+		if ((spec.type === "string" || spec.type === "number") && value === true)
+			throw new Error(
+				`${invokedAs} --${key} takes ${Array.isArray(choices) ? `one of ${choices.join(", ")}` : "a value"}`,
+			);
 		if (spec.type === "number" && !isNumber(value))
 			throw new Error(`${invokedAs} --${key} takes a number (got ${JSON.stringify(value)})`);
-		const choices = spec.enum;
 		if (Array.isArray(choices) && typeof value === "string" && !choices.includes(value))
 			throw new Error(
 				`${invokedAs} --${key} must be one of ${choices.join(", ")} (got "${value}")`,

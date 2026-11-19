@@ -902,7 +902,7 @@ const registry = createRegistry({
 await runToolRequest({ pipeline: "acme.notify --channel ops", ctx: { registry } });
 ```
 
-The flags in `argsSchema` are checked before any stage runs: a flag the command does not declare, a `type: "number"` flag whose value is not a number, a value outside a flag's `enum`, and a flag given together with another spelling of it (a property with `aliasOf: "<flag>"`) are refused.
+The flags in `argsSchema` are checked before any stage runs: a flag the command does not declare, a `type: "string"` or `type: "number"` flag given without a value, a number flag whose value is not a number, a value outside a flag's `enum`, and a flag given together with another spelling of it (a property with `aliasOf: "<flag>"`, which must name a declared flag) are refused.
 
 A name or alias defined by two packs is an error rather than an override.
 

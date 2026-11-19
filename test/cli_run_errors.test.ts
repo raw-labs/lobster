@@ -339,7 +339,7 @@ test("exec refuses a bare --shell instead of running only the first word", () =>
 	);
 	const envelope = JSON.parse(result.stdout);
 	assert.equal(envelope.ok, false);
-	assert.match(envelope.error.message, /--shell takes the command line as its value/);
+	assert.match(envelope.error.message, /exec --shell takes a value/);
 });
 
 test("exec refuses a bare --stdin instead of dropping the input", () => {
@@ -356,7 +356,7 @@ test("exec refuses a bare --stdin instead of dropping the input", () => {
 	);
 	const envelope = JSON.parse(result.stdout);
 	assert.equal(envelope.ok, false);
-	assert.match(envelope.error.message, /--stdin takes a format/);
+	assert.match(envelope.error.message, /exec --stdin takes one of raw, json/);
 });
 
 test("graph refuses words it would not use", async () => {
