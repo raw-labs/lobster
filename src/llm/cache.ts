@@ -2,15 +2,9 @@
 // from on resume, and the file cache shared by calls with the same cache key.
 import path from "node:path";
 import { promises as fsp } from "node:fs";
-import {
-	diffAndStore,
-	ensureDirectory,
-	atomicWriteWasPublished,
-	isJsonSyntaxError,
-	readStateJsonWithLock,
-	withFileLock,
-	writeFileAtomic,
-} from "../state/store.js";
+import { diffAndStore, isJsonSyntaxError, readStateJsonWithLock } from "../state/store.js";
+import { withFileLock } from "../state/file_lock.js";
+import { atomicWriteWasPublished, ensureDirectory, writeFileAtomic } from "../state/atomic_file.js";
 import { STATE_VERSION, type NormalizedInvocationItem } from "./protocol.js";
 
 type CacheEntry = {

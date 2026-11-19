@@ -3,7 +3,7 @@ import { promises as fsp, type Stats } from "node:fs";
 import path from "node:path";
 import { ensureDirectory } from "./atomic_file.js";
 
-export const FILE_LOCK_RETRY_MS = 10;
+const FILE_LOCK_RETRY_MS = 10;
 const FILE_LOCK_ORPHAN_MS = 30_000;
 const FILE_LOCK_HEARTBEAT_MS = 250;
 

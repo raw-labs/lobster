@@ -216,13 +216,10 @@ function renderMermaid(nodes: GraphNode[], edges: GraphEdge[]) {
 	const idMap = new Map<string, string>();
 	const used = new Set<string>();
 	for (const node of nodes) {
-		let key = sanitizeMermaidId(node.id) || "step";
-		if (/^\d/.test(key)) key = `s_${key}`;
-		let i = 2;
-		while (used.has(key)) {
-			key = `${sanitizeMermaidId(node.id)}_${i}`;
-			i += 1;
-		}
+		// Prefixed, so no step id reads as a Mermaid keyword (`end`, `style`) or starts with a digit.
+		const base = `s_${sanitizeMermaidId(node.id)}`;
+		let key = base;
+		for (let i = 2; used.has(key); i += 1) key = `${base}_${i}`;
 		used.add(key);
 		idMap.set(node.id, key);
 	}

@@ -38,12 +38,27 @@ test("workflow graph renderer outputs mermaid nodes and labeled edges", () => {
 		output,
 		/advice\["advice\\npipeline: llm\.invoke --prompt &quot;Summarize this weather&quot;"\]/,
 	);
-	assert.match(output, /fetch -->\|stdin\| confirm/);
-	assert.match(output, /fetch -->\|stdin\| advice/);
+	assert.match(output, /s_fetch -->\|stdin\| s_confirm/);
+	assert.match(output, /s_fetch -->\|stdin\| s_advice/);
 	assert.match(
 		output,
-		/confirm -->\|when: \$confirm\.approved &amp;&amp; \$fetch\.json\.temp &gt; 70\| advice/,
+		/s_confirm -->\|when: \$confirm\.approved &amp;&amp; \$fetch\.json\.temp &gt; 70\| s_advice/,
 	);
+});
+
+test("a step named like a Mermaid keyword still makes a graph Mermaid reads", () => {
+	const output = renderWorkflowGraph({
+		workflow: {
+			steps: [
+				{ id: "end", run: "echo a" },
+				{ id: "style", run: "echo b", stdin: "$end.stdout" },
+			],
+		},
+		format: "mermaid",
+	});
+	assert.match(output, /^  s_end\["end/m);
+	assert.match(output, /s_end -->\|stdin\| s_style/);
+	assert.doesNotMatch(output, /^  (end|style)\[/m);
 });
 
 test("workflow graph renderer contains Mermaid metacharacters in labels", () => {

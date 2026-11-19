@@ -90,3 +90,14 @@ test("an alias of a flag the command does not declare is refused when the comman
 		/flag "previewLimit" is an alias of undeclared flag "preview_limit"/,
 	);
 });
+
+test("a response schema that cannot be used says why", async (t) => {
+	const dir = await fs.mkdtemp(path.join(os.tmpdir(), "lobster-bad-schema-"));
+	t.after(() => fs.rm(dir, { recursive: true, force: true }));
+	const result = await runToolRequest({
+		pipeline: `ask --prompt hi --schema '{"$ref":"#/nope"}'`,
+		ctx: { env: { ...process.env, LOBSTER_STATE_DIR: path.join(dir, "state") } },
+	});
+	assert.equal(result.ok, false);
+	assert.match(!result.ok ? result.error.message : "", /ask response schema is invalid: \S/);
+});

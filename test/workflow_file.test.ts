@@ -9,7 +9,8 @@ import { createDefaultRegistry } from "../src/commands/registry.js";
 import { runWorkflowFile, advanceWorkflowRun } from "../src/engine/runner.js";
 import { openStoreSession } from "../src/persistence/session.js";
 import { decodeResumeToken } from "../src/resume/resume.js";
-import { keyToPath, readStateJsonWithLock as readStateJson } from "../src/state/store.js";
+import { readStateJsonWithLock as readStateJson } from "../src/state/store.js";
+import { keyToPath } from "../src/state/paths.js";
 
 async function savedPipelineInput(env: Record<string, string | undefined>, key: string) {
 	const store = await openStoreSession({ env, readOnly: true });

@@ -662,7 +662,7 @@ const GENERIC: Record<Concern, Custom> = {
 		for (const leaf of node.graph.leaves ?? ["n"])
 			assert.match(ascii, new RegExp(`^- ${leaf} -> next \\(next\\)$`, "m"));
 		const mermaid = renderWorkflowGraph({ workflow, format: "mermaid" });
-		assert.match(mermaid, node.graph.diamond ? /^ {2}n\{"n/m : /^ {2}n\["n/m);
+		assert.match(mermaid, node.graph.diamond ? /^ {2}s_n\{"n/m : /^ {2}s_n\["n/m);
 		const dot = renderWorkflowGraph({ workflow, format: "dot" });
 		assert.match(
 			dot,

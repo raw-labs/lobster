@@ -8,14 +8,16 @@ import { runPipeline } from "../src/pipeline/runtime.js";
 import { diffLast, stateSet } from "../src/sdk/primitives.js";
 import {
 	diffAndStore,
-	keyToPath,
-	withFileLock,
-	ensureDirectory,
 	writeStateJson,
 	readStateJsonWithLock as readStateJson,
-	writeFileAtomic,
 } from "../src/state/store.js";
-import { stripExtendedLengthPrefix } from "../src/state/atomic_file.js";
+import { keyToPath } from "../src/state/paths.js";
+import { withFileLock } from "../src/state/file_lock.js";
+import {
+	ensureDirectory,
+	stripExtendedLengthPrefix,
+	writeFileAtomic,
+} from "../src/state/atomic_file.js";
 import { openStoreSession } from "../src/persistence/session.js";
 import { SqliteBackend } from "../src/persistence/sqlite.js";
 

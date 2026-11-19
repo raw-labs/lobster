@@ -15,7 +15,7 @@ import { resumeToolRequest, runToolRequest } from "../src/core/tool_runtime.js";
 import { decodeResumeToken } from "../src/resume/resume.js";
 import { runPipeline } from "../src/pipeline/runtime.js";
 import { openStoreSession } from "../src/persistence/session.js";
-import { keyToPath } from "../src/state/store.js";
+import { keyToPath } from "../src/state/paths.js";
 import { encodeToken } from "../src/resume/token.js";
 import { advanceWorkflowRun } from "../src/engine/runner.js";
 

@@ -20,26 +20,22 @@ type Adapter = {
 	}) => Promise<LlmResponseEnvelope>;
 };
 
-type DirectAdapter =
-	| ((params: {
-			env: any;
-			args: any;
-			payload: Record<string, any>;
-			ctx: any;
-			signal?: AbortSignal;
-			assertInvocationCurrent?: () => void;
-	  }) => Promise<LlmResponseEnvelope>)
-	| {
-			source?: string;
-			invoke: (params: {
-				env: any;
-				args: any;
-				payload: Record<string, any>;
-				ctx: any;
-				signal?: AbortSignal;
-				assertInvocationCurrent?: () => void;
-			}) => Promise<LlmResponseEnvelope>;
-	  };
+/** A host's adapter (`ctx.llmAdapters`): its invoke function, or one with a source name. */
+type DirectInvoke = (params: {
+	env: any;
+	args: any;
+	payload: Record<string, any>;
+	ctx: any;
+	signal?: AbortSignal;
+	assertInvocationCurrent?: () => void;
+}) => Promise<LlmResponseEnvelope>;
+type DirectAdapter = DirectInvoke | { source?: string; invoke: DirectInvoke };
+
+/** The built-in HTTP adapters: the variables each reads its URL and token from. */
+const HTTP_ADAPTERS = {
+	pi: { url: "LOBSTER_PI_LLM_ADAPTER_URL", token: "LOBSTER_PI_LLM_ADAPTER_TOKEN" },
+	http: { url: "LOBSTER_LLM_ADAPTER_URL", token: "LOBSTER_LLM_ADAPTER_TOKEN" },
+} as const;
 
 export function resolveProvider(
 	args: any,
@@ -108,7 +104,7 @@ export function resolveAdapter({
 		const token = String(args.token ?? env.OPENCLAW_TOKEN ?? env.CLAWD_TOKEN ?? "").trim();
 		return {
 			provider,
-			source: config.sourceForProvider?.(provider) ?? "openclaw",
+			source: config.sourceForProvider(provider),
 			async invoke({ payload, signal, assertInvocationCurrent }) {
 				return invokeOpenClawAdapter({
 					endpoint,
@@ -122,39 +118,19 @@ export function resolveAdapter({
 		};
 	}
 
-	if (provider === "pi") {
-		const adapterUrl = String(env.LOBSTER_PI_LLM_ADAPTER_URL ?? "").trim();
-		if (!adapterUrl) {
-			throw new Error(`${config.name} requires LOBSTER_PI_LLM_ADAPTER_URL for provider=pi`);
-		}
-		const token = String(args.token ?? env.LOBSTER_PI_LLM_ADAPTER_TOKEN ?? "").trim();
-		return {
-			provider,
-			source: config.sourceForProvider?.(provider) ?? "pi",
-			async invoke({ payload, signal, assertInvocationCurrent }) {
-				return invokeHttpAdapter({
-					endpoint: buildAdapterEndpoint(adapterUrl),
-					maxResponseBytes,
-					token,
-					payload,
-					signal,
-					assertInvocationCurrent,
-				});
-			},
-		};
-	}
-
-	const adapterUrl = String(env.LOBSTER_LLM_ADAPTER_URL ?? "").trim();
+	const variables = HTTP_ADAPTERS[provider === "pi" ? "pi" : "http"];
+	const adapterUrl = String(env[variables.url] ?? "").trim();
 	if (!adapterUrl) {
-		throw new Error(`${config.name} requires LOBSTER_LLM_ADAPTER_URL for provider=http`);
+		throw new Error(`${config.name} requires ${variables.url} for provider=${provider}`);
 	}
-	const token = String(args.token ?? env.LOBSTER_LLM_ADAPTER_TOKEN ?? "").trim();
+	const endpoint = buildAdapterEndpoint(adapterUrl);
+	const token = String(args.token ?? env[variables.token] ?? "").trim();
 	return {
 		provider,
-		source: config.sourceForProvider?.(provider) ?? "http",
+		source: config.sourceForProvider(provider),
 		async invoke({ payload, signal, assertInvocationCurrent }) {
 			return invokeHttpAdapter({
-				endpoint: buildAdapterEndpoint(adapterUrl),
+				endpoint,
 				maxResponseBytes,
 				token,
 				payload,

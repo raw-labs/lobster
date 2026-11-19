@@ -4,6 +4,10 @@ All notable changes to Lobster will be documented in this file.
 
 ## Unreleased
 
+- A `null` written in a list matches a missing field, as `== null` does: `$a.json.v in [null, ""]` (and `[null] contains $a.json.v`) did not hold when `v` was missing.
+- `lobster graph` prefixes every Mermaid node (`s_end`), so a step named `end`, `style`, `class`, `graph` or another Mermaid keyword no longer makes a graph Mermaid refuses.
+- A response schema that cannot be used (`ask --schema` with a bad `$ref`, a command's `requestInput`) says why, as a workflow `input:` step and `llm.invoke` already did.
+- A malformed `LOBSTER_LLM_ADAPTER_URL` or `LOBSTER_PI_LLM_ADAPTER_URL` is reported as `Invalid URL` before the call, as a malformed `OPENCLAW_URL` is (it read "request failed: Invalid URL").
 - `runs advance` of a run whose `for_each`, `parallel`, `repeat` or `switch` failed on its own (its timeout, a `repeat` out of rounds, a `switch` with no matching case) runs that step as its next attempt: the commands inside got the same `LOBSTER_ACTIVITY_ID` and `LOBSTER_ACTIVITY_ATTEMPT` as the first time, so a host deduplicating on them skipped the re-run.
 - A run blocked because a command was interrupted says the same thing however it is reported (when it stopped, and when `runs advance` meets it again): its outcome is unknown, `lobster runs abandon` stops it, and `runs advance` runs it again only if the step has `recovery: repeat` (not said for standalone pipelines and SDK runs, which have none). It told every run to continue with `runs advance` (an SDK run with `Lobster.advance`), which only blocked it again, with a message that named the step differently and left out abandoning.
 - `runWorkflowFile`, `advanceWorkflowRun` and `abandonWorkflowRun` refuse a `leaseMs` under 100 before opening the store, as `advanceDueRuns` and `signalEvent` do: they opened (or created) the state directory first, and said "Workflow run not found" for an unknown run.

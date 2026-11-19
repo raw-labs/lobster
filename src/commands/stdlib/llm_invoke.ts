@@ -58,7 +58,7 @@ export type CommandConfig = {
 	helpTitle: string;
 	helpConfig: string[];
 	helpExamples: string[];
-	sourceForProvider?: (provider: SupportedProvider) => string;
+	sourceForProvider: (provider: SupportedProvider) => string;
 };
 
 export const llmInvokeCommand = createLlmInvokeCommand({

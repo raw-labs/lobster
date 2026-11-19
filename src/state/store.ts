@@ -7,10 +7,6 @@ import { withFileLock } from "./file_lock.js";
 import { generateApprovalId, isApprovalId } from "./approval_id.js";
 import { keyToPath, resolveStateDirectory } from "./paths.js";
 
-export { withFileLock } from "./file_lock.js";
-export { keyToPath } from "./paths.js";
-export { atomicWriteWasPublished, ensureDirectory, writeFileAtomic } from "./atomic_file.js";
-
 type Env = Record<string, string | undefined>;
 
 export function defaultStateDir(env: Env): string {

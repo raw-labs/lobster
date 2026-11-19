@@ -475,7 +475,12 @@ function compare(
 		case "in":
 		case "contains": {
 			const [item, container] = node.operator === "in" ? [left, right] : [right, left];
-			if (Array.isArray(container)) return container.some((entry) => equals(item, entry, false));
+			const list = node.operator === "in" ? node.right : node.left;
+			// A literal `null` in a written list matches a missing field, as `== null` does.
+			if (Array.isArray(container))
+				return container.some((entry, index) =>
+					equals(item, entry, list.kind === "list" && isNull(list.items[index])),
+				);
 			if (typeof container === "string" && typeof item === "string")
 				return container.includes(item);
 			return refuse(

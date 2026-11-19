@@ -279,3 +279,21 @@ test("comparing two fields never matches on a missing and a null value", async (
 	});
 	assert.deepEqual(result.output, ["end\n"]);
 });
+
+test("a null written in a list matches a missing field, as == null does", async () => {
+	const result = await runWorkflow({
+		steps: [
+			{ id: "data", command: `echo '{}'` },
+			{ id: "a", command: 'echo "a"', when: '$data.json.val in [null, ""]' },
+			{ id: "b", command: 'echo "b"', when: "[null] contains $data.json.val" },
+			{ id: "c", command: 'echo "c"', when: '$data.json.val in ["x"]' },
+			{
+				id: "report",
+				command: 'echo "matched"',
+				when: "$a.skipped != true && $b.skipped != true && $c.skipped == true",
+			},
+		],
+	});
+	assert.equal(result.status, "ok");
+	assert.deepEqual(result.output, ["matched\n"]);
+});

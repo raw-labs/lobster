@@ -1,5 +1,5 @@
 import { stableStringify } from "../util/serialization.js";
-import { prepareSchema, responseChecker } from "../util/validation.js";
+import { responseChecker } from "../util/validation.js";
 import { readLineFromStream } from "../io/read_line.js";
 import { approvalInputTimeoutMs, isInteractive } from "../io/terminal.js";
 
@@ -335,11 +335,7 @@ function validateRequestInputParams(params: RequestInputParams) {
 	if (params.responseSchema === undefined) {
 		throw new Error("requestInput responseSchema is required");
 	}
-	try {
-		prepareSchema(params.responseSchema);
-	} catch {
-		throw new Error("requestInput response schema is invalid");
-	}
+	responseChecker(params.responseSchema, "requestInput");
 }
 
 function validatePending(value: unknown): asserts value is CommandInputPendingRequest {

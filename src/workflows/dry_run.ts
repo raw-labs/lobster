@@ -5,7 +5,7 @@ import { checkedStages } from "./pipeline_check.js";
 import { resolveRetryConfig } from "./retry.js";
 import type { CommandLookup } from "../commands/types.js";
 import { hasStepRef, resolveArgsTemplate } from "./expressions.js";
-import { checkConditionSyntax, conditionRefs, evaluateCondition } from "./conditions.js";
+import { conditionRefs, evaluateCondition } from "./conditions.js";
 import { createRecord } from "./values.js";
 import { getStepExecution, isApprovalStep, isInputStep, stepIds } from "./steps.js";
 import type { WorkflowStep, WorkflowStepResult, WorkflowRunResult } from "./types.js";
@@ -43,13 +43,7 @@ function resolveDryRunTemplate(
 // Only `approved` (gates are assumed granted) and `skipped` are modelled by the plan, and
 // only for steps whose own condition was decided (`undecided` holds the others).
 function dependsOnStepOutput(condition: unknown, undecided: Set<string>) {
-	let refs: { id: string; path: string }[];
-	try {
-		refs = conditionRefs(condition);
-	} catch {
-		return false; // Not a valid condition: evaluating it reports why.
-	}
-	return refs.some(({ id, path }) => {
+	return conditionRefs(condition).some(({ id, path }) => {
 		const field = path.split(".")[0];
 		return (field !== "approved" && field !== "skipped") || undecided.has(id);
 	});
@@ -97,11 +91,9 @@ function planSteps(
 
 		const condition = step.when ?? step.condition;
 		const unknownCondition = dependsOnStepOutput(condition, undecided);
-		// A condition on output the plan does not have is only checked for syntax: its value,
-		// and whether its comparisons are valid, are known only when the run gets there.
-		const holds = unknownCondition
-			? (checkConditionSyntax(condition), true)
-			: evaluateCondition(condition, results);
+		// A condition on output the plan does not have (checked when the file loaded) is decided
+		// only when the run gets there.
+		const holds = unknownCondition || evaluateCondition(condition, results);
 		// Whether it runs is not known, so neither is anything inside it.
 		if (unknownCondition) for (const id of stepIds([step])) undecided.add(id);
 		if (!unknownCondition && !holds) {
@@ -156,7 +148,6 @@ function planSteps(
 		if (step.repeat && Array.isArray(step.steps)) {
 			lines.push(`  ${num}. ${step.id}  [repeat]`);
 			const until = String(step.repeat.until).replace(/\s+/g, " ").trim();
-			checkConditionSyntax(step.repeat.until);
 			lines.push(
 				`     until: ${until}  [at most ${step.repeat.max} round${step.repeat.max === 1 ? "" : "s"}${step.repeat.on_max === "continue" ? ", then continue" : ""}]`,
 			);
@@ -218,8 +209,6 @@ function planSteps(
 				} else if (branchExecution.kind === "shell") {
 					const command = resolveDryRunTemplate(branchExecution.value, resolvedArgs, results);
 					lines.push(`     branch ${branch.id}: [shell] ${annotated(command)}`);
-				} else {
-					lines.push(`     branch ${branch.id}: [no-op]`);
 				}
 				results[branch.id] = { id: branch.id };
 			}
@@ -302,7 +291,6 @@ function planSwitch(
 		const label = `case ${index + 1}: when ${String(entry.when).replace(/\s+/g, " ").trim()}`;
 		if (chosen) return branch(label, entry.steps, "not reached");
 		if (open || dependsOnStepOutput(entry.when, undecided)) {
-			checkConditionSyntax(entry.when);
 			open = true;
 			return branch(label, entry.steps, MAY_RUN);
 		}
