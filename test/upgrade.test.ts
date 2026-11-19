@@ -6,11 +6,17 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
-import { createDefaultRegistry, resumeToolRequest, runToolRequest } from "../src/core/index.js";
+import {
+	createDefaultRegistry,
+	resumeToolRequest,
+	runToolRequest,
+	runWorkflowFile,
+} from "../src/core/index.js";
+import { UpgradeRequiredError } from "../src/engine/errors.js";
 import { openStoreSession } from "../src/persistence/session.js";
 import { convertPipelinePause } from "../src/engine/legacy_pauses.js";
 import { withFileLock } from "../src/state/file_lock.js";
-import { encodeToken } from "../src/resume/token.js";
+import { encodeToken, workflowResumePayload } from "../src/resume/token.js";
 import { pendingUpgrade, savedByOlderVersion, upgradeStore } from "../src/engine/upgrade.js";
 
 const exec = promisify(execFile);
@@ -93,6 +99,15 @@ test("resuming anything saved by an older Lobster asks for `lobster upgrade`", a
 		ctx,
 	});
 	assert.equal(pipeline.error.type, "upgrade_required");
+	// Core's resume says the same as the tool's.
+	await assert.rejects(
+		runWorkflowFile({
+			resume: workflowResumePayload(saved.input),
+			response: { ok: true },
+			ctx,
+		}),
+		UpgradeRequiredError,
+	);
 });
 
 test("a crafted key cannot probe for files outside the state directory", async (t) => {

@@ -9,8 +9,6 @@ import { stopsRun } from "../errors.js";
 import { valueResult } from "../results.js";
 import { deliberateWait } from "../step_clock.js";
 import { sequence } from "./sequence.js";
-import { carryLlmProvenance } from "../../llm/accounting.js";
-import { concurrentLedger } from "../accounting.js";
 
 type Progress = NonNullable<Activation["forEach"]>;
 
@@ -29,8 +27,6 @@ export async function forEachStep(machine: Machine, step: WorkflowStep, key: str
 		if (!Array.isArray(resolved))
 			throw new Error(`Workflow step ${step.id} for_each: expected array, got ${typeof resolved}`);
 		items = structuredClone(resolved);
-		// The clone drops the marks of model calls; the record keeps them (records.ts).
-		carryLlmProvenance(resolved, items);
 		machine.records.put(itemsKey, items);
 		frame.forEach = { count: items.length, cursor: 0 };
 	}
@@ -65,8 +61,6 @@ export async function forEachStep(machine: Machine, step: WorkflowStep, key: str
 			gatesRefused,
 			...innerSettings(step, scope),
 			costPrefix: scope.costPrefix + step.id + ".",
-			// Items at once: each settles only the calls it made.
-			ledger: concurrency > 1 ? concurrentLedger(scope.ledger) : scope.ledger,
 			// Several items at once: a wait in one is not a wait of the loop.
 			holdClocks: concurrency > 1 ? undefined : scope.holdClocks,
 		});

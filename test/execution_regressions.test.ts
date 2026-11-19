@@ -13,6 +13,22 @@ import { bindResumeGuard, bindStoreSession } from "../src/persistence/context.js
 import { decodeResumeToken } from "../src/resume/resume.js";
 import { WaitConflictError } from "../src/persistence/backend.js";
 
+/** An `llm.invoke` call to `paid`, an adapter whose every answer costs $0.0125 (gpt-4o). */
+const paidCall = {
+	id: "paid",
+	pipeline: "llm.invoke --provider paid --model gpt-4o --prompt hi --disable-cache",
+};
+const llmAdapters = {
+	paid: async () => ({
+		ok: true,
+		result: {
+			model: "gpt-4o",
+			output: { text: "paid" },
+			usage: { inputTokens: 1000, outputTokens: 1000 },
+		},
+	}),
+};
+
 for (const backend of ["sqlite"]) {
 	test(`machine ${backend}: parent budget stops further child and parent effects`, async (t) => {
 		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "lobster-budget-regression-"));
@@ -24,15 +40,7 @@ for (const backend of ["sqlite"]) {
 		};
 		await fs.writeFile(
 			path.join(directory, "child.lobster"),
-			JSON.stringify({
-				steps: [
-					{
-						id: "paid",
-						run: `node -e 'console.log(JSON.stringify({model:"gpt-4o",usage:{inputTokens:1000,outputTokens:1000}}))'`,
-					},
-					effect,
-				],
-			}),
+			JSON.stringify({ steps: [paidCall, effect] }),
 		);
 		const filePath = path.join(directory, "parent.lobster");
 		await fs.writeFile(
@@ -51,6 +59,7 @@ for (const backend of ["sqlite"]) {
 						MARKER: marker,
 						LOBSTER_STATE_DIR: path.join(directory, "state"),
 					},
+					llmAdapters,
 				}),
 			}),
 			/Cost limit exceeded/,
@@ -286,13 +295,7 @@ test("child budget excludes prior parent spending", async (t) => {
 	await fs.writeFile(
 		filePath,
 		JSON.stringify({
-			steps: [
-				{
-					id: "paid",
-					run: `node -e 'console.log(JSON.stringify({model:"gpt-4o",usage:{inputTokens:1000,outputTokens:1000}}))'`,
-				},
-				{ id: "child", workflow: "child.lobster" },
-			],
+			steps: [paidCall, { id: "child", workflow: "child.lobster" }],
 		}),
 	);
 	await fs.writeFile(
@@ -306,6 +309,7 @@ test("child budget excludes prior parent spending", async (t) => {
 		filePath,
 		ctx: createToolContext({
 			env: { ...process.env, LOBSTER_STATE_DIR: path.join(directory, "state") },
+			llmAdapters,
 		}),
 	});
 	assert.deepEqual(result.output, ["free\n"]);

@@ -10,16 +10,13 @@ import {
 } from "../../pipeline/input_request.js";
 import { isPlainObject } from "../../util/objects.js";
 import { recorderFromEnv, bindRecorder } from "../../persistence/context.js";
-import { carryLlmProvenance } from "../../llm/accounting.js";
-import type { LlmSpendLedger } from "../../llm/accounting.js";
-import { assertSavable, stableStringify } from "../../util/serialization.js";
+import type { ModelCall } from "../../llm/cost_tracker.js";
+import { assertSavable } from "../../util/serialization.js";
 import type { WorkflowStepResult } from "../../workflows/types.js";
 import type { PipelinePause, WaitRequest } from "../checkpoint.js";
 import type { RunContext } from "../context.js";
 import { GateRefusedError, PipelineHaltError } from "../errors.js";
-import { stepScopedLedger } from "../accounting.js";
 import {
-	attachPipelineSourceItems,
 	inputValueToPipelineItems,
 	parseJson,
 	serializePipelineItemsToStdout,
@@ -47,11 +44,10 @@ export class PipelinePausedError extends Error {
  */
 export async function runPipelineStep({
 	stepId,
-	chargeAs,
 	pipelineText,
 	inputValue,
 	ctx,
-	llmSpendLedger,
+	recordModelCall,
 	env,
 	cwd,
 	resume,
@@ -60,12 +56,11 @@ export async function runPipelineStep({
 	standalone = false,
 }: {
 	stepId: string;
-	/** The name the step's LLM spend is billed under (chargeStep's name for it). */
-	chargeAs: string;
 	pipelineText: string;
 	inputValue: unknown;
 	ctx: RunContext;
-	llmSpendLedger?: LlmSpendLedger;
+	/** Counts a model call the pipeline made in the run's cost, under the step. */
+	recordModelCall?: (call: ModelCall) => void;
 	env: Record<string, string | undefined>;
 	cwd: string;
 	/** Continue after the question it paused on, with the answer (`response`, for an input). */
@@ -132,8 +127,7 @@ export async function runPipelineStep({
 		assertInvocationCurrent: ctx.assertInvocationCurrent,
 		onUnsafeCommandDispatch: ctx.hooks?.onUnsafeDispatch,
 		llmAdapters: ctx.llmAdapters,
-		// Scoped so a charge nothing bills can still name the step that opened it.
-		llmSpendLedger: llmSpendLedger ? stepScopedLedger(llmSpendLedger, chargeAs) : undefined,
+		recordModelCall,
 		input: resume
 			? resume.pause.mode === "next_stage" && resume.question.kind === "input"
 				? [resume.response]
@@ -228,18 +222,5 @@ export async function runPipelineStep({
 		json,
 		...(standalone ? { items: result.items, rendered: Boolean(result.rendered) } : {}),
 	};
-	// Only when a renderer consumed the pipeline: otherwise `json` already is those items.
-	if (!result.items.length && result.renderedItems.length) {
-		// Only restore marks from the renderer's own matching objects, never from public JSON fields.
-		const source = Array.isArray(json)
-			? result.renderedItems
-			: result.renderedItems.length === 1
-				? result.renderedItems[0]
-				: undefined;
-		if (source !== undefined && stableStringify(source) === stableStringify(json)) {
-			carryLlmProvenance(source, json);
-		}
-		attachPipelineSourceItems(stepResult, result.renderedItems);
-	}
 	return stepResult;
 }

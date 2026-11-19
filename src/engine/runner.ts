@@ -27,6 +27,7 @@ import { checkRunId, type RunKind } from "../persistence/model.js";
 import type { StoreSession } from "../persistence/session.js";
 import { ExecutionRecorder } from "../persistence/session.js";
 import { ResumeRefusedError, UpgradeRequiredError } from "./errors.js";
+import { savedByOlderVersion } from "./upgrade.js";
 import type { WorkflowResumePayload } from "../resume/token.js";
 import { decisionCount, type Decision } from "../resume/options.js";
 
@@ -257,6 +258,9 @@ function settled(state: ExecutionState) {
 async function resumedRunId(session: StoreSession, stateKey: string, ctx: RunContext) {
 	// Continuations are written by store transitions only: a plain read sees them whole.
 	const text = (await session.read(stateKey)).text;
+	// Still in a file an older Lobster wrote: it has to be imported first.
+	if (text === null && (await savedByOlderVersion(session.directory, stateKey)))
+		throw new UpgradeRequiredError();
 	const saved = (text === null ? null : JSON.parse(text)) as { type?: string } | null;
 	// A token an older Lobster already used left this marker behind.
 	if (!saved || saved.type === "lobster.consumed-resume-state.v1")

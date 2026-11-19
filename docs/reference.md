@@ -90,7 +90,7 @@ Notes:
 - Unknown keys are rejected when the file loads, with a suggestion for likely typos, so a misspelled `when:` cannot make a step run unconditionally.
 - `<`, `<=`, `>` and `>=` compare numbers (numeric strings such as `"0.9"` count). Comparing anything else, including a missing value or `null`, fails the step with an error rather than evaluating to false. Guard optional values with `&&` or `||`, which skip the right side when the left decides the result; compared with the literal `null` (also in parentheses), a missing field counts as null; two fields never match on "no value": `$score.json.value != null && $score.json.value > 0.8`.
 - Use `retry`, `timeout_ms`, and `on_error` per step to control transient-failure behavior and recovery.
-- On `for_each` and `repeat`, these policies cover the entire loop: each attempt gets one timeout budget (`pause_ms` pauses between batches do not count against it), and retry restarts at the first item or round. Previously completed children may run again, so only enable loop retries for work that is safe to repeat. A `cost_limit` stop or an attempted OpenClaw dispatch prevents retries; paid LLM usage is checked even when a later pipeline command fails. `on_error: continue` records `$loop.error` and proceeds to the next workflow step; `skip_rest` skips the remaining workflow steps.
+- On `for_each` and `repeat`, these policies cover the entire loop: each attempt gets one timeout budget (`pause_ms` pauses between batches do not count against it), and retry restarts at the first item or round. Previously completed children may run again, so only enable loop retries for work that is safe to repeat. A `cost_limit` stop or an attempted OpenClaw dispatch prevents retries; model calls are counted even when a later pipeline command fails. `on_error: continue` records `$loop.error` and proceeds to the next workflow step; `skip_rest` skips the remaining workflow steps.
 - Approval steps can optionally enforce identity constraints:
   - `approval.required_approver` (or `requiredApprover`) requires an exact approver id.
   - `approval.require_different_approver` (or `requireDifferentApprover`) requires approver id to differ from initiator.
@@ -432,7 +432,7 @@ inside the step (a question at the terminal, a `pause_ms` between batches, a sho
 ## Restarting workflow-file runs
 
 A workflow run saves its definition, resolved activity inputs, complete results,
-control position and accounting. After a process restart, completed activities
+control position and spend. After a process restart, completed activities
 are not executed again. Continue an unfinished run explicitly:
 
 ```sh
@@ -1018,7 +1018,7 @@ A host embedding Lobster can supply its own adapters through `ctx.llmAdapters`. 
 
 Workflow `_meta.cost` and `cost_limit` use a static pricing table plus optional overrides from `LOBSTER_LLM_PRICING_JSON`, for example `{"my-model":{"input":1.0,"output":2.0}}` in USD per million tokens. Unknown or missing model IDs still record token counts with zero estimated cost, but Lobster warns on stderr so stale or missing pricing does not fail silently.
 
-A cached or replayed answer is not billed again: a model call is counted once, in the run that made it, however many later steps re-emit its answer. This holds while the answer stays inside Lobster: through pipelines, renderers, projections, run state, `workflow:` steps and a resume. It does not survive a stage that hands the items to an external process and reads them back — `exec --stdin json --json ...` — because what comes back is whatever that process printed, and Lobster cannot tell a faithful copy of a replay from a fresh claim to have made the call. Such a step is billed as a call, which is what earlier versions did everywhere. A run saves where its paid answers are, with its own state, so an answer is still known to be paid after a pause however many calls the run made, and a value that merely copies an answer's public fields is not. A `workflow:` step counts what its sub-workflow spent, and a replay the sub-workflow returned is not billed a second time by the run that composed it. Spend also survives a pause — a workflow that stops at an approval or `input` gate keeps what it has recorded, so `_meta.cost` covers the whole run after a resume and `cost_limit` applies to the whole run rather than to the steps after the last gate.
+Each model call `llm.invoke` makes is counted when its answer arrives, under the step that made it: the `workflow:` step for a call inside a child workflow, `loop.step` inside a `for_each`. A cached or replayed answer is not a call and is never counted, however many later steps pass it on. Every call counts, including a rejected answer that `--max-validation-retries` asks again for, a call in a `wait: any` branch that lost the race (if its answer came before the branch was stopped), and a call in a step that then failed (so `cost_limit` stops a retry after a paid attempt). Only `llm.invoke` calls count: usage another command prints in its output is not counted. Spend survives a pause, so `_meta.cost` covers the whole run after a resume and `cost_limit` applies to the whole run rather than to the steps after the last gate; a child workflow's limit applies to what it spent.
 
 `llm_task.invoke` remains available as a backward-compatible alias for the OpenClaw provider.
 
@@ -1175,7 +1175,7 @@ The source is one TypeScript package; only `src/cli.ts` sits at the top of `src`
 | `src/persistence` | The SQLite run store, sessions, history and waits |
 | `src/state` | Stored values (`state.get`/`state.set`), short approval IDs, state keys, file locks and atomic writes |
 | `src/resume` | Resume arguments, options and tokens |
-| `src/llm` | `llm.invoke`'s protocol, adapters, answer cache and flags; LLM spend accounting and cost tracking |
+| `src/llm` | `llm.invoke`'s protocol, adapters, answer cache and flags; cost tracking |
 | `src/process`, `src/io`, `src/util` | Child processes, stream and HTTP reads, small shared helpers |
 
 Run `pnpm test`, `pnpm typecheck`, and `pnpm lint` before submitting changes.

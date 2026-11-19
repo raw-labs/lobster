@@ -94,19 +94,6 @@ export function readStateJsonWithLock({
 	return readLocked(env, key, signal, (session) => readJson(session, key, signal));
 }
 
-/** The stored text of `key` (or null), read under its lock like readStateJsonWithLock. */
-export function readStateTextWithLock({
-	env,
-	key,
-	signal,
-}: {
-	env: Env;
-	key: string;
-	signal?: AbortSignal;
-}): Promise<string | null> {
-	return readLocked(env, key, signal, async (session) => (await session.read(key)).text);
-}
-
 type WriteOptions = {
 	env: Env;
 	key: string;
@@ -116,26 +103,25 @@ type WriteOptions = {
 	assertInvocationCurrent?: () => void;
 };
 
-/** Write `value` under `key` as state text; returns the write's result and the text written. */
+/** Write `value` under `key` as state text. */
 async function writeJson(
 	session: StoreSession,
 	{ key, value, signal, assertInvocationCurrent }: WriteOptions,
 ) {
 	const text = JSON.stringify(value, null, 2) + "\n";
-	const result = await session.write(key, text, { signal, assertInvocationCurrent });
-	return { ...result, text };
+	return session.write(key, text, { signal, assertInvocationCurrent });
 }
 
-/** Write `value` under its key; returns the text written (what a later read gets back). */
+/** Write `value` under its key. */
 export function writeStateJson(options: WriteOptions) {
 	return inStore(options.env, { signal: options.signal }, async (session, env) => {
-		const { signalAbortedAfterCommit, text } = await withStateKeyLock(
+		const { signalAbortedAfterCommit } = await withStateKeyLock(
 			env,
 			options.key,
 			options.signal,
 			() => writeJson(session, options),
 		);
-		return { signalAbortedAfterCommit, text };
+		return { signalAbortedAfterCommit };
 	});
 }
 

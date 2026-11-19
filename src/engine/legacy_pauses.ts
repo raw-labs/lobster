@@ -53,7 +53,6 @@ export type OldWorkflowPause = {
 		commandInput: unknown;
 	};
 	cost?: ExecutionState["cost"];
-	llmSpend?: ExecutionState["llmSpend"];
 };
 
 export function isOldWorkflowPause(key: string, value: unknown): value is OldWorkflowPause {
@@ -139,8 +138,8 @@ export async function convertWorkflowPause(key: string, old: OldWorkflowPause) {
 		const approval = { ...approvalRequest(step, subject, {}), ...old.approvalIdentity };
 		gateKey = keys.approval(attemptKey);
 		wait = approval;
-		// The step already ran and was charged; only the decision is outstanding.
-		activations[stepKey] = { phase: "started", attempt: 1, accounted: true };
+		// The step already ran; only the decision is outstanding.
+		activations[stepKey] = { phase: "started", attempt: 1 };
 		activations[gateKey] = {
 			phase: "waiting",
 			result: {
@@ -249,7 +248,6 @@ export async function convertWorkflowPause(key: string, old: OldWorkflowPause) {
 		// Converted now: an event wait matches events from here on, as in a run started now.
 		startedAt: Date.now(),
 		...(old.cost ? { cost: old.cost } : {}),
-		...(old.llmSpend?.length ? { llmSpend: old.llmSpend } : {}),
 	};
 	const continuation = (runId: string) => continuationText(runId, gateKey, wait);
 	// Written as every save writes a checkpoint: an old output is a value, never a reference.

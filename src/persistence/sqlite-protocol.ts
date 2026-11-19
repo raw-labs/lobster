@@ -28,7 +28,7 @@ type Operations = {
 	acknowledge: { args: { runId: string; operationId: string }; result: void };
 	getRun: { args: { id: string }; result: RunRecord | null };
 	getRunState: { args: { id: string }; result: RunState | null };
-	listRuns: { args: Record<string, never>; result: RunRecord[] };
+	retainable: { args: { before: string }; result: string[] };
 	listRunSummaries: {
 		args: { after: string; limit: number; filter?: RunFilter };
 		result: RunSummary[];

@@ -1,5 +1,5 @@
 import { PersistenceError } from "../persistence/backend.js";
-import type { LlmSpendLedger } from "../llm/accounting.js";
+import type { ModelCall } from "../llm/cost_tracker.js";
 import {
 	InputRequestSuspension,
 	RequestInputResumeError,
@@ -25,7 +25,7 @@ export async function runPipeline({
 	input,
 	cwd = undefined,
 	llmAdapters = undefined,
-	llmSpendLedger = undefined,
+	recordModelCall = undefined,
 	signal = undefined,
 	forceTerminationSignal = undefined,
 	haltAfterStageOnAbort = false,
@@ -49,7 +49,8 @@ export async function runPipeline({
 	input?: any;
 	cwd?: string | undefined;
 	llmAdapters?: Record<string, any> | undefined;
-	llmSpendLedger?: LlmSpendLedger | undefined;
+	/** Counts a model call a command made in the run's cost. Absent outside a run. */
+	recordModelCall?: ((call: ModelCall) => void) | undefined;
 	signal?: AbortSignal | undefined;
 	forceTerminationSignal?: AbortSignal | undefined;
 	haltAfterStageOnAbort?: boolean;
@@ -72,7 +73,6 @@ export async function runPipeline({
 	await recorderFromEnv(env)?.definition(pipeline);
 	let stream = input ?? [];
 	let rendered = false;
-	const renderedItems: unknown[] = [];
 	let halted = false;
 	let haltedAt: { index: number; stage: (typeof pipeline)[number]; inPlace?: boolean } | null =
 		null;
@@ -98,9 +98,7 @@ export async function runPipeline({
 		renderOutput,
 		cwd,
 		llmAdapters,
-		// The ledger of live LLM calls this run has not billed yet, so a replay of one of them
-		// can still be charged to the run that made it. Absent outside a cost-tracked run.
-		llmSpendLedger,
+		recordModelCall,
 		signal,
 		forceTerminationSignal,
 		onNonRetryableSideEffect,
@@ -183,7 +181,7 @@ export async function runPipeline({
 				// The name used to invoke it, which may be an alias.
 				commandName: stage.name,
 				stdout: stageStdout,
-				render: createRecordingJsonRenderer(stageStdout, renderedItems),
+				render: createJsonRenderer(stageStdout),
 			};
 			const stageCtx = {
 				...ctx,
@@ -311,7 +309,7 @@ export async function runPipeline({
 		if (haltAfterStageOnAbort) signal?.throwIfAborted();
 		assertRequestInputResumeConsumed(requestInputResume);
 
-		return { items, rendered, renderedItems, halted, haltedAt, executionStarted };
+		return { items, rendered, halted, haltedAt, executionStarted };
 	}
 
 	async function closeStages() {
@@ -359,7 +357,6 @@ function dryRunPipeline({ pipeline, stderr }: { pipeline: any[]; stderr: any }) 
 	return {
 		items: [],
 		rendered: true,
-		renderedItems: [],
 		halted: false,
 		haltedAt: null,
 		executionStarted: false,
@@ -379,25 +376,6 @@ function formatStageArgs(args: Record<string, unknown>) {
 		}
 	}
 	return parts.join(", ");
-}
-
-/**
- * Wraps the stage renderer so the pipeline keeps the objects a renderer was handed. A renderer
- * writes them to stdout and returns no items, so a caller that reads the pipeline back from that
- * text only ever sees what JSON can express. Provenance a consumer must not take from the text
- * itself — whether an LLM result was replayed rather than paid for — lives on these originals.
- * They stay in this process and are never written or serialized.
- */
-function createRecordingJsonRenderer(stdout: any, collected: unknown[]) {
-	const renderer = createJsonRenderer(stdout);
-	return {
-		...renderer,
-		json(items: unknown) {
-			if (Array.isArray(items)) collected.push(...items);
-			else collected.push(items);
-			return renderer.json(items);
-		},
-	};
 }
 
 function throwIfAbortedAfterDrain(input: AsyncIterable<unknown>, signal?: AbortSignal) {

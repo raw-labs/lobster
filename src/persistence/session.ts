@@ -18,7 +18,6 @@ import { sessionFromEnv } from "./context.js";
 import { callerId } from "./waits.js";
 import { fingerprint } from "../util/serialization.js";
 import {
-	canRetain,
 	captureRunMetadata,
 	summarize,
 	type AttemptStatus,
@@ -322,14 +321,8 @@ export class StoreSession {
 				throw new Error("Invalid retention date");
 			}
 			const removed: string[] = [];
-			for (const run of await this.backend.listRuns()) {
-				if (!canRetain(run, before)) {
-					continue;
-				}
-				if (dryRun || (await this.backend.removeRun(run.id, before))) {
-					removed.push(run.id);
-				}
-			}
+			for (const id of await this.backend.retainable(before))
+				if (dryRun || (await this.backend.removeRun(id, before))) removed.push(id);
 			return removed;
 		}, !dryRun);
 	}

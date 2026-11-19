@@ -6,12 +6,12 @@ import { activation, keys } from "../checkpoint.js";
 import { createRecord } from "../../workflows/values.js";
 import type { Machine } from "../machine.js";
 import { GATES_REFUSED, innerSettings, type Scope } from "../scope.js";
-import { branchSpendBuffer, concurrentLedger } from "../accounting.js";
 import { stopsRun } from "../errors.js";
 
 /**
  * Each branch saves its result as it finishes. With `wait: any` the first branch to finish
- * wins: it is saved before the others are stopped, and only its spend is charged to the run.
+ * wins: it is saved before the others are stopped. The calls every branch made count in the
+ * run's cost, the losers' too.
  * A failed branch stops the others (with `wait: all`); either way the step returns only once
  * every branch has settled, so none can write or dispatch after it.
  */
@@ -56,17 +56,9 @@ export async function parallelStep(
 	try {
 		const run = async (branch: (typeof config.branches)[number]) => {
 			if (lost(branch.id)) return;
-			const buffer = race ? branchSpendBuffer(scope.ledger) : undefined;
-			const ledger = buffer ?? concurrentLedger(scope.ledger);
-			const childKey = keys.branch(key, branch.id);
-			const result = await machine.visit(branch, childKey, { ...branchScope, ledger }, false);
+			const result = await machine.visit(branch, keys.branch(key, branch.id), branchScope);
 			if (lost(branch.id)) return;
-			if (race) {
-				frame.parallel = { winner: branch.id };
-				// The winner's charges go with the save that names it: saved later, a crash in
-				// between would leave a winner whose calls are billed nowhere.
-				buffer!.release();
-			}
+			if (race) frame.parallel = { winner: branch.id };
 			(frame.results ??= {})[branch.id] = result;
 			await machine.save();
 			return result;

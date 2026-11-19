@@ -28,7 +28,6 @@ export type RunPipelineResult = {
 	items: unknown[];
 	/** Whether the last command rendered its own output. */
 	rendered: boolean;
-	renderedItems: unknown[];
 	/** Whether a stage halted the pipeline (to ask, or for approval). */
 	halted: boolean;
 	/** Where it halted: `inPlace` when a command asked mid-run and runs again once answered. */

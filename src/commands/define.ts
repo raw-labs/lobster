@@ -60,3 +60,13 @@ export function assertKnownFlags(
 			);
 	}
 }
+
+/** The value of whichever spelling of a flag was given; two spellings at once are refused. */
+export function oneSpelling(command: string, args: Record<string, unknown>, names: string[]) {
+	const given = names.filter((name) => args[name] !== undefined);
+	if (given.length > 1)
+		throw new Error(
+			`${command} takes ${given.map((name) => `--${name}`).join(" or ")}, not more than one`,
+		);
+	return given.length ? args[given[0]] : undefined;
+}

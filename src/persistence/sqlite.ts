@@ -263,8 +263,8 @@ export class SqliteBackend implements Backend {
 		return this.request("inspectRun", { id, afterSequence, limit });
 	}
 
-	listRuns(): Promise<RunRecord[]> {
-		return this.request("listRuns", {});
+	retainable(before: string): Promise<string[]> {
+		return this.request("retainable", { before });
 	}
 
 	export(): Promise<LogicalArchive> {

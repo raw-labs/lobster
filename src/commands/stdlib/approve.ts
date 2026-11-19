@@ -1,4 +1,4 @@
-import { defineCommand } from "../define.js";
+import { defineCommand, oneSpelling } from "../define.js";
 import { readLineFromStream } from "../../io/read_line.js";
 import { approvalInputTimeoutMs, isInteractive, yesOrNoPrompt } from "../../io/terminal.js";
 import { streamOf } from "../../io/streams.js";
@@ -33,8 +33,14 @@ export const approveCommand = defineCommand({
 	},
 	async run({ input, args, ctx }) {
 		const prompt = args.prompt ?? "Approve?";
-		const previewFromStdin = Boolean(args.previewFromStdin ?? args["preview-from-stdin"]);
-		const previewLimitRaw = args.limit ?? args.previewLimit ?? args["preview-limit"];
+		const previewFromStdin = Boolean(
+			oneSpelling("approve", args, ["preview-from-stdin", "previewFromStdin"]),
+		);
+		const previewLimitRaw = oneSpelling("approve", args, [
+			"limit",
+			"preview-limit",
+			"previewLimit",
+		]);
 		const previewLimit = Number.isFinite(Number(previewLimitRaw)) ? Number(previewLimitRaw) : 5;
 
 		const items = [];

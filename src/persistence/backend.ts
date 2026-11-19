@@ -51,7 +51,8 @@ export interface Backend {
 	acknowledge(runId: string, operationId: string): Promise<void>;
 	getRun(id: string): Promise<RunRecord | null>;
 	getRunState(id: string): Promise<RunState | null>;
-	listRuns(): Promise<RunRecord[]>;
+	/** Finished runs last updated before `before` that retention may remove now. */
+	retainable(before: string): Promise<string[]>;
 	listRunSummaries(after: string, limit: number, filter?: RunFilter): Promise<RunSummary[]>;
 	inspectRun(id: string, afterSequence: number, limit: number): Promise<HistoryPage | null>;
 	removeRun(id: string, before: string): Promise<boolean>;

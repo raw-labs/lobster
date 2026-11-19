@@ -136,11 +136,11 @@ async function dispatch(
 				);
 			result = await runPipelineStep({
 				stepId: step.id,
-				chargeAs: scope.accountAs ?? scope.costPrefix + step.id,
 				pipelineText: saved.text!,
 				inputValue: saved.input,
 				ctx,
-				llmSpendLedger: scope.ledger,
+				recordModelCall: ({ model, usage }) =>
+					machine.cost.recordUsage(scope.accountAs ?? scope.costPrefix + step.id, model, usage),
 				env,
 				cwd: inRunDirectory(scope.ctx, saved.cwd),
 				gatesRefused: scope.gatesRefused,

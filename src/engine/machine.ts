@@ -1,12 +1,11 @@
 // The machine that runs a saved execution: it visits steps (conditions, attempts, retries,
-// on_error, timeouts, approvals after a step), charges their cost, and saves the checkpoint.
+// on_error, timeouts, approvals after a step), checks their cost, and saves the checkpoint.
 // What each kind of step does is in nodes/; waits, records and reporting have modules of
 // their own.
 import { messageOf } from "../util/errors.js";
 import type { WorkflowStep, WorkflowStepResult, WorkflowRunResult } from "../workflows/types.js";
 import { isApprovalStep } from "../workflows/steps.js";
 import { computeDelay, resolveRetryConfig } from "../workflows/retry.js";
-import { createLlmSpendLedger, type LlmSpendLedger } from "../llm/accounting.js";
 import { CostTracker } from "../llm/cost_tracker.js";
 import { combineSignals } from "../process/owner_signal.js";
 import { sleepUntil } from "../util/duration.js";
@@ -25,7 +24,6 @@ import { ExecutionStore } from "./store.js";
 import { CheckpointRecords } from "./records.js";
 import { deliberateWait, StepClock } from "./step_clock.js";
 import type { Scope } from "./scope.js";
-import { chargeStep, settleUnbilledCharges } from "./accounting.js";
 import { pausedResult } from "./outcome.js";
 import { withdrawWaits } from "./waits.js";
 import { skippedInside, toOutputItems } from "./results.js";
@@ -46,13 +44,12 @@ import { approval } from "./nodes/approval.js";
 export class Machine {
 	readonly ctx: RunContext;
 	readonly cost: CostTracker;
-	readonly ledger: LlmSpendLedger;
 	readonly records: CheckpointRecords;
 
 	/**
-	 * The machine for a run's checkpoint, with the outputs it keeps as records put back in place
-	 * (and their model-call marks): before anything can save it, since a save of a checkpoint
-	 * still holding references would keep the references themselves.
+	 * The machine for a run's checkpoint, with the outputs it keeps as records put back in place:
+	 * before anything can save it, since a save of a checkpoint still holding references would
+	 * keep the references themselves.
 	 */
 	static async load(state: ExecutionState, store: ExecutionStore, ctx: RunContext) {
 		const machine = new Machine(state, store, ctx);
@@ -74,11 +71,7 @@ export class Machine {
 		};
 		this.cost = new CostTracker(CostTracker.parsePricingFromEnv(ctx.env, ctx.stderr), ctx.stderr);
 		this.cost.restore(state.cost?.byStep);
-		this.ledger = createLlmSpendLedger();
-		this.ledger.restore(state.llmSpend);
-		this.records = new CheckpointRecords(store.session, store.runId, (key) =>
-			this.ledger.isOpen(key),
-		);
+		this.records = new CheckpointRecords(store.session, store.runId);
 	}
 
 	/** Run the workflow from where it stands until it finishes, pauses or stops. */
@@ -104,10 +97,8 @@ export class Machine {
 				cwd: state.definition.workflow.cwd,
 				ancestors: [state.definition.filePath],
 				ctx: this.ctx,
-				ledger: this.ledger,
 				costPrefix: "",
 			});
-			settleUnbilledCharges(this.cost, this.ledger);
 			// A standalone pipeline's output is its items as they are.
 			const standalone = state.definition.standalone && Array.isArray(result.items);
 			state.output = standalone ? result.items! : toOutputItems(result);
@@ -138,21 +129,22 @@ export class Machine {
 
 	/**
 	 * Visit `step` at `key`: decide its condition, run its attempts (retrying them as its
-	 * `retry` allows), ask its approval, and apply `on_error`. `account: false` leaves the
-	 * charging to the caller (a parallel step charges its branches).
+	 * `retry` allows), ask its approval, and apply `on_error`.
 	 */
-	async visit(
-		step: WorkflowStep,
-		key: string,
-		scope: Scope,
-		account = true,
-	): Promise<WorkflowStepResult> {
+	async visit(step: WorkflowStep, key: string, scope: Scope): Promise<WorkflowStepResult> {
 		this.ctx.signal?.throwIfAborted();
 		this.checkAuthority();
 		const frame = activation(this.state, key);
 		if (frame.phase === "completed") return frame.result!;
 		if (frame.phase === "failed") throw new Error(frame.error);
-		if (skippedByCondition(step, frame, scope)) return frame.result!;
+		let skipped: boolean;
+		try {
+			skipped = skippedByCondition(step, frame, scope);
+		} catch (error) {
+			// A condition that cannot be decided fails the step; retrying would decide it the same.
+			return this.#fail(step, key, frame, error);
+		}
+		if (skipped) return frame.result!;
 		const node = nodeFor(step);
 		// Refused before dispatch: the command of a gated step must not run when nobody can be asked.
 		if (scope.gatesRefused && (isApprovalStep(step.approval) || node.role === "gate"))
@@ -169,14 +161,14 @@ export class Machine {
 				delete frame.retryAt;
 			}
 			const attemptKey = keys.attempt(key, frame.attempt);
-			// Once the approval after the step exists, the node has finished and been charged: its
-			// result is the question's subject, and it never runs again to ask.
+			// Once the approval after the step exists, the node has finished: its result is the
+			// question's subject, and it never runs again to ask.
 			const asked = this.state.activations[keys.approval(attemptKey)];
 			let result: WorkflowStepResult;
 			if (asked) result = asked.result!;
 			else
 				try {
-					result = await this.#runNode(step, node, frame, attemptKey, scope, account);
+					result = await this.#runNode(step, node, frame, attemptKey, scope);
 				} catch (error) {
 					this.checkAuthority(scope.ctx);
 					if (stopsRun(error) || scope.ctx.signal?.aborted) throw error;
@@ -196,14 +188,13 @@ export class Machine {
 		}
 	}
 
-	/** Run the step's node for one attempt, timed by its clock, and charge what it spent. */
+	/** Run the step's node for one attempt, timed by its clock, and check the run's cost. */
 	async #runNode(
 		step: WorkflowStep,
 		node: NodeHandler,
 		frame: Activation,
 		attemptKey: string,
 		scope: Scope,
-		account: boolean,
 	) {
 		const clock = new StepClock(step, frame, scope.ctx.hooks?.heartbeat, scope.holdClocks);
 		let result: WorkflowStepResult;
@@ -216,10 +207,7 @@ export class Machine {
 		}
 		const inner = this.state.activations[attemptKey]?.results;
 		if (inner) frame.results = inner;
-		if (account && !frame.accounted && !node.chargesInner)
-			chargeStep(this.cost, scope, step.id, result, frame.results);
-		if (account) this.checkCost(scope);
-		frame.accounted ||= account;
+		this.checkCost(scope);
 		return result;
 	}
 
@@ -237,7 +225,6 @@ export class Machine {
 	): Promise<"retry" | WorkflowStepResult> {
 		// A question the attempt published can no longer be answered.
 		await withdrawWaits(this, attemptKey);
-		settleUnbilledCharges(this.cost, scope.ledger);
 		this.checkCost(scope);
 		const message = messageOf(error);
 		const retry = resolveRetryConfig(step.retry);
@@ -256,6 +243,12 @@ export class Machine {
 			this.forgetBelow(attemptKey, true, frame);
 			return "retry";
 		}
+		return this.#fail(step, key, frame, error);
+	}
+
+	/** The step failed with `error`: fail the run, or complete the step with it under `on_error`. */
+	async #fail(step: WorkflowStep, key: string, frame: Activation, error: unknown) {
+		const message = messageOf(error);
 		frame.error = message;
 		if (!step.on_error || step.on_error === "stop") {
 			frame.phase = "failed";
@@ -348,10 +341,8 @@ export class Machine {
 	 * Save the checkpoint. Bookkeeping that is recomputed from saved results after a restart
 	 * (cursors, completion markers, evaluated conditions) is not saved on its own: it is
 	 * written with the next save, which writes the whole snapshot. Saves that guard an effect
-	 * (before dispatch, results, waits) are made at once. What was spent and the charges still
-	 * open are taken when the save's turn comes, with the activations and records they go with:
-	 * taken earlier, a queued save could write a branch's paid result beside a ledger from
-	 * before its call.
+	 * (before dispatch, results, waits) are made at once. The cost is taken when the save's turn
+	 * comes, with the activations and records it goes with.
 	 */
 	save(extras: Parameters<ExecutionStore["save"]>[1] = {}) {
 		return this.store.save(
@@ -360,7 +351,6 @@ export class Machine {
 			extras.publish || extras.consume ? () => this.checkAuthority() : undefined,
 			(state) => {
 				state.cost = this.cost.hasUsage() ? this.cost.getSummary() : undefined;
-				state.llmSpend = this.ledger.outstanding();
 				return this.records.prepare(state);
 			},
 		);

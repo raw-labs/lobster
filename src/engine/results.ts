@@ -69,7 +69,7 @@ export function resultOfLastStep(
 	if (!last) return result;
 	for (const field of ["json", "stdout", "response"] as const)
 		if (last[field] !== undefined) result[field] = last[field] as never;
-	return carrySourceItems(result, last);
+	return result;
 }
 
 /** Every step `steps` could have run (see stepIds), as skipped. */
@@ -110,31 +110,4 @@ export function serializeValueForStdout(value: unknown) {
 	if (value === null || value === undefined) return "";
 	if (typeof value === "string") return value;
 	return JSON.stringify(value);
-}
-
-const PIPELINE_SOURCE_ITEMS = Symbol("lobster.workflow.pipelineSourceItems");
-
-/**
- * Keep the items a pipeline produced on its step's result, out of sight of JSON: accounting
- * bills those (they carry the LLM marks), not the JSON re-read from the rendered output.
- */
-export function attachPipelineSourceItems<T extends object>(target: T, items: unknown[]) {
-	Object.defineProperty(target, PIPELINE_SOURCE_ITEMS, {
-		value: items,
-		enumerable: false,
-		configurable: true,
-	});
-	return target;
-}
-
-/** `to`, carrying the pipeline items `from` was built from, if any. */
-export function carrySourceItems<T extends object>(to: T, from: object | undefined): T {
-	const items = pipelineSourceItems(from);
-	return items ? attachPipelineSourceItems(to, items) : to;
-}
-
-export function pipelineSourceItems(target: object | undefined): unknown[] | undefined {
-	if (!target) return undefined;
-	const items = (target as Record<symbol, unknown>)[PIPELINE_SOURCE_ITEMS];
-	return Array.isArray(items) ? items : undefined;
 }

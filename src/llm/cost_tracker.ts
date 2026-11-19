@@ -13,6 +13,9 @@ export type CostSummary = {
 	byStep: StepCost[];
 };
 
+/** A model call a command made: what the provider was asked for, as it reported it. */
+export type ModelCall = { model: string | null; usage: Record<string, unknown> };
+
 export type CostLimit = {
 	max_usd: number;
 	action?: "warn" | "stop";

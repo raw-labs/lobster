@@ -1,4 +1,4 @@
-import { defineCommand } from "../define.js";
+import { defineCommand, oneSpelling } from "../define.js";
 import { responseChecker } from "../../util/validation.js";
 import { readLineFromStream } from "../../io/read_line.js";
 import {
@@ -55,7 +55,9 @@ export const askCommand = defineCommand({
 	},
 	async run({ input, args, ctx }) {
 		const prompt = typeof args.prompt === "string" ? args.prompt : "Input required";
-		const subjectFromStdin = Boolean(args["subject-from-stdin"] ?? args.subjectFromStdin);
+		const subjectFromStdin = Boolean(
+			oneSpelling("ask", args, ["subject-from-stdin", "subjectFromStdin"]),
+		);
 		const schemaRaw = typeof args.schema === "string" ? args.schema : null;
 
 		const defaultSchema = {

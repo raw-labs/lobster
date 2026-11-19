@@ -4,7 +4,6 @@
 import type { WorkflowApprovalIdentity, WorkflowStepResult } from "../workflows/types.js";
 import type { Definition } from "../workflows/definition.js";
 import type { CostSummary } from "../llm/cost_tracker.js";
-import type { LlmMarks, LlmOutstandingCharge } from "../llm/accounting.js";
 import type { CommandInputState } from "../pipeline/input_request.js";
 
 /** When a question or event wait stops waiting, and what happens then. */
@@ -73,8 +72,6 @@ export type Activation = {
 	error?: string;
 	/** A command that may not be repeated was dispatched here (or below, once forgotten). */
 	nonRetryable?: boolean;
-	/** Its cost was charged to the run. */
-	accounted?: boolean;
 	/** Results of the steps inside this node, readable by the steps after it. */
 	results?: Record<string, WorkflowStepResult>;
 	/** A step or a parallel with a timeout: when the running attempt times out (epoch ms). */
@@ -155,9 +152,6 @@ export type ExecutionState = {
 	output?: unknown[];
 	error?: string;
 	cost?: CostSummary;
-	llmSpend?: LlmOutstandingCharge[];
-	/** Where the marks of model calls sit in `activations`, as saved (records.ts). */
-	llmMarks?: LlmMarks;
 };
 
 /** The activation at `key`, created ready on first use. */

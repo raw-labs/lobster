@@ -23,8 +23,6 @@ export type NodeHandler = {
 	 * steps cannot pause.
 	 */
 	role: "activity" | "control" | "gate";
-	/** Its inner steps are charged as they run, so the step is not charged again. */
-	chargesInner?: boolean;
 };
 
 const activity: NodeHandler = { run: activityStep, role: "activity" };
@@ -34,11 +32,11 @@ const NODES: Record<StepKind, NodeHandler> = {
 	pipeline: activity,
 	approval: activity,
 	step: activity,
-	workflow: { run: childWorkflowStep, role: "control", chargesInner: true },
+	workflow: { run: childWorkflowStep, role: "control" },
 	parallel: { run: parallelStep, role: "control" },
-	for_each: { run: forEachStep, role: "control", chargesInner: true },
-	repeat: { run: repeatStep, role: "control", chargesInner: true },
-	switch: { run: switchStep, role: "control", chargesInner: true },
+	for_each: { run: forEachStep, role: "control" },
+	repeat: { run: repeatStep, role: "control" },
+	switch: { run: switchStep, role: "control" },
 	input: { run: inputStep, role: "gate" },
 	sleep: { run: sleepStep, role: "gate" },
 	wait: { run: waitStep, role: "gate" },

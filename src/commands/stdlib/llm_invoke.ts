@@ -1,6 +1,5 @@
 import { defineCommand } from "../define.js";
-import { markLlmItem } from "../../llm/accounting.js";
-import type { LlmChargeCost, LlmSpendLedger, LlmProvenance } from "../../llm/accounting.js";
+import type { ModelCall } from "../../llm/cost_tracker.js";
 import { formatSchemaError, prepareSchema, type SchemaValidator } from "../../util/validation.js";
 import { streamOf } from "../../io/streams.js";
 import {
@@ -38,28 +37,15 @@ import { messageOf } from "../../util/errors.js";
 const DEFAULT_MAX_VALIDATION_RETRIES = 1;
 
 /**
- * Opens a charge for a live call, and only for one that costs something. An answer that reports
- * no usage is billed nowhere however many times it is replayed, so a charge for it would sit in
- * the ledger with nothing to settle it -- and would be handed to the next caller with a real
- * call to account for, leaving that one's charge open to be billed a second time.
+ * Count a call the provider answered, as it reported it, in the run's cost (`_meta.cost`,
+ * `cost_limit`). Only calls are counted: an answer read back from the cache or run state was
+ * not a call, so it costs nothing however often it is used.
  */
-function recordLiveCharge(ctx: any, cacheKey: string, item: NormalizedInvocationItem | undefined) {
-	const cost = chargeCostOf(item);
-	if (!cost) return;
-	ledgerFrom(ctx)?.record(cacheKey, cost);
-}
-
-/** The cost of a live call, read from the item this module just built for it. */
-function chargeCostOf(item: NormalizedInvocationItem | undefined): LlmChargeCost | undefined {
+function recordCall(ctx: any, item: NormalizedInvocationItem | undefined) {
 	const usage = item?.usage;
-	if (!usage || typeof usage !== "object") return undefined;
-	return { model: typeof item?.model === "string" ? item.model : null, usage };
-}
-
-function ledgerFrom(ctx: any): LlmSpendLedger | null {
-	const ledger = ctx?.llmSpendLedger;
-	if (!ledger || typeof ledger !== "object") return null;
-	return typeof ledger.record === "function" && typeof ledger.claim === "function" ? ledger : null;
+	if (!usage || typeof usage !== "object") return;
+	const record: ((call: ModelCall) => void) | undefined = ctx?.recordModelCall;
+	record?.({ model: typeof item?.model === "string" ? item.model : null, usage });
 }
 
 export type CommandConfig = {
@@ -250,12 +236,14 @@ async function runLlmInvoke({
 		throwIfCancelled(signal);
 		const reused = pickReusableState(stored, cacheKey, config.stateType);
 		if (reused) {
-			const replay: LlmProvenance = { cacheKey, replayed: true };
 			return {
 				output: streamOf(
-					reused.items.map((item) =>
-						markLlmItem({ ...item, source: "run_state", cached: true, replayed: true }, replay),
-					),
+					reused.items.map((item) => ({
+						...item,
+						source: "run_state",
+						cached: true,
+						replayed: true,
+					})),
 				),
 			};
 		}
@@ -265,12 +253,9 @@ async function runLlmInvoke({
 		const cache = await readCacheEntry(env, cacheKey, config.cacheNamespace, ctx.signal);
 		throwIfCancelled(signal);
 		if (cache) {
-			const replay: LlmProvenance = { cacheKey, replayed: true };
 			return {
 				output: streamOf(
-					cache.items.map((item) =>
-						markLlmItem({ ...item, source: "cache", cached: true, replayed: true }, replay),
-					),
+					cache.items.map((item) => ({ ...item, source: "cache", cached: true, replayed: true })),
 				),
 			};
 		}
@@ -357,15 +342,10 @@ async function runLlmInvoke({
 			attempt,
 			itemKind: config.itemKind,
 		});
-		const live: LlmProvenance = { cacheKey, replayed: false };
-		for (const item of normalized) markLlmItem(item, live);
-		// The provider has answered and been paid, so the charge is opened here rather than at
-		// either of the returns below. An attempt the local validator rejects never reaches one
-		// of them -- it goes round the loop and asks again -- and its call was as real as the one
-		// that eventually satisfies the schema. Opening it here also puts it before the writes
-		// that store the answer: either can fail once run state already holds a replayable copy,
-		// and the retry that replays it must still find a charge to settle.
-		recordLiveCharge(ctx, cacheKey, normalized[0]);
+		// Counted as soon as the provider answers: an attempt the local validator rejects goes
+		// round the loop and asks again, and its call was as real as the one that satisfies the
+		// schema.
+		recordCall(ctx, normalized[0]);
 
 		if (!validator) {
 			ctx.signal?.throwIfAborted();

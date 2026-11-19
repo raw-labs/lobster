@@ -2,7 +2,7 @@
 
 ## Scope
 
-Replace the workflow-file executor with a saved-state interpreter. Keep YAML, commands, expressions and accounting; persist runs in one SQLite store, and import state saved by older versions once with `lobster upgrade`. Add durable sleeps, external-event waits and deadlines as pauses (see Time, events and liveness). Do not add task planning or a Gateway service in this change. Standalone pipelines and SDK pipelines run on the same interpreter (see Pipelines and the SDK), so there is one pause, resume and recovery mechanism.
+Replace the workflow-file executor with a saved-state interpreter. Keep YAML, commands, expressions and cost tracking; persist runs in one SQLite store, and import state saved by older versions once with `lobster upgrade`. Add durable sleeps, external-event waits and deadlines as pauses (see Time, events and liveness). Do not add task planning or a Gateway service in this change. Standalone pipelines and SDK pipelines run on the same interpreter (see Pipelines and the SDK), so there is one pause, resume and recovery mechanism.
 
 ## Source layout
 
@@ -14,7 +14,7 @@ Replace the workflow-file executor with a saved-state interpreter. Keep YAML, co
 - `engine/activities/`: running a shell command or a pipeline.
 - `engine/waits.ts`: publishing, answering, timing out, resolving and withdrawing waits, and asking at a terminal (or pausing when nobody can answer). `engine/asking.ts`: reading an answer at a terminal, and checking an answer and who gave it. `engine/outcome.ts`: what a paused run reports (token, approval ID, request).
 - `engine/records.ts`: values kept beside the checkpoint (loop items and outputs, large step outputs). `engine/store.ts`: serialized checkpoint writes, ownership leases and fencing.
-- `engine/scope.ts`, `engine/context.ts`, `engine/results.ts`, `engine/accounting.ts`, `engine/errors.ts`: what a node runs in, the run's context, step results, cost accounting, and the engine's errors.
+- `engine/scope.ts`, `engine/context.ts`, `engine/results.ts`, `engine/errors.ts`: what a node runs in, the run's context, step results, and the engine's errors.
 - `engine/runner.ts`: the run API for one run: start, resume, advance, abandon. `engine/upgrade.ts`: `lobster upgrade`, importing a state directory written by older versions.
 - `persistence/`: atomic transitions, storage receipts, history and the SQLite store. It stores checkpoints whole and reads them through `engine/checkpoint.ts`.
 - `commands/`, `packs/`: the command contract (`defineCommand`), the pack registry, `stdlib` and the integration packs; `repeatable: false` commands are never re-run on crash recovery.
@@ -23,7 +23,7 @@ This is a saved-state interpreter, not a bytecode VM or arbitrary JavaScript rep
 
 ## Model
 
-A run owns a versioned definition snapshot and activation records. An activation is one occurrence of a node (including iteration and explicit retry identities). Sequence cursors, loop inputs and progress, parallel branch outcomes, activity inputs/results, gates, retry deadlines and cost accounting are saved independently of optional diagnostic history. Control handlers share a single activity lifecycle. Completed activations return their saved result; interrupted activities either explicitly permit repetition or stop with an unknown outcome. A missing result is not proof that an effect did not happen.
+A run owns a versioned definition snapshot and activation records. An activation is one occurrence of a node (including iteration and explicit retry identities). Sequence cursors, loop inputs and progress, parallel branch outcomes, activity inputs/results, gates, retry deadlines and spend are saved independently of optional diagnostic history. Control handlers share a single activity lifecycle. Completed activations return their saved result; interrupted activities either explicitly permit repetition or stop with an unknown outcome. A missing result is not proof that an effect did not happen.
 
 A command/pipeline is one activity boundary. Pipelines must be fully drained before completion. Recovery inside a pipeline remains limited to its existing input continuation. Child workflows use the same engine, state and ownership, not another public invocation.
 
@@ -75,7 +75,7 @@ Timers, deadlines and event waits are gates, like approvals and input requests: 
 
 `test/execution_machine.test.ts` kills a real child process and starts a fresh process against the SQLite store. Cases cover result committed before cursor advancement, explicitly repeatable and uncertain activities, loop iteration progress, parallel branch progress, child-definition snapshots and retry count/deadline recovery. Counters prove which effects executed. The same file checks competing owners, stale checkpoint writes, interruption after question/decision/result commits, token versus short-ID competition, and host retirement before decision, dispatch or successor publication.
 
-Existing suites cover conditions, retries, timeouts, cancellation, composition, accounting, pipelines, input protocols, storage and packaging. Old workflow and pipeline tests tied to the previous checkpoint protocol (claims, consumed markers, handoffs, tombstones) are replaced by execution-transition checks; `failed_run_retry.test.ts` covers retries, and `upgrade.test.ts` resumes pipeline pauses written by the previous version.
+Existing suites cover conditions, retries, timeouts, cancellation, composition, cost, pipelines, input protocols, storage and packaging. Old workflow and pipeline tests tied to the previous checkpoint protocol (claims, consumed markers, handoffs, tombstones) are replaced by execution-transition checks; `failed_run_retry.test.ts` covers retries, and `upgrade.test.ts` resumes pipeline pauses written by the previous version.
 
 ## Limits
 

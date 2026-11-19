@@ -196,12 +196,6 @@ export async function resumeToolRequest(
 				if (owner && (!run || !visibleTo(run, callerId(ctx.runMetadata)))) return notFound();
 				stateKey = found;
 			}
-			// Still in a file an older Lobster wrote: it has to be imported first.
-			if (
-				(await store.read(stateKey)).text === null &&
-				(await savedByOlderVersion(store.directory, stateKey))
-			)
-				return errorEnvelope("upgrade_required", new UpgradeRequiredError());
 			return answerWait(ctx, stateKey, options);
 		});
 	} catch (error) {

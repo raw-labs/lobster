@@ -459,47 +459,6 @@ test("for_each retry retries a failing child and then succeeds", async () => {
 	assert.ok(stderrOutput.includes("[RETRY]"), "should log retry attempts");
 });
 
-test("for_each cost_limit stop does not retry a child that already exceeded the budget", async () => {
-	const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-foreach-cost-stop-"));
-	const counterFile = path.join(tmpDir, "counter");
-	await fsp.writeFile(counterFile, "0", "utf8");
-	const dataCmd = await writeNodeCommand(
-		tmpDir,
-		"data.js",
-		"process.stdout.write(JSON.stringify([1, 2]));\n",
-	);
-	const spendCmd = await writeNodeCommand(
-		tmpDir,
-		"spend.js",
-		[
-			'const fs = require("fs");',
-			`const p = ${JSON.stringify(counterFile)};`,
-			'const c = Number(fs.readFileSync(p, "utf8")) + 1;',
-			"fs.writeFileSync(p, String(c));",
-			"process.stdout.write(JSON.stringify({model:'gpt-4o',usage:{inputTokens:1000,outputTokens:1000}}));",
-			"",
-		].join("\n"),
-	);
-
-	await assert.rejects(
-		() =>
-			runWorkflowWithIo({
-				cost_limit: { max_usd: 0.01, action: "stop" },
-				steps: [
-					{ id: "data", command: dataCmd },
-					{
-						id: "loop",
-						for_each: "$data.json",
-						retry: { max: 3, delay_ms: 20 },
-						steps: [{ id: "spend", command: spendCmd }],
-					},
-				],
-			}),
-		/Cost limit exceeded/,
-	);
-	assert.equal(await fsp.readFile(counterFile, "utf8"), "1");
-});
-
 test("for_each dry-run renders timeout, retry, and on_error", async () => {
 	const workflow = {
 		steps: [

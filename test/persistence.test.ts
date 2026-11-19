@@ -211,7 +211,7 @@ test("SQLite sessions keep filesystem publication functions out of worker messag
 			key: "fixture",
 			value: 42,
 		});
-		assert.deepEqual(result, { signalAbortedAfterCommit: false, text: "42\n" });
+		assert.deepEqual(result, { signalAbortedAfterCommit: false });
 		assert.equal(JSON.parse((await store.read("fixture")).text), 42);
 	} finally {
 		await store.close();
@@ -363,7 +363,7 @@ for (const backend of ["sqlite"] as const) {
 		assert.equal(failed.ok, false);
 		const session = await openStoreSession({ env });
 		try {
-			const runs = await session.backend.listRuns();
+			const { runs } = await session.backend.export();
 			assert.ok(
 				runs.some(
 					(run) =>

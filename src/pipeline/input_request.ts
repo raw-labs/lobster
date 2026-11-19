@@ -1,4 +1,3 @@
-import { carryLlmProvenance } from "../llm/accounting.js";
 import { stableStringify } from "../util/serialization.js";
 import { prepareSchema, responseChecker } from "../util/validation.js";
 import { readLineFromStream } from "../io/read_line.js";
@@ -417,14 +416,12 @@ function snapshotOptionalState(state: unknown) {
 	return state === undefined ? undefined : snapshotJson(state, "requestInput suspendedState");
 }
 
-/** A JSON copy of `value`, keeping the marks of the model calls it carries. */
+/** A JSON copy of `value`. */
 function snapshotJson(value: unknown, label: string): unknown {
 	assertJsonSerializable(value, label, new WeakSet());
 	const text = JSON.stringify(value);
 	if (text === undefined) throw new Error(`${label} must be JSON-serializable`);
-	const copy = JSON.parse(text);
-	carryLlmProvenance(value, copy);
-	return copy;
+	return JSON.parse(text);
 }
 
 function assertJsonSerializable(value: unknown, label: string, seen: WeakSet<object>) {

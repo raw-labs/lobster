@@ -5,21 +5,13 @@ import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { PassThrough } from "node:stream";
+import { setTimeout as delay } from "node:timers/promises";
 
-import { builtinPacks, createDefaultRegistry, createRegistry } from "../src/commands/registry.js";
+import { builtinPacks, createRegistry } from "../src/commands/registry.js";
 import { defineCommand } from "../src/commands/define.js";
 import { CostTracker } from "../src/llm/cost_tracker.js";
-import {
-	createLlmSpendLedger,
-	llmMarksOf,
-	llmProvenanceOf,
-	markLlmItem,
-	restoreLlmMarks,
-} from "../src/llm/accounting.js";
-import type { LlmOutstandingCharge } from "../src/llm/accounting.js";
 import { runWorkflowFile } from "../src/engine/runner.js";
 import { decodeResumeToken } from "../src/resume/resume.js";
-import { openStoreSession } from "../src/persistence/session.js";
 
 test("CostTracker records usage and computes totals", () => {
 	const tracker = new CostTracker();
@@ -146,6 +138,44 @@ test("CostTracker checkLimit warns when action=warn and limit exceeded", () => {
 	assert.match(out, /\[WARN\] Cost/);
 });
 
+test("CostTracker escapes unknown model ids in warnings", () => {
+	const stderr = captureWritable();
+	const tracker = new CostTracker(undefined, stderr.stream);
+	tracker.recordUsage("step1", "bad\n\u001b[31m\u009b31m\u2028next\u2029line", {
+		inputTokens: 1,
+		outputTokens: 1,
+	});
+	assert.ok(stderr.output().includes('"bad\\n\\u001b[31m\\u009b31m\\u2028next\\u2029line"'));
+	assert.equal(stderr.output().includes("\u009b"), false);
+	assert.equal(stderr.output().includes("\u2028"), false);
+	assert.equal(stderr.output().includes("\u2029"), false);
+});
+
+// Holds its items for --ms (or until the step is stopped), then passes them on.
+const hold = defineCommand({
+	name: "test.hold",
+	meta: {
+		description: "Passes items on after a delay",
+		argsSchema: { type: "object", properties: { ms: { type: "number" } } },
+		sideEffects: [],
+		repeatable: true,
+	},
+	help: () => "test.hold",
+	async run({ input, args, ctx }) {
+		const items = [];
+		for await (const item of input) items.push(item);
+		await delay(Number(args.ms), undefined, { signal: ctx.signal });
+		return {
+			output: (async function* () {
+				yield* items;
+			})(),
+		};
+	},
+});
+const registry = createRegistry({
+	packs: [...builtinPacks, { name: "test", description: "Test", commands: [hold] }],
+});
+
 async function runWorkflow(
 	workflow: unknown,
 	envOverride?: Record<string, string>,
@@ -170,7 +200,7 @@ async function runWorkflow(
 				stderr,
 				env: { ...process.env, LOBSTER_STATE_DIR: stateDir, ...envOverride },
 				mode: "tool",
-				registry: createDefaultRegistry(),
+				registry,
 				llmAdapters,
 			},
 		});
@@ -182,130 +212,6 @@ async function runWorkflow(
 	}
 }
 
-test("workflow result includes _meta.cost when usage is present", async () => {
-	const { result } = await runWorkflow({
-		steps: [
-			{
-				id: "llm",
-				command:
-					"node -e \"process.stdout.write(JSON.stringify({model:'gpt-4o',usage:{inputTokens:100,outputTokens:50},output:{text:'hi'}}))\"",
-			},
-		],
-	});
-
-	assert.equal(result.status, "ok");
-	assert.ok(result._meta?.cost);
-	assert.equal(result._meta!.cost!.totalInputTokens, 100);
-	assert.equal(result._meta!.cost!.totalOutputTokens, 50);
-	assert.equal(result._meta!.cost!.byStep[0].model, "gpt-4o");
-});
-
-test("workflow result omits _meta.cost when no usage exists", async () => {
-	const { result } = await runWorkflow({
-		steps: [{ id: "plain", command: 'echo "hello"' }],
-	});
-	assert.equal(result.status, "ok");
-	assert.equal(result._meta, undefined);
-});
-
-test("cost_limit warn logs warning and continues", async () => {
-	const { result, stderrOutput } = await runWorkflow({
-		cost_limit: { max_usd: 0.00001, action: "warn" },
-		steps: [
-			{
-				id: "llm",
-				command:
-					"node -e \"process.stdout.write(JSON.stringify({model:'gpt-4o',usage:{inputTokens:1000,outputTokens:1000}}))\"",
-			},
-			{ id: "after", command: "echo done" },
-		],
-	});
-	assert.equal(result.status, "ok");
-	assert.match(stderrOutput, /\[WARN\] Cost/);
-	assert.deepEqual(result.output, ["done\n"]);
-});
-
-test("cost_limit stop throws when exceeded", async () => {
-	await assert.rejects(
-		() =>
-			runWorkflow({
-				cost_limit: { max_usd: 0.00001, action: "stop" },
-				steps: [
-					{
-						id: "llm",
-						command:
-							"node -e \"process.stdout.write(JSON.stringify({model:'gpt-4o',usage:{inputTokens:1000,outputTokens:1000}}))\"",
-					},
-				],
-			}).then((x) => x.result),
-		/Cost limit exceeded/,
-	);
-});
-
-test("workflow cost tracking warns for unknown model ids", async () => {
-	const { result, stderrOutput } = await runWorkflow({
-		cost_limit: { max_usd: 0.00001, action: "warn" },
-		steps: [
-			{
-				id: "llm",
-				command:
-					"node -e \"process.stdout.write(JSON.stringify({model:'unknown-model',usage:{inputTokens:1000,outputTokens:1000}}))\"",
-			},
-		],
-	});
-
-	assert.equal(result.status, "ok");
-	assert.equal(result._meta?.cost?.estimatedCostUsd, 0);
-	assert.match(stderrOutput, /No LLM pricing configured for model "unknown-model"/);
-});
-
-test("workflow cost tracking warns for invalid pricing env json", async () => {
-	const { result, stderrOutput } = await runWorkflow(
-		{
-			steps: [
-				{
-					id: "llm",
-					command:
-						"node -e \"process.stdout.write(JSON.stringify({model:'gpt-4o',usage:{inputTokens:1000,outputTokens:1000}}))\"",
-				},
-			],
-		},
-		{ LOBSTER_LLM_PRICING_JSON: "{not-json" },
-	);
-
-	assert.equal(result.status, "ok");
-	assert.match(stderrOutput, /Ignoring invalid LOBSTER_LLM_PRICING_JSON/);
-});
-
-test("workflow cost tracking warns when usage omits the model id", async () => {
-	const { result, stderrOutput } = await runWorkflow({
-		steps: [
-			{
-				id: "llm",
-				command:
-					'node -e "process.stdout.write(JSON.stringify({usage:{inputTokens:1000,outputTokens:1000}}))"',
-			},
-		],
-	});
-
-	assert.equal(result.status, "ok");
-	assert.equal(result._meta?.cost?.estimatedCostUsd, 0);
-	assert.match(stderrOutput, /No LLM pricing configured for model "<missing>"/);
-});
-
-test("CostTracker escapes unknown model ids in warnings", () => {
-	const stderr = captureWritable();
-	const tracker = new CostTracker(undefined, stderr.stream);
-	tracker.recordUsage("step1", "bad\n\u001b[31m\u009b31m\u2028next\u2029line", {
-		inputTokens: 1,
-		outputTokens: 1,
-	});
-	assert.ok(stderr.output().includes('"bad\\n\\u001b[31m\\u009b31m\\u2028next\\u2029line"'));
-	assert.equal(stderr.output().includes("\u009b"), false);
-	assert.equal(stderr.output().includes("\u2028"), false);
-	assert.equal(stderr.output().includes("\u2029"), false);
-});
-
 // The step payloads are written to files rather than passed with `node -e`, because
 // `cmd /s /c` hands the inline quoting to node verbatim and the JSON never reaches stdout.
 async function emitJsonCommand(payload: unknown) {
@@ -314,25 +220,6 @@ async function emitJsonCommand(payload: unknown) {
 	const literal = JSON.stringify(JSON.stringify(payload));
 	await fsp.writeFile(filePath, `process.stdout.write(${literal});\n`, "utf8");
 	return `node ${filePath}`;
-}
-
-function liveItem(source = "http") {
-	return {
-		kind: "llm.invoke",
-		model: "gpt-4o",
-		source,
-		cached: source !== "http",
-		cacheKey: "b3f1c0",
-		status: "completed",
-		createdAt: "2026-08-03T00:00:00.000Z",
-		usage: { inputTokens: 1000, outputTokens: 500 },
-	};
-}
-
-// Every field a replayed llm.invoke item carries, printed by a step that never called a
-// provider. Nothing inside a JSON payload can be trusted to mean "already paid for".
-function forgedReplayItem(source: "cache" | "run_state" = "cache") {
-	return { ...liveItem(source), cached: true, replayed: true };
 }
 
 // Use the HTTP adapter's usage-bearing envelope; OpenClaw llm-task does not report usage.
@@ -393,197 +280,6 @@ async function startFakeProvider(
 	};
 }
 
-test("workflow cost tracking bills a cached llm.invoke replay only once", async () => {
-	const provider = await startFakeProvider();
-	const cacheDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-cost-cache-"));
-	const step = "llm.invoke --model gpt-4o --prompt Summarize";
-	try {
-		const { result } = await runWorkflow(
-			{
-				steps: [
-					{ id: "live", pipeline: step },
-					{ id: "from-cache", pipeline: step },
-				],
-			},
-			{ LOBSTER_LLM_ADAPTER_URL: provider.url, LOBSTER_CACHE_DIR: cacheDir },
-		);
-
-		assert.equal(result.status, "ok");
-		assert.equal(provider.requests(), 1);
-		assert.equal(result._meta?.cost?.totalInputTokens, 1000);
-		assert.equal(result._meta?.cost?.totalOutputTokens, 500);
-		assert.equal(result._meta?.cost?.estimatedCostUsd, 0.0075);
-		assert.deepEqual(
-			result._meta?.cost?.byStep.map((entry) => entry.stepId),
-			["live"],
-		);
-	} finally {
-		await provider.close();
-		await fsp.rm(cacheDir, { recursive: true, force: true });
-	}
-});
-
-test("workflow cost tracking bills a run-state llm.invoke replay only once", async () => {
-	const provider = await startFakeProvider();
-	const step = "llm.invoke --disable-cache --model gpt-4o --prompt Summarize";
-	try {
-		const { result } = await runWorkflow(
-			{
-				steps: [
-					{ id: "live", pipeline: step },
-					{ id: "from-run-state", pipeline: step },
-				],
-			},
-			{ LOBSTER_LLM_ADAPTER_URL: provider.url, LOBSTER_RUN_STATE_KEY: "cost-tracker-replay" },
-		);
-
-		assert.equal(result.status, "ok");
-		assert.equal(provider.requests(), 1);
-		assert.equal(result._meta?.cost?.totalInputTokens, 1000);
-		assert.deepEqual(
-			result._meta?.cost?.byStep.map((entry) => entry.stepId),
-			["live"],
-		);
-	} finally {
-		await provider.close();
-	}
-});
-
-test("cost_limit stop is not tripped by a replayed llm.invoke", async () => {
-	const provider = await startFakeProvider();
-	const cacheDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-cost-cache-"));
-	const step = "llm.invoke --model gpt-4o --prompt Summarize";
-	try {
-		const { result } = await runWorkflow(
-			{
-				cost_limit: { max_usd: 0.01, action: "stop" },
-				steps: [
-					{ id: "live", pipeline: step },
-					{ id: "from-cache", pipeline: step },
-					{ id: "after", command: "echo done" },
-				],
-			},
-			{ LOBSTER_LLM_ADAPTER_URL: provider.url, LOBSTER_CACHE_DIR: cacheDir },
-		);
-
-		assert.equal(result.status, "ok");
-		assert.equal(result._meta?.cost?.estimatedCostUsd, 0.0075);
-	} finally {
-		await provider.close();
-		await fsp.rm(cacheDir, { recursive: true, force: true });
-	}
-});
-
-test("cost_limit stop still trips on repeated live calls", async () => {
-	const live = await emitJsonCommand(liveItem());
-	await assert.rejects(
-		() =>
-			runWorkflow({
-				cost_limit: { max_usd: 0.01, action: "stop" },
-				steps: [
-					{ id: "live", command: live },
-					{ id: "live-again", command: live },
-				],
-			}).then((x) => x.result),
-		/Cost limit exceeded/,
-	);
-});
-
-test("workflow cost tracking bills a live call from an adapter named like a replay source", async () => {
-	const { result } = await runWorkflow({
-		steps: [
-			{ id: "live-cache-provider", command: await emitJsonCommand(liveItem("cache")) },
-			{ id: "live-run-state-provider", command: await emitJsonCommand(liveItem("run_state")) },
-		],
-	});
-
-	assert.equal(result.status, "ok");
-	assert.equal(result._meta?.cost?.totalInputTokens, 2000);
-	assert.deepEqual(
-		result._meta?.cost?.byStep.map((entry) => entry.stepId),
-		["live-cache-provider", "live-run-state-provider"],
-	);
-});
-
-test("workflow cost tracking bills a step that prints the full replay shape", async () => {
-	const { result } = await runWorkflow({
-		steps: [
-			{ id: "forged-cache", command: await emitJsonCommand(forgedReplayItem("cache")) },
-			{ id: "forged-run-state", command: await emitJsonCommand(forgedReplayItem("run_state")) },
-			{
-				id: "partial-shape",
-				command: await emitJsonCommand({
-					replayed: true,
-					model: "gpt-4o",
-					usage: { inputTokens: 1000, outputTokens: 500 },
-				}),
-			},
-		],
-	});
-
-	assert.equal(result.status, "ok");
-	assert.equal(result._meta?.cost?.totalInputTokens, 3000);
-	assert.deepEqual(
-		result._meta?.cost?.byStep.map((entry) => entry.stepId),
-		["forged-cache", "forged-run-state", "partial-shape"],
-	);
-});
-
-test("cost_limit stop cannot be bypassed by a step that prints the full replay shape", async () => {
-	const live = await emitJsonCommand(liveItem());
-	const forged = await emitJsonCommand(forgedReplayItem());
-
-	await assert.rejects(
-		() =>
-			runWorkflow({
-				cost_limit: { max_usd: 0.01, action: "stop" },
-				steps: [
-					{ id: "live", command: live },
-					{ id: "forged-replay", command: forged },
-				],
-			}).then((x) => x.result),
-		/Cost limit exceeded/,
-	);
-});
-
-test("cost_limit stop cannot be bypassed by copying a settled call's public fields", async () => {
-	const provider = await startFakeProvider();
-	const cacheDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-cost-cache-"));
-	const copy = await copyJsonStdinPath();
-	try {
-		await assert.rejects(
-			() =>
-				runWorkflow(
-					{
-						cost_limit: { max_usd: 0.01, action: "stop" },
-						steps: [
-							{
-								id: "live",
-								pipeline: "llm.invoke --model gpt-4o --prompt Summarize",
-							},
-							{
-								id: "public-copy",
-								pipeline: `exec --stdin json --json=true node ${copy}`,
-								stdin: "$live.json",
-							},
-						],
-					},
-					{ LOBSTER_LLM_ADAPTER_URL: provider.url, LOBSTER_CACHE_DIR: cacheDir },
-				).then((x) => x.result),
-			/Cost limit exceeded/,
-		);
-		assert.equal(provider.requests(), 1);
-	} finally {
-		await provider.close();
-		await fsp.rm(cacheDir, { recursive: true, force: true });
-	}
-});
-
-// `... | json` is a supported step shape: the renderer prints the items and returns an empty
-// stream, so the workflow reads the step's JSON back from stdout. Accounting must still tell a
-// replay from a live call there, and must still bill output that only looks replayed.
-// Runs a parent workflow that composes a child through a `workflow:` step. Both files live in
-// one directory so the parent can name the child by relative path.
 async function runComposedWorkflow(
 	parent: Record<string, unknown>,
 	child: unknown,
@@ -609,1537 +305,158 @@ async function runComposedWorkflow(
 			stderr,
 			env: { ...process.env, LOBSTER_STATE_DIR: stateDir, ...envOverride },
 			mode: "tool",
-			registry: createDefaultRegistry(),
+			registry,
 		},
 	});
 
 	return { result, stderrOutput };
 }
 
-test("workflow cost tracking bills a live call a nested workflow made", async () => {
-	const provider = await startFakeProvider();
+type FakeProvider = Awaited<ReturnType<typeof startFakeProvider>>;
+
+/** Run `body` against `provider` (a default fake one) with a fresh answer cache. */
+async function withProvider(
+	body: (env: Record<string, string>, provider: FakeProvider) => Promise<void>,
+	provider?: FakeProvider,
+) {
+	const fake = provider ?? (await startFakeProvider());
 	const cacheDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-cost-cache-"));
 	try {
-		const { result } = await runComposedWorkflow(
-			{ steps: [{ id: "child", workflow: "child.lobster" }] },
-			{ steps: [{ id: "llm", pipeline: "llm.invoke --model gpt-4o --prompt Summarize | json" }] },
-			{ LOBSTER_LLM_ADAPTER_URL: provider.url, LOBSTER_CACHE_DIR: cacheDir },
-		);
-
-		assert.equal(result.status, "ok");
-		assert.equal(provider.requests(), 1);
-		// The composing run counts the spend its child handed back, exactly once.
-		assert.equal(result._meta?.cost?.totalInputTokens, 1000);
-		assert.equal(result._meta?.cost?.totalOutputTokens, 500);
-		assert.deepEqual(
-			result._meta?.cost?.byStep.map((entry) => entry.stepId),
-			["child"],
-		);
+		await body({ LOBSTER_LLM_ADAPTER_URL: fake.url, LOBSTER_CACHE_DIR: cacheDir }, fake);
 	} finally {
-		await provider.close();
+		await fake.close();
 		await fsp.rm(cacheDir, { recursive: true, force: true });
 	}
-});
+}
 
-test("workflow cost tracking bills a cached replay a nested workflow returned only once", async () => {
-	const provider = await startFakeProvider();
-	const cacheDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-cost-cache-"));
-	const step = "llm.invoke --model gpt-4o --prompt Summarize | json";
-	try {
-		const { result } = await runComposedWorkflow(
-			{
-				steps: [
-					{ id: "live", pipeline: step },
-					{ id: "child", workflow: "child.lobster" },
-				],
-			},
-			{ steps: [{ id: "llm", pipeline: step }] },
-			{ LOBSTER_LLM_ADAPTER_URL: provider.url, LOBSTER_CACHE_DIR: cacheDir },
-		);
+const invoke = (prompt = "Summarize", model = "gpt-4o") =>
+	`llm.invoke --model ${model} --prompt ${prompt}`;
+const stepIds = (result: { _meta?: { cost?: { byStep: Array<{ stepId: string }> } } }) =>
+	result._meta?.cost?.byStep.map((entry) => entry.stepId).sort();
 
+test("a model call is counted under the step that made it", async () => {
+	await withProvider(async (env, provider) => {
+		const { result } = await runWorkflow({ steps: [{ id: "llm", pipeline: invoke() }] }, env);
 		assert.equal(result.status, "ok");
 		assert.equal(provider.requests(), 1);
-		// The child replayed the answer the parent already paid for; billing it again would
-		// charge the run for tokens no provider was asked to spend.
 		assert.equal(result._meta?.cost?.totalInputTokens, 1000);
 		assert.equal(result._meta?.cost?.totalOutputTokens, 500);
-		assert.deepEqual(
-			result._meta?.cost?.byStep.map((entry) => entry.stepId),
-			["live"],
-		);
-	} finally {
-		await provider.close();
-		await fsp.rm(cacheDir, { recursive: true, force: true });
-	}
-});
-
-test("cost_limit stop is not tripped by a replay a nested workflow returned", async () => {
-	const provider = await startFakeProvider();
-	const cacheDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-cost-cache-"));
-	const step = "llm.invoke --model gpt-4o --prompt Summarize | json";
-	try {
-		const { result } = await runComposedWorkflow(
-			{
-				cost_limit: { max_usd: 0.01, action: "stop" },
-				steps: [
-					{ id: "live", pipeline: step },
-					{ id: "child", workflow: "child.lobster" },
-				],
-			},
-			{ steps: [{ id: "llm", pipeline: step }] },
-			{ LOBSTER_LLM_ADAPTER_URL: provider.url, LOBSTER_CACHE_DIR: cacheDir },
-		);
-
-		// One call is $0.0075; billing the child's replay too would exceed the $0.01 limit.
-		assert.equal(result.status, "ok");
-		assert.equal(provider.requests(), 1);
 		assert.equal(result._meta?.cost?.estimatedCostUsd, 0.0075);
-	} finally {
-		await provider.close();
-		await fsp.rm(cacheDir, { recursive: true, force: true });
-	}
+		assert.deepEqual(
+			result._meta?.cost?.byStep.map(({ stepId, model }) => ({ stepId, model })),
+			[{ stepId: "llm", model: "gpt-4o" }],
+		);
+	});
 });
 
-test("workflow cost tracking bills a nested workflow that prints the full replay shape", async () => {
-	const emitPath = await emitJsonPath(forgedReplayItem());
-	const { result } = await runComposedWorkflow(
-		{ steps: [{ id: "child", workflow: "child.lobster" }] },
-		{ steps: [{ id: "forged", command: `node ${emitPath}` }] },
-	);
-
-	// Nothing a child prints can exempt itself: provenance is a symbol this process attaches.
+test("workflow result omits _meta.cost when no model call was made", async () => {
+	const { result } = await runWorkflow({ steps: [{ id: "plain", command: 'echo "hello"' }] });
 	assert.equal(result.status, "ok");
-	assert.equal(result._meta?.cost?.totalInputTokens, 1000);
-	assert.equal(result._meta?.cost?.totalOutputTokens, 500);
+	assert.equal(result._meta, undefined);
 });
 
-async function emitJsonPath(payload: unknown) {
-	const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-cost-emit-"));
-	const filePath = path.join(dir, "emit.mjs");
-	const literal = JSON.stringify(JSON.stringify(payload));
-	await fsp.writeFile(filePath, `process.stdout.write(${literal});\n`, "utf8");
-	return filePath.split(path.sep).join("/");
-}
-
-async function copyJsonStdinPath() {
-	const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-cost-copy-"));
-	const filePath = path.join(dir, "copy.mjs");
-	await fsp.writeFile(
-		filePath,
-		'let input = "";\nprocess.stdin.setEncoding("utf8");\nprocess.stdin.on("data", (chunk) => (input += chunk));\nprocess.stdin.on("end", () => process.stdout.write(input));\n',
-		"utf8",
-	);
-	return filePath.split(path.sep).join("/");
-}
-
-test("workflow cost tracking bills a cached llm.invoke replay only once behind a renderer", async () => {
-	const provider = await startFakeProvider();
-	const cacheDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-cost-cache-"));
-	const step = "llm.invoke --model gpt-4o --prompt Summarize | json";
-	try {
-		const { result } = await runWorkflow(
-			{
-				steps: [
-					{ id: "live", pipeline: step },
-					{ id: "from-cache", pipeline: step },
-				],
-			},
-			{ LOBSTER_LLM_ADAPTER_URL: provider.url, LOBSTER_CACHE_DIR: cacheDir },
-		);
-
-		assert.equal(result.status, "ok");
-		assert.equal(provider.requests(), 1);
-		assert.equal(result._meta?.cost?.totalInputTokens, 1000);
-		assert.equal(result._meta?.cost?.totalOutputTokens, 500);
-		assert.deepEqual(
-			result._meta?.cost?.byStep.map((entry) => entry.stepId),
-			["live"],
-		);
-	} finally {
-		await provider.close();
-		await fsp.rm(cacheDir, { recursive: true, force: true });
-	}
-});
-
-test("workflow cost tracking bills a run-state llm.invoke replay only once behind a renderer", async () => {
-	const provider = await startFakeProvider();
-	const step = "llm.invoke --disable-cache --model gpt-4o --prompt Summarize | json";
-	try {
-		const { result } = await runWorkflow(
-			{
-				steps: [
-					{ id: "live", pipeline: step },
-					{ id: "from-run-state", pipeline: step },
-				],
-			},
-			{
-				LOBSTER_LLM_ADAPTER_URL: provider.url,
-				LOBSTER_RUN_STATE_KEY: "cost-tracker-rendered-replay",
-			},
-		);
-
-		assert.equal(result.status, "ok");
-		assert.equal(provider.requests(), 1);
-		assert.equal(result._meta?.cost?.totalInputTokens, 1000);
-		assert.deepEqual(
-			result._meta?.cost?.byStep.map((entry) => entry.stepId),
-			["live"],
-		);
-	} finally {
-		await provider.close();
-	}
-});
-
-test("cost_limit stop is not tripped by a replayed llm.invoke behind a renderer", async () => {
-	const provider = await startFakeProvider();
-	const cacheDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-cost-cache-"));
-	const step = "llm.invoke --model gpt-4o --prompt Summarize | json";
-	try {
-		const { result } = await runWorkflow(
-			{
-				cost_limit: { max_usd: 0.01, action: "stop" },
-				steps: [
-					{ id: "live", pipeline: step },
-					{ id: "from-cache", pipeline: step },
-					{ id: "after", command: "echo done" },
-				],
-			},
-			{ LOBSTER_LLM_ADAPTER_URL: provider.url, LOBSTER_CACHE_DIR: cacheDir },
-		);
-
-		assert.equal(result.status, "ok");
-		assert.equal(result._meta?.cost?.estimatedCostUsd, 0.0075);
-	} finally {
-		await provider.close();
-		await fsp.rm(cacheDir, { recursive: true, force: true });
-	}
-});
-
-test("workflow cost tracking bills a rendered step that prints the full replay shape", async () => {
-	const forgedCache = await emitJsonPath(forgedReplayItem("cache"));
-	const forgedRunState = await emitJsonPath(forgedReplayItem("run_state"));
-	const { result } = await runWorkflow({
-		steps: [
-			{ id: "forged-cache", pipeline: `exec --json=true node ${forgedCache} | json` },
-			{ id: "forged-run-state", pipeline: `exec --json=true node ${forgedRunState} | json` },
-		],
-	});
-
-	assert.equal(result.status, "ok");
-	assert.equal(result._meta?.cost?.totalInputTokens, 2000);
-	assert.deepEqual(
-		result._meta?.cost?.byStep.map((entry) => entry.stepId),
-		["forged-cache", "forged-run-state"],
-	);
-});
-
-test("cost_limit stop cannot be bypassed by a rendered step that prints the replay shape", async () => {
-	const live = await emitJsonCommand(liveItem());
-	const forged = await emitJsonPath(forgedReplayItem());
-
-	await assert.rejects(
-		() =>
-			runWorkflow({
-				cost_limit: { max_usd: 0.01, action: "stop" },
-				steps: [
-					{ id: "live", command: live },
-					{ id: "forged-replay", pipeline: `exec --json=true node ${forged} | json` },
-				],
-			}).then((x) => x.result),
-		/Cost limit exceeded/,
-	);
-});
-
-// A projection such as `pick model,usage` builds a new object from named fields, so an item's
-// own marker does not reach accounting. The usage record it carries is the thing being billed,
-// and it crosses the projection by reference.
-test("workflow cost tracking bills a cached llm.invoke replay only once through a projection", async () => {
-	const provider = await startFakeProvider();
-	const cacheDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-cost-cache-"));
-	const step = "llm.invoke --model gpt-4o --prompt Summarize | pick model,usage";
-	try {
-		const { result } = await runWorkflow(
-			{
-				steps: [
-					{ id: "live", pipeline: step },
-					{ id: "from-cache", pipeline: step },
-				],
-			},
-			{ LOBSTER_LLM_ADAPTER_URL: provider.url, LOBSTER_CACHE_DIR: cacheDir },
-		);
-
-		assert.equal(result.status, "ok");
-		assert.equal(provider.requests(), 1);
-		assert.equal(result._meta?.cost?.totalInputTokens, 1000);
-		assert.deepEqual(
-			result._meta?.cost?.byStep.map((entry) => entry.stepId),
-			["live"],
-		);
-	} finally {
-		await provider.close();
-		await fsp.rm(cacheDir, { recursive: true, force: true });
-	}
-});
-
-test("workflow cost tracking bills a run-state llm.invoke replay only once through a projection", async () => {
-	const provider = await startFakeProvider();
-	const step = "llm.invoke --disable-cache --model gpt-4o --prompt Summarize | pick model,usage";
-	try {
-		const { result } = await runWorkflow(
-			{
-				steps: [
-					{ id: "live", pipeline: step },
-					{ id: "from-run-state", pipeline: step },
-				],
-			},
-			{
-				LOBSTER_LLM_ADAPTER_URL: provider.url,
-				LOBSTER_RUN_STATE_KEY: "cost-tracker-projected-replay",
-			},
-		);
-
-		assert.equal(result.status, "ok");
-		assert.equal(provider.requests(), 1);
-		assert.equal(result._meta?.cost?.totalInputTokens, 1000);
-		assert.deepEqual(
-			result._meta?.cost?.byStep.map((entry) => entry.stepId),
-			["live"],
-		);
-	} finally {
-		await provider.close();
-	}
-});
-
-test("workflow cost tracking prices a projected live call from the charge it settled", async () => {
-	const provider = await startFakeProvider();
-	try {
-		const { result } = await runWorkflow(
-			{
-				steps: [
-					{
-						id: "live",
-						pipeline: "llm.invoke --disable-cache --model gpt-4o --prompt Summarize | pick usage",
-					},
-				],
-			},
-			{ LOBSTER_LLM_ADAPTER_URL: provider.url },
-		);
-
-		assert.equal(result.status, "ok");
-		assert.equal(provider.requests(), 1);
-		assert.equal(result._meta?.cost?.totalInputTokens, 1000);
-		assert.equal(result._meta?.cost?.estimatedCostUsd, 0.0075);
-		assert.deepEqual(
-			result._meta?.cost?.byStep.map((entry) => entry.model),
-			["gpt-4o"],
-		);
-	} finally {
-		await provider.close();
-	}
-});
-
-test("workflow cost tracking prices a live call whose model field a step rewrote", async () => {
-	const provider = await startFakeProvider();
-	try {
-		const { result } = await runWorkflow(
-			{
-				steps: [
-					{
-						id: "live",
-						pipeline:
-							"llm.invoke --disable-cache --model gpt-4o --prompt Summarize | map model=gpt-3.5-turbo",
-					},
-				],
-			},
-			{ LOBSTER_LLM_ADAPTER_URL: provider.url },
-		);
-
-		assert.equal(result.status, "ok");
-		assert.equal(provider.requests(), 1);
-		assert.equal(result._meta?.cost?.estimatedCostUsd, 0.0075);
-		assert.deepEqual(
-			result._meta?.cost?.byStep.map((entry) => entry.model),
-			["gpt-4o"],
-		);
-	} finally {
-		await provider.close();
-	}
-});
-
-test("workflow cost tracking bills a projected step that prints the full replay shape", async () => {
-	const forged = await emitJsonPath(forgedReplayItem("cache"));
-	const { result } = await runWorkflow({
-		steps: [
-			{ id: "forged-picked", pipeline: `exec --json=true node ${forged} | pick model,usage` },
-			{
-				id: "forged-picked-rendered",
-				pipeline: `exec --json=true node ${forged} | pick model,usage | json`,
-			},
-		],
-	});
-
-	assert.equal(result.status, "ok");
-	assert.equal(result._meta?.cost?.totalInputTokens, 2000);
-	assert.deepEqual(
-		result._meta?.cost?.byStep.map((entry) => entry.stepId),
-		["forged-picked", "forged-picked-rendered"],
-	);
-});
-
-// A command that fails the first time it runs and succeeds afterwards, so a step carrying it
-// takes exactly two attempts under `retry`.
-// Fails on its first run, succeeds afterwards. These tests need the failure to come after the
-// sibling `llm.invoke` branches stored their answers: a failure that came first would abort
-// them mid-request, and the retry would rightly call the provider again. So the failing run
-// waits for a stored answer in `cacheDir`, then lets concurrent writers of the same key finish.
-async function failsOnceCommand(cacheDir: string) {
-	const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-cost-flaky-"));
-	const marker = JSON.stringify(path.join(dir, "attempted"));
-	const filePath = path.join(dir, "flaky.mjs");
-	await fsp.writeFile(
-		filePath,
-		`import fs from "node:fs";\n` +
-			`import path from "node:path";\n` +
-			`if (fs.existsSync(${marker})) { process.stdout.write("ok"); process.exit(0); }\n` +
-			`fs.writeFileSync(${marker}, "1");\n` +
-			`const stored = (dir) => fs.readdirSync(dir, { withFileTypes: true }).some((e) =>\n` +
-			`  e.isDirectory() ? stored(path.join(dir, e.name)) : !e.name.startsWith(".") && e.name.endsWith(".json"));\n` +
-			`const deadline = Date.now() + 10000;\n` +
-			`while (!stored(${JSON.stringify(cacheDir)}) && Date.now() < deadline) await new Promise((r) => setTimeout(r, 10));\n` +
-			`await new Promise((r) => setTimeout(r, 250));\n` +
-			`process.exit(1);\n`,
-		"utf8",
-	);
-	return `node ${filePath}`;
-}
-
-// `llm.invoke` stores the live answer before it returns, and a step's cost is recorded only
-// once the step succeeds. So when a later part of a retried step fails, the provider has
-// already been paid and the retry replays that answer: the replay is the only place the spend
-// can still be recorded, and exempting it would report $0 for a call that really happened.
-test("workflow cost tracking bills a replay standing in for a retried step's live call", async () => {
-	const provider = await startFakeProvider();
-	const cacheDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-cost-cache-"));
-	const flaky = await failsOnceCommand(cacheDir);
-	try {
-		const { result } = await runWorkflow(
-			{
-				steps: [
-					{
-						id: "invoke-then-fail",
-						retry: { max: 2, delay_ms: 1 },
-						parallel: {
-							branches: [
-								{ id: "invoke", pipeline: "llm.invoke --model gpt-4o --prompt Summarize" },
-								{ id: "flaky", command: flaky },
-							],
-						},
-					},
-				],
-			},
-			{ LOBSTER_LLM_ADAPTER_URL: provider.url, LOBSTER_CACHE_DIR: cacheDir },
-		);
-
-		assert.equal(result.status, "ok");
-		assert.equal(provider.requests(), 1);
-		assert.equal(result._meta?.cost?.totalInputTokens, 1000);
-		assert.equal(result._meta?.cost?.totalOutputTokens, 500);
-		assert.deepEqual(
-			result._meta?.cost?.byStep.map((entry) => entry.stepId),
-			["invoke"],
-		);
-	} finally {
-		await provider.close();
-		await fsp.rm(cacheDir, { recursive: true, force: true });
-	}
-});
-
-// The spend a retried step recovers is real money, so it has to reach `cost_limit` too.
-test("cost_limit stop counts the live call a retried step's replay stands in for", async () => {
-	const provider = await startFakeProvider();
-	const cacheDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-cost-cache-"));
-	const flaky = await failsOnceCommand(cacheDir);
-	try {
-		await assert.rejects(
-			() =>
-				runWorkflow(
-					{
-						cost_limit: { max_usd: 0.001, action: "stop" },
-						steps: [
-							{
-								id: "invoke-then-fail",
-								retry: { max: 2, delay_ms: 1 },
-								parallel: {
-									branches: [
-										{ id: "invoke", pipeline: "llm.invoke --model gpt-4o --prompt Summarize" },
-										{ id: "flaky", command: flaky },
-									],
-								},
-							},
-							{ id: "after", command: "echo done" },
-						],
-					},
-					{ LOBSTER_LLM_ADAPTER_URL: provider.url, LOBSTER_CACHE_DIR: cacheDir },
-				).then((x) => x.result),
-			/Cost limit exceeded/,
-		);
-		assert.equal(provider.requests(), 1);
-	} finally {
-		await provider.close();
-		await fsp.rm(cacheDir, { recursive: true, force: true });
-	}
-});
-
-// A command that always fails, so a step carrying it never succeeds. With `cacheDir`, it fails
-// only once a sibling `llm.invoke` branch has stored its answer there (see failsOnceCommand).
-async function alwaysFailsCommand(cacheDir?: string) {
-	const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-cost-fail-"));
-	const filePath = path.join(dir, "fail.mjs");
-	await fsp.writeFile(
-		filePath,
-		cacheDir === undefined
-			? "process.exit(1);\n"
-			: `import fs from "node:fs";\n` +
-					`import path from "node:path";\n` +
-					`const stored = (dir) => fs.existsSync(dir) && fs.readdirSync(dir, { withFileTypes: true }).some((e) =>\n` +
-					`  e.isDirectory() ? stored(path.join(dir, e.name)) : !e.name.startsWith(".") && e.name.endsWith(".json"));\n` +
-					`const deadline = Date.now() + 10000;\n` +
-					`while (!stored(${JSON.stringify(cacheDir)}) && Date.now() < deadline) await new Promise((r) => setTimeout(r, 10));\n` +
-					`await new Promise((r) => setTimeout(r, 250));\n` +
-					`process.exit(1);\n`,
-		"utf8",
-	);
-	return `node ${filePath}`;
-}
-
-// The charge a run opens belongs to that run. If its step never succeeds, the charge is never
-// recovered — and a later run that replays the same stored answer called no provider, so
-// billing it there would move one run's spend onto another. The ledger is per-run, so it
-// cannot: this also covers a live call made outside any cost accounting, such as the SDK
-// pipeline API, whose cache entry a workflow may later reuse.
-test("workflow cost tracking does not bill a replay of a call another run paid for", async () => {
-	const provider = await startFakeProvider();
-	const cacheDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-cost-cache-"));
-	const failing = await alwaysFailsCommand(cacheDir);
-	const invoke = "llm.invoke --model gpt-4o --prompt Summarize";
-	const env = { LOBSTER_LLM_ADAPTER_URL: provider.url, LOBSTER_CACHE_DIR: cacheDir };
-	try {
-		const first = await runWorkflow(
-			{
-				steps: [
-					{
-						id: "spends",
-						on_error: "continue",
-						parallel: {
-							branches: [
-								{ id: "invoke", pipeline: invoke },
-								{ id: "fails", command: failing },
-							],
-						},
-					},
-				],
-			},
-			env,
-		);
-		assert.equal(first.result.status, "ok");
-		// The step failed, so no item of it was ever billed -- but the provider had already
-		// answered, and the charge that survives it is the only record of that. The run that
-		// made the call is where it belongs; the alternative is that it is billed nowhere at all.
-		assert.equal(first.result._meta?.cost?.totalInputTokens, 1000);
-		assert.deepEqual(
-			first.result._meta?.cost?.byStep.map((entry) => entry.stepId),
-			["invoke"],
-		);
-
-		const second = await runWorkflow({ steps: [{ id: "replays", pipeline: invoke }] }, env);
-		assert.equal(second.result.status, "ok");
-		assert.equal(provider.requests(), 1);
-		// The point of the case: this run paid for nothing, so it is charged nothing.
-		assert.equal(second.result._meta?.cost, undefined);
-	} finally {
-		await provider.close();
-		await fsp.rm(cacheDir, { recursive: true, force: true });
-	}
-});
-
-// Two identical calls that race on a cold cache are two provider charges under one cache key.
-// If the step is then retried, both replays have to be billable: a ledger that only remembered
-// "this key is unpaid" would settle once and silently drop the second real charge.
-test("workflow cost tracking bills both live calls a retried step's replays stand in for", async () => {
-	const provider = await startFakeProvider(2);
-	const cacheDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-cost-cache-"));
-	const flaky = await failsOnceCommand(cacheDir);
-	const invoke = "llm.invoke --model gpt-4o --prompt Summarize";
-	try {
-		const { result } = await runWorkflow(
-			{
-				steps: [
-					{
-						id: "invoke-twice-then-fail",
-						retry: { max: 2, delay_ms: 1 },
-						parallel: {
-							branches: [
-								{ id: "invoke-a", pipeline: invoke },
-								{ id: "invoke-b", pipeline: invoke },
-								{ id: "flaky", command: flaky },
-							],
-						},
-					},
-				],
-			},
-			{ LOBSTER_LLM_ADAPTER_URL: provider.url, LOBSTER_CACHE_DIR: cacheDir },
-		);
-
-		assert.equal(result.status, "ok");
-		assert.equal(provider.requests(), 2);
-		assert.equal(result._meta?.cost?.totalInputTokens, 2000);
-		assert.equal(result._meta?.cost?.totalOutputTokens, 1000);
-		assert.deepEqual(result._meta?.cost?.byStep.map((entry) => entry.stepId).sort(), [
-			"invoke-a",
-			"invoke-b",
-		]);
-	} finally {
-		await provider.close();
-		await fsp.rm(cacheDir, { recursive: true, force: true });
-	}
-});
-
-// A gate pauses a run, it does not reset what the run has spent. The resume is a separate run
-// with its own accounting, so a call made before the gate lives only in the paused run's
-// record: if a later step repeats the prompt it replays, correctly bills nothing, and the
-// provider call would end up in no total at all. Carrying the record forward also stops a
-// `cost_limit` being walked past one gate at a time.
-test("workflow cost tracking carries spend across an approval resume", async () => {
-	const provider = await startFakeProvider();
-	const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-cost-resume-"));
-	const cacheDir = path.join(tmpDir, "cache");
-	const stateDir = path.join(tmpDir, "state");
-	await fsp.mkdir(cacheDir, { recursive: true });
-	const invoke = "llm.invoke --model gpt-4o --prompt Summarize";
-	const filePath = path.join(tmpDir, "workflow.lobster");
-	await fsp.writeFile(
-		filePath,
-		JSON.stringify({
-			steps: [
-				{ id: "live", pipeline: invoke },
-				{ id: "gate", run: "echo gate", approval: "Continue?" },
-				{ id: "replay", pipeline: invoke },
-			],
-		}),
-		"utf8",
-	);
-
-	const env = {
-		...process.env,
-		LOBSTER_STATE_DIR: stateDir,
-		LOBSTER_CACHE_DIR: cacheDir,
-		LOBSTER_LLM_ADAPTER_URL: provider.url,
-	};
-	const ctx = () => ({
-		stdin: process.stdin,
-		stdout: process.stdout,
-		stderr: new PassThrough(),
-		env,
-		mode: "tool" as const,
-		registry: createDefaultRegistry(),
-	});
-
-	try {
-		const paused = await runWorkflowFile({ filePath, ctx: ctx() });
-		assert.equal(paused.status, "needs_approval");
-		const token = paused.requiresApproval?.resumeToken;
-		assert.equal(typeof token, "string");
-
-		const resumed = await runWorkflowFile({
-			filePath,
-			ctx: ctx(),
-			resume: decodeResumeToken(token as string),
-			approved: true,
-		});
-
-		assert.equal(resumed.status, "ok");
-		assert.equal(provider.requests(), 1);
-		// The live call happened before the gate; the step after it only replayed.
-		assert.equal(resumed._meta?.cost?.totalInputTokens, 1000);
-		assert.equal(resumed._meta?.cost?.totalOutputTokens, 500);
-		assert.deepEqual(
-			resumed._meta?.cost?.byStep.map((entry) => entry.stepId),
-			["live"],
-		);
-	} finally {
-		await provider.close();
-		await fsp.rm(tmpDir, { recursive: true, force: true });
-	}
-});
-
-// A pipeline can pause *between* paying for a call and billing it: `llm.invoke | ask` in tool
-// mode suspends after the model answered, and `ask` consumes the items, so the usage never
-// reaches accounting. The charge exists only as an outstanding entry in the paused run's
-// ledger — if that does not travel with the resume state, the replay a later step produces is
-// exempt and the call is billed nowhere.
-test("workflow cost tracking carries an unbilled call across a pipeline input resume", async () => {
-	const provider = await startFakeProvider();
-	const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-cost-input-"));
-	const cacheDir = path.join(tmpDir, "cache");
-	const stateDir = path.join(tmpDir, "state");
-	await fsp.mkdir(cacheDir, { recursive: true });
-	const invoke = "llm.invoke --model gpt-4o --prompt Summarize";
-	const filePath = path.join(tmpDir, "workflow.lobster");
-	await fsp.writeFile(
-		filePath,
-		JSON.stringify({
-			steps: [
-				{ id: "ask-after-invoke", pipeline: `${invoke} | ask --prompt Continue?` },
-				{ id: "replay", pipeline: invoke },
-			],
-		}),
-		"utf8",
-	);
-
-	const env = {
-		...process.env,
-		LOBSTER_STATE_DIR: stateDir,
-		LOBSTER_CACHE_DIR: cacheDir,
-		LOBSTER_LLM_ADAPTER_URL: provider.url,
-	};
-	const ctx = () => ({
-		stdin: process.stdin,
-		stdout: process.stdout,
-		stderr: new PassThrough(),
-		env,
-		mode: "tool" as const,
-		registry: createDefaultRegistry(),
-	});
-
-	try {
-		const paused = await runWorkflowFile({ filePath, ctx: ctx() });
-		assert.equal(paused.status, "needs_input");
-		const token = paused.requiresInput?.resumeToken;
-		assert.equal(typeof token, "string");
-
-		const resumed = await runWorkflowFile({
-			filePath,
-			ctx: ctx(),
-			resume: decodeResumeToken(token as string),
-			response: { decision: "approve" },
-		});
-
-		assert.equal(resumed.status, "ok");
-		assert.equal(provider.requests(), 1);
-		// `ask` swallowed the item that carried the usage, so the replay in the next step is
-		// the only carrier left for a call the provider really answered.
-		assert.equal(resumed._meta?.cost?.totalInputTokens, 1000);
-		assert.equal(resumed._meta?.cost?.totalOutputTokens, 500);
-	} finally {
-		await provider.close();
-		await fsp.rm(tmpDir, { recursive: true, force: true });
-	}
-});
-
-// The provider is paid the moment it answers, before Lobster stores anything. A coordinated
-// state/cache publication failure rolls both stores back, so the retry makes another live call.
-// Both calls must be charged even though only the retry produces a step result.
-test("workflow cost tracking bills both calls when the first cache write fails", async () => {
-	const provider = await startFakeProvider();
-	const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-cost-unwritable-"));
-	const cacheDir = path.join(tmpDir, "cache");
-	const cacheNamespaceDir = path.join(cacheDir, "llm.invoke");
-	const originalMkdir = fsp.mkdir;
-	let cacheNamespaceMkdirs = 0;
-	try {
-		Object.defineProperty(fsp, "mkdir", {
-			configurable: true,
-			writable: true,
-			async value(
-				target: Parameters<typeof fsp.mkdir>[0],
-				options?: Parameters<typeof fsp.mkdir>[1],
-			) {
-				if (String(target) === cacheNamespaceDir && ++cacheNamespaceMkdirs === 2) {
-					throw Object.assign(new Error("cache directory unavailable"), { code: "EIO" });
-				}
-				return originalMkdir(target, options);
-			},
-		});
-		const { result } = await runWorkflow(
-			{
-				steps: [
-					{
-						id: "invoke",
-						retry: { max: 2, delay_ms: 1 },
-						pipeline: "llm.invoke --model gpt-4o --prompt Summarize",
-					},
-				],
-			},
-			{
-				LOBSTER_LLM_ADAPTER_URL: provider.url,
-				LOBSTER_CACHE_DIR: cacheDir,
-				LOBSTER_RUN_STATE_KEY: "cost-tracker-unwritable-cache",
-			},
-		);
-
-		assert.equal(result.status, "ok");
-		assert.equal(provider.requests(), 2);
-		assert.equal(result._meta?.cost?.totalInputTokens, 2000);
-		assert.equal(result._meta?.cost?.totalOutputTokens, 1000);
-	} finally {
-		Object.defineProperty(fsp, "mkdir", {
-			configurable: true,
-			writable: true,
-			value: originalMkdir,
-		});
-		await provider.close();
-		await fsp.rm(tmpDir, { recursive: true, force: true });
-	}
-});
-
-test("workflow cost tracking bills one call when a parallel replay branch is declared first", async () => {
-	const provider = await startFakeProvider();
-	const cacheDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-cost-cache-"));
-	const step = "llm.invoke --model gpt-4o --prompt Summarize";
-	try {
-		// The replay branch is declared before the live one, so it is accounted first: without
-		// holding replays back it claims the charge the refresh branch opened and is billed for
-		// it, and the refresh branch -- billed whatever its own claim returns -- is billed again.
-		const { result } = await runWorkflow(
-			{
-				steps: [
-					{ id: "warm", pipeline: step },
-					{
-						id: "both",
-						parallel: {
-							wait: "all",
-							branches: [
-								{ id: "replay", pipeline: step },
-								{ id: "refresh", pipeline: `${step} --refresh` },
-							],
-						},
-					},
-				],
-			},
-			{ LOBSTER_LLM_ADAPTER_URL: provider.url, LOBSTER_CACHE_DIR: cacheDir },
-		);
-
-		assert.equal(result.status, "ok");
-		assert.equal(provider.requests(), 2, "one warm-up call and one refresh");
-		assert.equal(result._meta?.cost?.totalInputTokens, 2000);
-		assert.equal(result._meta?.cost?.totalOutputTokens, 1000);
-		assert.deepEqual(
-			result._meta?.cost?.byStep.map((entry) => entry.stepId),
-			["warm", "refresh"],
-		);
-	} finally {
-		await provider.close();
-		await fsp.rm(cacheDir, { recursive: true, force: true });
-	}
-});
-
-test("cost_limit stop is not tripped by a parallel replay branch declared first", async () => {
-	const provider = await startFakeProvider();
-	const cacheDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-cost-cache-"));
-	const step = "llm.invoke --model gpt-4o --prompt Summarize";
-	try {
-		// Two provider calls cost $0.0150; the third charge the ordering bug added took the run
-		// to $0.0225 and stopped it at a budget it had not spent.
-		const { result } = await runWorkflow(
-			{
-				cost_limit: { max_usd: 0.02, action: "stop" },
-				steps: [
-					{ id: "warm", pipeline: step },
-					{
-						id: "both",
-						parallel: {
-							wait: "all",
-							branches: [
-								{ id: "replay", pipeline: step },
-								{ id: "refresh", pipeline: `${step} --refresh` },
-							],
-						},
-					},
-					{ id: "after", command: "echo done" },
-				],
-			},
-			{ LOBSTER_LLM_ADAPTER_URL: provider.url, LOBSTER_CACHE_DIR: cacheDir },
-		);
-
-		assert.equal(result.status, "ok");
-		assert.equal(result._meta?.cost?.estimatedCostUsd, 0.015);
-		assert.equal(String(result.output?.[0]).trim(), "done", "the step after ran");
-	} finally {
-		await provider.close();
-		await fsp.rm(cacheDir, { recursive: true, force: true });
-	}
-});
-
-test("workflow cost tracking bills a call a nested workflow made before a plain final step", async () => {
-	const provider = await startFakeProvider();
-	const cacheDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-cost-cache-"));
-	try {
-		const { result } = await runComposedWorkflow(
-			{ steps: [{ id: "child", workflow: "child.lobster" }] },
-			{
-				steps: [
-					{ id: "llm", pipeline: "llm.invoke --model gpt-4o --prompt Summarize | json" },
-					{ id: "done", command: "echo done" },
-				],
-			},
-			{ LOBSTER_LLM_ADAPTER_URL: provider.url, LOBSTER_CACHE_DIR: cacheDir },
-		);
-
-		assert.equal(result.status, "ok");
-		assert.equal(provider.requests(), 1);
-		// Only the child's last step crosses the composition boundary, and it carries no items.
-		// The charge the child opened in this run's ledger is still a call this run paid for.
-		assert.equal(result._meta?.cost?.totalInputTokens, 1000);
-		assert.equal(result._meta?.cost?.totalOutputTokens, 500);
-	} finally {
-		await provider.close();
-		await fsp.rm(cacheDir, { recursive: true, force: true });
-	}
-});
-
-test("workflow cost tracking bills a call whose only item an ask gate consumed", async () => {
-	const provider = await startFakeProvider();
-	const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-cost-input-"));
-	const cacheDir = path.join(tmpDir, "cache");
-	const stateDir = path.join(tmpDir, "state");
-	await fsp.mkdir(cacheDir, { recursive: true });
-	const filePath = path.join(tmpDir, "workflow.lobster");
-	// Nothing replays the call after the resume, so the item `ask` swallowed was the only
-	// carrier its usage ever had.
-	await fsp.writeFile(
-		filePath,
-		JSON.stringify({
-			steps: [
-				{
-					id: "ask-after-invoke",
-					pipeline: "llm.invoke --model gpt-4o --prompt Summarize | ask --prompt Continue?",
-				},
-				{ id: "done", command: "echo done" },
-			],
-		}),
-		"utf8",
-	);
-
-	const env = {
-		...process.env,
-		LOBSTER_STATE_DIR: stateDir,
-		LOBSTER_CACHE_DIR: cacheDir,
-		LOBSTER_LLM_ADAPTER_URL: provider.url,
-	};
-	const ctx = () => ({
-		stdin: process.stdin,
-		stdout: process.stdout,
-		stderr: new PassThrough(),
-		env,
-		mode: "tool" as const,
-		registry: createDefaultRegistry(),
-	});
-
-	try {
-		const paused = await runWorkflowFile({ filePath, ctx: ctx() });
-		assert.equal(paused.status, "needs_input");
-		const token = paused.requiresInput?.resumeToken;
-		assert.equal(typeof token, "string");
-
-		const resumed = await runWorkflowFile({
-			filePath,
-			ctx: ctx(),
-			resume: decodeResumeToken(token as string),
-			response: { decision: "approve" },
-		});
-
-		assert.equal(resumed.status, "ok");
-		assert.equal(provider.requests(), 1);
-		assert.equal(resumed._meta?.cost?.totalInputTokens, 1000);
-		assert.equal(resumed._meta?.cost?.totalOutputTokens, 500);
-	} finally {
-		await provider.close();
-		await fsp.rm(tmpDir, { recursive: true, force: true });
-	}
-});
-
-test("workflow cost tracking bills a rendered call when a later stage emits its own items", async () => {
-	const provider = await startFakeProvider();
-	const cacheDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-cost-cache-"));
-	const stateDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-cost-state-"));
-	try {
-		// `json` records the model items it rendered and hands the next stage an empty stream;
-		// `state.get` then emits an item of its own, which carries no usage.
-		const { result } = await runWorkflow(
-			{
-				steps: [
-					{
-						id: "render-then-read",
-						pipeline: "llm.invoke --model gpt-4o --prompt Summarize | json | state.get cost-probe",
-					},
-				],
-			},
-			{
-				LOBSTER_LLM_ADAPTER_URL: provider.url,
-				LOBSTER_CACHE_DIR: cacheDir,
-				LOBSTER_STATE_DIR: stateDir,
-			},
-		);
-
-		assert.equal(result.status, "ok");
-		assert.equal(provider.requests(), 1);
-		assert.equal(result._meta?.cost?.totalInputTokens, 1000);
-		assert.equal(result._meta?.cost?.totalOutputTokens, 500);
-	} finally {
-		await provider.close();
-		await fsp.rm(cacheDir, { recursive: true, force: true });
-		await fsp.rm(stateDir, { recursive: true, force: true });
-	}
-});
-
-test("workflow cost tracking bills a call once when only a JSON round trip of its item survives", async () => {
-	const provider = await startFakeProvider();
-	const cacheDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-cost-cache-"));
-	const stateDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-cost-state-"));
-	try {
-		// `state.set` stores the model item and `state.get` reads it back as a plain object: the
-		// numbers survive, the in-process mark does not. Nothing bills the original -- the step
-		// ends on an unrelated key -- so the call is billed to the step that made it, and the
-		// copy surfacing a step later must not be billed on top of it.
-		const { result } = await runWorkflow(
-			{
-				steps: [
-					{
-						id: "store",
-						pipeline:
-							"llm.invoke --model gpt-4o --prompt Summarize | state.set probe | state.get sink",
-					},
-					{ id: "reload", pipeline: "state.get probe" },
-				],
-			},
-			{
-				LOBSTER_LLM_ADAPTER_URL: provider.url,
-				LOBSTER_CACHE_DIR: cacheDir,
-				LOBSTER_STATE_DIR: stateDir,
-			},
-		);
-
-		assert.equal(result.status, "ok");
-		assert.equal(provider.requests(), 1);
-		assert.equal(result._meta?.cost?.totalInputTokens, 1000);
-		assert.equal(result._meta?.cost?.totalOutputTokens, 500);
-		assert.deepEqual(
-			result._meta?.cost?.byStep.map((entry) => entry.stepId),
-			["store"],
-		);
-	} finally {
-		await provider.close();
-		await fsp.rm(cacheDir, { recursive: true, force: true });
-		await fsp.rm(stateDir, { recursive: true, force: true });
-	}
-});
-
-test("llm spend ledger bills a copy of an item only for a call nothing accounted for", () => {
-	const ledger = createLlmSpendLedger();
-	ledger.record("key-a", { model: "gpt-4o", usage: { inputTokens: 1000, outputTokens: 500 } });
-
-	// A step can print any cache key it likes, so a key alone settles nothing: an item whose
-	// cost the run never recorded is billed on its own account and leaves the charge open, which
-	// is what stops an invented item from hiding real spend.
-	ledger.settleCopy("key-a", "gpt-4o", { inputTokens: 1, outputTokens: 1 });
-	ledger.settleCopy("key-b", "gpt-4o", { inputTokens: 1000, outputTokens: 500 });
-	ledger.settleCopy("key-a", "gpt-5", { inputTokens: 1000, outputTokens: 500 });
-	assert.equal(ledger.outstanding().length, 1);
-
-	// The recorded cost settles the charge, and the copy is billed as its carrier. Key order
-	// changes across a JSON round trip; the numbers do not.
-	ledger.settleCopy("key-a", "gpt-4o", { outputTokens: 500, inputTokens: 1000 });
-	assert.deepEqual(ledger.outstanding(), []);
-
-	// Public fields never prove that a later item is the same call.
-	ledger.settleCopy("key-a", "gpt-4o", { inputTokens: 1000, outputTokens: 500 });
-});
-
-test("llm spend ledger does not trust a copy of a call the run already settled", () => {
-	const ledger = createLlmSpendLedger();
-	const usage = { inputTokens: 1000, outputTokens: 500 };
-	ledger.record("key-a", { model: "gpt-4o", usage });
-
-	// However the call was accounted for, ordinary JSON cannot prove it came from that call.
-	assert.ok(ledger.claim("key-a"));
-	ledger.settleCopy("key-a", "gpt-4o", { ...usage });
-	ledger.settleCopy("key-a", "gpt-4o", { inputTokens: 7 });
-});
-
-// Two identical calls that race on a cold cache do not cost the same: output length varies with
-// sampling. Only one of the two answers is stored, so every replay of them carries that one
-// answer's numbers -- billing each replay by the copy it holds reports both calls at the price
-// of whichever won the cache write.
-test("workflow cost tracking bills each retried replay at what its own call cost", async () => {
-	const provider = await startFakeProvider(2, (seen) => ({
-		inputTokens: seen === 1 ? 1000 : 3000,
-		outputTokens: seen === 1 ? 500 : 100,
-	}));
-	const cacheDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-cost-cache-"));
-	const flaky = await failsOnceCommand(cacheDir);
-	const invoke = "llm.invoke --model gpt-4o --prompt Summarize";
-	try {
-		const { result } = await runWorkflow(
-			{
-				steps: [
-					{
-						id: "invoke-twice-then-fail",
-						retry: { max: 2, delay_ms: 1 },
-						parallel: {
-							branches: [
-								{ id: "invoke-a", pipeline: invoke },
-								{ id: "invoke-b", pipeline: invoke },
-								{ id: "flaky", command: flaky },
-							],
-						},
-					},
-				],
-			},
-			{ LOBSTER_LLM_ADAPTER_URL: provider.url, LOBSTER_CACHE_DIR: cacheDir },
-		);
-
-		assert.equal(result.status, "ok");
-		assert.equal(provider.requests(), 2);
-		// 1000 + 3000 and 500 + 100: what the provider was actually paid, whichever answer the
-		// two replays ended up carrying.
-		assert.equal(result._meta?.cost?.totalInputTokens, 4000);
-		assert.equal(result._meta?.cost?.totalOutputTokens, 600);
-	} finally {
-		await provider.close();
-		await fsp.rm(cacheDir, { recursive: true, force: true });
-	}
-});
-
-test("cost_limit stop halts before the next step when no item carried the call's usage", async () => {
-	const provider = await startFakeProvider();
-	const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-cost-limit-"));
-	const marker = path.join(tmpDir, "ran.txt").replaceAll(path.sep, "/");
-	const script = path.join(tmpDir, "touch.mjs");
-	await fsp.writeFile(
-		script,
-		`import fs from "node:fs";
-fs.writeFileSync("${marker}", "ran");
-`,
-		"utf8",
-	);
-
-	try {
-		// The renderer consumes the model item and `state.get` emits one of its own, so the step
-		// completes with nothing carrying the call's usage. The budget is already blown when the
-		// step ends, and the step after it must not get to run its side effect.
-		await assert.rejects(
-			() =>
-				runWorkflow(
-					{
-						cost_limit: { max_usd: 0.001, action: "stop" },
-						steps: [
-							{
-								id: "spends",
-								pipeline: "llm.invoke --model gpt-4o --prompt Summarize | json | state.get sink",
-							},
-							{ id: "after", command: `node ${script}` },
-						],
-					},
-					{
-						LOBSTER_LLM_ADAPTER_URL: provider.url,
-						LOBSTER_CACHE_DIR: path.join(tmpDir, "cache"),
-						LOBSTER_STATE_DIR: path.join(tmpDir, "state"),
-					},
-				).then((run) => run.result),
-			/Cost limit exceeded/,
-		);
-		await assert.rejects(() => fsp.access(marker), "the step after the limit must not run");
-	} finally {
-		await provider.close();
-		await fsp.rm(tmpDir, { recursive: true, force: true });
-	}
-});
-
-test("cost_limit stop halts before the next step when the step that spent it failed", async () => {
-	const provider = await startFakeProvider();
-	const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-cost-limit-"));
-	const marker = path.join(tmpDir, "ran.txt").replaceAll(path.sep, "/");
-	const script = path.join(tmpDir, "touch.mjs");
-	await fsp.writeFile(
-		script,
-		`import fs from "node:fs";
-fs.writeFileSync("${marker}", "ran");
-`,
-		"utf8",
-	);
-	const failing = await alwaysFailsCommand(path.join(tmpDir, "cache"));
-
-	try {
-		// One branch pays a provider, another fails, and `on_error: continue` advances the run.
-		// No item of the failed step is ever billed, so the charge it left behind is the only
-		// record of the spend -- and the budget is already gone by the time the next step is
-		// asked to run its side effect.
-		await assert.rejects(
-			() =>
-				runWorkflow(
-					{
-						cost_limit: { max_usd: 0.001, action: "stop" },
-						steps: [
-							{
-								id: "spends",
-								on_error: "continue",
-								parallel: {
-									branches: [
-										{ id: "invoke", pipeline: "llm.invoke --model gpt-4o --prompt Summarize" },
-										{ id: "fails", command: failing },
-									],
-								},
-							},
-							{ id: "after", command: `node ${script}` },
-						],
-					},
-					{
-						LOBSTER_LLM_ADAPTER_URL: provider.url,
-						LOBSTER_CACHE_DIR: path.join(tmpDir, "cache"),
-					},
-				).then((run) => run.result),
-			/Cost limit exceeded/,
-		);
-		await assert.rejects(() => fsp.access(marker), "the step after the limit must not run");
-	} finally {
-		await provider.close();
-		await fsp.rm(tmpDir, { recursive: true, force: true });
-	}
-});
-
-test("llm spend ledger matches a copy on the token counts that are billed", () => {
-	const ledger = createLlmSpendLedger();
-	ledger.record("key-a", {
+test("usage a command prints is not a call, and is not counted", async () => {
+	const printed = await emitJsonCommand({
+		kind: "llm.invoke",
 		model: "gpt-4o",
-		usage: { inputTokens: 1000, outputTokens: 500, totalTokens: 1500 },
-	});
-
-	// A stage that rebuilds an item can drop or recompute a field nothing is charged for. The
-	// charge is the same charge, so the copy has to settle it rather than be billed beside it.
-	ledger.settleCopy("key-a", "gpt-4o", { inputTokens: 1000, outputTokens: 500 });
-	assert.deepEqual(ledger.outstanding(), []);
-});
-
-test("llm spend ledger matches a copy across the token field names providers use", () => {
-	const ledger = createLlmSpendLedger();
-	ledger.record("key-a", { model: "gpt-4o", usage: { inputTokens: 1000, outputTokens: 500 } });
-
-	// `CostTracker` bills these spellings as the same tokens, so the ledger has to read them as
-	// the same charge.
-	ledger.settleCopy("key-a", "gpt-4o", { prompt_tokens: 1000, completion_tokens: 500 });
-	assert.deepEqual(ledger.outstanding(), []);
-
-	// A cost the run never recorded still settles nothing.
-	ledger.record("key-b", { model: "gpt-4o", usage: { inputTokens: 1000, outputTokens: 500 } });
-	ledger.settleCopy("key-b", "gpt-4o", { prompt_tokens: 999 });
-	assert.equal(ledger.outstanding().length, 1);
-});
-
-test("workflow cost tracking bills a call once when the copy of its item lost the cache key", async () => {
-	const provider = await startFakeProvider();
-	const cacheDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-cost-cache-"));
-	const stateDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-cost-state-"));
-	try {
-		// `state.get` reads the stored item back without its marks and `pick` projects it down to
-		// the two fields that matter, dropping the cache key with them. All that reaches the
-		// accounting is a cost, and it is the cost of the call whose charge is still open.
-		const { result } = await runWorkflow(
-			{
-				steps: [
-					{
-						id: "invoke",
-						pipeline:
-							"llm.invoke --model gpt-4o --prompt Summarize | state.set probe | state.get probe | pick model,usage",
-					},
-				],
-			},
-			{
-				LOBSTER_LLM_ADAPTER_URL: provider.url,
-				LOBSTER_CACHE_DIR: cacheDir,
-				LOBSTER_STATE_DIR: stateDir,
-			},
-		);
-
-		assert.equal(result.status, "ok");
-		assert.equal(provider.requests(), 1);
-		assert.equal(result._meta?.cost?.totalInputTokens, 1000);
-		assert.equal(result._meta?.cost?.totalOutputTokens, 500);
-	} finally {
-		await provider.close();
-		await fsp.rm(cacheDir, { recursive: true, force: true });
-		await fsp.rm(stateDir, { recursive: true, force: true });
-	}
-});
-
-test("workflow cost tracking does not let an answer that cost nothing stand in for one that did", async () => {
-	// The first answer reports no usage at all, so nothing bills it and nothing ever will. A
-	// charge for it would be the one handed to the refresh below, leaving the refresh's own
-	// charge open for the end-of-step settlement to bill on top of the item already recorded.
-	const provider = await startFakeProvider(1, (seen) =>
-		seen === 1 ? null : { inputTokens: 1000, outputTokens: 500 },
-	);
-	const cacheDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-cost-cache-"));
-	const invoke = "llm.invoke --model gpt-4o --prompt Summarize";
-	try {
-		const { result } = await runWorkflow(
-			{
-				steps: [
-					{ id: "no-usage", pipeline: `${invoke} | json` },
-					{ id: "refresh", pipeline: `${invoke} --refresh | json` },
-				],
-			},
-			{ LOBSTER_LLM_ADAPTER_URL: provider.url, LOBSTER_CACHE_DIR: cacheDir },
-		);
-
-		assert.equal(result.status, "ok");
-		assert.equal(provider.requests(), 2);
-		assert.equal(result._meta?.cost?.totalInputTokens, 1000);
-		assert.equal(result._meta?.cost?.totalOutputTokens, 500);
-	} finally {
-		await provider.close();
-		await fsp.rm(cacheDir, { recursive: true, force: true });
-	}
-});
-
-test("llm spend ledger reads a copy that kept no cache key by what it cost", () => {
-	const ledger = createLlmSpendLedger();
-	const usage = { inputTokens: 1000, outputTokens: 500 };
-	ledger.record("key-a", { model: "gpt-4o", usage });
-
-	// Without a key the cost is the only evidence, and it is enough to settle an open charge --
-	// which only ever adds a record of a call, never removes one.
-	ledger.settleCopy(null, "gpt-4o", { inputTokens: 7 });
-	assert.equal(ledger.outstanding().length, 1);
-	ledger.settleCopy(null, "gpt-4o", { ...usage });
-	assert.deepEqual(ledger.outstanding(), []);
-});
-
-test("llm spend ledger never lets a keyless item withhold its own record", () => {
-	const ledger = createLlmSpendLedger();
-	const usage = { inputTokens: 1000, outputTokens: 500 };
-	ledger.record("key-a", { model: "gpt-4o", usage });
-	assert.ok(ledger.claim("key-a"));
-
-	// Resembling a call this run already billed is not evidence of being a copy of it: two
-	// unrelated objects can carry the same model and the same counts, and an ordinary step
-	// printing `{ model, usage }` must not be able to drop out of `cost_limit` that way. With
-	// a matching public key remains forgeable, so both forms are billed.
-	ledger.settleCopy(null, "gpt-4o", { ...usage });
-	ledger.settleCopy("key-a", "gpt-4o", { ...usage });
-});
-
-test("llm spend ledger keeps a copy naming one call from settling another", () => {
-	const ledger = createLlmSpendLedger();
-	ledger.record("key-a", { model: "gpt-4o", usage: { inputTokens: 1000, outputTokens: 500 } });
-
-	// The key a copy still carries says which call it came from, so it is read against that
-	// call rather than against whichever other charge happens to have cost the same.
-	ledger.settleCopy("key-b", "gpt-4o", { inputTokens: 1000, outputTokens: 500 });
-	assert.equal(ledger.outstanding().length, 1);
-});
-
-// A step that pays a provider and then fails is retried, and `--refresh` makes the retry pay
-// again rather than replay. Two charges under one key, and they did not cost the same: only the
-// retry produces an item, so the charge it settles decides what the failed attempt is billed as.
-test("workflow cost tracking bills a retried live call and the attempt before it at their own costs", async () => {
-	const provider = await startFakeProvider(1, (seen) =>
-		seen === 1
-			? { inputTokens: 1000, outputTokens: 500 }
-			: { inputTokens: 3000, outputTokens: 100 },
-	);
-	const cacheDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-cost-cache-"));
-	const flaky = await failsOnceCommand(cacheDir);
-	try {
-		const { result } = await runWorkflow(
-			{
-				steps: [
-					{
-						id: "pay-fail-pay",
-						retry: { max: 2, delay_ms: 1 },
-						parallel: {
-							branches: [
-								{
-									id: "invoke",
-									pipeline: "llm.invoke --model gpt-4o --prompt Summarize --refresh",
-								},
-								{ id: "flaky", command: flaky },
-							],
-						},
-					},
-				],
-			},
-			{ LOBSTER_LLM_ADAPTER_URL: provider.url, LOBSTER_CACHE_DIR: cacheDir },
-		);
-
-		assert.equal(result.status, "ok");
-		assert.equal(provider.requests(), 2);
-		// 1000 + 3000 and 500 + 100. Billing the retry's item against the failed attempt's charge
-		// would report the retry twice and the attempt before it not at all.
-		assert.equal(result._meta?.cost?.totalInputTokens, 4000);
-		assert.equal(result._meta?.cost?.totalOutputTokens, 600);
-	} finally {
-		await provider.close();
-		await fsp.rm(cacheDir, { recursive: true, force: true });
-	}
-});
-
-test("workflow cost tracking bills a keyless step that resembles a call already billed", async () => {
-	const provider = await startFakeProvider();
-	const cacheDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-cost-cache-"));
-	const lookalike = await emitJsonCommand({
-		model: "gpt-4o",
+		source: "http",
 		usage: { inputTokens: 1000, outputTokens: 500 },
 	});
-	try {
-		// The second step prints the same model and the same counts as the call the first one
-		// paid for, and names no cache key. That is not evidence of being a copy of it, so it is
-		// billed on its own account -- the run is charged for both.
-		const { result } = await runWorkflow(
-			{
-				steps: [
-					{ id: "live", pipeline: "llm.invoke --model gpt-4o --prompt Summarize | json" },
-					{ id: "lookalike", command: lookalike },
-				],
-			},
-			{ LOBSTER_LLM_ADAPTER_URL: provider.url, LOBSTER_CACHE_DIR: cacheDir },
-		);
-
-		assert.equal(result.status, "ok");
-		assert.equal(result._meta?.cost?.totalInputTokens, 2000);
-		assert.deepEqual(
-			result._meta?.cost?.byStep.map((entry) => entry.stepId),
-			["live", "lookalike"],
-		);
-	} finally {
-		await provider.close();
-		await fsp.rm(cacheDir, { recursive: true, force: true });
-	}
+	const { result } = await runWorkflow({
+		cost_limit: { max_usd: 0.00001, action: "stop" },
+		steps: [{ id: "printed", command: printed }],
+	});
+	assert.equal(result.status, "ok");
+	assert.equal(result._meta, undefined);
 });
 
-// Two live calls in one step, costing the same and made under different cache keys. One branch
-// hands on a copy that lost its mark and its key, so all the ledger can read it by is the cost --
-// and until the marked branch has settled its own charge, the other call's charge answers to that
-// cost just as well.
-test("workflow cost tracking does not let a keyless copy settle another call's charge", async () => {
-	const provider = await startFakeProvider(1, undefined, (prompt) => (prompt === "Beta" ? 60 : 0));
-	const cacheDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-cost-cache-"));
-	const stateDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-cost-state-"));
-	try {
-		const { result } = await runWorkflow(
+for (const [replay, flags, env] of [
+	["a cached answer", "", {}],
+	["a run-state replay", " --disable-cache", { LOBSTER_RUN_STATE_KEY: "cost-tracker-replay" }],
+] as const)
+	test(`${replay} is not a call, and is not counted`, async () => {
+		await withProvider(async (providerEnv, provider) => {
+			const { result } = await runWorkflow(
+				{
+					cost_limit: { max_usd: 0.01, action: "stop" },
+					steps: [
+						{ id: "live", pipeline: invoke() + flags },
+						{ id: "replayed", pipeline: invoke() + flags },
+						{ id: "copy", pipeline: "head --n 1", stdin: "$live.json" },
+					],
+				},
+				{ ...providerEnv, ...env },
+			);
+			assert.equal(result.status, "ok");
+			assert.equal(provider.requests(), 1);
+			assert.equal(result._meta?.cost?.estimatedCostUsd, 0.0075);
+			assert.deepEqual(stepIds(result), ["live"]);
+		});
+	});
+
+test("cost_limit warn logs a warning and the run continues", async () => {
+	await withProvider(async (env) => {
+		const { result, stderrOutput } = await runWorkflow(
 			{
+				cost_limit: { max_usd: 0.00001, action: "warn" },
 				steps: [
-					{
-						id: "two-calls",
-						parallel: {
-							wait: "all",
-							branches: [
-								{
-									// Declared first, so it is accounted first; its own call answers last.
-									id: "filtered",
-									pipeline:
-										"llm.invoke --model gpt-4o --prompt Beta | state.set probe | state.get probe | pick model,usage",
-								},
-								{ id: "marked", pipeline: "llm.invoke --model gpt-4o --prompt Alpha | json" },
-							],
-						},
-					},
-				],
-			},
-			{
-				LOBSTER_LLM_ADAPTER_URL: provider.url,
-				LOBSTER_CACHE_DIR: cacheDir,
-				LOBSTER_STATE_DIR: stateDir,
-			},
-		);
-
-		assert.equal(result.status, "ok");
-		assert.equal(provider.requests(), 2);
-		// Two calls, two records. Reading the copy before the marked branch settles leaves the
-		// copy on one charge, the marked branch billed regardless, and the third charge for the
-		// step settlement to find.
-		assert.equal(result._meta?.cost?.totalInputTokens, 2000);
-		assert.equal(result._meta?.cost?.totalOutputTokens, 1000);
-	} finally {
-		await provider.close();
-		await fsp.rm(cacheDir, { recursive: true, force: true });
-		await fsp.rm(stateDir, { recursive: true, force: true });
-	}
-});
-
-test("workflow cost tracking does not bill a replay routed through state storage", async () => {
-	const provider = await startFakeProvider();
-	const cacheDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-cost-cache-"));
-	const stateDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-cost-state-"));
-	const invoke = "llm.invoke --model gpt-4o --prompt Summarize";
-	const env = {
-		LOBSTER_LLM_ADAPTER_URL: provider.url,
-		LOBSTER_CACHE_DIR: cacheDir,
-		LOBSTER_STATE_DIR: stateDir,
-	};
-	try {
-		// An earlier run paid for the answer, so this run has no charge of its own to settle: it
-		// is billed nothing whether or not it stores the replay on the way past. `state.get`
-		// rebuilds the item from its own JSON, which carries none of the marks this process
-		// attached -- but the command wrote those bytes itself a moment earlier, so it knows what
-		// the value it hands back stands in for.
-		const first = await runWorkflow({ steps: [{ id: "warm", pipeline: `${invoke} | json` }] }, env);
-		assert.equal(first.result._meta?.cost?.totalInputTokens, 1000);
-
-		const { result } = await runWorkflow(
-			{
-				steps: [
-					{ id: "through-state", pipeline: `${invoke} | state.set probe | state.get probe | json` },
+					{ id: "llm", pipeline: invoke() },
+					{ id: "after", command: "echo done" },
 				],
 			},
 			env,
 		);
-
 		assert.equal(result.status, "ok");
-		assert.equal(provider.requests(), 1);
-		assert.equal(result._meta?.cost, undefined);
-	} finally {
-		await provider.close();
-		await fsp.rm(cacheDir, { recursive: true, force: true });
-		await fsp.rm(stateDir, { recursive: true, force: true });
-	}
+		assert.match(stderrOutput, /\[WARN\] Cost/);
+		assert.deepEqual(result.output, ["done\n"]);
+	});
 });
 
-test("workflow cost tracking still bills a state value this process never wrote", async () => {
-	const provider = await startFakeProvider();
-	const cacheDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-cost-cache-"));
-	const stateDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-cost-state-"));
-	// A stored value some other run -- or some other program -- left behind. It looks exactly like
-	// a replay and says so, and it is still billed: the stored bytes were never handed to this
-	// process to be marked, so nothing about them can claim the call was already paid for.
-	const planter = await openStoreSession({ directory: stateDir });
-	try {
-		await planter.write("planted", JSON.stringify(forgedReplayItem("cache"), null, 2) + "\n");
-	} finally {
-		await planter.close();
-	}
-	try {
-		const { result } = await runWorkflow(
-			{ steps: [{ id: "planted", pipeline: "state.get planted | json" }] },
-			{
-				LOBSTER_LLM_ADAPTER_URL: provider.url,
-				LOBSTER_CACHE_DIR: cacheDir,
-				LOBSTER_STATE_DIR: stateDir,
-			},
+test("cost_limit stop ends the run once the calls made pass it", async () => {
+	await withProvider(async (env, provider) => {
+		await assert.rejects(
+			runWorkflow(
+				{
+					cost_limit: { max_usd: 0.01, action: "stop" },
+					steps: [
+						{ id: "first", pipeline: invoke("One") },
+						{ id: "second", pipeline: invoke("Two") },
+						{ id: "third", pipeline: invoke("Three") },
+					],
+				},
+				env,
+			),
+			/Cost limit exceeded/,
 		);
+		assert.equal(provider.requests(), 2);
+	});
+});
 
+test("a call to a model with no price is counted at zero, with a warning", async () => {
+	await withProvider(async (env) => {
+		const { result, stderrOutput } = await runWorkflow(
+			{ steps: [{ id: "llm", pipeline: invoke("Summarize", "unknown-model") }] },
+			env,
+		);
 		assert.equal(result.status, "ok");
 		assert.equal(result._meta?.cost?.totalInputTokens, 1000);
-	} finally {
-		await provider.close();
-		await fsp.rm(cacheDir, { recursive: true, force: true });
-		await fsp.rm(stateDir, { recursive: true, force: true });
-	}
+		assert.equal(result._meta?.cost?.estimatedCostUsd, 0);
+		assert.match(stderrOutput, /No LLM pricing configured for model "unknown-model"/);
+	});
 });
 
-// A response the local validator rejects was still answered by a provider, and paid for. The
-// command asks again inside the same step, so nothing downstream ever sees the rejected attempt
-// -- the charge it opened is the only record that the call happened.
-test("workflow cost tracking bills a provider call the schema validator rejected", async () => {
+test("workflow cost tracking warns for invalid pricing env json", async () => {
+	await withProvider(async (env) => {
+		const { result, stderrOutput } = await runWorkflow(
+			{ steps: [{ id: "llm", pipeline: invoke() }] },
+			{ ...env, LOBSTER_LLM_PRICING_JSON: "{not-json" },
+		);
+		assert.equal(result.status, "ok");
+		assert.match(stderrOutput, /Ignoring invalid LOBSTER_LLM_PRICING_JSON/);
+	});
+});
+
+test("every provider call is counted, one the schema validator rejected too", async () => {
 	const provider = await startFakeProvider(
 		1,
 		(seen) =>
@@ -2149,194 +466,92 @@ test("workflow cost tracking bills a provider call the schema validator rejected
 		() => 0,
 		(seen) => (seen === 1 ? {} : { summary: "hello" }),
 	);
-	const cacheDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-cost-cache-"));
 	const schema = JSON.stringify({
 		type: "object",
 		required: ["summary"],
 		properties: { summary: { type: "string" } },
 	});
-	try {
+	await withProvider(async (env) => {
 		const { result } = await runWorkflow(
-			{
-				steps: [
-					{
-						id: "validated",
-						pipeline: `llm.invoke --model gpt-4o --prompt Summarize --output-schema '${schema}' | json`,
-					},
-				],
-			},
-			{ LOBSTER_LLM_ADAPTER_URL: provider.url, LOBSTER_CACHE_DIR: cacheDir },
+			{ steps: [{ id: "validated", pipeline: `${invoke()} --output-schema '${schema}' | json` }] },
+			env,
 		);
-
 		assert.equal(result.status, "ok");
 		assert.equal(provider.requests(), 2, "the first answer failed the schema and was asked again");
-		// 1000 + 3000 and 500 + 100: both calls, not just the one that satisfied the schema.
 		assert.equal(result._meta?.cost?.totalInputTokens, 4000);
 		assert.equal(result._meta?.cost?.totalOutputTokens, 600);
-	} finally {
-		await provider.close();
-		await fsp.rm(cacheDir, { recursive: true, force: true });
-	}
+	}, provider);
 });
 
-// Restoring what a paused run spent without restoring what it spent it on counts one call
-// twice. The steps come back from the resume state as JSON, so a completed `llm.invoke` output
-// among them carries no mark this process put there — only the cache key, which is an ordinary
-// field. A later step that re-emits that output is then a copy of a call the fresh ledger has
-// never heard of, and it is billed on top of the restored total.
-// A large answer is kept as a record while the run is paused, and must come back as a paid one.
-for (const [size, summary] of [
-	["a small", "hello"],
-	["a large", "x".repeat(3000)],
-] as const)
-	test(`workflow cost tracking does not rebill ${size} pre-pause answer re-emitted after a resume`, async () => {
-		const provider = await startFakeProvider(1, undefined, undefined, () => ({ summary }));
-		const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-cost-rebill-"));
-		const cacheDir = path.join(tmpDir, "cache");
-		const stateDir = path.join(tmpDir, "state");
-		await fsp.mkdir(cacheDir, { recursive: true });
+test("what a run spent before an approval is still counted after the resume", async () => {
+	await withProvider(async (providerEnv, provider) => {
+		const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-cost-resume-"));
 		const filePath = path.join(tmpDir, "workflow.lobster");
 		await fsp.writeFile(
 			filePath,
 			JSON.stringify({
 				steps: [
-					{ id: "live", pipeline: "llm.invoke --model gpt-4o --prompt Summarize" },
+					{ id: "live", pipeline: invoke() },
 					{ id: "gate", run: "echo gate", approval: "Continue?" },
-					// Re-emits the answer the run paid for before the gate, as a plain JSON copy.
-					{ id: "echo", pipeline: "head --n 1", stdin: "$live.json" },
+					{ id: "replay", pipeline: invoke() },
+					{ id: "after", pipeline: invoke("Again") },
 				],
 			}),
-			"utf8",
 		);
-
-		const env = {
-			...process.env,
-			LOBSTER_STATE_DIR: stateDir,
-			LOBSTER_CACHE_DIR: cacheDir,
-			LOBSTER_LLM_ADAPTER_URL: provider.url,
-		};
 		const ctx = () => ({
 			stdin: process.stdin,
 			stdout: process.stdout,
 			stderr: new PassThrough(),
-			env,
+			env: { ...process.env, ...providerEnv, LOBSTER_STATE_DIR: path.join(tmpDir, "state") },
 			mode: "tool" as const,
-			registry: createDefaultRegistry(),
+			registry,
 		});
-
 		try {
 			const paused = await runWorkflowFile({ filePath, ctx: ctx() });
 			assert.equal(paused.status, "needs_approval");
-			const token = paused.requiresApproval?.resumeToken;
-			assert.equal(typeof token, "string");
-
 			const resumed = await runWorkflowFile({
 				filePath,
 				ctx: ctx(),
-				resume: decodeResumeToken(token as string),
+				resume: decodeResumeToken(paused.requiresApproval!.resumeToken!),
 				approved: true,
 			});
-
 			assert.equal(resumed.status, "ok");
-			// One provider call, so one call's worth of tokens however many steps show its answer.
-			assert.equal(provider.requests(), 1);
-			assert.equal(resumed._meta?.cost?.totalInputTokens, 1000);
-			assert.equal(resumed._meta?.cost?.totalOutputTokens, 500);
-			assert.deepEqual(
-				resumed._meta?.cost?.byStep.map((entry) => entry.stepId),
-				["live"],
-			);
+			assert.equal(provider.requests(), 2);
+			assert.equal(resumed._meta?.cost?.totalInputTokens, 2000);
+			assert.deepEqual(stepIds(resumed), ["after", "live"]);
 		} finally {
-			await provider.close();
 			await fsp.rm(tmpDir, { recursive: true, force: true });
 		}
 	});
-
-// Saved marks come back exactly where they were: a look-alike with the same public fields,
-// which a command could print, is not marked, and a projection that drops the key keeps its own.
-test("saved model-call marks come back exactly where they were, and nowhere else", () => {
-	const usage = { inputTokens: 1000, outputTokens: 500 };
-	const paid = markLlmItem(
-		{ cacheKey: "key-a", model: "gpt-4o", usage: { ...usage } },
-		{ cacheKey: "key-a", replayed: true },
-	);
-	const projected = { model: "gpt-4o", usage: paid.usage };
-	const lookAlike = { cacheKey: "key-a", model: "gpt-4o", usage: { ...usage } };
-	const saved = JSON.parse(JSON.stringify({ paid, projected, lookAlike }));
-	restoreLlmMarks(saved, llmMarksOf({ paid, projected, lookAlike }), () => false);
-	assert.deepEqual(llmProvenanceOf(saved.paid), { cacheKey: "key-a", replayed: true });
-	assert.deepEqual(llmProvenanceOf(saved.projected.usage), { cacheKey: "key-a", replayed: true });
-	assert.equal(llmProvenanceOf(saved.lookAlike), null);
 });
 
-// What the ledger hands to a pausing run has to be readable by the run that resumes it: a
-// charge still open travels as open, for the resumed run to settle.
-test("a ledger's open charges survive a round trip through resume state", () => {
-	const source = createLlmSpendLedger();
-	source.record("billed-key", {
-		stepId: "one",
-		model: "gpt-4o",
-		usage: { inputTokens: 100, outputTokens: 20 },
+test("a child workflow's calls count under its workflow step, a loop's as loop.step", async () => {
+	await withProvider(async (env, provider) => {
+		const { result } = await runComposedWorkflow(
+			{
+				steps: [
+					{ id: "kid", workflow: "child.lobster" },
+					{ id: "items", run: "echo '[1]'" },
+					{
+						id: "loop",
+						for_each: "$items.json",
+						steps: [{ id: "inloop", pipeline: invoke("Loop") }],
+					},
+				],
+			},
+			{ steps: [{ id: "llm", pipeline: invoke("Child") + " | json" }] },
+			env,
+		);
+		assert.equal(result.status, "ok", JSON.stringify(result));
+		assert.equal(provider.requests(), 2);
+		assert.deepEqual(stepIds(result), ["kid", "loop.inloop"]);
 	});
-	source.record("open-key", {
-		stepId: "two",
-		model: "gpt-4o",
-		usage: { inputTokens: 300, outputTokens: 40 },
-	});
-	source.claim("billed-key", { model: "gpt-4o", usage: { inputTokens: 100, outputTokens: 20 } });
-
-	const carried = JSON.parse(JSON.stringify({ llmSpend: source.outstanding() }));
-	assert.deepEqual(
-		carried.llmSpend.map((charge: LlmOutstandingCharge) => charge.cacheKey),
-		["open-key"],
-	);
-	const resumed = createLlmSpendLedger();
-	resumed.restore(carried.llmSpend);
-	assert.deepEqual(resumed.claim("open-key")?.usage, { inputTokens: 300, outputTokens: 40 });
-	assert.equal(resumed.claim("billed-key"), null);
 });
 
-// A `wait: "any"` step keeps the first branch to answer and abandons the rest, but an abandoned
-// branch is not a stopped one: it can still be waiting on a provider, and it pays when the answer
-// arrives. Whether that spend reached the workflow's own total used to depend on nothing but how
-// long the run happened to live afterwards, so the same workflow over the same three calls billed
-// two of them or three. The discarded branch's output is thrown away and its cost goes with it.
-async function runDiscardedBranchRace(finishSlowDuringRun: boolean) {
-	let requests = 0;
-	let slowStarted: () => void;
-	const slowEntered = new Promise<void>((resolve) => (slowStarted = resolve));
-	let releaseSlow: () => void;
-	const slowReleased = new Promise<void>((resolve) => (releaseSlow = resolve));
-	const response = {
-		ok: true,
-		result: {
-			model: "gpt-4o",
-			output: { data: { summary: "hello" } },
-			usage: { inputTokens: 1000, outputTokens: 500 },
-		},
-	};
-	let slowFinished = false;
-	const slowResponse = slowReleased.then(() => {
-		slowFinished = true;
-		return response;
-	});
-	const adapter = async ({ payload }: { payload: { prompt: string } }) => {
-		requests += 1;
-		if (payload.prompt === "Slow") {
-			slowStarted();
-			return slowResponse;
-		}
-		if (payload.prompt === "Fast") {
-			// Both calls must start, but only Fast can finish before the tail begins.
-			await slowEntered;
-		} else if (finishSlowDuringRun) {
-			releaseSlow();
-			await slowResponse;
-		}
-		return response;
-	};
-	const cacheDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-cost-cache-"));
-	try {
+test("every branch's calls count, a wait:any race's losers too", async () => {
+	// Slow's call answers at once; Fast's answer comes later, but its step ends first.
+	const provider = await startFakeProvider(1, undefined, (prompt) => (prompt === "Fast" ? 200 : 0));
+	await withProvider(async (env) => {
 		const { result } = await runWorkflow(
 			{
 				steps: [
@@ -2345,53 +560,53 @@ async function runDiscardedBranchRace(finishSlowDuringRun: boolean) {
 						parallel: {
 							wait: "any",
 							branches: [
-								{ id: "fast", pipeline: "llm.invoke --model gpt-4o --prompt Fast | json" },
-								{ id: "slow", pipeline: "llm.invoke --model gpt-4o --prompt Slow | json" },
+								{ id: "fast", pipeline: invoke("Fast") },
+								{ id: "slow", pipeline: invoke("Slow") + " | test.hold --ms 10000" },
 							],
 						},
 					},
-					{ id: "tail", pipeline: "llm.invoke --model gpt-4o --prompt Tail | json" },
 				],
 			},
-			{ LOBSTER_LLM_PROVIDER: "race", LOBSTER_CACHE_DIR: cacheDir },
-			{ race: adapter },
+			env,
 		);
-		assert.equal(slowFinished, finishSlowDuringRun);
-		return { result, requests };
-	} finally {
-		releaseSlow();
-		await slowResponse;
-		await fsp.rm(cacheDir, { recursive: true, force: true });
-	}
-}
-
-test("workflow cost tracking leaves a discarded wait:any branch out of the total", async () => {
-	// The run ends while the losing branch is still waiting on its provider.
-	const ended = await runDiscardedBranchRace(false);
-	// The run is still going when that branch pays.
-	const running = await runDiscardedBranchRace(true);
-
-	for (const { result, requests } of [ended, running]) {
-		assert.equal(result.status, "ok");
-		// All three calls really were made; only two of them are the workflow's.
-		assert.equal(requests, 3);
+		assert.equal(result.status, "ok", JSON.stringify(result));
+		assert.equal(provider.requests(), 2);
 		assert.equal(result._meta?.cost?.totalInputTokens, 2000);
-		assert.equal(result._meta?.cost?.totalOutputTokens, 1000);
-		assert.deepEqual(
-			result._meta?.cost?.byStep.map((entry) => entry.stepId),
-			["fast", "tail"],
-		);
-	}
+		assert.deepEqual(stepIds(result), ["fast", "slow"]);
+	}, provider);
+});
 
-	// The total is the same either way: it does not turn on the losing branch's timing.
-	assert.equal(
-		ended.result._meta?.cost?.totalInputTokens,
-		running.result._meta?.cost?.totalInputTokens,
-	);
+test("items running at once each have their calls counted", async () => {
+	await withProvider(async (env, provider) => {
+		const { result } = await runWorkflow(
+			{
+				steps: [
+					{ id: "items", run: "echo '[0, 300]'" },
+					{
+						id: "loop",
+						for_each: "$items.json",
+						concurrency: 2,
+						steps: [
+							{
+								id: "call",
+								pipeline:
+									"llm.invoke --model gpt-4o --prompt 'hi $item.json' | test.hold --ms $item.json",
+							},
+						],
+					},
+				],
+			},
+			env,
+		);
+		assert.equal(result.status, "ok", JSON.stringify(result));
+		assert.equal(provider.requests(), 2);
+		assert.equal(result._meta?.cost?.totalInputTokens, 2000);
+		assert.deepEqual(stepIds(result), ["loop.call", "loop.call"]);
+	});
 });
 
 for (const loop of [false, true]) {
-	test(`cost_limit stops ${loop ? "for_each" : "pipeline"} retries after a paid call loses its output`, async () => {
+	test(`cost_limit stops ${loop ? "for_each" : "pipeline"} retries once a failed attempt's call passed it`, async () => {
 		let calls = 0;
 		const step = {
 			id: "spend",
@@ -2434,429 +649,6 @@ for (const loop of [false, true]) {
 				),
 			/Cost limit exceeded/,
 		);
-		assert.equal(calls, 1, "a downstream failure must not hide paid usage from the retry budget");
+		assert.equal(calls, 1, "a failed attempt's call counts before the step is retried");
 	});
 }
-
-for (const rendered of [false, true]) {
-	for (const passthrough of ["head --n 1", "pick usage"]) {
-		test(`uninterrupted workflow does not rebill ${rendered ? "rendered" : "live"} output through ${passthrough}`, async () => {
-			const provider = await startFakeProvider();
-			const cacheDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-cost-step-reference-"));
-			try {
-				const { result } = await runWorkflow(
-					{
-						cost_limit: { max_usd: 0.01, action: "stop" },
-						steps: [
-							{
-								id: "live",
-								pipeline: `llm.invoke --model gpt-4o --prompt Summarize${rendered ? " | json" : ""}`,
-							},
-							{ id: "copy", pipeline: passthrough, stdin: "$live.json" },
-							{ id: "again", pipeline: "head --n 1", stdin: "$copy.json" },
-						],
-					},
-					{ LOBSTER_LLM_ADAPTER_URL: provider.url, LOBSTER_CACHE_DIR: cacheDir },
-				);
-				assert.equal(provider.requests(), 1);
-				assert.equal(result._meta?.cost?.totalInputTokens, 1000);
-				assert.equal(result._meta?.cost?.totalOutputTokens, 500);
-				assert.deepEqual(
-					result._meta?.cost?.byStep.map((entry) => entry.stepId),
-					["live"],
-				);
-			} finally {
-				await provider.close();
-				await fsp.rm(cacheDir, { recursive: true, force: true });
-			}
-		});
-	}
-}
-
-test("a call whose usage no item carries is billed under the step's name, in a child or a loop", async () => {
-	const provider = await startFakeProvider();
-	const cacheDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-cost-cache-"));
-	// `pick` keeps the summary and drops the item that carried the call's usage.
-	const dropped = "llm.invoke --model gpt-4o --prompt Summarize --refresh | pick summary";
-	try {
-		const { result } = await runComposedWorkflow(
-			{
-				steps: [
-					{ id: "kid", workflow: "child.lobster" },
-					{ id: "items", run: "echo '[1]'" },
-					{ id: "loop", for_each: "$items.json", steps: [{ id: "inloop", pipeline: dropped }] },
-				],
-			},
-			{ steps: [{ id: "dropped", pipeline: dropped }] },
-			{ LOBSTER_LLM_ADAPTER_URL: provider.url, LOBSTER_CACHE_DIR: cacheDir },
-		);
-		assert.equal(result.status, "ok", JSON.stringify(result));
-		assert.deepEqual(result._meta?.cost?.byStep.map((entry) => entry.stepId).sort(), [
-			"kid",
-			"loop.inloop",
-		]);
-	} finally {
-		await provider.close();
-		await fsp.rm(cacheDir, { recursive: true, force: true });
-	}
-});
-
-test("a call made in a loop is billed once when a later step re-emits the loop's output", async () => {
-	const provider = await startFakeProvider();
-	const cacheDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-cost-cache-"));
-	try {
-		const { result } = await runComposedWorkflow(
-			{
-				steps: [
-					{ id: "one", run: "echo '[1]'" },
-					{
-						id: "loop",
-						for_each: "$one.json",
-						steps: [{ id: "ask", pipeline: "llm.invoke --model gpt-4o --prompt Summarize" }],
-					},
-					{ id: "echo", pipeline: "map --unwrap ask", stdin: "$loop.json" },
-				],
-			},
-			{ steps: [{ id: "unused", run: "true" }] },
-			{ LOBSTER_LLM_ADAPTER_URL: provider.url, LOBSTER_CACHE_DIR: cacheDir },
-		);
-		assert.equal(result.status, "ok", JSON.stringify(result));
-		assert.equal(provider.requests(), 1);
-		assert.deepEqual(
-			result._meta?.cost?.byStep.map((entry) => entry.stepId),
-			["loop.ask"],
-		);
-	} finally {
-		await provider.close();
-		await fsp.rm(cacheDir, { recursive: true, force: true });
-	}
-});
-
-test("a paid answer a command asked about at the terminal is billed once", async () => {
-	const provider = await startFakeProvider();
-	const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-cost-asked-"));
-	// Asks a question mid-run, then passes its input on.
-	const asker = defineCommand({
-		name: "test.asker",
-		meta: {
-			description: "Asks, then passes its input on",
-			argsSchema: { type: "object", properties: {} },
-			sideEffects: [],
-			repeatable: true,
-		},
-		help: () => "test.asker",
-		async run({ input, ctx }) {
-			const items = [];
-			for await (const item of input) items.push(item);
-			await ctx.requestInput!({ prompt: "Go?", responseSchema: { type: "boolean" } });
-			return {
-				output: (async function* () {
-					yield* items;
-				})(),
-			};
-		},
-	});
-	const registry = createRegistry({
-		packs: [...builtinPacks, { name: "test", description: "Test", commands: [asker] }],
-	});
-	const filePath = path.join(tmpDir, "workflow.lobster");
-	await fsp.writeFile(
-		filePath,
-		JSON.stringify({
-			steps: [
-				{ id: "live", pipeline: "llm.invoke --model gpt-4o --prompt Summarize" },
-				{ id: "q", pipeline: "test.asker", stdin: "$live.json" },
-			],
-		}),
-	);
-	const stdin = Object.assign(new PassThrough(), { isTTY: true });
-	const stdout = new PassThrough();
-	stdout.on("data", (chunk) => {
-		if (String(chunk).includes("Go?")) stdin.write("true\n");
-	});
-	try {
-		const result = await runWorkflowFile({
-			filePath,
-			ctx: {
-				stdin,
-				stdout,
-				stderr: new PassThrough(),
-				env: {
-					...process.env,
-					LOBSTER_STATE_DIR: path.join(tmpDir, "state"),
-					LOBSTER_CACHE_DIR: path.join(tmpDir, "cache"),
-					LOBSTER_LLM_ADAPTER_URL: provider.url,
-				},
-				mode: "human",
-				registry,
-			},
-		});
-		assert.equal(result.status, "ok", JSON.stringify(result));
-		assert.equal(provider.requests(), 1);
-		assert.deepEqual(
-			result._meta?.cost?.byStep.map((entry) => entry.stepId),
-			["live"],
-		);
-	} finally {
-		stdin.destroy();
-		stdout.destroy();
-		await provider.close();
-		await fsp.rm(tmpDir, { recursive: true, force: true });
-	}
-});
-
-test("a call approved inside its pipeline is billed once when a later step re-emits it", async () => {
-	const provider = await startFakeProvider();
-	const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-cost-approved-"));
-	const filePath = path.join(tmpDir, "workflow.lobster");
-	await fsp.writeFile(
-		filePath,
-		JSON.stringify({
-			steps: [
-				{
-					id: "draft",
-					pipeline: "llm.invoke --model gpt-4o --prompt Summarize | approve --prompt ok",
-				},
-				{ id: "echo", pipeline: "head --n 1", stdin: "$draft.json" },
-			],
-		}),
-	);
-	const ctx = () => ({
-		stdin: process.stdin,
-		stdout: process.stdout,
-		stderr: new PassThrough(),
-		env: {
-			...process.env,
-			LOBSTER_STATE_DIR: path.join(tmpDir, "state"),
-			LOBSTER_CACHE_DIR: path.join(tmpDir, "cache"),
-			LOBSTER_LLM_ADAPTER_URL: provider.url,
-		},
-		mode: "tool" as const,
-		registry: createDefaultRegistry(),
-	});
-	try {
-		const paused = await runWorkflowFile({ filePath, ctx: ctx() });
-		assert.equal(paused.status, "needs_approval", JSON.stringify(paused));
-		const resumed = await runWorkflowFile({
-			filePath,
-			ctx: ctx(),
-			resume: decodeResumeToken(paused.requiresApproval!.resumeToken),
-			approved: true,
-		});
-		assert.equal(resumed.status, "ok", JSON.stringify(resumed));
-		assert.equal(provider.requests(), 1);
-		assert.deepEqual(
-			resumed._meta?.cost?.byStep.map((entry) => entry.stepId),
-			["draft"],
-		);
-	} finally {
-		await provider.close();
-		await fsp.rm(tmpDir, { recursive: true, force: true });
-	}
-});
-
-test("calls made in a long loop are billed once when a second loop re-emits them", async () => {
-	const provider = await startFakeProvider();
-	const cacheDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-cost-cache-"));
-	// More calls than a run remembers as billed: in one process, their answers keep their marks.
-	const count = 300;
-	try {
-		const prompts = await emitJsonCommand(Array.from({ length: count }, (_, i) => `p${i}`));
-		const { result } = await runComposedWorkflow(
-			{
-				steps: [
-					{ id: "list", run: prompts },
-					{
-						id: "loop",
-						for_each: "$list.json",
-						steps: [{ id: "llm", pipeline: "llm.invoke --model gpt-4o --prompt $item.json" }],
-					},
-					{
-						id: "again",
-						for_each: "$loop.json",
-						steps: [{ id: "echo", pipeline: "head --n 1", stdin: "$item.json.llm" }],
-					},
-				],
-			},
-			{ steps: [{ id: "unused", run: "true" }] },
-			{ LOBSTER_LLM_ADAPTER_URL: provider.url, LOBSTER_CACHE_DIR: cacheDir },
-		);
-		assert.equal(result.status, "ok", JSON.stringify(result).slice(0, 500));
-		assert.equal(provider.requests(), count);
-		assert.deepEqual(
-			[...new Set(result._meta?.cost?.byStep.map((entry) => entry.stepId))],
-			["loop.llm"],
-		);
-		assert.equal(result._meta?.cost?.totalInputTokens, 1000 * count);
-	} finally {
-		await provider.close();
-		await fsp.rm(cacheDir, { recursive: true, force: true });
-	}
-});
-
-/** Run `steps`, pause at their approval, approve, and return the resumed result. */
-async function approvedRun(steps: unknown[], summary = "hello") {
-	const provider = await startFakeProvider(1, undefined, undefined, () => ({ summary }));
-	const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-cost-approved-"));
-	const filePath = path.join(tmpDir, "workflow.lobster");
-	await fsp.writeFile(filePath, JSON.stringify({ steps }));
-	const ctx = () => ({
-		stdin: process.stdin,
-		stdout: process.stdout,
-		stderr: new PassThrough(),
-		env: {
-			...process.env,
-			LOBSTER_STATE_DIR: path.join(tmpDir, "state"),
-			LOBSTER_CACHE_DIR: path.join(tmpDir, "cache"),
-			LOBSTER_LLM_ADAPTER_URL: provider.url,
-		},
-		mode: "tool" as const,
-		registry: createDefaultRegistry(),
-	});
-	try {
-		const paused = await runWorkflowFile({ filePath, ctx: ctx() });
-		assert.equal(paused.status, "needs_approval", JSON.stringify(paused));
-		const resumed = await runWorkflowFile({
-			filePath,
-			ctx: ctx(),
-			resume: decodeResumeToken(paused.requiresApproval!.resumeToken),
-			approved: true,
-		});
-		assert.equal(resumed.status, "ok", JSON.stringify(resumed));
-		return { resumed, requests: provider.requests() };
-	} finally {
-		await provider.close();
-		await fsp.rm(tmpDir, { recursive: true, force: true });
-	}
-}
-
-test("a command's copy of a paid answer is billed as a call, whether or not it pauses", async () => {
-	// The command echoes its input: what comes back is whatever it printed (see the docs).
-	const echo = await emitJsonCommand(null);
-	const script = echo.replace(/emit\.mjs$/, "echo.mjs");
-	await fsp.writeFile(
-		script.slice("node ".length),
-		"let s='';process.stdin.on('data',d=>s+=d).on('end',()=>process.stdout.write(s));\n",
-	);
-	const { resumed, requests } = await approvedRun([
-		{ id: "live", pipeline: "llm.invoke --model gpt-4o --prompt Summarize" },
-		{
-			id: "copy",
-			pipeline: `exec --stdin json --json=true ${script} | approve --prompt ok`,
-			stdin: "$live.json",
-		},
-	]);
-	assert.equal(requests, 1);
-	assert.deepEqual(
-		resumed._meta?.cost?.byStep.map((entry) => entry.stepId),
-		["live", "copy"],
-	);
-});
-
-test("a projected paid answer is billed once after a resume", async () => {
-	const { resumed, requests } = await approvedRun([
-		{ id: "draft", pipeline: "llm.invoke --model gpt-4o --prompt Summarize | pick model,usage" },
-		{ id: "gate", approval: true },
-		{ id: "echo", pipeline: "head --n 1", stdin: "$draft.json" },
-	]);
-	assert.equal(requests, 1);
-	assert.deepEqual(
-		resumed._meta?.cost?.byStep.map((entry) => entry.stepId),
-		["draft"],
-	);
-});
-
-test("a large paid answer saved before its step was billed is not revived by another call", async () => {
-	// `b` asks again under the same cache key, and its charge is open while the run pauses.
-	const ask = "llm.invoke --model gpt-4o --prompt Summarize";
-	const { resumed, requests } = await approvedRun(
-		[
-			{ id: "a", pipeline: ask },
-			{ id: "b", pipeline: `${ask} --refresh | approve --prompt ok` },
-			{ id: "c", pipeline: "pick model,usage", stdin: "$a.json" },
-		],
-		"x".repeat(3000),
-	);
-	assert.equal(requests, 2);
-	assert.equal(resumed._meta?.cost?.totalInputTokens, 2000);
-});
-
-test("a saved mark cannot be placed outside the value it was saved with", () => {
-	restoreLlmMarks({}, [[["__proto__"], { cacheKey: "k", replayed: true }]], () => false);
-	assert.equal(llmProvenanceOf({}), null);
-});
-
-test("items running at once each settle only their own calls", async () => {
-	const provider = await startFakeProvider();
-	const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-cost-concurrent-"));
-	// Holds its items for --ms, then passes them on: one item's step ends while the other's call
-	// is made and not yet accounted for.
-	const hold = defineCommand({
-		name: "test.hold",
-		meta: {
-			description: "Passes items on after a delay",
-			argsSchema: { type: "object", properties: { ms: { type: "number" } } },
-			sideEffects: [],
-			repeatable: true,
-		},
-		help: () => "test.hold",
-		async run({ input, args }) {
-			const items = [];
-			for await (const item of input) items.push(item);
-			await new Promise((resolve) => setTimeout(resolve, Number(args.ms)));
-			return {
-				output: (async function* () {
-					yield* items;
-				})(),
-			};
-		},
-	});
-	const registry = createRegistry({
-		packs: [...builtinPacks, { name: "test", description: "Test", commands: [hold] }],
-	});
-	const filePath = path.join(tmpDir, "workflow.lobster");
-	await fsp.writeFile(
-		filePath,
-		JSON.stringify({
-			steps: [
-				{ id: "items", run: "echo '[0, 600]'" },
-				{
-					id: "loop",
-					for_each: "$items.json",
-					concurrency: 2,
-					steps: [
-						{
-							id: "call",
-							pipeline:
-								"llm.invoke --model gpt-4o --prompt 'hi $item.json' --refresh | test.hold --ms $item.json",
-						},
-					],
-				},
-			],
-		}),
-	);
-	try {
-		const result = await runWorkflowFile({
-			filePath,
-			ctx: {
-				stdin: process.stdin,
-				stdout: process.stdout,
-				stderr: new PassThrough(),
-				env: {
-					...process.env,
-					LOBSTER_STATE_DIR: path.join(tmpDir, "state"),
-					LOBSTER_CACHE_DIR: path.join(tmpDir, "cache"),
-					LOBSTER_LLM_ADAPTER_URL: provider.url,
-				},
-				mode: "tool",
-				registry,
-			},
-		});
-		assert.equal(result.status, "ok", JSON.stringify(result));
-		assert.equal(provider.requests(), 2);
-		assert.equal(result._meta?.cost?.totalInputTokens, 2000);
-	} finally {
-		await provider.close();
-		await fsp.rm(tmpDir, { recursive: true, force: true });
-	}
-});

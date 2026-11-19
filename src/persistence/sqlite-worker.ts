@@ -212,6 +212,16 @@ function listRuns(): RunRecord[] {
 	return rows.map((row) => getRun(row.id)!);
 }
 
+/** IDs of finished runs last updated before `before`, after `after`: what retention may remove. */
+function finishedBefore(before: string, after = "", limit = -1): string[] {
+	const rows = prepare(`SELECT id FROM runs WHERE id > ?
+		AND json_extract(record, '$.status') IN ('completed', 'failed', 'cancelled')
+		AND json_extract(record, '$.updatedAt') < ? ORDER BY id LIMIT ?`).all(after, before, limit) as {
+		id: string;
+	}[];
+	return rows.map((row) => row.id);
+}
+
 const PRUNE_INTERVAL_MS = 24 * 60 * 60 * 1000;
 const PRUNE_BATCH = 500;
 
@@ -492,8 +502,11 @@ function handle(request: WorkerRequest): WorkerResult<WorkerMethod> {
 				}
 				return historyPage(run, args.afterSequence, args.limit);
 			}, false);
-		case "listRuns":
-			return listRuns();
+		case "retainable":
+			return transaction(
+				() => finishedBefore(args.before).filter((id) => canRetain(getRun(id)!, args.before)),
+				false,
+			);
 		case "export":
 			return transaction(() => {
 				const states: Record<string, string> = {};
@@ -537,16 +550,8 @@ function handle(request: WorkerRequest): WorkerResult<WorkerMethod> {
 				).run(key, value);
 			const last = meta("lastPrune");
 			if (last && Date.parse(args.now) - Date.parse(last) < PRUNE_INTERVAL_MS) return [];
-			const ids = prepare(`SELECT id FROM runs WHERE id > ?
-				AND json_extract(record, '$.status') IN ('completed', 'failed', 'cancelled')
-				AND json_extract(record, '$.updatedAt') < ? ORDER BY id LIMIT ?`).all(
-				meta("pruneCursor") ?? "",
-				args.before,
-				PRUNE_BATCH,
-			) as { id: string }[];
-			const removed = ids
-				.filter((row) => transaction(() => removeRun(row.id, args.before)))
-				.map((row) => row.id);
+			const ids = finishedBefore(args.before, meta("pruneCursor") ?? "", PRUNE_BATCH);
+			const removed = ids.filter((id) => transaction(() => removeRun(id, args.before)));
 			if (ids.length < PRUNE_BATCH) {
 				// Keep events an unfinished run may still wait for: those since the oldest one started.
 				const oldest = prepare(`SELECT MIN(json_extract(record, '$.execution.startedAt')) AS at
@@ -559,7 +564,7 @@ function handle(request: WorkerRequest): WorkerResult<WorkerMethod> {
 				setMeta("pruneCursor", "");
 				setMeta("lastPrune", args.now);
 			} else {
-				setMeta("pruneCursor", ids.at(-1)!.id);
+				setMeta("pruneCursor", ids.at(-1)!);
 			}
 			return removed;
 		}

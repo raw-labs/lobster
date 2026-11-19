@@ -389,3 +389,24 @@ test("a failed run whose parallel branch was cut off can be abandoned", async (t
 	assert.equal(abandoned.abandoned.length, 1);
 	assert.match(abandoned.abandoned[0], /slow/);
 });
+
+test("a when: that fails at run time fails its step: on_error applies, and runs advance retries it", async (t) => {
+	const { dir, env, advance } = await fixture(t);
+	const steps = (onError?: string) => [
+		{ id: "a", run: `echo '{"n":"high"}'` },
+		{ id: "b", run: "echo big", when: "$a.json.n > 5", ...(onError ? { on_error: onError } : {}) },
+		{ id: "c", run: "echo after" },
+	];
+	const filePath = path.join(dir, "flow.lobster");
+	await fs.writeFile(filePath, JSON.stringify({ steps: steps("continue") }));
+	const tolerated = await runToolRequest({ filePath, ctx: { env } });
+	assert.equal(tolerated.ok, true, JSON.stringify(tolerated));
+	assert.deepEqual(tolerated.ok && tolerated.output, ["after\n"]);
+
+	await fs.writeFile(filePath, JSON.stringify({ steps: steps() }));
+	const failed = await runToolRequest({ filePath, ctx: { env } });
+	assert.equal(failed.ok, false);
+	assert.match(failed.ok ? "" : failed.error.message, /cannot compare/);
+	// The step failed, so the run continues from it: its condition is decided again.
+	await assert.rejects(advance(failed.runId!), /cannot compare/);
+});

@@ -14,7 +14,7 @@ import { snapshotDefinition } from "../../workflows/definition.js";
 import { activation } from "../checkpoint.js";
 import type { Machine } from "../machine.js";
 import { GATES_REFUSED, type Scope } from "../scope.js";
-import { carrySourceItems, createSyntheticStepResult, toOutputItems } from "../results.js";
+import { createSyntheticStepResult, toOutputItems } from "../results.js";
 import { sequence } from "./sequence.js";
 
 /**
@@ -73,9 +73,8 @@ export async function childWorkflowStep(
 				? resolveCwd(step.cwd, scope.args)
 				: (child.definition.workflow.cwd ?? resolveCwd(scope.cwd, scope.args)),
 		ancestors: [...scope.ancestors, child.definition.filePath],
-		costPrefix: scope.costPrefix + step.id + ".",
 	});
 	const output = toOutputItems(result);
 	const value = output.length === 1 ? output[0] : output;
-	return carrySourceItems(createSyntheticStepResult(step.id, value), result);
+	return createSyntheticStepResult(step.id, value);
 }
