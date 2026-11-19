@@ -26,8 +26,7 @@ type ApprovalWait = Extract<WaitRequest, { kind: "approval" }>;
 
 /**
  * The approval gate after a step: asks about the step's result (`subject`), and completes with
- * it plus `approved`. The node before it has finished and been charged; it never runs again
- * to ask.
+ * it plus `approved`. The node before it has finished; it never runs again to ask.
  */
 export async function approval(
 	machine: Machine,
@@ -137,7 +136,10 @@ export function approvalRequest(
 	const json = subject.json;
 	if (isPlainObject(json)) {
 		const nested = json.requiresApproval;
-		const asked = readApprovalFields(isPlainObject(nested) && nested.prompt ? nested : json);
+		const asked = readApprovalFields(
+			isPlainObject(nested) && nested.prompt ? nested : json,
+			`Workflow step ${step.id}: its output asking for approval`,
+		);
 		if (asked.prompt) {
 			const preview = setting.preview ?? asked.preview;
 			return {
@@ -164,10 +166,10 @@ export function approvalRequest(
  * The approval fields of a setting or of a step's output, in either spelling (camel or snake)
  * but not both: only one would be read, and the other dropped without a word.
  */
-function readApprovalFields(raw: Record<string, unknown>) {
+function readApprovalFields(raw: Record<string, unknown>, what = "An approval") {
 	const either = (camel: string, snake: string) => {
 		if (raw[camel] !== undefined && raw[snake] !== undefined)
-			throw new Error(`An approval takes ${snake} or ${camel}, not both`);
+			throw new Error(`${what} takes ${snake} or ${camel}, not both`);
 		return raw[camel] ?? raw[snake];
 	};
 	const text = (value: unknown) => (typeof value === "string" && value) || undefined;

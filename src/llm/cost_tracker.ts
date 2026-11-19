@@ -23,7 +23,8 @@ export type CostLimit = {
 
 export class CostLimitExceededError extends Error {
 	constructor(estimatedCostUsd: number, maxUsd: number) {
-		super(`Cost limit exceeded: $${estimatedCostUsd.toFixed(4)} > $${maxUsd.toFixed(2)} limit`);
+		// The limit as written: rounded to cents, a limit under a cent would read as $0.00.
+		super(`Cost limit exceeded: $${estimatedCostUsd.toFixed(4)} > $${maxUsd} limit`);
 		this.name = "CostLimitExceededError";
 	}
 }
@@ -150,9 +151,7 @@ export class CostTracker {
 		}
 
 		if (stderr) {
-			stderr.write(
-				`[WARN] Cost $${costUsd.toFixed(4)} exceeds limit $${limit.max_usd.toFixed(2)}\n`,
-			);
+			stderr.write(`[WARN] Cost $${costUsd.toFixed(4)} exceeds limit $${limit.max_usd}\n`);
 		}
 	}
 

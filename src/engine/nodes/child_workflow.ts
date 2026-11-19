@@ -10,7 +10,7 @@ import {
 	withoutArgEnv,
 } from "../../workflows/values.js";
 import { resolveWorkflowArgs } from "../../workflows/args.js";
-import { snapshotDefinition } from "../../workflows/definition.js";
+import { snapshotChild } from "../../workflows/definition.js";
 import { checkPipelineSteps } from "../../workflows/pipeline_check.js";
 import { activation } from "../checkpoint.js";
 import type { Machine } from "../machine.js";
@@ -20,8 +20,8 @@ import { sequence } from "./sequence.js";
 
 /**
  * The child's definition, arguments and environment are frozen on entry and saved, so a
- * recovered run continues the same child. Its steps are charged to this step, under this
- * workflow's cost limits as well as its own, and they cannot pause.
+ * recovered run continues the same child. Its steps' model calls are counted under this step,
+ * under this workflow's cost limits as well as its own, and they cannot pause.
  */
 export async function childWorkflowStep(
 	machine: Machine,
@@ -36,10 +36,8 @@ export async function childWorkflowStep(
 			path.dirname(scope.definition.filePath),
 			resolveTemplate(step.workflow!, scope.args, scope.results),
 		);
-		if (scope.ancestors.includes(file))
-			throw new Error(`Workflow step ${step.id} creates a cycle: ${file}`);
 		const frozen = scope.definition.children[scope.definitionPath!];
-		const definition = frozen ?? (await snapshotDefinition(file, args, scope.ancestors));
+		const definition = frozen ?? (await snapshotChild(step, file, args, scope.ancestors));
 		const childArgs = resolveWorkflowArgs(definition.workflow.args, args);
 		// A child named only now (from a step's output) is checked as a start checks a file,
 		// before any of its steps acts; one the run froze at its start was checked then.

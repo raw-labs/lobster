@@ -1199,3 +1199,25 @@ test("a host's store handle checks a run listing as core's listRuns does", async
 	await assert.rejects(store.listRuns({ callerId: "" }), /Invalid caller ID/);
 	assert.deepEqual((await store.listRuns()).runs, []);
 });
+
+test("an approval a step's output asks for with two spellings of a setting names the step", async (t) => {
+	const directory = await fs.mkdtemp(path.join(os.tmpdir(), "lobster-approval-spelling-"));
+	t.after(() => fs.rm(directory, { recursive: true, force: true }));
+	const filePath = path.join(directory, "flow.lobster");
+	const asked = { requiresApproval: { prompt: "Ship?", initiated_by: "a", initiatedBy: "b" } };
+	await fs.writeFile(
+		filePath,
+		JSON.stringify({
+			steps: [{ id: "ship", run: `echo '${JSON.stringify(asked)}'`, approval: "required" }],
+		}),
+	);
+	await assert.rejects(
+		runWorkflowFile({
+			filePath,
+			ctx: createToolContext({
+				env: { ...process.env, LOBSTER_STATE_DIR: path.join(directory, "state") },
+			}),
+		}),
+		/Workflow step ship: its output asking for approval takes initiated_by or initiatedBy, not both/,
+	);
+});

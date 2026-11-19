@@ -4,6 +4,9 @@ All notable changes to Lobster will be documented in this file.
 
 ## Unreleased
 
+- A child workflow that cannot be loaded (missing, invalid, a cycle, args it does not take) is reported with the step that names it and its file, and a missing one as "Workflow file not found": the error was the raw file-system message, or named a step of the child as if it were in the file being run.
+- An approval that a step's output asks for with two spellings of a setting (`initiated_by` and `initiatedBy`) names the step and says the output is at fault.
+- Cost limit messages show the limit as written: a limit under a cent read as 0.00.
 - An `input:` step first in a `switch` case, a loop body or a `repeat` round shows the step before the case or loop as its subject, as it would outside it: it showed none, so a person was asked about nothing.
 - A child workflow named at run time (`workflow: $pick.stdout`) has its pipeline steps checked when it is entered, before any of its steps acts, as a child named in the file is checked at the start: a misspelled flag in a later step failed the run after earlier steps had acted, and the child was saved with the mistake, so `runs advance` met it again after the file was fixed.
 - `lobster graph --args-json` refuses an arg the workflow does not declare (suggesting the nearest name), as `run` does; required args may still be left out of a graph.

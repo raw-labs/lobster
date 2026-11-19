@@ -197,6 +197,41 @@ test("indirect cycle is detected", async () => {
 	await assert.rejects(() => runWorkflow(paths["a.lobster"], stateDir), /creates a cycle/);
 });
 
+test("a cycle through a child named at run time is detected", async () => {
+	const { stateDir, paths } = await setupWorkflows({
+		"self.lobster": {
+			steps: [
+				{ id: "name", run: "printf self.lobster" },
+				{ id: "loop", workflow: "$name.stdout" },
+			],
+		},
+	});
+	await assert.rejects(
+		() => runWorkflow(paths["self.lobster"], stateDir),
+		/Workflow step loop \(.*self\.lobster\): Workflow creates a cycle/,
+	);
+});
+
+for (const named of ["in the file", "at run time"]) {
+	test(`a child workflow that cannot load, named ${named}, is reported with its step and file`, async () => {
+		const { stateDir, paths } = await setupWorkflows({
+			"parent.lobster": {
+				steps:
+					named === "in the file"
+						? [{ id: "kid", workflow: "missing.lobster" }]
+						: [
+								{ id: "name", run: "printf missing.lobster" },
+								{ id: "kid", workflow: "$name.stdout" },
+							],
+			},
+		});
+		await assert.rejects(
+			() => runWorkflow(paths["parent.lobster"], stateDir),
+			/^Error: Workflow step kid \(.*missing\.lobster\): Workflow file not found: .*missing\.lobster$/,
+		);
+	});
+}
+
 test("sub-workflow string output remains raw in stdout", async () => {
 	const { stateDir, paths } = await setupWorkflows({
 		"child.lobster": {

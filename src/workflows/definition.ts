@@ -5,6 +5,7 @@ import path from "node:path";
 import { loadWorkflowFile } from "./load.js";
 import { resolveTemplate } from "./expressions.js";
 import { fingerprint } from "../util/serialization.js";
+import { messageOf } from "../util/errors.js";
 import { resolveWorkflowStepArgs } from "./values.js";
 import { checkWorkflowArgs, resolveWorkflowArgs } from "./args.js";
 import type { WorkflowFile, WorkflowStep } from "./types.js";
@@ -31,7 +32,10 @@ export async function snapshotDefinition(
 	args: Record<string, unknown>,
 	ancestors: string[] = [],
 ): Promise<Definition> {
-	const canonical = await fs.realpath(filePath);
+	const canonical = await fs.realpath(filePath).catch((error) => {
+		if (error?.code !== "ENOENT") throw error;
+		throw Object.assign(new Error(`Workflow file not found: ${filePath}`), { code: "ENOENT" });
+	});
 	if (ancestors.includes(canonical)) throw new Error(`Workflow creates a cycle: ${canonical}`);
 	const workflow = await loadWorkflowFile(canonical);
 	checkWorkflowArgs(workflow.args, args, `Workflow ${canonical}`);
@@ -43,7 +47,8 @@ export async function snapshotDefinition(
 			if (step.workflow) {
 				const ref = resolveTemplate(step.workflow, resolved, {});
 				if (!ref.includes("$")) {
-					children[key] = await snapshotDefinition(
+					children[key] = await snapshotChild(
+						step,
 						path.resolve(path.dirname(canonical), ref),
 						resolveWorkflowStepArgs(step.workflow_args, resolved, {}),
 						[...ancestors, canonical],
@@ -67,6 +72,23 @@ export async function snapshotDefinition(
 		workflow,
 		children,
 	};
+}
+
+/**
+ * Freeze the child workflow `step` names, from `file`. A child that cannot be frozen (missing,
+ * invalid, a cycle, args it does not take) is reported with the step and the file.
+ */
+export async function snapshotChild(
+	step: WorkflowStep,
+	file: string,
+	args: Record<string, unknown>,
+	ancestors: string[],
+) {
+	try {
+		return await snapshotDefinition(file, args, ancestors);
+	} catch (error) {
+		throw new Error(`Workflow step ${step.id} (${file}): ${messageOf(error)}`);
+	}
 }
 
 /** A standalone pipeline as a one-step workflow definition, fed `input` items as they are. */

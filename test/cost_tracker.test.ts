@@ -652,3 +652,15 @@ for (const loop of [false, true]) {
 		assert.equal(calls, 1, "a failed attempt's call counts before the step is retried");
 	});
 }
+
+test("cost limit messages show a limit under a cent as written", () => {
+	const tracker = new CostTracker();
+	tracker.recordUsage("step", "gpt-4o", { inputTokens: 100, outputTokens: 100 });
+	assert.throws(
+		() => tracker.checkLimit({ max_usd: 0.001, action: "stop" }),
+		/Cost limit exceeded: \$0\.001\d > \$0\.001 limit/,
+	);
+	const stderr = captureWritable();
+	tracker.checkLimit({ max_usd: 0.001, action: "warn" }, stderr.stream);
+	assert.match(stderr.output(), /exceeds limit \$0\.001\n/);
+});
