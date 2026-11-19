@@ -23,4 +23,4 @@ Lobster currently renders static workflow graphs in Mermaid, DOT, and ASCII. A l
 
 Use a direct tool call for a one-off action. Use Lobster when a sequence is repeatable, needs saved state, or includes a human checkpoint. Deterministic steps avoid repeatedly asking a model to reconstruct the same execution sequence; model calls remain explicit stages where judgment is needed.
 
-See the [README](README.md) for working commands, workflow syntax, cancellation, output limits, and SDK examples.
+See the [README](README.md) for a short guide, and the [reference](docs/reference.md) for workflow syntax, cancellation, output limits, and SDK examples.

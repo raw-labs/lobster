@@ -1,10 +1,10 @@
-import type { WorkflowFile, WorkflowStep, WorkflowStepResult } from "./types.js";
 import {
 	resolveArgsTemplate,
 	resolveTemplate,
 	parseStepRef,
 	getStepRefValue,
 } from "./expressions.js";
+import type { WorkflowFile, WorkflowStep, WorkflowStepResult } from "./types.js";
 
 export function createRecord<T>(source?: Record<string, T>): Record<string, T> {
 	const record = Object.create(null) as Record<string, T>;
@@ -24,6 +24,23 @@ export function parseWorkflowArgsJson(raw: string, label: string): Record<string
 		throw new Error(`${label} --args-json must be a JSON object`);
 	}
 	return value as Record<string, unknown>;
+}
+
+/**
+ * `env` without the variables `args` put there (`LOBSTER_ARG_*`, `LOBSTER_ARGS_JSON`): a child
+ * workflow sees its own args, never the ones its parent did not pass it.
+ */
+export function withoutArgEnv(
+	env: Record<string, string | undefined>,
+	args: Record<string, unknown>,
+) {
+	const rest = createRecord(env);
+	delete rest.LOBSTER_ARGS_JSON;
+	for (const key of Object.keys(args)) {
+		const normalized = normalizeArgEnvKey(key);
+		if (normalized) delete rest[`LOBSTER_ARG_${normalized}`];
+	}
+	return rest;
 }
 
 export function mergeEnv(
@@ -91,15 +108,6 @@ export function resolveInputValue(
 		return resolveTemplate(stdin, args, results);
 	}
 	return stdin;
-}
-
-export function resolveShellStdin(
-	stdin: unknown,
-	args: Record<string, unknown>,
-	results: Record<string, WorkflowStepResult>,
-) {
-	const value = resolveInputValue(stdin, args, results);
-	return encodeShellInput(value);
 }
 
 export function resolveWorkflowStepArgs(

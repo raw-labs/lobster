@@ -1,16 +1,18 @@
-function stringifyCell(v) {
+import { defineCommand } from "../define.js";
+function stringifyCell(v: unknown) {
 	if (v === null || v === undefined) return "";
 	if (typeof v === "string") return v;
 	if (typeof v === "number" || typeof v === "boolean") return String(v);
 	return JSON.stringify(v);
 }
 
-export const tableCommand = {
+export const tableCommand = defineCommand({
 	name: "table",
 	meta: {
 		description: "Render items as a simple table",
 		argsSchema: { type: "object", properties: {}, required: [] },
 		sideEffects: [],
+		repeatable: true,
 	},
 	help() {
 		return `table — render items as a simple table\n\nUsage:\n  ... | table\n\nNotes:\n  - If items are objects, columns are union of keys (first 20 items).\n`;
@@ -27,8 +29,8 @@ export const tableCommand = {
 
 		const sample = items.slice(0, 20);
 		if (sample.every((x) => x && typeof x === "object" && !Array.isArray(x))) {
-			const cols = [];
-			const seen = new Set();
+			const cols: string[] = [];
+			const seen = new Set<string>();
 			for (const obj of sample) {
 				for (const k of Object.keys(obj)) {
 					if (!seen.has(k)) {
@@ -46,7 +48,7 @@ export const tableCommand = {
 				rows.reduce((width, row) => Math.max(width, row[i].length), 3),
 			);
 
-			const renderRow = (row) => row.map((cell, i) => cell.padEnd(widths[i])).join("  ");
+			const renderRow = (row: string[]) => row.map((cell, i) => cell.padEnd(widths[i])).join("  ");
 			ctx.stdout.write(renderRow(rows[0]) + "\n");
 			ctx.stdout.write(widths.map((w) => "-".repeat(w)).join("  ") + "\n");
 			for (const row of rows.slice(1)) ctx.stdout.write(renderRow(row) + "\n");
@@ -57,6 +59,6 @@ export const tableCommand = {
 		for (const item of items) ctx.stdout.write(stringifyCell(item) + "\n");
 		return { output: emptyStream(), rendered: true };
 	},
-};
+});
 
 async function* emptyStream() {}

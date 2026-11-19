@@ -8,7 +8,8 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 
 import { createDefaultRegistry } from "../src/commands/registry.js";
-import { keyToPath, stableStringify } from "../src/state/store.js";
+import { keyToPath } from "../src/state/paths.js";
+import { stableStringify } from "../src/util/serialization.js";
 
 function streamOf(items: any[]) {
 	return (async function* () {
@@ -879,7 +880,8 @@ test("llm.invoke aborts while waiting for its reusable run-state lock", async ()
 		const early = await Promise.race([
 			completion,
 			new Promise<{ kind: "timeout" }>((resolve) =>
-				setTimeout(() => resolve({ kind: "timeout" }), 75),
+				// Only a missed abort waits this long; an observed one settles at once.
+				setTimeout(() => resolve({ kind: "timeout" }), 2000),
 			),
 		]);
 		if (early.kind === "timeout") await fsp.rm(lockPath, { recursive: true, force: true });
@@ -1291,3 +1293,109 @@ async function closeServer(server: http.Server) {
 	if (!server.listening) return;
 	await new Promise<void>((resolve) => server.close(() => resolve()));
 }
+
+/** An adapter that answers each request with the next `data` value, recording requests. */
+async function scriptedAdapter(responses: unknown[]) {
+	const requests: any[] = [];
+	const server = http.createServer((req, res) => {
+		let body = "";
+		req.setEncoding("utf8");
+		req.on("data", (chunk) => (body += chunk));
+		req.on("end", () => {
+			requests.push(JSON.parse(body || "{}"));
+			const data = responses.shift();
+			res.writeHead(200, { "content-type": "application/json" });
+			res.end(
+				JSON.stringify({
+					ok: true,
+					result: { output: { format: "json", text: JSON.stringify(data), data } },
+				}),
+			);
+		});
+	});
+	await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+	const addr = server.address();
+	const port = typeof addr === "object" && addr ? addr.port : 0;
+	return { server, requests, url: `http://127.0.0.1:${port}/invoke` };
+}
+
+test("llm.invoke accepts different output schemas that share an $id", async () => {
+	const registry = createDefaultRegistry();
+	const cmd = registry.get("llm.invoke")!;
+	const adapter = await scriptedAdapter([{ a: 1 }, { b: 1 }, { a: 1 }]);
+	const invoke = (schema: object) =>
+		cmd.run({
+			input: streamOf([]),
+			args: {
+				_: [],
+				provider: "http",
+				prompt: "Decide",
+				"disable-cache": true,
+				"max-validation-retries": 0,
+				"output-schema": JSON.stringify(schema),
+			},
+			ctx: baseCtx({ LOBSTER_LLM_ADAPTER_URL: adapter.url }, registry),
+		} as any);
+	const id = "https://example.test/llm-output";
+	try {
+		const first = await collect(
+			(await invoke({ $id: id, type: "object", required: ["a"] })).output!,
+		);
+		assert.deepEqual(first[0].output.data, { a: 1 });
+		const second = await collect(
+			(await invoke({ $id: id, type: "object", required: ["b"] })).output!,
+		);
+		assert.deepEqual(second[0].output.data, { b: 1 });
+		// The second schema, not the first one registered under that $id, is the one applied.
+		await assert.rejects(
+			async () => collect((await invoke({ $id: id, type: "object", required: ["b"] })).output!),
+			/output failed schema validation/,
+		);
+	} finally {
+		await closeServer(adapter.server);
+	}
+});
+
+test("llm.invoke tells the model every validation error as <path> <message>", async () => {
+	const registry = createDefaultRegistry();
+	const cmd = registry.get("llm.invoke")!;
+	const adapter = await scriptedAdapter([{ n: "x", extra: true }, { n: 1 }]);
+	try {
+		const result = await cmd
+			.run({
+				input: streamOf([]),
+				args: {
+					_: [],
+					provider: "http",
+					prompt: "Count",
+					"disable-cache": true,
+					"output-schema": JSON.stringify({
+						type: "object",
+						properties: { n: { type: "integer" }, label: { type: "string" } },
+						required: ["n", "label"],
+						additionalProperties: false,
+					}),
+				},
+				ctx: baseCtx({ LOBSTER_LLM_ADAPTER_URL: adapter.url }, registry),
+			} as any)
+			.catch((error) => error);
+		assert.ok(result instanceof Error, "the second answer still lacks label");
+		const errors: string[] = adapter.requests[1].retryContext.validationErrors;
+		assert.ok(errors.length >= 3, JSON.stringify(errors));
+		for (const error of errors) assert.match(error, /^\/\S* \S/);
+		assert.ok(
+			errors.some((e) => e.startsWith("/n ")),
+			JSON.stringify(errors),
+		);
+		assert.ok(
+			errors.some((e) => /label/.test(e)),
+			JSON.stringify(errors),
+		);
+		assert.ok(
+			errors.some((e) => /extra|additional/.test(e)),
+			JSON.stringify(errors),
+		);
+	} finally {
+		await closeServer(adapter.server);
+	}
+});

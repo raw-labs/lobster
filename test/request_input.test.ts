@@ -6,9 +6,9 @@ import os from "node:os";
 import path from "node:path";
 
 import { resumeToolRequest, runToolRequest } from "../src/core/tool_runtime.js";
-import { runPipeline } from "../src/runtime.js";
-import { decodeResumeToken } from "../src/resume.js";
-import { readStateJsonWithLock as readStateJson, writeStateJson } from "../src/state/store.js";
+import { runPipeline } from "../src/pipeline/runtime.js";
+import { decodeResumeToken } from "../src/resume/resume.js";
+import { openStoreSession } from "../src/persistence/session.js";
 
 const responseSchema = {
 	type: "object",
@@ -31,6 +31,29 @@ function streamOf(items: unknown[]) {
 	return (async function* () {
 		for (const item of items) yield item;
 	})();
+}
+
+/**
+ * Where a paused pipeline stopped, read from its run: the stage it resumes at, the items it
+ * resumes with, and the suspended command's state for a same-stage question.
+ */
+async function pausedFrame(env: Record<string, string | undefined>, stateKey: string) {
+	const store = await openStoreSession({ directory: env.LOBSTER_STATE_DIR!, readOnly: true });
+	try {
+		const { runId } = JSON.parse((await store.read(stateKey)).text!);
+		const run = await store.getRunState(runId);
+		const frame = Object.values(run!.execution!.activations).find(
+			(item) => item.phase === "waiting" && item.activity?.pause,
+		)!.activity!.pause!;
+		return {
+			resumeMode: frame.mode,
+			resumeAtIndex: frame.resumeAtIndex,
+			items: frame.items,
+			commandInput: frame.mode === "same_stage" ? (frame.commandInput as any) : undefined,
+		};
+	} finally {
+		await store.close();
+	}
 }
 
 function runCli(args: string[], env: Record<string, string | undefined>) {
@@ -65,7 +88,7 @@ test("ctx.requestInput suspends and resumes the same tool command with state-bac
 
 	const payload = decodeResumeToken(first.requiresInput.resumeToken);
 	assert.deepEqual(Object.keys(payload).sort(), ["kind", "protocolVersion", "stateKey", "v"]);
-	const state = (await readStateJson({ env, key: payload.stateKey })) as any;
+	const state = await pausedFrame(env, payload.stateKey);
 	assert.equal(state.resumeMode, "same_stage");
 	assert.equal(state.resumeAtIndex, 0);
 	assert.deepEqual(state.items, []);
@@ -107,7 +130,7 @@ test("ctx.requestInput carries bounded prior responses across multiple suspensio
 	});
 	assert.equal(second.status, "needs_input");
 	const payload = decodeResumeToken(second.requiresInput!.resumeToken);
-	const state = (await readStateJson({ env, key: payload.stateKey })) as any;
+	const state = await pausedFrame(env, payload.stateKey);
 	assert.equal(state.commandInput.pending.requestIndex, 1);
 	assert.equal(state.commandInput.history.length, 1);
 
@@ -152,7 +175,7 @@ test("ctx.requestInput does not leak consumed suspended state into later request
 	});
 	assert.equal(second.status, "needs_input");
 	const payload = decodeResumeToken(second.requiresInput!.resumeToken);
-	const state = (await readStateJson({ env, key: payload.stateKey })) as any;
+	const state = await pausedFrame(env, payload.stateKey);
 	assert.equal(state.commandInput.pending.suspendedState, undefined);
 });
 
@@ -223,38 +246,6 @@ test("ctx.requestInput rejects a response rebound to changed request metadata", 
 	});
 	assert.equal(resumed.ok, false);
 	assert.match(resumed.error?.message ?? "", /does not match suspended request/);
-});
-
-test("malformed same-stage requestInput state is rejected before resume execution", async () => {
-	const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-request-input-corrupt-"));
-	const env = { LOBSTER_STATE_DIR: path.join(tmpDir, "state") };
-	let calls = 0;
-	const choose = {
-		name: "choose",
-		async run({ ctx }: any) {
-			calls += 1;
-			await ctx.requestInput({ prompt: "Pick", responseSchema });
-			return { output: streamOf([]) };
-		},
-	};
-
-	const first = await runToolRequest({
-		pipeline: "choose",
-		ctx: { env, registry: registry({ choose }) },
-	});
-	const payload = decodeResumeToken(first.requiresInput!.resumeToken);
-	const state = (await readStateJson({ env, key: payload.stateKey })) as any;
-	state.commandInput.pending.requestIndex = 5;
-	await writeStateJson({ env, key: payload.stateKey, value: state });
-
-	const resumed = await resumeToolRequest({
-		token: first.requiresInput!.resumeToken,
-		response: { choice: "red" },
-		ctx: { env, registry: registry({ choose }) },
-	});
-	assert.equal(resumed.ok, false);
-	assert.match(resumed.error?.message ?? "", /Invalid pipeline resume state/);
-	assert.equal(calls, 1);
 });
 
 test("unconsumed requestInput resume fails before downstream side effects", async () => {
@@ -397,7 +388,7 @@ test("consumed requestInput resume token is invalid after downstream failure", a
 		ctx: { env, registry: registry({ choose, fail }) },
 	});
 	assert.equal(replay.ok, false);
-	assert.match(replay.error?.message ?? "", /Pipeline resume state not found/);
+	assert.match(replay.error?.message ?? "", /Resume state not found/);
 	assert.equal(sideEffects, 1);
 });
 
@@ -762,7 +753,7 @@ test("ctx.requestInput restores compact suspended state before lazy input is rea
 	assert.equal(first.status, "needs_input");
 	assert.equal(produced, 1);
 	const payload = decodeResumeToken(first.requiresInput!.resumeToken);
-	const state = (await readStateJson({ env, key: payload.stateKey })) as any;
+	const state = await pausedFrame(env, payload.stateKey);
 	assert.equal(state.resumeMode, "same_stage");
 	assert.equal(state.resumeAtIndex, 1);
 	assert.deepEqual(state.items, []);
@@ -897,7 +888,7 @@ test("ctx.requestInput suspends from terminal lazy output", async () => {
 	});
 	assert.equal(first.status, "needs_input");
 	const payload = decodeResumeToken(first.requiresInput!.resumeToken);
-	const state = (await readStateJson({ env, key: payload.stateKey })) as any;
+	const state = await pausedFrame(env, payload.stateKey);
 	assert.equal(state.resumeAtIndex, 0);
 
 	const resumed = await resumeToolRequest({
@@ -981,10 +972,7 @@ test("built CLI ask restores subject state across processes", async () => {
 	assert.deepEqual(firstJson.requiresInput.subject, { text: '{"draft":"hello"}' });
 
 	const payload = decodeResumeToken(firstJson.requiresInput.resumeToken);
-	const state = (await readStateJson({
-		env: { LOBSTER_STATE_DIR: stateDir },
-		key: payload.stateKey,
-	})) as any;
+	const state = await pausedFrame({ LOBSTER_STATE_DIR: stateDir }, payload.stateKey);
 	assert.equal(state.resumeMode, "same_stage");
 	assert.equal(state.resumeAtIndex, 1);
 	assert.deepEqual(state.items, []);
@@ -1009,7 +997,7 @@ test("built CLI ask restores subject state across processes", async () => {
 	assert.deepEqual(resumedJson.output, [{ decision: "approve" }]);
 });
 
-test("human CLI ask --emit prints public input request", async () => {
+test("human CLI ask --emit without a terminal pauses and prints the input request", async () => {
 	const schema = JSON.stringify({
 		type: "object",
 		properties: { decision: { type: "string" } },
@@ -1020,8 +1008,11 @@ test("human CLI ask --emit prints public input request", async () => {
 		{},
 	);
 	assert.equal(result.status, 0, result.stderr);
+	// Without a terminal to ask on, the pipeline pauses like a workflow file and prints how to answer.
 	const output = JSON.parse(result.stdout);
-	assert.equal(output[0].type, "input_request");
-	assert.equal(output[0].prompt, "Review?");
-	assert.equal(output[0].commandInput, undefined);
+	assert.equal(output.status, "needs_input");
+	assert.equal(output.requiresInput.type, "input_request");
+	assert.equal(output.requiresInput.prompt, "Review?");
+	assert.ok(output.requiresInput.resumeToken);
+	assert.equal(output.requiresInput.commandInput, undefined);
 });

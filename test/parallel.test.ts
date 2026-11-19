@@ -5,7 +5,8 @@ import os from "node:os";
 import path from "node:path";
 
 import { createDefaultRegistry } from "../src/commands/registry.js";
-import { loadWorkflowFile, runWorkflowFile } from "../src/workflows/file.js";
+import { runWorkflowFile } from "../src/engine/runner.js";
+import { loadWorkflowFile } from "../src/workflows/load.js";
 
 async function runWorkflow(workflow: unknown) {
 	const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-parallel-"));
@@ -122,7 +123,7 @@ test("parallel wait=all propagates branch failure", async () => {
 	);
 });
 
-test("parallel pipeline branches reject command-level requestInput", async () => {
+test("parallel pipeline branches refuse ask, saying why, in tool mode too", async () => {
 	await assert.rejects(
 		() =>
 			runWorkflow({
@@ -136,8 +137,68 @@ test("parallel pipeline branches reject command-level requestInput", async () =>
 					},
 				],
 			}),
-		/requestInput is not supported in this pipeline context/,
+		/halted for input inside pipeline stage ask; .*parallel/,
 	);
+});
+
+test("a refused question in a branch stops the run: on_error does not let it through", async () => {
+	await assert.rejects(
+		() =>
+			runWorkflow({
+				steps: [
+					{
+						id: "p",
+						on_error: "continue",
+						parallel: { branches: [{ id: "review", pipeline: "ask --prompt 'Review?'" }] },
+					},
+					{ id: "after", run: "echo went-on" },
+				],
+			}),
+		/halted for input inside pipeline stage ask/,
+	);
+});
+
+test("parallel pipeline branches say why an emitted input request cannot pause", async () => {
+	await assert.rejects(
+		() =>
+			runWorkflow({
+				steps: [
+					{
+						id: "p",
+						parallel: {
+							wait: "all",
+							branches: [
+								{
+									id: "review",
+									pipeline: `ask --emit --prompt Continue? --schema '{"type":"integer"}'`,
+								},
+							],
+						},
+					},
+				],
+			}),
+		/halted for input inside pipeline stage ask; .* inside a parallel branch/,
+	);
+});
+
+test("a race's losing branches are skipped, so later steps can read them", async () => {
+	const result = await runWorkflow({
+		steps: [
+			{
+				id: "p",
+				parallel: {
+					wait: "any",
+					branches: [
+						{ id: "fast", run: "echo fast" },
+						{ id: "slow", run: "sleep 2; echo slow" },
+					],
+				},
+			},
+			{ id: "after", when: "$slow.skipped", run: "echo slow-was-skipped" },
+		],
+	});
+	assert.equal(result.status, "ok", JSON.stringify(result));
+	assert.deepEqual(result.output, ["slow-was-skipped\n"]);
 });
 
 test("parallel validation rejects empty branches", async () => {
@@ -218,4 +279,22 @@ test("parallel timeout aborts block", async () => {
 			}),
 		/Parallel step p timed out after 100ms/,
 	);
+});
+
+test("a branch named approval or activity does not stand in for the step's own gate", async () => {
+	const result = await runWorkflow({
+		steps: [
+			{
+				id: "both",
+				approval: "Ship it?",
+				parallel: {
+					branches: [
+						{ id: "approval", run: "echo one" },
+						{ id: "activity", run: "echo two" },
+					],
+				},
+			},
+		],
+	});
+	assert.equal(result.status, "needs_approval", JSON.stringify(result));
 });

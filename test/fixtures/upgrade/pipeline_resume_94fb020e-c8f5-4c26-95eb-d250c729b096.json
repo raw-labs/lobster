@@ -1,0 +1,35 @@
+{
+	"pipeline": [
+		{
+			"name": "exec",
+			"args": {
+				"_": [],
+				"json": true,
+				"shell": "echo x >> __DIR__/count_pipe; echo [1,2]"
+			},
+			"raw": "exec --json --shell 'echo x >> __DIR__/count_pipe; echo [1,2]'"
+		},
+		{
+			"name": "approve",
+			"args": {
+				"_": [],
+				"prompt": "pipe ok?"
+			},
+			"raw": "approve --prompt 'pipe ok?'"
+		},
+		{
+			"name": "exec",
+			"args": {
+				"_": [],
+				"shell": "echo x >> __DIR__/count_pipe_after; echo done"
+			},
+			"raw": "exec --shell 'echo x >> __DIR__/count_pipe_after; echo done'"
+		}
+	],
+	"resumeAtIndex": 2,
+	"items": [1, 2],
+	"haltType": "approval_request",
+	"prompt": "pipe ok?",
+	"supersededResumeStateKeys": [],
+	"createdAt": "2026-11-16T15:26:09.170Z"
+}

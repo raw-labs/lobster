@@ -1,0 +1,42 @@
+{
+	"pipeline": [
+		{
+			"name": "exec",
+			"args": {
+				"_": [],
+				"json": true,
+				"shell": "echo x >> __DIR__/count_emit; echo [3]"
+			},
+			"raw": "exec --json --shell 'echo x >> __DIR__/count_emit; echo [3]'"
+		},
+		{
+			"name": "ask",
+			"args": {
+				"_": [],
+				"emit": true,
+				"prompt": "Name?",
+				"schema": "{\"type\":\"string\"}"
+			},
+			"raw": "ask --emit --prompt 'Name?' --schema '{\"type\":\"string\"}'"
+		},
+		{
+			"name": "exec",
+			"args": {
+				"_": [],
+				"json": true,
+				"shell": "echo x >> __DIR__/count_emit_after; cat"
+			},
+			"raw": "exec --json --shell 'echo x >> __DIR__/count_emit_after; cat'"
+		}
+	],
+	"resumeAtIndex": 2,
+	"items": [],
+	"haltType": "input_request",
+	"resumeMode": "next_stage",
+	"inputSchema": {
+		"type": "string"
+	},
+	"prompt": "Name?",
+	"supersededResumeStateKeys": [],
+	"createdAt": "2026-11-17T17:30:32.055Z"
+}

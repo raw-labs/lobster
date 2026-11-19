@@ -1,4 +1,5 @@
-import { getByPath } from "../../core/value_path.js";
+import { defineCommand } from "../define.js";
+import { getByPath } from "../../util/value_path.js";
 
 function defaultCompare(a: unknown, b: unknown): number {
 	const aU = a === undefined || a === null;
@@ -17,7 +18,7 @@ function defaultCompare(a: unknown, b: unknown): number {
 	return 0;
 }
 
-export const sortCommand = {
+export const sortCommand = defineCommand({
 	name: "sort",
 	meta: {
 		description: "Sort items (stable) by a key or by stringified value",
@@ -31,6 +32,7 @@ export const sortCommand = {
 			required: [],
 		},
 		sideEffects: [],
+		repeatable: true,
 	},
 	help() {
 		return (
@@ -68,4 +70,4 @@ export const sortCommand = {
 			})(),
 		};
 	},
-};
+});

@@ -1,10 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { parsePipeline } from "../src/parser.js";
-import { runPipeline } from "../src/runtime.js";
+import { parsePipeline } from "../src/pipeline/parser.js";
+import { runPipeline } from "../src/pipeline/runtime.js";
 import { createDefaultRegistry } from "../src/commands/registry.js";
-import { applyFilters, parseFilterExpression } from "../src/core/filters.js";
+import { applyFilters, parseFilterExpression } from "../src/commands/stdlib/template_filters.js";
 
 async function run(pipelineText: string, input: any[]) {
 	const pipeline = parsePipeline(pipelineText);

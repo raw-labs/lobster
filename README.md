@@ -2,17 +2,13 @@
 
 ![Lobster banner](docs/assets/readme-banner.jpg)
 
-An OpenClaw-native workflow shell: typed (JSON-first) pipelines and approval gates.
+Lobster runs repeatable workflows for agents such as OpenClaw, with people in the loop.
 
-## Example
+A workflow is a file of steps. Lobster runs it on your machine, saves every step as it goes,
+pauses when it needs a person, a time or an event, and picks up where it stopped. That
+holds after a crash too. It needs no server: all state lives in one SQLite file.
 
-A named workflow fetches a pull request with `gh`, compares it with the saved snapshot, and returns a notification only when it changes:
-
-```bash
-node bin/lobster.js run --mode tool "workflows.run --name github.pr.monitor.notify --args-json '{\"repo\":\"openclaw/lobster\",\"pr\":167}'"
-```
-
-For repeatable automation, put shell commands, native pipeline steps, and explicit approval/input gates in a workflow file. OpenClaw presents the gate to the user and resumes with their decision.
+This page is the short guide. The [reference](docs/reference.md) has everything else.
 
 ## Goals
 
@@ -21,359 +17,135 @@ For repeatable automation, put shell commands, native pipeline steps, and explic
 - No new auth surface: Lobster must not own OAuth/tokens.
 - Composable macros that OpenClaw (or any agent) can invoke in one step to save tokens.
 
-## Quick start
+## Install
 
-Requires Node.js 22 or newer and the pnpm version pinned in `package.json`. From this folder:
+Requires Node.js >=24.16.0 <25 or >=26.1.0 and the pnpm version pinned in `package.json`.
 
-- `pnpm install --frozen-lockfile`
-- `pnpm build`
-- `pnpm test`
-- `pnpm lint`
-- `node ./bin/lobster.js --help`
-- `node ./bin/lobster.js doctor`
-- `node ./bin/lobster.js "exec --json --shell 'echo [1,2,3]' | where '0>=0' | json"`
-
-### Notes
-
-- `pnpm test` runs `tsc` and then executes tests against `dist/`.
-- `bin/lobster.js` runs the compiled entrypoint in `dist/`; build after changing source files.
-Invalid workflow file paths are reported as input errors (exit code 2), whether passed with `--file` or as a single positional path (no whitespace; contains a path separator or ends in `.lobster`, `.yaml`, `.yml`, or `.json`). In `--mode tool`, these failures use the same JSON error envelope as other parsing errors.
-
-## Process output limits
-
-Captured process stdout and stderr remain unlimited by default. Set
-`LOBSTER_MAX_OUTPUT_BYTES` to a positive integer to opt into a byte limit **per
-stream, per process**. Unset or empty means unlimited; zero, negative, fractional,
-and non-numeric values are rejected before a process starts. This applies to
-CLI `exec`, workflow shell steps, SDK `exec`/shell calls, GitHub recipes, and Gog
-commands. The existing `openclaw.agent` 10 MiB limit remains in place; an opted-in
-limit can lower it.
-
-```bash
-LOBSTER_MAX_OUTPUT_BYTES=1048576 lobster run --mode tool 'exec my-command'
+```sh
+pnpm install --frozen-lockfile
+pnpm build
+node ./bin/lobster.js --help
 ```
 
-Use workflow or step `env` to scope the limit:
+## Five ideas
+
+1. **Steps.** `run:` runs a shell command and `pipeline:` runs Lobster's typed commands
+   (`llm.invoke`, `where`, `openclaw.invoke`…). A later step reads an earlier one as
+   `$id.json`, `$id.stdout`, `$id.approved`.
+2. **Gates.** `approval:` asks a yes/no and `input:` asks for structured data. The run
+   pauses, and the agent or host shows the question and resumes with the answer.
+3. **Flow.** `when:` runs a step only if a condition holds, and `switch:` picks one of
+   several cases. `for_each:` loops over a list, `repeat:` loops until a condition holds,
+   `parallel:` runs commands at once, and `workflow:` calls another workflow file.
+4. **Waits.** `sleep: 3d` and `wait: { event: … }` pause a run until a time or an event.
+   Nothing keeps running meanwhile. Something outside, such as cron or the OpenClaw
+   gateway, calls `lobster runs advance --due` or `lobster signal`.
+5. **Runs.** Every run is saved. Steps that finished are never run again. A command that
+   may already have acted and isn't safe to repeat stops the run as `blocked` for a person
+   to check, rather than running twice.
+
+## A first workflow
 
 ```yaml
-steps:
-  - id: bounded
-    env:
-      LOBSTER_MAX_OUTPUT_BYTES: "1048576"
-    run: my-command
-```
-
-SDK callers set the same variable in `new Lobster({ env: { ...process.env,
-LOBSTER_MAX_OUTPUT_BYTES: "1048576" } })`. Values exactly at the limit succeed;
-overflow terminates the process tree and returns an error without partial
-output. POSIX capped calls own a process group so background producers cannot
-keep pipes open after overflow. Calls without an AbortSignal relay terminal
-interrupts to that group and retain the host's existing signal handlers or
-conventional interrupt exit status.
-
-## Commands
-
-- `exec`: run OS commands
-- `exec --json <command...>`: parse subprocess stdout as JSON before the next stage
-- `exec --stdin raw|json|jsonl`: feed pipeline input into subprocess stdin
-- Explicit quoted empty arguments are retained by both pipeline `exec` and SDK `exec`. Invocation shims preserve argument punctuation without shell expansion.
-- `where`, `pick`, `head`: data shaping
-- `head --n N` stops reading upstream as soon as N items have been yielded; `--n 0` does not read upstream input.
-- `pick` and `map` preserve field names such as `__proto__` as ordinary own data fields.
-- `json`, `table`: renderers
-- `approve`: approval gate (TTY prompt or `--emit` for OpenClaw integration)
-
-In top-level `--mode tool` pipelines (including resumes and the core tool API), `json` and `table` preserve typed items in the single JSON envelope instead of writing terminal output. Human-mode rendering and rendered output captured within workflow-file steps remain unchanged.
-
-## SDK cancellation
-
-Pass an `AbortSignal` to `new Lobster({ signal })` to cancel SDK `exec()` stages,
-including `exec(command, { shell: true })`. The signal is retained by `clone()`
-and forwarded when a pipeline resumes. Aborting terminates the running child
-process tree before `run()` or `resume()` returns an error result containing the
-abort reason. A signal that is already aborted prevents the command from starting.
-
-```js
-import { Lobster, exec } from '@clawdbot/lobster';
-
-const controller = new AbortController();
-const pending = new Lobster({ signal: controller.signal })
-  .pipe(exec('node long-task.js', { json: false }))
-  .run();
-// When the host needs to stop the command:
-controller.abort(new Error('Host cancelled the command'));
-const result = await pending;
-```
-
-Custom stages receive the signal as `ctx.signal` and must cooperate with it to
-cancel their own work.
-
-## Host invocation authority
-
-Hosts using the core `runToolRequest()` and `resumeToolRequest()` APIs can pass
-`ctx.assertInvocationCurrent`, a synchronous callback that throws when the host
-has retired an invocation. Lobster rechecks it before built-in process, network,
-and state effects, including after asynchronous resume preparation. Keep passing
-an `AbortSignal` to cancel work that has already started.
-
-A retired resume restores its caller-owned checkpoint when no unsafe dispatch
-has started. Once an unsafe pipeline command has been entered, the approval stays
-consumed even if a later authority check prevents the effect. This conservative
-boundary prevents replaying work that may already have happened. Custom commands
-and injected adapters must check the callback themselves after awaited preparation
-and before their own effects. The SDK does not expose this host-authority contract;
-CLI behavior is unchanged when no callback is supplied.
-
-## GitHub recipe cancellation
-
-The SDK GitHub recipes accept an `AbortSignal` in both
-`prMonitor({ repo, pr, signal })` and `prMonitorNotify({ repo, pr, signal })`.
-Aborting stops the running GitHub CLI child before the recipe returns an error
-result containing the abort reason. A cancelled fetch does not update the saved
-PR snapshot or emit a notification.
-
-For a manually composed pipeline, pass the signal to
-`new Lobster({ signal }).pipe(ghPrView({ repo, pr }))`. Custom stages receive
-`ctx.signal` and must cooperate with it to cancel their own work.
-
-## Workflow files
-
-Lobster workflow files are meant to read like small scripts:
-
-- `run:` or `command:` for deterministic shell/CLI steps
-- `pipeline:` for native Lobster stages like `llm.invoke`
-- `approval:` for hard workflow gates between steps
-- `stdin: $step.stdout` or `stdin: $step.json` to pass data forward
-
-```
-lobster run path/to/workflow.lobster
-lobster run --file path/to/workflow.lobster --args-json '{"tag":"family"}'
-```
-
-`--args-json` must be a JSON object. Anything else (an array, a string, `null`, an empty value) is an input error (exit code 2, `parse_error` in tool mode) and no step runs.
-
-Example file:
-
-```yaml
-name: jacket-advice
+name: support-triage
 args:
-  location:
-    default: Phoenix
+  email: { description: ID of the customer's email }
 steps:
   - id: fetch
-    run: weather --json ${location}
+    run: mail show --json ${email}
 
-  - id: confirm
-    approval: Want jacket advice from the LLM?
-    stdin: $fetch.json
-
-  - id: advice
+  - id: classify
     pipeline: >
-      llm.invoke --prompt "Given this weather data, should I wear a jacket?
-      Be concise and return JSON."
+      llm.invoke --prompt "Classify this email as refund, spam or other, with a score"
+      --output-schema '{"type":"object","properties":{"label":{"type":"string"},"score":{"type":"number"}}}'
+      | map --unwrap output | map --unwrap data
     stdin: $fetch.json
-    when: $confirm.approved
+
+  - id: route
+    switch:
+      cases:
+        - when: $classify.json.label == refund && $classify.json.score >= 0.8
+          steps:
+            - id: confirm
+              approval: { prompt: Issue the refund?, on_reject: continue }
+            - id: refund
+              run: billing refund --email ${email}
+              when: $confirm.approved
+        - when: $classify.json.label in [spam, junk]
+          steps:
+            - id: drop
+              run: mail archive ${email}
+      else:
+        - id: ticket
+          run: tickets create --queue support
+
+  - id: follow_up
+    sleep: 2d
+
+  - id: survey
+    run: send-survey --email ${email}
+    when: $refund.json.ok == true
 ```
 
-Notes:
+Run it, see where it stopped, and answer:
 
-- `run:` and `command:` are equivalent; `run:` is the preferred spelling for new files.
-- `pipeline:` shares the same args/env/results model as shell steps, so later steps can still reference `$step.stdout` or `$step.json`.
-- If you need a human checkpoint before an LLM call, use a dedicated `approval:` step in the workflow file rather than `approve` inside the nested pipeline.
-- `cwd`, `env`, `stdin`, `when`, and `condition` work for both shell and pipeline steps.
-- Use `retry`, `timeout_ms`, and `on_error` per step to control transient-failure behavior and recovery.
-- On `for_each`, these policies cover the entire loop: each attempt gets one timeout budget (including batch pauses), and retry restarts at the first item. Previously completed children may run again, so only enable loop retries for work that is safe to repeat. A `cost_limit` stop or an attempted OpenClaw dispatch prevents retries; paid LLM usage is checked even when a later pipeline command fails. `on_error: continue` records `$loop.error` and proceeds to the next workflow step; `skip_rest` skips the remaining workflow steps.
-- Approval steps can optionally enforce identity constraints:
-  - `approval.required_approver` (or `requiredApprover`) requires an exact approver id.
-  - `approval.require_different_approver` (or `requireDifferentApprover`) requires approver id to differ from initiator.
-  - `approval.initiated_by` (or `initiatedBy`) sets the initiator id for comparison.
-  - `LOBSTER_APPROVAL_INITIATED_BY` can provide a default initiator id at run time.
-  - `LOBSTER_APPROVAL_APPROVED_BY` is used at resume/approval time for identity checks.
-
-### Retries after OpenClaw dispatch
-
-`openclaw.invoke` (including `clawd.invoke`) and `openclaw.agent` suppress automatic workflow-step retries once dispatch is attempted. This applies to timeouts, HTTP or process failures, and errors in later commands of the same pipeline step, even when `retry.max` is greater than one. A failed local request cannot establish whether a remote action already completed. Read-only and dry-run requests use the same conservative rule: Lobster does not know the remote tool’s retry guarantees, and the [OpenClaw gateway currently ignores `dryRun`](https://docs.openclaw.ai/gateway/tools-invoke-http-api#request-body). The flag does not prevent tool execution. Check the remote outcome before manually running the step again. `llm.invoke` retains its existing retry policy.
-
-### Command-level input requests
-
-Pipeline commands can call `ctx.requestInput({ prompt, responseSchema, defaults, subject, suspendedState })` to pause in tool mode, workflows, or the SDK and resume the same command after a structured response. CLI/tool resume tokens store only a state key; the persisted state validates the suspended request metadata before returning the submitted response to the command. SDK same-command resumes store the command frame in the configured SDK state directory.
-
-Commands are re-run on resume, so they must be idempotent until `requestInput` returns. Array-backed command input is snapshotted with bounds for replay; lazy stream input is not buffered and requires a compact JSON `suspendedState` supplied by the command. On resume, call `ctx.requestInput.getSuspendedState()` before reading lazy input to restore that command-owned continuation state.
-
-## Visualizing workflows
-
-Use `lobster graph` to inspect workflow structure before execution.
-
-```bash
-lobster graph --help
-lobster graph --file path/to/workflow.lobster
-lobster graph --file path/to/workflow.lobster --format mermaid
-lobster graph --file path/to/workflow.lobster --format dot
-lobster graph --file path/to/workflow.lobster --format ascii
-lobster graph --file path/to/workflow.lobster --args-json '{"location":"Seattle"}'
+```sh
+lobster run --file support-triage.lobster --args-json '{"email":"m-123"}'
+lobster runs list --status waiting
+lobster resume <approval ID or token> --approve yes
 ```
 
-What gets visualized:
+The run pauses at `confirm` until someone answers, then at `follow_up` for two days. A
+scheduled `lobster runs advance --due` wakes it, and `survey` runs.
 
-- each workflow step as a node (`run`, `pipeline`, `approval`, etc.)
-- data-flow edges from `stdin: $step.stdout` / `$step.json` references
-- conditional dependencies from `when:` / `condition:` expressions
-- approval gates as diamond-shaped nodes in `mermaid` and `dot` output
+[examples/](examples/) has workflows that run as they are, one or two features each:
+approvals, loops, parallel steps, waiting for events, calling other workflows, and the SDK.
 
-Format notes:
+`lobster run --dry-run <file>` prints the plan without running anything, and
+`lobster graph <file>` draws it. A file with a typo in a key, a condition that reads a
+step that doesn't run before it, or a malformed condition is refused before any step runs.
 
-- `mermaid` (default): emits `flowchart TD` text for GitHub/Markdown rendering
-- `dot`: emits Graphviz DOT syntax
-- `ascii`: emits a terminal-friendly node/edge list
+## Calling Lobster from an agent
 
-## Calling LLMs from workflows
+Agents use tool mode, which prints one JSON envelope:
 
-Use `llm.invoke` from a native `pipeline:` step for model-backed work:
-
-```bash
-llm.invoke --prompt 'Summarize this diff'
-llm.invoke --provider openclaw --prompt 'Summarize this diff'
-llm.invoke --provider pi --prompt 'Summarize this diff'
+```sh
+lobster run --mode tool --file workflow.lobster --args-json '{"tag":"family"}'
 ```
 
-Provider resolution order:
+- **`ok`** is `false` on an error, and `error` says what went wrong.
+- **`status`** is `ok`, `needs_approval`, `needs_input`, `waiting` or `cancelled`.
+- **`requiresApproval` / `requiresInput`** hold the question and its resume token. Show
+  them to the user, and resume only with the user's own answer:
+  `lobster resume <token> --approve yes|no` or `--response-json '{…}'`.
+- **`runId`** names the run, also on failures, so `lobster runs advance <runId>` can retry it.
 
-- `--provider`
-- `LOBSTER_LLM_PROVIDER`
-- auto-detect from environment
+A pipeline works the same way without a file: `lobster run --mode tool "exec --json --shell
+'echo [1,2,3]' | head --n 2"`. Hosts can embed Lobster through
+`@clawdbot/lobster/core` (`runToolRequest`, `resumeToolRequest`) or the SDK.
 
-Built-in providers today:
+## Operating runs
 
-- `openclaw` via `OPENCLAW_URL` / `OPENCLAW_TOKEN`
-- `pi` via `LOBSTER_PI_LLM_ADAPTER_URL` (typically supplied by the Pi extension)
-- `http` via `LOBSTER_LLM_ADAPTER_URL`
-
-The OpenClaw adapter calls the gateway's `llm-task` tool: artifacts become `input`, and `--max-output-tokens` becomes `maxTokens`. It reads JSON from the tool's `details.json` result. `--output-schema` is included in the model prompt and validated locally so `--max-validation-retries` still controls retries, including validation feedback. Gateway failures are surfaced without a validation retry. The tool currently does not return token usage, so this adapter cannot estimate spend or enforce token-based cost limits for these calls.
-
-A host embedding Lobster can supply its own adapters through `ctx.llmAdapters`. Step `timeout_ms` and workflow cancellation reach an adapter as `ctx.signal`: Lobster stops waiting as soon as that signal aborts, so the step fails or retries on time either way, but it cannot cancel work an adapter has already started. An injected adapter should observe `ctx.signal` and abort its own request — otherwise a timed-out step can leave a model call running, and billed, in the background.
-
-Workflow `_meta.cost` and `cost_limit` use a static pricing table plus optional overrides from `LOBSTER_LLM_PRICING_JSON`, for example `{"my-model":{"input":1.0,"output":2.0}}` in USD per million tokens. Unknown or missing model IDs still record token counts with zero estimated cost, but Lobster warns on stderr so stale or missing pricing does not fail silently.
-
-A cached or replayed answer is not billed again: a model call is counted once, in the run that made it, however many later steps re-emit its answer. This holds while the answer stays inside Lobster: through pipelines, renderers, projections, run state, `workflow:` steps and a resume. It does not survive a stage that hands the items to an external process and reads them back — `exec --stdin json --json ...` — because what comes back is whatever that process printed, and Lobster cannot tell a faithful copy of a replay from a fresh claim to have made the call. Such a step is billed as a call, which is what earlier versions did everywhere. A `workflow:` step counts what its sub-workflow spent, and a replay the sub-workflow returned is not billed a second time by the run that composed it. Spend also survives a pause — a workflow that stops at an approval or `input` gate keeps what it has recorded, so `_meta.cost` covers the whole run after a resume and `cost_limit` applies to the whole run rather than to the steps after the last gate.
-
-`llm_task.invoke` remains available as a backward-compatible alias for the OpenClaw provider.
-
-### Calling configured OpenClaw agents
-
-Use `openclaw.agent` when a workflow needs a configured OpenClaw agent rather than a direct model call:
-
-```bash
-openclaw.agent --agent ops --prompt 'Summarize these logs'
-openclaw.agent --agent ops --session-key incident-42 --model openai/gpt-5.4 --prompt 'Continue the investigation'
+```sh
+lobster runs list [--status waiting|blocked|failed]
+lobster runs show <runId>
+lobster runs advance <runId>       # continue or retry a run
+lobster runs advance --due         # wake every run whose time has come (cron, launchd, systemd)
+                                   #   (4 at once; --concurrency N to change)
+lobster signal <event> --data '{…}'
+lobster runs abandon <runId>       # stop a run for good
 ```
 
-The command delegates agent identity, model defaults and overrides, sessions, authentication, and execution to the installed `openclaw agent` CLI. It accepts `--agent`, `--session-key`, `--session-id`, `--model`, `--thinking`, `--timeout`, and `--local`, and returns OpenClaw's structured `--json` response. Pipeline input is appended to the prompt as labeled JSONL.
+Finished runs are deleted after 30 days (`LOBSTER_RUN_RETENTION_DAYS`). State saved by an
+older version needs `lobster upgrade` once.
 
-### `pipeline:` vs `run:` for LLM calls
+## Read more
 
-- Use `pipeline:` for `openclaw.agent`, `llm.invoke`, and `llm_task.invoke` (they are Lobster pipeline stages, not shell executables).
-- Use `run:` only for real binaries in your shell (for example `openclaw.invoke`).
-
-Example (`stdin` from a prior step is passed to the LLM as artifacts):
-
-```yaml
-steps:
-  - id: make_words
-    run: echo "One two three four five six"
-
-  - id: count_words
-    pipeline: llm_task.invoke --prompt "How many words have been pasted below?"
-    stdin: $make_words.stdout
-```
-
-## Calling OpenClaw tools from workflows
-
-Shell `run:` steps execute in your system shell, so OpenClaw tool calls there must be real executables.
-
-If you install Lobster via npm/pnpm, it installs a small shim executable named:
-
-- `openclaw.invoke` (preferred)
-- `clawd.invoke` (alias)
-
-These shims forward to the Lobster pipeline command of the same name.
-
-### Example: invoke llm-task
-
-Prereqs:
-
-- `OPENCLAW_URL` points at a running OpenClaw gateway
-- optionally `OPENCLAW_TOKEN` if auth is enabled
-
-```bash
-export OPENCLAW_URL=http://127.0.0.1:18789
-# export OPENCLAW_TOKEN=...
-```
-
-In a workflow:
-
-```yaml
-name: hello-world
-steps:
-  - id: greeting
-    run: >
-      openclaw.invoke --tool llm-task --action json --args-json '{"prompt":"Hello"}'
-```
-
-### Passing data between steps (no temp files)
-
-Use `stdin: $stepId.stdout` to pipe output from one step into the next.
-
-## Args and shell-safety
-
-`${arg}` substitution is a raw string replace into the shell command text.
-
-For anything that may contain quotes, `$`, backticks, or newlines, prefer env vars:
-
-- every resolved workflow arg is exposed as `LOBSTER_ARG_<NAME>` (uppercased, non-alnum → `_`)
-- the full args object is also available as `LOBSTER_ARGS_JSON`
-
-Example:
-
-```yaml
-args:
-  text:
-    default: ""
-steps:
-  - id: safe
-    command: |
-      jq -n --arg text "$LOBSTER_ARG_TEXT" '{"result": $text}'
-```
-
-Values in an `env:` block are not shell-expanded, so `TEXT: "$LOBSTER_ARG_TEXT"`
-sets `TEXT` to that literal string. To pass an arg under another name, use
-`TEXT: "${text}"`; env values never go through the shell, so this stays safe.
-
-## HTTP response limits
-
-HTTP response bodies remain unlimited by default. Set
-`LOBSTER_MAX_HTTP_RESPONSE_BYTES` to a positive integer to opt into a per-response
-byte limit for `openclaw.invoke`/`clawd.invoke` and the built-in OpenClaw, HTTP,
-and Pi `llm.invoke` adapters. Unset or empty means unlimited; invalid or non-positive
-values fail before dispatch. Host-injected adapters own their transport limits.
-
-```bash
-LOBSTER_MAX_HTTP_RESPONSE_BYTES=1048576 lobster run --mode tool 'openclaw.invoke --tool example --action read'
-```
-
-Workflow and step `env` can set the same variable. SDK integrations pass it in
-their environment (`new Lobster({ env: { ...process.env,
-LOBSTER_MAX_HTTP_RESPONSE_BYTES: "1048576" } })` or the tool-runtime context).
-Responses exactly at the limit succeed. Oversized declared or streamed bodies
-are cancelled and rejected before JSON parsing; no partial response is returned.
-The limit counts bytes read from the response stream, including decompressed
-content. A declared Content-Length over the limit is also rejected immediately.
-Tool dispatch remains non-retryable after an overflow, as with other
-post-dispatch errors; `llm.invoke` retains its existing retry policy.
-
-## Development
-
-The source is one TypeScript package. `src/core` contains the embeddable tool API, cost tracking, and LLM accounting; `src/sdk` provides pipeline composition; `src/commands` holds the command registry and standard library. Workflow loading, expressions, dry-run rendering, and execution live under `src/workflows`. `src/state` owns atomic file persistence, locks, and resume capabilities. GitHub SDK recipes and built-in workflows share transport and snapshot helpers.
-
-Run `pnpm test`, `pnpm typecheck`, and `pnpm lint` before submitting changes. Tests compile into `dist/test` and use Node's test runner; platform-specific process tests run only where their OS primitives exist. Dependencies observe the two-day release-age policy in `pnpm-workspace.yaml`.
-
-To validate release packaging from the current `main` without publishing, run `gh workflow run lobster-npm-release.yml --ref main -f tag=v$(node -p "require('./package.json').version") -F dry_run=true`. This builds the selected commit and skips publishing, promotion, and uploading a promotable artifact. The existing `preflight_only` mode still builds the requested release tag for later promotion.
+- [Workflow files](docs/reference.md#workflow-files): every step key, [conditions](docs/reference.md#conditions), [switch](docs/reference.md#switch), [loops](docs/reference.md#loops), retries and errors.
+- [Waiting for time and events](docs/reference.md#waiting-for-time-and-events): `sleep`, `wait`, deadlines and heartbeats.
+- [Restarting runs](docs/reference.md#restarting-workflow-file-runs): crashes, `blocked` runs and `recovery: repeat`.
+- [Persistence and run history](docs/reference.md#persistence-and-run-history): the store, the run API, upgrading and the SDK.
+- [Commands](docs/reference.md#commands): command packs and adding your own.
+- [Calling LLMs](docs/reference.md#calling-llms-from-workflows) and [OpenClaw tools](docs/reference.md#calling-openclaw-tools-from-workflows).
+- [Development](docs/reference.md#development): building, testing and the source layout.
+- [VISION.md](VISION.md): what Lobster is for, and what it leaves to the host.

@@ -1,40 +1,16 @@
-import { compileCached } from "../../validation.js";
+import { defineCommand } from "../define.js";
+import { responseChecker } from "../../util/validation.js";
+import { readLineFromStream } from "../../io/read_line.js";
+import {
+	approvalInputTimeoutMs,
+	firstAccepted,
+	isInteractive,
+	PREVIEW_CHARS,
+	textAnswerCandidates,
+} from "../../io/terminal.js";
+import { streamOf } from "../../io/streams.js";
 
-function isInteractive(stdin) {
-	return Boolean(stdin.isTTY);
-}
-
-function compileAskValidator(schema) {
-	try {
-		return compileCached(schema);
-	} catch {
-		throw new Error("ask response schema is invalid");
-	}
-}
-
-function validateAskResponse(validator, response) {
-	const ok = validator(response);
-	if (ok) return;
-	const first = validator.errors?.[0];
-	const pathValue = first?.instancePath || "/";
-	const reason = first?.message ? ` ${first.message}` : "";
-	throw new Error(`ask response failed schema validation at ${pathValue}:${reason}`);
-}
-
-function parseInteractiveCandidates(text) {
-	let parsed;
-	try {
-		parsed = JSON.parse(text);
-	} catch {
-		return [text, { decision: text }];
-	}
-	if (typeof parsed === "string") {
-		return [parsed, { decision: parsed }];
-	}
-	return [parsed];
-}
-
-export const askCommand = {
+export const askCommand = defineCommand({
 	name: "ask",
 	meta: {
 		description: "Pause and request structured input from the user",
@@ -51,12 +27,18 @@ export const askCommand = {
 					type: "boolean",
 					description: "Use stdin content as the subject (preview text)",
 				},
+				subjectFromStdin: {
+					type: "boolean",
+					aliasOf: "subject-from-stdin",
+					description: "Alias for subject-from-stdin",
+				},
 				emit: { type: "boolean", description: "Force emit mode" },
 				_: { type: "array", items: { type: "string" } },
 			},
 			required: [],
 		},
 		sideEffects: [],
+		repeatable: true,
 		resumeSafeBeforeInput: true,
 		resumeSafeAfterInput: true,
 	},
@@ -77,6 +59,7 @@ export const askCommand = {
 	},
 	async run({ input, args, ctx }) {
 		const prompt = typeof args.prompt === "string" ? args.prompt : "Input required";
+		// One spelling at most: two are refused with the stage's flags.
 		const subjectFromStdin = Boolean(args["subject-from-stdin"] ?? args.subjectFromStdin);
 		const schemaRaw = typeof args.schema === "string" ? args.schema : null;
 
@@ -102,7 +85,7 @@ export const askCommand = {
 			}
 			responseSchema = parsedSchema;
 		}
-		const responseValidator = compileAskValidator(responseSchema);
+		const checkResponse = responseChecker(responseSchema, "ask");
 
 		const forceEmit = Boolean(args.emit);
 		const emit = forceEmit || ctx.mode === "tool" || !isInteractive(ctx.stdin);
@@ -124,7 +107,7 @@ export const askCommand = {
 			const preview = items
 				.map((item) => (typeof item === "string" ? item : JSON.stringify(item)))
 				.join("\n")
-				.slice(0, 2000);
+				.slice(0, PREVIEW_CHARS);
 			subject = { text: preview };
 		}
 
@@ -137,7 +120,7 @@ export const askCommand = {
 					suspendedState: { type: "ask", ...(subject ? { subject } : null) },
 				});
 				return {
-					output: asStream([response]),
+					output: streamOf([response]),
 				};
 			}
 			return {
@@ -155,27 +138,13 @@ export const askCommand = {
 		}
 
 		ctx.stdout.write(`${prompt}\n> `);
-		const { readLineFromStream } = await import("../../read_line.js");
-		const raw = await readLineFromStream(ctx.stdin, { timeoutMs: 0, signal: ctx.signal });
-		const text = String(raw ?? "").trim();
+		const raw = await readLineFromStream(ctx.stdin, {
+			timeoutMs: approvalInputTimeoutMs(ctx.env),
+			signal: ctx.signal,
+		});
+		const text = raw.trim();
 
-		let lastError;
-		for (const candidate of parseInteractiveCandidates(text)) {
-			try {
-				validateAskResponse(responseValidator, candidate);
-				return {
-					output: (async function* () {
-						yield candidate;
-					})(),
-				};
-			} catch (err) {
-				lastError = err;
-			}
-		}
-		throw lastError ?? new Error("ask response failed schema validation");
+		const response = firstAccepted(textAnswerCandidates(text), checkResponse);
+		return { output: streamOf([response]) };
 	},
-};
-
-async function* asStream(items) {
-	for (const item of items) yield item;
-}
+});

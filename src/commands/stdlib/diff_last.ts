@@ -1,6 +1,7 @@
+import { defineCommand } from "../define.js";
 import { diffAndStore } from "../../state/store.js";
 
-export const diffLastCommand = {
+export const diffLastCommand = defineCommand({
 	name: "diff.last",
 	meta: {
 		description: "Compare current items to last stored snapshot",
@@ -13,6 +14,7 @@ export const diffLastCommand = {
 			required: ["key"],
 		},
 		sideEffects: ["writes_state"],
+		repeatable: true,
 	},
 	help() {
 		return `diff.last — compare current items to last stored snapshot\n\nUsage:\n  <items> | diff.last --key <stateKey>\n\nOutput:\n  { changed, key, before, after }\n`;
@@ -30,7 +32,7 @@ export const diffLastCommand = {
 			key,
 			value: after,
 			signal: ctx.signal,
-			atomicWriteOptions: { assertInvocationCurrent: ctx.assertInvocationCurrent },
+			assertInvocationCurrent: ctx.assertInvocationCurrent,
 		});
 
 		return {
@@ -39,4 +41,4 @@ export const diffLastCommand = {
 			})(),
 		};
 	},
-};
+});

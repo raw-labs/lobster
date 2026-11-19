@@ -1,4 +1,5 @@
-import { getByPath } from "../../core/value_path.js";
+import { defineCommand } from "../define.js";
+import { getByPath } from "../../util/value_path.js";
 
 function renderTemplate(tpl: string, ctx: any): string {
 	return tpl.replace(/\{\{\s*([^}]+?)\s*\}\}/g, (_m, expr) => {
@@ -24,7 +25,7 @@ function parseAssignments(tokens: any[]): Array<{ key: string; value: string }> 
 	return out;
 }
 
-export const mapCommand = {
+export const mapCommand = defineCommand({
 	name: "map",
 	meta: {
 		description: "Transform items (wrap/unwrap/add fields)",
@@ -42,6 +43,7 @@ export const mapCommand = {
 			required: [],
 		},
 		sideEffects: [],
+		repeatable: true,
 	},
 	help() {
 		return (
@@ -104,4 +106,4 @@ export const mapCommand = {
 			})(),
 		};
 	},
-};
+});

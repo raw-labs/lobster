@@ -1,0 +1,1 @@
+{"steps":[{"id":"prep","command":"echo x >> __DIR__/count_pprep; echo '{\"v\":3}'"},{"id":"pick","pipeline":"ask --prompt 'Pick a number' --schema '{\"type\":\"integer\"}'"},{"id":"done","command":"echo x >> __DIR__/count_pdone; echo ok"}]}

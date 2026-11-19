@@ -7,9 +7,11 @@ import { spawnSync } from "node:child_process";
 import { access, mkdir, mkdtemp, realpath, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { Readable } from "node:stream";
+import { discardStream } from "../src/io/streams.js";
 
 import { Lobster } from "../src/sdk/Lobster.js";
-import { exec, shell } from "../src/sdk/primitives/exec.js";
+import { exec } from "../src/sdk/primitives.js";
 import { approve, runPipeline } from "../src/sdk/index.js";
 
 function emptyInput() {
@@ -92,7 +94,7 @@ test("sdk shell abort signal kills a long-running child", async () => {
 		const controller = new AbortController();
 		const fixture = await nodeShellFixture(dir, longChildScript);
 		const pending = runAbortableStage(
-			shell(fixture.command, { json: false }),
+			exec(fixture.command, { shell: true, json: false }),
 			controller.signal,
 			dir,
 			fixture.env,
@@ -207,7 +209,7 @@ for (const useShell of [false, true]) {
 			assert.deepEqual(success.output, [1, 2]);
 			const failed = await run('console.error("failed");process.exit(7)');
 			assert.equal(failed.ok, false);
-			assert.match(failed.error.message, /exited with code 7: failed/);
+			assert.match(failed.error.message, /exec failed \(7\): failed/);
 			const missing = await new Lobster({
 				env: { ...process.env, LOBSTER_SHELL: "lobster-nonexistent-executable-for-test" },
 				signal: controller.signal,
@@ -218,8 +220,8 @@ for (const useShell of [false, true]) {
 			assert.match(
 				missing.error.message,
 				useShell
-					? /exec shell not found; check LOBSTER_SHELL or ComSpec/
-					: /Failed to execute .* ENOENT/,
+					? /exec shell or working directory \(.*\) not found; check LOBSTER_SHELL or ComSpec/
+					: /exec command or working directory \(.*\) not found: lobster-nonexistent-executable-for-test/,
 			);
 			assert.equal(getEventListeners(controller.signal, "abort").length, 0);
 		} finally {
@@ -245,7 +247,7 @@ test(
 			const result = await new Lobster({
 				env: { ...process.env, ...fixture.env, LOBSTER_TEST_NODE: executable },
 			})
-				.pipe(shell(fixture.command, { cwd: dir }))
+				.pipe(exec(fixture.command, { shell: true, cwd: dir }))
 				.run();
 			assert.equal(result.ok, true);
 			assert.deepEqual(result.output, [await realpath(fixture.env.LOBSTER_TEST_SCRIPT)]);
@@ -260,17 +262,45 @@ test("exported SDK runPipeline keeps signal optional and forwards supplied signa
 	const controller = new AbortController();
 	for (const options of [{}, { signal: controller.signal }]) {
 		const result = await runPipeline({
-			pipeline: [{ name: "signal", args: {} }],
+			pipeline: [{ name: "signal", args: { _: [] }, raw: "signal" }],
 			registry: {
-				get: () => ({ run: ({ ctx }: any) => ({ output: [ctx.signal === options.signal] }) }),
+				get: () => ({
+					run: async ({ ctx }: any) => ({ output: [ctx.signal === options.signal] }),
+				}),
 			},
-			stdin: { isTTY: false },
-			stdout: { write() {} },
-			stderr: { write() {} },
+			stdin: Readable.from([]),
+			stdout: discardStream(),
+			stderr: discardStream(),
 			env: process.env,
 			input: [],
 			...options,
 		});
 		assert.deepEqual(result.items, [true]);
+	}
+});
+
+test("exec's relative cwd is the run's directory, even when resumed from another", async () => {
+	const dir = await realpath(await mkdtemp(join(tmpdir(), "lobster-sdk-cwd-")));
+	const elsewhere = await realpath(await mkdtemp(join(tmpdir(), "lobster-sdk-elsewhere-")));
+	const started = process.cwd();
+	try {
+		await mkdir(join(dir, "sub"));
+		const workflow = () =>
+			new Lobster({ stateDir: join(dir, "state") })
+				.pipe(approve({ prompt: "Go?" }))
+				.pipe(exec("pwd", { cwd: "sub", json: false }));
+		process.chdir(dir);
+		const first = await workflow().run([1]);
+		assert.equal(first.status, "needs_approval", JSON.stringify(first));
+		process.chdir(elsewhere);
+		const resumed = await workflow().resume(first.requiresApproval!.resumeToken, {
+			approved: true,
+		});
+		assert.equal(resumed.ok, true, JSON.stringify(resumed));
+		assert.deepEqual(resumed.output, [join(dir, "sub")]);
+	} finally {
+		process.chdir(started);
+		await rm(dir, { recursive: true, force: true });
+		await rm(elsewhere, { recursive: true, force: true });
 	}
 });

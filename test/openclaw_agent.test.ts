@@ -4,10 +4,7 @@ import { access, mkdtemp, readFile, rm } from "node:fs/promises";
 import { readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import {
-	createOpenClawAgentCommand,
-	runOpenClawAgentCli,
-} from "../src/commands/stdlib/openclaw_agent.js";
+import { createOpenClawAgentCommand, runOpenClawAgentCli } from "../src/packs/openclaw/agent.js";
 
 function streamOf(items: unknown[]) {
 	return (async function* () {

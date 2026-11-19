@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { createServer } from "node:http";
 import { promisify } from "node:util";
-import { parsePipeline } from "../src/parser.js";
+import { parsePipeline } from "../src/pipeline/parser.js";
 import { Lobster, exec } from "../src/sdk/index.js";
 
 const runFile = promisify(execFile);

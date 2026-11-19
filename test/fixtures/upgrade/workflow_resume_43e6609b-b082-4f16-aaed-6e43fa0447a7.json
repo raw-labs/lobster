@@ -1,0 +1,29 @@
+{
+	"filePath": "__DIR__/input.lobster",
+	"resumeAtIndex": 2,
+	"steps": {
+		"prep": {
+			"id": "prep",
+			"stdout": "{\"draft\":\"hi\"}\n",
+			"json": {
+				"draft": "hi"
+			}
+		}
+	},
+	"args": {},
+	"inputStepId": "review",
+	"inputSchema": {
+		"type": "object",
+		"properties": {
+			"ok": {
+				"type": "boolean"
+			}
+		},
+		"required": ["ok"]
+	},
+	"inputSubject": {
+		"draft": "hi"
+	},
+	"supersededResumeStateKeys": [],
+	"createdAt": "2026-11-16T13:27:45.709Z"
+}

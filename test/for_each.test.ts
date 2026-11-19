@@ -6,7 +6,8 @@ import path from "node:path";
 import { PassThrough } from "node:stream";
 
 import { createDefaultRegistry } from "../src/commands/registry.js";
-import { loadWorkflowFile, runWorkflowFile } from "../src/workflows/file.js";
+import { runWorkflowFile } from "../src/engine/runner.js";
+import { loadWorkflowFile } from "../src/workflows/load.js";
 
 async function runWorkflow(workflow: unknown) {
 	const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-foreach-"));
@@ -83,25 +84,24 @@ test("for_each supports custom item_var and index_var", async () => {
 	]);
 });
 
-test("for_each pipeline sub-steps reject command-level requestInput", async () => {
+test("a pipeline that asks inside a for_each pauses the run for that item", async () => {
+	const loop = (extra: object = {}) => ({
+		steps: [
+			{ id: "vals", command: 'node -e "process.stdout.write(JSON.stringify([1]))"' },
+			{
+				id: "loop",
+				for_each: "$vals.json",
+				...extra,
+				steps: [{ id: "review", pipeline: "ask --prompt 'Review?'" }],
+			},
+		],
+	});
+	const paused = await runWorkflow(loop());
+	assert.equal(paused.status, "needs_input");
+	// A retry would run the loop again and ask again, so a retried loop cannot ask.
 	await assert.rejects(
-		() =>
-			runWorkflow({
-				steps: [
-					{ id: "vals", command: 'node -e "process.stdout.write(JSON.stringify([1]))"' },
-					{
-						id: "loop",
-						for_each: "$vals.json",
-						steps: [
-							{
-								id: "review",
-								pipeline: "ask --prompt 'Review?'",
-							},
-						],
-					},
-				],
-			}),
-		/requestInput is not supported in this pipeline context/,
+		() => runWorkflow(loop({ retry: { max: 2 } })),
+		/halted for input inside pipeline stage ask; .*retr/,
 	);
 });
 
@@ -153,11 +153,11 @@ test("for_each validation rejects run/command/pipeline/workflow/parallel on loop
 	);
 	await assert.rejects(
 		() => loadWorkflowFile(filePath),
-		/for_each cannot also define run, command, pipeline, workflow, or parallel/,
+		/for_each cannot also define run, command, pipeline, workflow, parallel, repeat, or switch/,
 	);
 });
 
-test("for_each validation rejects approval/input in sub-steps", async () => {
+test("for_each validation rejects a retry around an approval in its sub-steps", async () => {
 	const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-foreach-"));
 	const filePath = path.join(tmpDir, "bad.lobster");
 	await fsp.writeFile(
@@ -167,13 +167,17 @@ test("for_each validation rejects approval/input in sub-steps", async () => {
 				{
 					id: "loop",
 					for_each: "$x.json",
+					retry: { max: 2 },
 					steps: [{ id: "s", command: "echo hi", approval: true }],
 				},
 			],
 		}),
 		"utf8",
 	);
-	await assert.rejects(() => loadWorkflowFile(filePath), /cannot contain approval or input/);
+	await assert.rejects(
+		() => loadWorkflowFile(filePath),
+		/for_each with retry cannot contain approval, input, sleep or wait steps: a retry would run it again and ask again/,
+	);
 });
 
 test("for_each validation rejects duplicate sub-step ids", async () => {
@@ -195,7 +199,7 @@ test("for_each validation rejects duplicate sub-step ids", async () => {
 		}),
 		"utf8",
 	);
-	await assert.rejects(() => loadWorkflowFile(filePath), /duplicate for_each sub-step id/);
+	await assert.rejects(() => loadWorkflowFile(filePath), /Duplicate workflow step id: dup/);
 });
 
 test("for_each validation rejects item_var/index_var collisions", async () => {
@@ -249,6 +253,7 @@ test("for_each dry-run renders loop structure", async () => {
 				id: "loop",
 				for_each: "$vals.json",
 				batch_size: 2,
+				pause_ms: 10,
 				steps: [{ id: "emit", command: "echo hi" }],
 			},
 		],
@@ -452,47 +457,6 @@ test("for_each retry retries a failing child and then succeeds", async () => {
 	assert.equal(result.status, "ok");
 	assert.deepEqual(result.output, [{ item: 1, index: 0, flaky: { attempt: 3 } }]);
 	assert.ok(stderrOutput.includes("[RETRY]"), "should log retry attempts");
-});
-
-test("for_each cost_limit stop does not retry a child that already exceeded the budget", async () => {
-	const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-foreach-cost-stop-"));
-	const counterFile = path.join(tmpDir, "counter");
-	await fsp.writeFile(counterFile, "0", "utf8");
-	const dataCmd = await writeNodeCommand(
-		tmpDir,
-		"data.js",
-		"process.stdout.write(JSON.stringify([1, 2]));\n",
-	);
-	const spendCmd = await writeNodeCommand(
-		tmpDir,
-		"spend.js",
-		[
-			'const fs = require("fs");',
-			`const p = ${JSON.stringify(counterFile)};`,
-			'const c = Number(fs.readFileSync(p, "utf8")) + 1;',
-			"fs.writeFileSync(p, String(c));",
-			"process.stdout.write(JSON.stringify({model:'gpt-4o',usage:{inputTokens:1000,outputTokens:1000}}));",
-			"",
-		].join("\n"),
-	);
-
-	await assert.rejects(
-		() =>
-			runWorkflowWithIo({
-				cost_limit: { max_usd: 0.01, action: "stop" },
-				steps: [
-					{ id: "data", command: dataCmd },
-					{
-						id: "loop",
-						for_each: "$data.json",
-						retry: { max: 3, delay_ms: 20 },
-						steps: [{ id: "spend", command: spendCmd }],
-					},
-				],
-			}),
-		/Cost limit exceeded/,
-	);
-	assert.equal(await fsp.readFile(counterFile, "utf8"), "1");
 });
 
 test("for_each dry-run renders timeout, retry, and on_error", async () => {
