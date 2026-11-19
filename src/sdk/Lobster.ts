@@ -1,17 +1,29 @@
 // The SDK's `Lobster` class: a pipeline of JavaScript stages, run, resumed and advanced as a
 // run of the engine, and the conversion of tokens handed out before SDK pipelines were runs.
-import { decisionCount, type ResumeDecision, type WaitResumeOptions } from "../resume/options.js";
+import { checkRunId } from "../persistence/model.js";
+import {
+	decisionCount,
+	type Decision,
+	type ResumeDecision,
+	type WaitResumeOptions,
+} from "../resume/options.js";
 import type { SdkResult } from "./types.js";
-import { createHash, randomUUID } from "node:crypto";
-import { discardStream } from "../io/terminal.js";
+import { createHash } from "node:crypto";
+import { Readable } from "node:stream";
+import { discardStream } from "../io/streams.js";
 import { validateCommandInputState } from "../pipeline/input_request.js";
 import { parsePipeline } from "../pipeline/parser.js";
-import { runtimeErrorDetails } from "../persistence/backend.js";
-import { sessionFromEnv, bindResumeGuard, bindStoreSession } from "../persistence/context.js";
+import { runtimeErrorDetails, WaitConflictError } from "../persistence/backend.js";
+import { sessionFromEnv, bindResumeGuard } from "../persistence/context.js";
 import { withStoreContext } from "../persistence/execution.js";
-import type { PersistenceOptions, StoreEnvironment, StoreHandle } from "../persistence/context.js";
-import { findWaitAtRevision, callerId } from "../persistence/waits.js";
-import { decodeToken } from "../resume/token.js";
+import type { PersistenceOptions, StoreEnvironment } from "../persistence/context.js";
+import { findWaitAtRevision, callerId, checkWaitReference } from "../persistence/waits.js";
+import {
+	decodeToken,
+	decodeWorkflowResumePayload,
+	workflowResumePayload,
+} from "../resume/token.js";
+import { isPlainObject } from "../util/objects.js";
 import type { RunContext } from "../engine/context.js";
 import { pipelineDefinition } from "../workflows/definition.js";
 import { advanceWorkflowRun, runWorkflowFile, runIdOf } from "../engine/runner.js";
@@ -21,6 +33,7 @@ import { savedByOlderVersion } from "../engine/upgrade.js";
 import { waitingPipelineRun, type PausedPipeline } from "../engine/legacy_pauses.js";
 import { CheckpointTakenError } from "../persistence/session.js";
 import { sdkInputItems, sdkPipelineText, sdkStageRegistry, type SdkStage } from "./runtime.js";
+import { assertSavable } from "../util/serialization.js";
 
 /** A token handed out by Lobster versions before SDK pipelines became runs. */
 type LegacySdkToken = {
@@ -55,7 +68,6 @@ export class Lobster {
 		this.#options = {
 			storeSession: options.storeSession,
 			history: options.history,
-			trackRuns: options.trackRuns,
 			runMetadata: options.runMetadata,
 			env: options.env ?? process.env,
 			stateDir: options.stateDir,
@@ -80,10 +92,16 @@ export class Lobster {
 		return this.#meta;
 	}
 
-	async run(initialInput = []): Promise<SdkResult> {
+	/**
+	 * Run the stages on `initialInput`: an iterable of items (a string is iterated by
+	 * character), null or undefined as no items, or any other value as one item.
+	 */
+	async run(initialInput: unknown = []): Promise<SdkResult> {
 		try {
 			const input = await sdkInputItems(initialInput);
 			if (!this.#stages.length) return finished({ status: "ok", output: input });
+			// Refused before the run exists: input the run cannot save would leave it stuck.
+			assertSavable(input, "Lobster input");
 			return await this.#execute(this.#options.env, (ctx) =>
 				runWorkflowFile({
 					definition: pipelineDefinition(this.#pipeline(), input),
@@ -98,19 +116,12 @@ export class Lobster {
 	}
 
 	resume(token: string, options: ResumeDecision): Promise<SdkResult>;
-	async resume(
-		token: string,
-		options: { approved?: boolean; response?: unknown; cancel?: boolean } = {},
-	): Promise<SdkResult> {
-		assertOneDecision(options);
-		const payload = decodeToken(token) as Record<string, unknown> | null;
-		if (!payload || typeof payload !== "object" || payload.protocolVersion !== 1)
-			throw new Error("Invalid token");
-		if (payload.kind === "workflow-file") {
-			if (payload.v !== 1 || typeof payload.stateKey !== "string" || !payload.stateKey)
-				throw new Error("Invalid token");
-			return this.#resumeKey(payload.stateKey, options, this.#options.env);
-		}
+	async resume(token: string, options: Decision = {}): Promise<SdkResult> {
+		refuseSeveralDecisions(options);
+		const payload = decodeToken(token);
+		if (!isPlainObject(payload) || payload.protocolVersion !== 1) throw new Error("Invalid token");
+		const workflow = decodeWorkflowResumePayload(payload);
+		if (workflow) return this.#resumeKey(workflow.stateKey, options, this.#options.env);
 		const legacy = decodeLegacyToken(payload);
 		return this.#resumeKey(
 			(env) => this.#convertLegacyToken(token, legacy, env),
@@ -121,26 +132,31 @@ export class Lobster {
 
 	/** Answer a wait found with `getRun`/`getWait`, checking it is still at `expectedRevision`. */
 	async resumeWait(options: WaitResumeOptions): Promise<SdkResult> {
-		assertOneDecision(options);
-		return withStoreContext(
-			{ ...this.#options, env: stateEnv(this.#options), trackRuns: true },
-			async (ctx) => {
-				const store = sessionFromEnv(ctx.env);
-				if (!store) throw new Error("Wait resume requires a persistence session");
-				const wait = await findWaitAtRevision(
-					store,
-					options.waitId,
-					options.expectedRevision,
-					callerId(this.#options.runMetadata),
-				);
-				const { waitId: _waitId, expectedRevision, ...decision } = options;
-				return this.#resumeKey(
-					wait.key,
-					decision,
-					bindResumeGuard(ctx.env, { key: wait.key, expectedRevision, admitted: false }),
-				);
-			},
-		);
+		refuseSeveralDecisions(options);
+		// Like a malformed token, a malformed reference is refused before the store is opened.
+		checkWaitReference(options.waitId, options.expectedRevision);
+		try {
+			return await withStoreContext(
+				{ ...this.#options, env: stateEnv(this.#options) },
+				async (ctx) => {
+					const store = sessionFromEnv(ctx.env)!;
+					const wait = await findWaitAtRevision(
+						store,
+						options.waitId,
+						options.expectedRevision,
+						callerId(this.#options.runMetadata),
+					);
+					const { waitId: _waitId, expectedRevision, ...decision } = options;
+					return this.#resumeKey(
+						wait.key,
+						decision,
+						bindResumeGuard(ctx.env, { key: wait.key, expectedRevision }),
+					);
+				},
+			);
+		} catch (err) {
+			return refusedOrFailed(err);
+		}
 	}
 
 	/**
@@ -148,50 +164,49 @@ export class Lobster {
 	 * process stopped, or one that failed (it is retried from the stage step that failed).
 	 */
 	async advance(runId: string): Promise<SdkResult> {
+		checkRunId(runId); // Malformed input is thrown, as in resume and resumeWait.
 		try {
 			return await this.#execute(this.#options.env, (ctx) =>
 				advanceWorkflowRun({ runId, ctx, sdk: { pipeline: this.#pipeline() } }),
 			);
 		} catch (err) {
-			if (err instanceof ResumeRefusedError) throw err;
-			return failed(err, runId);
+			return refusedOrFailed(err);
 		}
 	}
 
 	async #resumeKey(
 		key: string | ((env: StoreEnvironment) => Promise<string>),
-		decision: { approved?: boolean; response?: unknown; cancel?: boolean },
+		decision: Decision,
 		env: NodeJS.ProcessEnv,
 	): Promise<SdkResult> {
 		try {
 			return await this.#execute(env, async (ctx) => {
 				const stateKey = typeof key === "string" ? key : await key(ctx.env);
 				return runWorkflowFile({
-					resume: { protocolVersion: 1, v: 1, kind: "workflow-file", stateKey },
+					resume: workflowResumePayload(stateKey),
 					...decision,
 					sdk: { pipeline: this.#pipeline() },
 					ctx,
 				});
 			});
 		} catch (err) {
-			// Nothing ran: the token, the answer or this instance does not fit the paused run.
-			if (err instanceof InvalidAnswerError || err instanceof ResumeRefusedError) throw err;
-			return failed(err);
+			return refusedOrFailed(err);
 		}
 	}
 
 	async #execute(
-		env: NodeJS.ProcessEnv | undefined,
+		env: NodeJS.ProcessEnv,
 		task: (ctx: RunContext) => Promise<WorkflowRunResult & { runId?: string }>,
 	): Promise<SdkResult> {
 		return withStoreContext(
-			{ ...this.#options, env: stateEnv({ ...this.#options, env }), trackRuns: true },
+			{ ...this.#options, env: stateEnv({ ...this.#options, env }) },
 			async (store) =>
 				finished(
 					await task({
 						env: store.env!,
 						mode: "sdk",
-						stdin: { isTTY: false } as unknown as NodeJS.ReadableStream,
+						// Nobody is at a terminal here: a question pauses the run.
+						stdin: Readable.from([]),
 						stdout: discardStream(),
 						stderr: discardStream(),
 						cwd: process.cwd(),
@@ -212,8 +227,8 @@ export class Lobster {
 	 * resumes that run, and a token used before is refused instead of acting again.
 	 */
 	async #convertLegacyToken(token: string, legacy: LegacySdkToken, env: StoreEnvironment) {
-		const session = sessionFromEnv(env);
-		if (!session) throw new Error("SDK resume requires a persistence session");
+		// Called inside the run's store context, which always binds a session.
+		const session = sessionFromEnv(env)!;
 		let key: string;
 		let pause: PausedPipeline;
 		let once: string | undefined;
@@ -269,21 +284,33 @@ export class Lobster {
 							prompt: legacy.prompt ?? "Approve?",
 						};
 		}
-		if (pause.resumeAtIndex > this.#stages.length)
+		// A pause continues at that stage: one asked inside a stage runs that stage again, so it
+		// must exist; one asked after a stage may continue past the last.
+		const lastStart = this.#stages.length - (pause.gate === "same_stage" ? 1 : 0);
+		if (pause.resumeAtIndex > lastStart)
 			throw new ResumeRefusedError(
 				`This Lobster instance has ${this.#stages.length} stages; the paused pipeline had more`,
 			);
 		const text = this.#pipeline();
 		const registry = sdkStageRegistry(this.#stages);
-		const stages = parsePipeline(text, registry);
-		const { execution, continuation } = waitingPipelineRun(
+		const stages = parsePipeline(text, registry).map((stage) => stage.raw);
+		const { execution, records, continuation } = waitingPipelineRun(
 			key,
 			pipelineDefinition(text, []),
 			stages,
 			pause,
 		);
 		await session
-			.createWaitingRun({ id: randomUUID(), kind: "sdk", key, execution, continuation, once })
+			.createWaitingRun({
+				kind: "sdk",
+				key,
+				execution,
+				records,
+				continuation,
+				once,
+				// The converting host's scope, so it can see and resume the run.
+				metadata: this.#options.runMetadata,
+			})
 			.catch((error) => {
 				// Another resume converted it first: resume that run.
 				if (!(error instanceof CheckpointTakenError)) throw error;
@@ -299,10 +326,13 @@ export class Lobster {
 	}
 }
 
-function assertOneDecision(options: { approved?: boolean; response?: unknown; cancel?: boolean }) {
-	const count = decisionCount(options);
-	if (count > 1) throw new Error("resume accepts only one of approved, response, or cancel");
-	if (count === 0) throw new Error("resume requires approved, response, or cancel");
+/**
+ * More than one decision is refused up front, as core refuses it; none is left to the
+ * question, whose own message says what it needs (as in tool mode).
+ */
+function refuseSeveralDecisions(options: Decision) {
+	if (decisionCount(options) > 1)
+		throw new InvalidAnswerError("resume takes only one of approved, response, or cancel");
 }
 
 function decodeLegacyToken(data: Record<string, unknown>): LegacySdkToken {
@@ -332,8 +362,23 @@ function decodeLegacyToken(data: Record<string, unknown>): LegacySdkToken {
 	return data as unknown as LegacySdkToken;
 }
 
+/**
+ * A failure as the SDK reports it. A refusal (nothing ran: the token, the answer, the wait's
+ * revision or this instance does not fit the paused run) is thrown; anything else is a
+ * failed result.
+ */
+function refusedOrFailed(err: unknown): SdkResult {
+	if (
+		err instanceof InvalidAnswerError ||
+		err instanceof ResumeRefusedError ||
+		err instanceof WaitConflictError
+	)
+		throw err;
+	return failed(err);
+}
+
 /** The SDK's result shape for a finished run step. */
-function finished(output: Partial<WorkflowRunResult> & { runId?: string }): SdkResult {
+function finished(output: WorkflowRunResult & { runId?: string }): SdkResult {
 	const runId = output.runId ? { runId: output.runId } : {};
 	if (output.status === "needs_approval")
 		return {
@@ -341,11 +386,7 @@ function finished(output: Partial<WorkflowRunResult> & { runId?: string }): SdkR
 			ok: true,
 			status: "needs_approval",
 			output: [],
-			// A paused run always reports the token that resumes it.
-			requiresApproval: {
-				...output.requiresApproval!,
-				resumeToken: output.requiresApproval!.resumeToken!,
-			},
+			requiresApproval: output.requiresApproval!,
 			requiresInput: null,
 		};
 	if (output.status === "needs_input")
@@ -355,7 +396,7 @@ function finished(output: Partial<WorkflowRunResult> & { runId?: string }): SdkR
 			status: "needs_input",
 			output: [],
 			requiresApproval: null,
-			requiresInput: { ...output.requiresInput!, resumeToken: output.requiresInput!.resumeToken! },
+			requiresInput: output.requiresInput!,
 		};
 	if (output.status === "cancelled")
 		return {
@@ -372,7 +413,7 @@ function finished(output: Partial<WorkflowRunResult> & { runId?: string }): SdkR
 		...runId,
 		ok: true,
 		status: "ok",
-		output: (output.output ?? []) as unknown[],
+		output: output.output,
 		requiresApproval: null,
 		requiresInput: null,
 	};
@@ -391,14 +432,7 @@ function failed(err: unknown, runId = runIdOf(err)): SdkResult {
 	};
 }
 
-/** The environment a run of these options uses: `stateDir` and `storeSession` applied. */
-function stateEnv(options: {
-	stateDir?: string;
-	env?: NodeJS.ProcessEnv;
-	storeSession?: StoreHandle;
-}) {
-	const env = options.stateDir
-		? { ...(options.env ?? process.env), LOBSTER_STATE_DIR: options.stateDir }
-		: (options.env ?? process.env);
-	return options.storeSession ? bindStoreSession(env, options.storeSession) : env;
+/** The env with the instance's `stateDir`, if it set one (a `storeSession` is bound by the store context). */
+function stateEnv(options: { stateDir?: string; env: NodeJS.ProcessEnv }) {
+	return options.stateDir ? { ...options.env, LOBSTER_STATE_DIR: options.stateDir } : options.env;
 }

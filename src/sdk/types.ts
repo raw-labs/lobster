@@ -1,9 +1,7 @@
 import type { ToolEnvelope } from "../core/tool_runtime.js";
 
-export type SdkApprovalRequest = NonNullable<ToolEnvelope["requiresApproval"]> & {
-	resumeToken: string;
-};
-export type SdkInputRequest = NonNullable<ToolEnvelope["requiresInput"]> & { resumeToken: string };
+export type SdkApprovalRequest = NonNullable<ToolEnvelope["requiresApproval"]>;
+export type SdkInputRequest = NonNullable<ToolEnvelope["requiresInput"]>;
 
 /** SDK outcomes retain their existing wire shape (including status: "error"). */
 export type SdkResult<T = any> = {

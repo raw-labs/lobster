@@ -4,6 +4,7 @@ import { createRecord } from "../../workflows/values.js";
 import { activation, keys } from "../checkpoint.js";
 import type { Machine } from "../machine.js";
 import type { Scope } from "../scope.js";
+import { markSkipped } from "../results.js";
 
 /** Run `steps` in order; the result is that of the last step that ran. */
 export async function sequence(
@@ -38,7 +39,14 @@ export async function sequence(
 		}
 		progress.cursor++;
 		if (!result.skipped && !result.error) progress.lastStepId = step.id;
-		if (result.error && step.on_error === "skip_rest") progress.cursor = steps.length;
+		if (result.error && step.on_error === "skip_rest") {
+			// The rest did not run: recorded as skipped, so later steps can read them as such.
+			const rest = createRecord<WorkflowStepResult>();
+			markSkipped(steps.slice(progress.cursor), rest);
+			Object.assign(frame.results, rest);
+			Object.assign(results, rest);
+			progress.cursor = steps.length;
+		}
 		// The cursor is past this step and its result is kept above: one copy is enough.
 		machine.forgetBelow(childKey, true, frame);
 	}

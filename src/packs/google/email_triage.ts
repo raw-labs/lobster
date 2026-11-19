@@ -1,5 +1,5 @@
 import { defineCommand } from "../../commands/define.js";
-import { streamOf } from "../../io/terminal.js";
+import { streamOf } from "../../io/streams.js";
 type EmailLike = {
 	id?: string;
 	threadId?: string;

@@ -1,6 +1,7 @@
 // Pauses saved by Lobster versions before the run store, rebuilt as waiting runs of the
 // engine: paused workflow files and paused standalone pipelines. A paused SDK step becomes a
 // run the same way, the first time its host resumes it with its old token.
+import { newRunCheckpoint } from "./records.js";
 import { messageOf } from "../util/errors.js";
 import { isPlainObject } from "../util/objects.js";
 import path from "node:path";
@@ -17,10 +18,21 @@ import {
 	keys,
 	type Activation,
 	type ExecutionState,
-	type PipelineStage,
 	type WaitRequest,
 } from "./checkpoint.js";
 import { approvalRequest } from "./nodes/approval.js";
+
+/** A pipeline stage as an older version saved it: its text is what a run continues by. */
+type OldStage = { name: string; args: Record<string, unknown>; raw?: string };
+
+/** The text of each saved stage, if every one has it. */
+function stageTexts(stages: unknown): string[] | undefined {
+	if (!Array.isArray(stages) || !stages.length) return undefined;
+	const texts = stages.map((stage) => (stage as OldStage | undefined)?.raw);
+	return texts.every((raw): raw is string => typeof raw === "string" && raw.length > 0)
+		? texts
+		: undefined;
+}
 
 export type OldWorkflowPause = {
 	filePath: string;
@@ -34,7 +46,7 @@ export type OldWorkflowPause = {
 	inputSchema?: unknown;
 	inputSubject?: unknown;
 	pipelineInput?: {
-		pipeline: PipelineStage[];
+		pipeline: OldStage[];
 		resumeAtIndex: number;
 		items?: unknown[];
 		/** Untrusted until validated (validateCommandInputState). */
@@ -42,7 +54,6 @@ export type OldWorkflowPause = {
 	};
 	cost?: ExecutionState["cost"];
 	llmSpend?: ExecutionState["llmSpend"];
-	llmBilled?: ExecutionState["llmBilled"];
 };
 
 export function isOldWorkflowPause(key: string, value: unknown): value is OldWorkflowPause {
@@ -55,7 +66,7 @@ export function isOldWorkflowPause(key: string, value: unknown): value is OldWor
 }
 
 export type OldPipelinePause = {
-	pipeline: { name: string; args: Record<string, unknown>; raw?: string }[];
+	pipeline: OldStage[];
 	resumeAtIndex: number;
 	items: unknown[];
 	haltType?: "approval_request" | "input_request";
@@ -163,7 +174,15 @@ export async function convertWorkflowPause(key: string, old: OldWorkflowPause) {
 				`Workflow file changed since the pause: step '${stepId}' is no longer a pipeline`,
 			);
 		const saved = old.pipelineInput;
-		if (!saved || !Number.isSafeInteger(saved.resumeAtIndex))
+		// The pause runs its stage again, so that stage must exist.
+		const stages = stageTexts(saved?.pipeline);
+		if (
+			!saved ||
+			!stages ||
+			!Number.isSafeInteger(saved.resumeAtIndex) ||
+			saved.resumeAtIndex < 0 ||
+			saved.resumeAtIndex >= stages.length
+		)
 			throw new Error("Unrecognized saved workflow state");
 		const commandInput = validCommandInput(saved.commandInput, "workflow");
 		const pending = commandInput.pending;
@@ -191,7 +210,7 @@ export async function convertWorkflowPause(key: string, old: OldWorkflowPause) {
 					...(cwd ? { cwd } : {}),
 				},
 				pause: {
-					pipeline: saved.pipeline,
+					stages,
 					resumeAtIndex: saved.resumeAtIndex,
 					items: saved.items ?? [],
 					mode: "same_stage",
@@ -231,10 +250,10 @@ export async function convertWorkflowPause(key: string, old: OldWorkflowPause) {
 		startedAt: Date.now(),
 		...(old.cost ? { cost: old.cost } : {}),
 		...(old.llmSpend?.length ? { llmSpend: old.llmSpend } : {}),
-		...(old.llmBilled?.length ? { llmBilled: old.llmBilled } : {}),
 	};
 	const continuation = (runId: string) => continuationText(runId, gateKey, wait);
-	return { execution, continuation };
+	// Written as every save writes a checkpoint: an old output is a value, never a reference.
+	return { ...newRunCheckpoint(execution), continuation };
 }
 
 /**
@@ -243,26 +262,24 @@ export async function convertWorkflowPause(key: string, old: OldWorkflowPause) {
  * old one would have.
  */
 export function convertPipelinePause(key: string, old: OldPipelinePause) {
-	const stages = old.pipeline;
+	const stages = stageTexts(old.pipeline);
 	const sameStage = old.resumeMode === "same_stage";
 	const input = old.haltType === "input_request";
 	if (
-		!Array.isArray(stages) ||
-		!stages.length ||
-		!stages.every((stage) => typeof stage?.raw === "string" && stage.raw.length > 0) ||
+		!stages ||
 		!Number.isSafeInteger(old.resumeAtIndex) ||
 		old.resumeAtIndex < 0 ||
-		old.resumeAtIndex > stages.length ||
+		// A same-stage pause runs that stage again, so it must exist.
+		old.resumeAtIndex > stages.length - (sameStage ? 1 : 0) ||
 		!Array.isArray(old.items) ||
 		(input && (typeof old.prompt !== "string" || old.inputSchema === undefined)) ||
 		(sameStage && !input)
 	)
 		throw new Error("Unrecognized saved pipeline state");
-	const text = stages.map((stage) => stage.raw!).join(" | ");
 	return waitingPipelineRun(
 		key,
-		pipelineDefinition(text),
-		stages.map((stage) => ({ name: stage.name, args: stage.args, raw: stage.raw! })),
+		pipelineDefinition(stages.join(" | ")),
+		stages,
 		sameStage
 			? {
 					gate: "same_stage",
@@ -312,7 +329,7 @@ export type PausedPipeline =
 export function waitingPipelineRun(
 	key: string,
 	definition: Definition,
-	stages: PipelineStage[],
+	stages: string[],
 	pause: PausedPipeline,
 ) {
 	const text = String(definition.workflow.steps[0].pipeline);
@@ -359,7 +376,7 @@ export function waitingPipelineRun(
 					env: mergeEnv({}, undefined, undefined, {}, {}),
 				},
 				pause: {
-					pipeline: stages,
+					stages,
 					resumeAtIndex: pause.resumeAtIndex,
 					items: pause.gate === "input" ? [] : pause.items,
 					...(pause.gate === "same_stage"
@@ -382,7 +399,8 @@ export function waitingPipelineRun(
 		startedAt: Date.now(),
 	};
 	const continuation = (runId: string) => continuationText(runId, gateKey, wait);
-	return { execution, continuation };
+	// Written as every save writes a checkpoint: an old output is a value, never a reference.
+	return { ...newRunCheckpoint(execution), continuation };
 }
 
 /** A saved command's question state, checked: a pause that fails it cannot be converted. */

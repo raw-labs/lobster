@@ -6,10 +6,12 @@ import {
 	InvalidSchemaError,
 	prepareSchema,
 	schemaValidationMessage,
-	validateValue,
 	withSchemaCompiler,
 	type HostSchemaCompiler,
 } from "../src/util/validation.js";
+
+const validateValue = (schema: unknown, value: unknown, options?: { allErrors?: boolean }) =>
+	prepareSchema(schema).validate(value, options);
 
 const errorsOf = (schema: unknown, value: unknown, allErrors = true) =>
 	validateValue(schema, value, { allErrors }).errors.map(formatSchemaError);
@@ -224,7 +226,7 @@ test("a host's compiler checks a resumed answer through runToolRequest and resum
 		}),
 	);
 	assert.equal(paused.status, "needs_input", JSON.stringify(paused));
-	const token = paused.requiresInput!.resumeToken!;
+	const token = paused.requiresInput!.resumeToken;
 	const refused = await hostHook(compiler, () =>
 		resumeToolRequest({ token, response: 13, ctx: { env } }),
 	);

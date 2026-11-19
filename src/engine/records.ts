@@ -1,7 +1,10 @@
 // Values kept beside the checkpoint, each written once: a loop's items and outputs, and step
 // outputs too large to rewrite with every save. Otherwise every save rewrites every large
 // output of every step before it, and a loop over a big list costs the square of its length.
+// A saved value keeps the marks of the model calls it carries (JSON drops them), so a paid
+// answer read back is still known to be paid, and nothing else is.
 import { randomUUID } from "node:crypto";
+import { llmMarksOf, restoreLlmMarks, type LlmMarks } from "../llm/accounting.js";
 import type { WorkflowStepResult } from "../workflows/types.js";
 import type { StoreSession } from "../persistence/session.js";
 import type { Activation, ExecutionState } from "./checkpoint.js";
@@ -14,6 +17,11 @@ type OutlinedField = (typeof OUTLINED_FIELDS)[number];
 const RECORD_REF = "$lobster.record";
 
 type RecordRef = { [RECORD_REF]: string };
+
+/** How a record is written: the value, and where its model-call marks sit. */
+function encode(value: unknown) {
+	return JSON.stringify({ value, marks: llmMarksOf(value) });
+}
 
 function isRecordRef(value: unknown): value is RecordRef {
 	return (
@@ -30,24 +38,40 @@ export type PreparedSave = {
 	drop: string[];
 };
 
+/**
+ * The checkpoint of a run that does not exist yet (a pause an older version saved, converted),
+ * written as every save writes one: its large outputs as `records`, created with the run.
+ */
+export function newRunCheckpoint(state: ExecutionState) {
+	const records: Record<string, string> = {};
+	return { execution: new Outliner().checkpoint(state, records), records };
+}
+
 export class CheckpointRecords {
 	#put = new Map<string, string>();
 	#drop = new Set<string>();
-	// The key of each value saved so far, so the next save refers to it instead of writing it.
-	#objectKeys = new WeakMap<object, string | false>();
-	#textKeys = new Map<string, string>();
+	#outliner = new Outliner();
 
 	constructor(
 		private readonly session: StoreSession,
 		private readonly runId: string,
+		/** Whether a model call's charge is still open: its saved marks are live (see restoreLlmMarks). */
+		private readonly isOpenCall: (cacheKey: string) => boolean,
 	) {}
+
+	/** A record's value, with its marks; `resultValue`: a step output, billed when it completed. */
+	#decode(text: string, resultValue: boolean): unknown {
+		const { value, marks } = JSON.parse(text) as { value: unknown; marks: LlmMarks };
+		restoreLlmMarks(value, marks, (_, cacheKey) => !resultValue && this.isOpenCall(cacheKey));
+		return value;
+	}
 
 	/**
 	 * Keep `value` under `key`, written with the next save. Keys start with the activation's
 	 * path, so a node's records are found and dropped by that prefix.
 	 */
 	put(key: string, value: unknown) {
-		this.#put.set(key, JSON.stringify(value));
+		this.#put.set(key, encode(value));
 	}
 
 	/** Forget every record under `prefix`, with the next save. */
@@ -57,37 +81,39 @@ export class CheckpointRecords {
 	}
 
 	/** The records under `prefix`, as saved and as changed since, by key. */
-	async read(prefix: string): Promise<Map<string, unknown>> {
+	read(prefix: string): Promise<Map<string, unknown>> {
+		return this.#read(prefix, false);
+	}
+
+	async #read(prefix: string, resultValues: boolean): Promise<Map<string, unknown>> {
 		const found = new Map<string, unknown>();
 		const dropped = (key: string) => [...this.#drop].some((drop) => key.startsWith(drop));
 		if (!dropped(prefix))
 			for (const row of await this.session.readRecords(this.runId, prefix))
-				if (!dropped(row.key)) found.set(row.key, JSON.parse(row.text));
+				if (!dropped(row.key)) found.set(row.key, this.#decode(row.text, resultValues));
 		for (const [key, text] of this.#put)
-			if (key.startsWith(prefix)) found.set(key, JSON.parse(text));
+			if (key.startsWith(prefix)) found.set(key, this.#decode(text, resultValues));
 		return found;
 	}
 
 	/**
 	 * What to write for `state` now: the records changed since the last save, and the checkpoint
-	 * with step outputs over OUTLINE_CHARS replaced by references to records. Called when the
-	 * save's turn comes, so the records go with the state they belong to.
+	 * with step outputs over OUTLINE_CHARS replaced by references to records, and with the marks
+	 * of the model calls its activations carry. Called when the save's turn comes, so the
+	 * records go with the state they belong to.
 	 */
 	prepare(state: ExecutionState): PreparedSave {
 		const put = Object.fromEntries(this.#put);
 		const drop = [...this.#drop];
 		this.#put = new Map();
 		this.#drop = new Set();
-		// A finished run keeps no records (and few activations): its checkpoint stays whole.
-		if (state.status === "completed" || state.status === "cancelled")
-			return { execution: state, put, drop };
-		const activations: ExecutionState["activations"] = {};
-		for (const [path, frame] of Object.entries(state.activations))
-			activations[path] = this.#outlineFrame(frame, put);
-		return { execution: { ...state, activations }, put, drop };
+		return { execution: this.#outliner.checkpoint(state, put), put, drop };
 	}
 
-	/** Put the outputs a checkpoint refers to back in place; done before the run continues. */
+	/**
+	 * Put the outputs a checkpoint refers to back in place, and the marks of the model calls it
+	 * carries; done before the run continues.
+	 */
 	async hydrate(state: ExecutionState) {
 		const refs: Array<[WorkflowStepResult, OutlinedField, string]> = [];
 		const collect = (result: WorkflowStepResult | undefined) => {
@@ -104,27 +130,63 @@ export class CheckpointRecords {
 		// Only the outputs referred to: a long run may have saved many that it no longer needs.
 		const values = new Map<string, unknown>();
 		for (const key of new Set(refs.map(([, , key]) => key))) {
-			const found = await this.read(key);
+			const found = await this.#read(key, true);
 			if (found.has(key)) values.set(key, found.get(key));
 		}
 		for (const [result, field, key] of refs) {
 			if (!values.has(key)) throw new Error(`Saved step output ${key} is missing`);
 			const value = values.get(key);
 			result[field] = value as never;
-			// Saved already: the next save refers to it again instead of writing it again.
-			if (typeof value === "string") this.#textKeys.set(value, key);
-			else if (value && typeof value === "object") this.#objectKeys.set(value, key);
+			this.#outliner.remember(value, key);
 		}
+		// A step's result is billed when the step completes: a mark saved on one is a replay. Only
+		// a mark elsewhere (a paused pipeline's items) may belong to a call not yet billed.
+		restoreLlmMarks(
+			state.activations,
+			state.llmMarks,
+			(path, cacheKey) =>
+				path[1] !== "result" && path[1] !== "results" && this.isOpenCall(cacheKey),
+		);
+		delete state.llmMarks;
+	}
+}
+
+/**
+ * Writes checkpoints with step outputs over OUTLINE_CHARS (and any value shaped like a
+ * reference) kept as records, each written once: it remembers the key of every value saved.
+ */
+class Outliner {
+	#objectKeys = new WeakMap<object, string | false>();
+	#textKeys = new Map<string, string>();
+
+	/**
+	 * `state` as written: its outputs replaced by references to records (added to `put`), and
+	 * with the marks of the model calls its activations carry. A finished run keeps no records
+	 * (and few activations): its checkpoint stays whole.
+	 */
+	checkpoint(state: ExecutionState, put: Record<string, string>): ExecutionState {
+		if (state.status === "completed" || state.status === "cancelled") return state;
+		const activations: ExecutionState["activations"] = {};
+		for (const [path, frame] of Object.entries(state.activations))
+			activations[path] = this.#frame(frame, put);
+		const llmMarks = llmMarksOf(activations);
+		return { ...state, activations, ...(llmMarks.length ? { llmMarks } : {}) };
 	}
 
-	#outlineFrame(frame: Activation, put: Record<string, string>): Activation {
+	/** `value` is saved under `key` already: a later save refers to it instead of writing it. */
+	remember(value: unknown, key: string) {
+		if (typeof value === "string") this.#textKeys.set(value, key);
+		else if (value && typeof value === "object") this.#objectKeys.set(value, key);
+	}
+
+	#frame(frame: Activation, put: Record<string, string>): Activation {
 		let copy: Activation | undefined;
-		const result = this.#outlineResult(frame.result, put);
+		const result = this.#result(frame.result, put);
 		if (result !== frame.result) (copy ??= { ...frame }).result = result;
 		if (frame.results) {
 			let results: Record<string, WorkflowStepResult> | undefined;
 			for (const [id, entry] of Object.entries(frame.results)) {
-				const outlined = this.#outlineResult(entry, put);
+				const outlined = this.#result(entry, put);
 				if (outlined !== entry) (results ??= { ...frame.results })[id] = outlined!;
 			}
 			if (results) (copy ??= { ...frame }).results = results;
@@ -132,25 +194,25 @@ export class CheckpointRecords {
 		return copy ?? frame;
 	}
 
-	#outlineResult(result: WorkflowStepResult | undefined, put: Record<string, string>) {
+	#result(result: WorkflowStepResult | undefined, put: Record<string, string>) {
 		if (!result) return result;
 		let copy: WorkflowStepResult | undefined;
 		for (const field of OUTLINED_FIELDS) {
 			if (result[field] === undefined) continue;
-			const outlined = this.#outlineValue(result[field], put);
+			const outlined = this.#value(result[field], put);
 			if (outlined !== result[field]) (copy ??= { ...result })[field] = outlined as never;
 		}
 		return copy ?? result;
 	}
 
-	#outlineValue(value: unknown, put: Record<string, string>): unknown {
+	#value(value: unknown, put: Record<string, string>): unknown {
 		if (typeof value === "string") {
 			if (value.length <= OUTLINE_CHARS) return value;
 			let key = this.#textKeys.get(value);
 			if (!key) {
 				key = "value/" + randomUUID();
 				this.#textKeys.set(value, key);
-				put[key] = JSON.stringify(value);
+				put[key] = encode(value);
 			}
 			return { [RECORD_REF]: key };
 		}
@@ -158,8 +220,10 @@ export class CheckpointRecords {
 		let key = this.#objectKeys.get(value);
 		if (key === undefined) {
 			const text = JSON.stringify(value);
-			key = text.length > OUTLINE_CHARS ? "value/" + randomUUID() : false;
-			if (key) put[key] = text;
+			// A value shaped like a reference is kept as a record too: left inline, it would be
+			// read back as a reference to another value.
+			key = text.length > OUTLINE_CHARS || isRecordRef(value) ? "value/" + randomUUID() : false;
+			if (key) put[key] = encode(value);
 			this.#objectKeys.set(value, key);
 		}
 		return key ? { [RECORD_REF]: key } : value;

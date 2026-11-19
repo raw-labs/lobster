@@ -32,7 +32,7 @@ async function answer(first: Envelope, decisions: boolean[], env: NodeJS.Process
 		assert.equal(result.status, "needs_approval", JSON.stringify(result));
 		prompts.push(result.requiresApproval!.items);
 		result = await resumeToolRequest({
-			token: result.requiresApproval!.resumeToken!,
+			token: result.requiresApproval!.resumeToken,
 			approved,
 			ctx: { env },
 		});
@@ -101,14 +101,14 @@ test("a rejection that lets the run go on is checked against the required approv
 	});
 	const asked = await runToolRequest({ filePath, ctx: { env } });
 	const refused = await resumeToolRequest({
-		token: asked.requiresApproval!.resumeToken!,
+		token: asked.requiresApproval!.resumeToken,
 		approved: false,
 		ctx: { env: { ...env, LOBSTER_APPROVAL_APPROVED_BY: "mallory" } },
 	});
 	assert.equal(refused.ok, false);
 	assert.match(refused.error!.message, /alice/);
 	const decided = await resumeToolRequest({
-		token: asked.requiresApproval!.resumeToken!,
+		token: asked.requiresApproval!.resumeToken,
 		approved: false,
 		ctx: { env: { ...env, LOBSTER_APPROVAL_APPROVED_BY: "alice" } },
 	});
@@ -133,7 +133,7 @@ test("a loop's timeout covers its work, not the time a person takes to answer", 
 	for (let i = 0; i < 2; i++) {
 		await sleep(450);
 		result = await resumeToolRequest({
-			token: result.requiresApproval!.resumeToken!,
+			token: result.requiresApproval!.resumeToken,
 			approved: true,
 			ctx: { env },
 		});

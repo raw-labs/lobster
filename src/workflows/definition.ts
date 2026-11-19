@@ -4,9 +4,9 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import { loadWorkflowFile } from "./load.js";
 import { resolveTemplate } from "./expressions.js";
-import { fingerprint } from "../persistence/model.js";
+import { fingerprint } from "../util/serialization.js";
 import { resolveWorkflowStepArgs } from "./values.js";
-import { resolveWorkflowArgs } from "./args.js";
+import { checkWorkflowArgs, resolveWorkflowArgs } from "./args.js";
 import type { WorkflowFile, WorkflowStep } from "./types.js";
 
 /** A workflow frozen for a run: the file, its hash, and the child workflows it names. */
@@ -34,6 +34,7 @@ export async function snapshotDefinition(
 	const canonical = await fs.realpath(filePath);
 	if (ancestors.includes(canonical)) throw new Error(`Workflow creates a cycle: ${canonical}`);
 	const workflow = await loadWorkflowFile(canonical);
+	checkWorkflowArgs(workflow.args, args, `Workflow ${canonical}`);
 	const resolved = resolveWorkflowArgs(workflow.args, args);
 	const children: Record<string, Definition> = {};
 	const collect = async (steps: WorkflowStep[], prefix: string) => {

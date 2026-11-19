@@ -1,6 +1,6 @@
 import { defineCommand } from "../define.js";
 import { registryWorkflows } from "../named_workflows.js";
-import { streamOf } from "../../io/terminal.js";
+import { streamOf } from "../../io/streams.js";
 
 export const workflowsListCommand = defineCommand({
 	name: "workflows.list",

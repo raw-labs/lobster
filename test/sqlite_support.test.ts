@@ -6,6 +6,7 @@ import test from "node:test";
 import { once } from "node:events";
 import { Worker } from "node:worker_threads";
 import { openStoreSession } from "../src/persistence/session.js";
+import { SqliteBackend } from "../src/persistence/sqlite.js";
 import { assertSqliteRuntime } from "../src/persistence/sqlite-support.js";
 
 for (const node of ["24.16.0", "24.22.1", "26.1.0", "26.12.1", "27.0.0"]) {
@@ -36,7 +37,7 @@ test("SQLite admission qualifies the connection instead of stale process version
 	await store.close();
 	const sqlite = await openStoreSession({ directory });
 	try {
-		assert.equal(sqlite.backend.kind, "sqlite");
+		assert.ok(sqlite.backend instanceof SqliteBackend);
 		assert.equal((await sqlite.read("saved")).text, "42\n");
 	} finally {
 		await sqlite.close();

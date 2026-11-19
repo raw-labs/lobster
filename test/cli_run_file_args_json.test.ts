@@ -122,3 +122,39 @@ test("cli: graph rejects invalid, empty and non-object --args-json", async () =>
 		assert.equal(res.stderr, "graph --args-json must be a JSON object\n");
 	}
 });
+
+test("lobster run --mode tool reports a cancelled run as cancelled", async () => {
+	const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-cli-cancel-"));
+	const filePath = path.join(tmpDir, "workflow.lobster");
+	await fsp.writeFile(
+		filePath,
+		JSON.stringify({ steps: [{ id: "w", wait: { event: "never", timeout: 0 } }] }),
+		"utf8",
+	);
+	const res = runLobster(["run", "--mode", "tool", "--file", filePath], {
+		env: { LOBSTER_STATE_DIR: path.join(tmpDir, "state") },
+	});
+	const envelope = JSON.parse(res.stdout);
+	assert.equal(envelope.ok, true);
+	assert.equal(envelope.status, "cancelled");
+});
+
+test("lobster run --mode tool names no run when the run never started", async () => {
+	const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-cli-"));
+	const filePath = path.join(tmpDir, "workflow.lobster");
+	await fsp.writeFile(filePath, "name: test\nsteps:\n  - id: s\n    run: echo hi\n", "utf8");
+	const env = { LOBSTER_STATE_DIR: path.join(tmpDir, "state") };
+
+	for (const args of [
+		["run", "--mode", "tool", 'exec "abc'],
+		["run", "--mode", "tool", "--file", filePath, "--args-json", "{bad"],
+	]) {
+		const res = runLobster(args, { env });
+		assert.equal(res.status, 2, res.stdout);
+		const envelope = JSON.parse(res.stdout);
+		assert.equal(envelope.error.type, "parse_error");
+		assert.equal(envelope.runId, undefined, `${args.join(" ")} named a run: ${res.stdout}`);
+	}
+	const runs = runLobster(["runs", "list"], { env });
+	assert.deepEqual(JSON.parse(runs.stdout).runs, []);
+});

@@ -1,6 +1,6 @@
 // The run store as hosts see it: open a session, inspect runs and waits, close it. Executor
 // transitions stay inside Lobster.
-import { getRun, getWait } from "./runs.js";
+import { getRun, getWait, listRuns } from "./runs.js";
 import { registerHandle, type PublicStoreSession, type RunScope } from "../persistence/context.js";
 import {
 	openStoreSession as openSession,
@@ -19,9 +19,13 @@ function exposeStoreSession(session: Session): PublicStoreSession {
 	const handle: PublicStoreSession = Object.freeze({
 		directory: session.directory,
 		history: session.history,
-		trackRuns: session.trackRuns,
 		readOnly: session.readOnly,
-		listRuns: session.listRuns.bind(session),
+		// Through core, as getRun and getWait: one check of the filter, whichever way runs are listed.
+		listRuns: ({ callerId, ...query }: Parameters<Session["listRuns"]>[0] = {}) =>
+			listRuns({
+				...query,
+				ctx: { storeSession: handle, runMetadata: callerId === undefined ? {} : { callerId } },
+			}),
 		getRun: (runId: string, scope: RunScope = {}) =>
 			getRun({
 				runId,

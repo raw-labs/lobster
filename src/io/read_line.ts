@@ -22,7 +22,7 @@ export function readLineFromStream(
 		const cleanup = () => {
 			stream.off("data", onData);
 			stream.off("end", onEnd);
-			stream.off("close", onClose);
+			stream.off("close", onEnd);
 			stream.off("error", onError);
 			stream.pause();
 			signal?.removeEventListener("abort", onAbort);
@@ -61,13 +61,8 @@ export function readLineFromStream(
 			while (!settled && (chunk = stream.read()) !== null) onData(chunk);
 		};
 
+		// The input ended (or the stream closed): what was typed so far is the line.
 		const onEnd = () => {
-			drainBuffered();
-			if (settled) return;
-			unreadInput.delete(stream);
-			finish(buf);
-		};
-		const onClose = () => {
 			drainBuffered();
 			if (settled) return;
 			unreadInput.delete(stream);
@@ -92,7 +87,7 @@ export function readLineFromStream(
 
 		stream.on("data", onData);
 		stream.on("end", onEnd);
-		stream.on("close", onClose);
+		stream.on("close", onEnd);
 		stream.on("error", onError);
 		signal?.addEventListener("abort", onAbort, { once: true });
 		drainBuffered();

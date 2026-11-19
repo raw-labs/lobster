@@ -1,6 +1,7 @@
 import { defineCommand } from "../define.js";
 import { readLineFromStream } from "../../io/read_line.js";
-import { approvalInputTimeoutMs, isInteractive, streamOf } from "../../io/terminal.js";
+import { approvalInputTimeoutMs, isInteractive, yesOrNoPrompt } from "../../io/terminal.js";
+import { streamOf } from "../../io/streams.js";
 
 export const approveCommand = defineCommand({
 	name: "approve",
@@ -64,9 +65,10 @@ export const approveCommand = defineCommand({
 			signal: ctx.signal,
 		});
 
-		if (!/^y(es)?$/i.test(String(answer).trim())) {
-			throw new Error("Not approved");
-		}
+		const text = answer.trim();
+		const approved = yesOrNoPrompt(text);
+		if (approved === undefined) throw new Error(`Answer yes or no (got ${JSON.stringify(text)})`);
+		if (!approved) throw new Error("Not approved");
 
 		return { output: streamOf(items) };
 	},

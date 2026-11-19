@@ -11,6 +11,12 @@ import type { PreparedSave } from "./records.js";
 /** What a save publishes or consumes with the checkpoint: a wait's continuation. */
 type SaveExtras = Pick<Extract<RunAction, { kind: "execution-save" }>, "publish" | "consume">;
 
+/** Refuse a lease shorter than 100 ms: checked before a run is created, and by the store. */
+export function checkLeaseMs(leaseMs: number) {
+	if (!Number.isSafeInteger(leaseMs) || leaseMs < 100)
+		throw new Error("Execution lease must be at least 100ms");
+}
+
 /** Serialize branch checkpoints; ownership is checked inside the backend transaction. */
 export class ExecutionStore {
 	readonly owner = randomUUID();
@@ -26,8 +32,7 @@ export class ExecutionStore {
 		readonly runId: string,
 		readonly leaseMs = 30000,
 	) {
-		if (!Number.isSafeInteger(leaseMs) || leaseMs < 100)
-			throw new Error("Execution lease must be at least 100ms");
+		checkLeaseMs(leaseMs);
 	}
 
 	async #transition(action: RunAction, assertCurrent?: () => void) {
@@ -37,7 +42,6 @@ export class ExecutionStore {
 		try {
 			const result = await this.session.transition(
 				{ runId: this.runId, operationId, action },
-				undefined,
 				assertCurrent,
 			);
 			if (result.status !== "committed") throw new ExecutionConflictError();
@@ -88,20 +92,18 @@ export class ExecutionStore {
 
 	/**
 	 * Save `state` after every save queued before it. `prepare`, called when this save's turn
-	 * comes, may give a smaller checkpoint to write instead, plus records to write with it.
+	 * comes, gives the checkpoint to write (smaller than `state`), plus records to write with it.
 	 */
 	save(
 		state: ExecutionState,
-		extras: SaveExtras = {},
-		assertCurrent?: () => void,
-		prepare?: (state: ExecutionState) => PreparedSave,
+		extras: SaveExtras,
+		assertCurrent: (() => void) | undefined,
+		prepare: (state: ExecutionState) => PreparedSave,
 	) {
 		return this.#enqueue(async () => {
-			const prepared = prepare?.(state);
-			const next = structuredClone(prepared?.execution ?? state);
+			const { execution, put, drop } = prepare(state);
+			const next = structuredClone(execution);
 			next.revision = state.revision + 1;
-			const put = prepared?.put ?? {};
-			const drop = prepared?.drop ?? [];
 			const records = drop.length || Object.keys(put).length ? { records: { drop, put } } : {};
 			await this.#transition(
 				{

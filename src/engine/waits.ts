@@ -5,7 +5,8 @@ import { messageOf } from "../util/errors.js";
 import { randomUUID } from "node:crypto";
 import type { WorkflowStepResult, WorkflowWaitTimeout } from "../workflows/types.js";
 import { WaitConflictError } from "../persistence/backend.js";
-import { resumeGuardFromEnv } from "../persistence/context.js";
+import { resumeGuardFromEnv, type StoreEnvironment } from "../persistence/context.js";
+import { decisionCount, type Decision } from "../resume/options.js";
 import { cleanupApprovalIndexByStateKey } from "../state/store.js";
 import { parseDuration } from "../util/duration.js";
 import {
@@ -23,15 +24,15 @@ import type { Machine } from "./machine.js";
 import { decideApproval, readAnswer, validateInputResponse } from "./asking.js";
 import { isInteractive } from "../io/terminal.js";
 import type { Scope } from "./scope.js";
+import { deliberateWait } from "./step_clock.js";
 import {
 	ExecutionConflictError,
 	ResumeRefusedError,
 	RunCancelledError,
 	RunSuspendedError,
 	InvalidAnswerError,
+	stopsRun,
 } from "./errors.js";
-
-type Decision = { approved?: boolean; response?: unknown; cancel?: boolean };
 
 type WaitOf<K extends WaitRequest["kind"]> = Extract<WaitRequest, { kind: K }>;
 
@@ -63,16 +64,15 @@ export function waitDeadline(config: WorkflowWaitTimeout | undefined, what: stri
 
 /**
  * Save the wait of `frame` as pending, in the same save that marks the run waiting.
- * Returns false when it was published before (a question asked again, e.g. on advance).
+ * Returns false when it was published before (a question asked again, e.g. on advance); the
+ * run is saved again all the same, with what changed since (the deadlines a pause clears).
  */
 export async function publishWait(machine: Machine, key: string, frame: Activation) {
 	machine.checkAuthority();
 	const wait = frame.wait!;
 	if (wait.key) {
-		if (machine.state.status !== "waiting") {
-			machine.state.status = "waiting";
-			await machine.save();
-		}
+		machine.state.status = "waiting";
+		await machine.save();
 		return false;
 	}
 	wait.key = "workflow_resume_" + randomUUID();
@@ -104,9 +104,9 @@ export async function resolveWait(machine: Machine, frame: Activation, result: W
 }
 
 /** Whether a question or event wait is past its deadline. */
-export function expired(frame: Activation, now = Date.now()) {
+export function expired(frame: Activation) {
 	const deadline = deadlineOf(frame.wait?.request);
-	return deadline !== undefined && now >= deadline;
+	return deadline !== undefined && Date.now() >= deadline;
 }
 
 /**
@@ -148,9 +148,52 @@ export async function askAtTerminal(
 	if (scope.ctx.mode === "tool" || !isInteractive(scope.ctx.stdin))
 		await suspend(machine, key, frame);
 	scope.ctx.stdout.write(prompt);
-	const read = await readAnswer(scope.ctx, deadlineOf(frame.wait?.request));
+	const read = await deliberateWait(scope.holdClocks, async () => {
+		await machine.save();
+		return readAnswer(scope.ctx, deadlineOf(frame.wait?.request));
+	});
 	if ("expired" in read) return { timedOut: await timeOut(machine, frame, unanswered) };
 	return { answer: read.answer.trim() };
+}
+
+/**
+ * Why an answer finds its wait gone. One for a revision of that wait (a wait ID) lost a race
+ * to another answer: the same `wait_conflict` as one refused before the race. Otherwise the
+ * token or approval ID no longer names a question.
+ */
+export function waitGone(env: StoreEnvironment, waitKey: string) {
+	return resumeGuardFromEnv(env)?.key === waitKey
+		? new WaitConflictError()
+		: new ResumeRefusedError();
+}
+
+/**
+ * Run `ask`, which asks `frame`'s question and checks the answer. A failed answer (a refused
+ * approver, a read that timed out, an answer that does not parse or fit its schema) fails this
+ * question only: its waits are withdrawn, and it stops the run as an InvalidAnswerError (as
+ * the same answer sent with `resume` is refused), so neither the step's `retry` nor its
+ * `on_error` treats a person's mistake as the step failing. A retried run asks the question
+ * again without running the step before it again. A pause, a cancellation or a stopped run is
+ * not a failure.
+ */
+export async function failOnlyTheQuestion<T>(
+	machine: Machine,
+	key: string,
+	frame: Activation,
+	scope: Scope,
+	ask: () => Promise<T>,
+): Promise<T> {
+	try {
+		return await ask();
+	} catch (error) {
+		const failed =
+			(!stopsRun(error) || error instanceof InvalidAnswerError) && !scope.ctx.signal?.aborted;
+		if (!failed) throw error;
+		await withdrawWaits(machine, key);
+		frame.phase = "failed";
+		frame.error = messageOf(error);
+		throw error instanceof InvalidAnswerError ? error : new InvalidAnswerError(messageOf(error));
+	}
 }
 
 /**
@@ -190,10 +233,14 @@ export async function cancelWithdrawing(machine: Machine, reason: string) {
 export async function answer(machine: Machine, waitKey: string, decision: Decision) {
 	machine.ctx.signal?.throwIfAborted();
 	machine.checkAuthority();
+	// Checked here, for every caller: an answer that also cancels must not cancel the run. (No
+	// decision at all is refused below, with what this question needs.)
+	if (decisionCount(decision) > 1)
+		throw new InvalidAnswerError("resume takes only one of approved, response, or cancel");
 	const entry = Object.entries(machine.state.activations).find(
 		([, frame]) => isPending(frame) && frame.wait!.key === waitKey,
 	);
-	if (!entry || isFinished(machine.state)) throw new ResumeRefusedError();
+	if (!entry || isFinished(machine.state)) throw waitGone(machine.ctx.env, waitKey);
 	const [path, frame] = entry;
 	const wait = frame.wait!.request;
 	if (wait.kind === "timer")
@@ -209,24 +256,31 @@ export async function answer(machine: Machine, waitKey: string, decision: Decisi
 			`This question expired at ${new Date(wait.deadline!).toISOString()}; \`lobster runs advance --due\` applies its timeout`,
 		);
 	clearTimeoutsAbove(machine.state, path);
-	if (decision.cancel) cancelled(machine, "Cancelled");
+	if (decision.cancel === true) cancelled(machine, "Cancelled");
 	else if (wait.kind === "approval") {
-		if (typeof decision.approved !== "boolean" || decision.response !== undefined)
+		if (typeof decision.approved !== "boolean")
 			throw new InvalidAnswerError(
-				"Workflow resume requires --approve yes|no for approval requests",
+				"This question needs an approval: approved true or false (`--approve yes|no`)",
 			);
 		if (!decision.approved && wait.onReject !== "continue") cancelled(machine, "Not approved");
 		else {
 			frame.result = {
 				...frame.result!,
-				...decideApproval(frame.wait!.stepId, wait, decision.approved, machine.ctx.env),
+				...decideApproval(
+					{ stepId: frame.wait!.stepId, standalone: machine.state.definition.standalone },
+					wait,
+					decision.approved,
+					machine.ctx.env,
+				),
 			};
 			frame.phase = "completed";
 			machine.state.status = "running";
 		}
 	} else {
 		if (decision.response === undefined || decision.approved !== undefined)
-			throw new InvalidAnswerError("Workflow resume requires --response-json for input requests");
+			throw new InvalidAnswerError(
+				"This question needs a response: `response` (`--response-json '{...}'`)",
+			);
 		try {
 			validateInputResponse({
 				schema: wait.responseSchema,

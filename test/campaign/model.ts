@@ -13,7 +13,7 @@ import { openStoreSession } from "../../src/persistence/session.js";
 import { ExecutionConflictError } from "../../src/engine/errors.js";
 import { advanceWorkflowRun, runWorkflowFile } from "../../src/engine/runner.js";
 import { signalEvent } from "../../src/engine/due.js";
-import { decodeToken } from "../../src/resume/token.js";
+import { decodeResumeToken } from "../../src/resume/resume.js";
 import type { WorkflowStep } from "../../src/workflows/types.js";
 import type { ExecutionState } from "../../src/engine/checkpoint.js";
 import type { FakeBehavior } from "../helpers/fake_command.js";
@@ -508,7 +508,7 @@ export async function drive(
 					const request = result.requiresApproval;
 					const approved = decision(request.prompt, request.approvalId);
 					answered.push(`${request.prompt}=${approved}`);
-					const resume = decodeToken(request.resumeToken);
+					const resume = decodeResumeToken(request.resumeToken);
 					result = await attempt(() =>
 						runWorkflowFile({ resume, approved, ctx: ctx(), leaseMs: LEASE_MS } as any),
 					);
@@ -517,7 +517,7 @@ export async function drive(
 				}
 				case "needs_input": {
 					const request = result.requiresInput;
-					const resume = decodeToken(request.resumeToken);
+					const resume = decodeResumeToken(request.resumeToken);
 					const response = { ok: decision(request.prompt, String(resume.stateKey)) };
 					answered.push(`${request.prompt}=${response.ok}`);
 					result = await attempt(() =>

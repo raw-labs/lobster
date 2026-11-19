@@ -3,9 +3,10 @@ import { messageOf } from "../../util/errors.js";
 import { combineSignals } from "../../process/owner_signal.js";
 import type { WorkflowStep, WorkflowStepResult } from "../../workflows/types.js";
 import { activation, keys } from "../checkpoint.js";
+import { createRecord } from "../../workflows/values.js";
 import type { Machine } from "../machine.js";
-import { GATES_REFUSED, type Scope } from "../scope.js";
-import { branchSpendBuffer, type BranchSpendBuffer } from "../accounting.js";
+import { GATES_REFUSED, innerSettings, type Scope } from "../scope.js";
+import { branchSpendBuffer, concurrentLedger } from "../accounting.js";
 import { stopsRun } from "../errors.js";
 
 /**
@@ -47,21 +48,25 @@ export async function parallelStep(
 		...scope,
 		gatesRefused: GATES_REFUSED.parallel,
 		ctx: { ...scope.ctx, signal },
-		env: { ...scope.env, ...step.env },
-		cwd: step.cwd ?? scope.cwd,
+		...innerSettings(step, scope),
+		// Branches run at once: a wait in one is not a wait of the step.
+		holdClocks: undefined,
 	};
-	const buffers = new Map<string, BranchSpendBuffer>();
 	const lost = (branchId: string) => race && frame.parallel && frame.parallel.winner !== branchId;
 	try {
 		const run = async (branch: (typeof config.branches)[number]) => {
 			if (lost(branch.id)) return;
 			const buffer = race ? branchSpendBuffer(scope.ledger) : undefined;
-			if (buffer) buffers.set(branch.id, buffer);
-			const ledger = buffer ?? scope.ledger;
-			const childKey = keys.occurrence(key, branch.id);
+			const ledger = buffer ?? concurrentLedger(scope.ledger);
+			const childKey = keys.branch(key, branch.id);
 			const result = await machine.visit(branch, childKey, { ...branchScope, ledger }, false);
 			if (lost(branch.id)) return;
-			if (race) frame.parallel = { winner: branch.id };
+			if (race) {
+				frame.parallel = { winner: branch.id };
+				// The winner's charges go with the save that names it: saved later, a crash in
+				// between would leave a winner whose calls are billed nowhere.
+				buffer!.release();
+			}
 			(frame.results ??= {})[branch.id] = result;
 			await machine.save();
 			return result;
@@ -83,11 +88,15 @@ export async function parallelStep(
 		if (failure) throw failure;
 		if (timeout.signal.aborted) throw timeout.signal.reason;
 		const winner = frame.parallel?.winner;
-		if (winner) buffers.get(winner)?.release();
 		const results: Record<string, WorkflowStepResult> = winner
 			? { [winner]: frame.results![winner] }
 			: (frame.results ?? {});
-		frame.results = results;
+		// The step's output is the branches that count; the others (a race's losers) did not
+		// finish, and are recorded as skipped so later steps can read them as such.
+		frame.results = createRecord<WorkflowStepResult>();
+		for (const branch of config.branches)
+			frame.results[branch.id] = { id: branch.id, skipped: true };
+		Object.assign(frame.results, results);
 		const json = Object.fromEntries(
 			Object.entries(results).map(([id, result]) => [id, result.json]),
 		);

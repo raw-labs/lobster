@@ -2,8 +2,14 @@
 // command does in a pipeline (same checks, errors and host-authority calls) and carries the
 // command's meta, which tells the engine how to recover and resume it.
 import { approveCommand } from "../commands/stdlib/approve.js";
+import { inRunDirectory } from "../engine/context.js";
 import { diffLastCommand } from "../commands/stdlib/diff_last.js";
-import { execCommand, runExec, type ExecTarget } from "../commands/stdlib/exec.js";
+import {
+	execCommand,
+	runExec,
+	type ExecTarget,
+	type StdinFormat,
+} from "../commands/stdlib/exec.js";
 import { stateGetCommand, stateSetCommand } from "../commands/stdlib/state.js";
 import type { CommandMeta, DefinedCommand } from "../commands/types.js";
 import { tokenizeCommand } from "../pipeline/command_tokens.js";
@@ -38,7 +44,7 @@ export type ExecOptions = {
 	/** Working directory (default: the run's). */
 	cwd?: string;
 	/** Write the stage's input to the command's stdin in this format. */
-	stdin?: "raw" | "json" | "jsonl";
+	stdin?: StdinFormat;
 };
 
 /**
@@ -58,7 +64,7 @@ export function exec(command: string, options: ExecOptions = {}) {
 	// Through runExec, not the command's run: a single argument containing a space (a quoted
 	// path) stays one executable instead of becoming a shell line.
 	return commandStage(execCommand, args, ({ input, ctx }) =>
-		runExec(target, flags, input, options.cwd ? { ...ctx, cwd: options.cwd } : ctx),
+		runExec(target, flags, input, { ...ctx, cwd: inRunDirectory(ctx, options.cwd) }),
 	);
 }
 

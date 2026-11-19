@@ -126,7 +126,15 @@ const NODES: NodeExample[] = [
 		reference: { expr: "$n.json", expected: fakeResult("w", 1) },
 		dryRun: [/2?\d\. n {2}\[shell\]/, /run: .*fake-bin\.mjs" w/],
 		graph: { type: "run" },
-		invalid: [["run as a number", (step) => ({ ...step, run: 5 })]],
+		invalid: [
+			["run as a number", (step) => ({ ...step, run: 5 })],
+			["workflow_args on a run step", (step) => ({ ...step, workflow_args: { x: 1 } })],
+			["an unquoted number in env", (step) => ({ ...step, env: { PORT: 8080 } })],
+			["env as a string", (step) => ({ ...step, env: "FOO=1" })],
+			["cwd as a number", (step) => ({ ...step, cwd: 5 })],
+			["a NUL in an env value", (step) => ({ ...step, env: { FOO: "a\0b" } })],
+			["stdin from a step that never ran", (step) => ({ ...step, stdin: "$nosuch.stdout" })],
+		],
 		cells: all("generic"),
 	},
 	{
@@ -202,6 +210,7 @@ const NODES: NodeExample[] = [
 		graph: { type: "input" },
 		invalid: [
 			["input.prompt as a number", (step) => ({ ...step, input: { ...step.input, prompt: 5 } })],
+			["cwd on an input step", (step) => ({ ...step, cwd: "/tmp" })],
 			[
 				"input.responseSchema as a string",
 				(step) => ({ ...step, input: { ...step.input, responseSchema: "object" } }),
@@ -242,6 +251,7 @@ const NODES: NodeExample[] = [
 		invalid: [
 			["when as an object", (step) => ({ ...step, when: { eq: 1 } })],
 			["condition as a number", (step) => ({ ...step, when: undefined, condition: 1 })],
+			["both when and condition", (step) => ({ ...step, condition: "false" })],
 		],
 		cells: all("generic"),
 	},
@@ -271,7 +281,9 @@ const NODES: NodeExample[] = [
 		graph: { type: "for_each" },
 		invalid: [
 			["for_each as a number", (step) => ({ ...step, for_each: 5 })],
+			["for_each over a step that never ran", (step) => ({ ...step, for_each: "$nosuch.json" })],
 			["batch_size of 0", (step) => ({ ...step, batch_size: 0 })],
+			["batch_size without pause_ms", (step) => ({ ...step, batch_size: 2 })],
 			["empty steps", (step) => ({ ...step, steps: [] })],
 			["unknown sub-step key", (step) => ({ ...step, steps: [{ ...step.steps[0], wehn: true }] })],
 		],
@@ -336,6 +348,17 @@ const NODES: NodeExample[] = [
 		graph: { type: "parallel" },
 		invalid: [
 			["unknown wait", (step) => ({ ...step, parallel: { ...step.parallel, wait: "some" } })],
+			["stdin on the parallel step", (step) => ({ ...step, stdin: "hello" })],
+			[
+				"a branch's stdin from a step that never ran",
+				(step) => ({
+					...step,
+					parallel: {
+						...step.parallel,
+						branches: [{ ...step.parallel.branches[0], stdin: "$nosuch.stdout" }],
+					},
+				}),
+			],
 			["no branches", (step) => ({ ...step, parallel: { ...step.parallel, branches: [] } })],
 			[
 				"a branch with when",
@@ -377,6 +400,7 @@ const NODES: NodeExample[] = [
 		invalid: [
 			["workflow as a number", (step) => ({ ...step, workflow: 5 })],
 			["workflow_args as a list", (step) => ({ ...step, workflow_args: ["x"] })],
+			["stdin on a child workflow", (step) => ({ ...step, stdin: "hello" })],
 			["missing child file", (step) => ({ ...step, workflow: "missing.lobster" })],
 		],
 		cells: {
@@ -505,6 +529,9 @@ const NODES: NodeExample[] = [
 			["negative sleep", (step) => ({ ...step, sleep: -1 })],
 			["sleep with a command", (step) => ({ ...step, run: "true" })],
 			["sleep with an approval", (step) => ({ ...step, approval: "Ok?" })],
+			["stdin on a sleep", (step) => ({ ...step, stdin: "hello" })],
+			["env on a sleep", (step) => ({ ...step, env: { FOO: "bar" } })],
+			["cwd on a sleep", (step) => ({ ...step, cwd: "/tmp" })],
 		],
 		rejectedIn: { child: /are not supported inside a child workflow/ },
 		cells: {
@@ -527,6 +554,12 @@ const NODES: NodeExample[] = [
 		graph: { type: "wait" },
 		invalid: [
 			["wait as a string", (step) => ({ ...step, wait: "contract.done" })],
+			[
+				"wait.match from a step that never ran",
+				(step) => ({ ...step, wait: { ...step.wait, match: { ok: "$nosuch.json" } } }),
+			],
+			["stdin on a wait", (step) => ({ ...step, stdin: "hello" })],
+			["env on a wait", (step) => ({ ...step, env: { FOO: "bar" } })],
 			["wait without an event", (step) => ({ ...step, wait: { match: {} } })],
 			["unknown wait key", (step) => ({ ...step, wait: { ...step.wait, evnet: "x" } })],
 			["wait.timeout as a word", (step) => ({ ...step, wait: { ...step.wait, timeout: "soon" } })],

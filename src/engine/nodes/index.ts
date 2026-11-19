@@ -36,7 +36,7 @@ const NODES: Record<StepKind, NodeHandler> = {
 	step: activity,
 	workflow: { run: childWorkflowStep, role: "control", chargesInner: true },
 	parallel: { run: parallelStep, role: "control" },
-	for_each: { run: forEachStep, role: "control" },
+	for_each: { run: forEachStep, role: "control", chargesInner: true },
 	repeat: { run: repeatStep, role: "control", chargesInner: true },
 	switch: { run: switchStep, role: "control", chargesInner: true },
 	input: { run: inputStep, role: "gate" },

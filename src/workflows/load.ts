@@ -1,7 +1,7 @@
 import { checkCondition } from "./conditions.js";
-import { isApprovalStep, isInputStep } from "./steps.js";
+import { parseStepRef } from "./expressions.js";
+import { isApprovalStep, isInputStep, nonBlank, shellCommandOf } from "./steps.js";
 import { isPlainObject } from "../util/objects.js";
-export { getStepExecution, isApprovalStep, isInputStep } from "./steps.js";
 import { MAX_TIMER_MS, parseDuration } from "../util/duration.js";
 import { closestMatch } from "../util/suggest.js";
 import { promises as fsp } from "node:fs";
@@ -49,16 +49,21 @@ export async function loadWorkflowFile(filePath: string): Promise<WorkflowFile> 
 		throw new Error("Workflow file requires a non-empty steps array");
 	}
 	rejectUnknownKeys(parsed as Record<string, unknown>);
-	const cwd = (parsed as WorkflowFile).cwd;
-	if (typeof cwd === "string" && cwd.includes("\0"))
-		throw new Error("Workflow cwd cannot contain a NUL character");
+	validateEnvAndCwd(parsed as Record<string, unknown>, "Workflow");
+	for (const field of ["name", "description"] as const) {
+		const value: unknown = (parsed as WorkflowFile)[field];
+		if (value !== undefined && typeof value !== "string")
+			throw new Error(`Workflow ${field} must be a string`);
+	}
+	validateArgDefinitions((parsed as WorkflowFile).args);
 
 	const costLimit = (parsed as WorkflowFile).cost_limit;
 	if (costLimit !== undefined) {
 		if (!isPlainObject(costLimit)) {
 			throw new Error("Workflow cost_limit must be an object");
 		}
-		if (!Number.isFinite(Number(costLimit.max_usd)) || Number(costLimit.max_usd) < 0) {
+		const maxUsd: unknown = costLimit.max_usd;
+		if (typeof maxUsd !== "number" || !Number.isFinite(maxUsd) || maxUsd < 0) {
 			throw new Error("Workflow cost_limit.max_usd must be a non-negative number");
 		}
 		if (
@@ -74,6 +79,20 @@ export async function loadWorkflowFile(filePath: string): Promise<WorkflowFile> 
 	return parsed as WorkflowFile;
 }
 
+/** A workflow's `args`: each name maps to an object with an optional default and description. */
+function validateArgDefinitions(args: unknown) {
+	if (args === undefined) return;
+	if (!isPlainObject(args)) throw new Error("Workflow args must be an object");
+	for (const [name, definition] of Object.entries(args)) {
+		const where = `Workflow arg ${name}`;
+		if (!isPlainObject(definition))
+			throw new Error(`${where} must be an object (with a default and a description)`);
+		checkKeys(definition, ARG_KEYS, where);
+		if (definition.description !== undefined && typeof definition.description !== "string")
+			throw new Error(`${where} description must be a string`);
+	}
+}
+
 /**
  * Validates steps that run in order. `seen` holds every step id so far, which must be unique;
  * `known` holds the steps whose results exist when these start, and gains each step as it is
@@ -84,19 +103,19 @@ function validateSteps(steps: WorkflowStep[], seen: Set<string>, known: Set<stri
 		if (!step || typeof step !== "object") {
 			throw new Error("Workflow step must be an object");
 		}
-		validateRecovery(step);
 		if (!step.id || typeof step.id !== "string") {
 			throw new Error("Workflow step requires an id");
 		}
+		validateRecovery(step, `Workflow step ${step.id}`);
 		if (step.workflow !== undefined && typeof step.workflow !== "string") {
 			throw new Error(`Workflow step ${step.id} workflow must be a string (file path)`);
 		}
 		if (typeof step.workflow === "string" && !step.workflow.trim()) {
 			throw new Error(`Workflow step ${step.id} workflow path cannot be blank`);
 		}
-		for (const key of ["workflow", "cwd"] as const)
-			if (typeof step[key] === "string" && step[key].includes("\0"))
-				throw new Error(`Workflow step ${step.id} ${key} cannot contain a NUL character`);
+		if (typeof step.workflow === "string" && step.workflow.includes("\0"))
+			throw new Error(`Workflow step ${step.id} workflow cannot contain a NUL character`);
+		validateEnvAndCwd(step as Record<string, unknown>, `Workflow step ${step.id}`);
 		if (step.workflow_args !== undefined) {
 			if (!isPlainObject(step.workflow_args)) {
 				throw new Error(`Workflow step ${step.id} workflow_args must be a plain object`);
@@ -132,14 +151,19 @@ function validateSteps(steps: WorkflowStep[], seen: Set<string>, known: Set<stri
 				if (!branch || typeof branch !== "object") {
 					throw new Error(`Workflow step ${step.id} parallel branches must be objects`);
 				}
-				validateRecovery(branch);
-				if (typeof branch.cwd === "string" && branch.cwd.includes("\0"))
-					throw new Error(
-						`Workflow step ${step.id} parallel branch ${branch.id} cwd cannot contain a NUL character`,
-					);
 				if (!branch.id || typeof branch.id !== "string") {
 					throw new Error(`Workflow step ${step.id} parallel branch requires an id`);
 				}
+				validateRecovery(branch, `Workflow step ${step.id} parallel branch ${branch.id}`);
+				validateEnvAndCwd(
+					branch as Record<string, unknown>,
+					`Workflow step ${step.id} parallel branch ${branch.id}`,
+				);
+				checkStepRefs(
+					branch.stdin,
+					`Workflow step ${step.id} parallel branch ${branch.id} stdin`,
+					known,
+				);
 				if (branch.id === step.id) {
 					throw new Error(`Workflow step ${step.id} parallel branch id cannot match the step id`);
 				}
@@ -150,8 +174,12 @@ function validateSteps(steps: WorkflowStep[], seen: Set<string>, known: Set<stri
 					throw new Error(`Duplicate workflow id across steps/parallel branches: ${branch.id}`);
 				}
 				branchIds.add(branch.id);
-				const branchShell = typeof branch.run === "string" ? branch.run : branch.command;
-				const branchPipeline = typeof branch.pipeline === "string" ? branch.pipeline : undefined;
+				if (branch.run !== undefined && branch.command !== undefined)
+					throw new Error(
+						`Workflow step ${step.id} parallel branch ${branch.id} takes run or command, not both`,
+					);
+				const branchShell = shellCommandOf(branch);
+				const branchPipeline = nonBlank(branch.pipeline);
 				const branchExecCount = Number(Boolean(branchShell)) + Number(Boolean(branchPipeline));
 				if (branchExecCount === 0) {
 					throw new Error(
@@ -226,6 +254,10 @@ function validateSteps(steps: WorkflowStep[], seen: Set<string>, known: Set<stri
 					`Workflow step ${step.id} for_each cannot combine concurrency with pause_ms or batch_size (they pace items one at a time)`,
 				);
 			}
+			if (step.batch_size !== undefined && step.pause_ms === undefined)
+				throw new Error(
+					`Workflow step ${step.id} batch_size applies only with pause_ms (it sets how many items run between pauses)`,
+				);
 			if (isApprovalStep(step.approval)) {
 				throw new Error(
 					`Workflow step ${step.id} for_each steps cannot define approval (put it on a step inside the loop, or after it)`,
@@ -236,13 +268,8 @@ function validateSteps(steps: WorkflowStep[], seen: Set<string>, known: Set<stri
 					`Workflow step ${step.id} for_each steps cannot define input (put it on a step inside the loop, or after it)`,
 				);
 			}
-			if (step.stdin !== undefined && step.stdin !== null) {
-				throw new Error(
-					`Workflow step ${step.id} for_each steps cannot define stdin (loop input comes from the for_each expression)`,
-				);
-			}
-			const loopShell = typeof step.run === "string" ? step.run : step.command;
-			const loopPipeline = typeof step.pipeline === "string" ? step.pipeline : undefined;
+			const loopShell = shellCommandOf(step);
+			const loopPipeline = nonBlank(step.pipeline);
 			if (
 				loopShell ||
 				loopPipeline ||
@@ -266,34 +293,24 @@ function validateSteps(steps: WorkflowStep[], seen: Set<string>, known: Set<stri
 			if (loopItemVar === loopIndexVar) {
 				throw new Error(`Workflow step ${step.id} item_var and index_var cannot be the same`);
 			}
-			const subStepIds = new Set<string>();
-			for (const sub of step.steps) {
-				if (!sub || typeof sub !== "object" || !sub.id || typeof sub.id !== "string") {
-					throw new Error(`Workflow step ${step.id} for_each sub-step requires an id`);
-				}
-				if (sub.id === loopItemVar || sub.id === loopIndexVar) {
-					throw new Error(
-						`Workflow step ${step.id} for_each sub-step id '${sub.id}' conflicts with loop variable`,
-					);
-				}
-				if (subStepIds.has(sub.id)) {
-					throw new Error(`Workflow step ${step.id} duplicate for_each sub-step id: ${sub.id}`);
-				}
-				subStepIds.add(sub.id);
-			}
-			// The body is steps like any other. Its ids are its own: each item's results are
-			// gone after the item, and the loop's result carries what later steps can read.
-			validateSteps(step.steps, new Set<string>(), new Set([...known, loopItemVar, loopIndexVar]));
+			// The body is steps like any other, in a scope of its own that starts with the steps
+			// before the loop and the loop variables: no body step, however nested, may take one of
+			// their names and hide it. Its ids stay its own: each item's results are gone after
+			// the item, and the loop's result carries what later steps can read.
+			const inside = new Set([...known, loopItemVar, loopIndexVar]);
+			validateSteps(step.steps, new Set(inside), inside);
 			refuseGatesUnderRetry(step, "for_each");
 			if ((step.concurrency ?? 1) > 1 && containsGate(step.steps))
 				throw new Error(
 					`Workflow step ${step.id} for_each with concurrency cannot contain approval, input, sleep or wait steps: several items would wait at once`,
 				);
 		}
-		const shellCommand = typeof step.run === "string" ? step.run : step.command;
-		const pipeline = typeof step.pipeline === "string" ? step.pipeline : undefined;
-		const workflowRef =
-			typeof step.workflow === "string" && step.workflow.trim() ? step.workflow : undefined;
+		// Only `run` is read: a `command` beside it would be dropped without a word.
+		if (step.run !== undefined && step.command !== undefined)
+			throw new Error(`Workflow step ${step.id} takes run or command, not both`);
+		const shellCommand = shellCommandOf(step);
+		const pipeline = nonBlank(step.pipeline);
+		const workflowRef = nonBlank(step.workflow);
 		const isSleep = step.sleep !== undefined;
 		const isWait = step.wait !== undefined;
 		const isSwitch = step.switch !== undefined;
@@ -341,16 +358,21 @@ function validateSteps(steps: WorkflowStep[], seen: Set<string>, known: Set<stri
 				`Workflow step ${step.id} repeat steps cannot define approval (put it on a step inside)`,
 			);
 		}
-		if (isRepeat && step.stdin !== undefined && step.stdin !== null) {
+		// Only steps that run a command, or ask (no execution kind), read their input.
+		const readsStdin = Boolean(shellCommand || pipeline) || executionCount === 0;
+		if (step.stdin !== undefined && step.stdin !== null && !readsStdin)
 			throw new Error(
-				`Workflow step ${step.id} repeat steps cannot define stdin (give it to the steps inside)`,
+				`Workflow step ${step.id} stdin applies only to run, command, pipeline, input and approval steps (give it to the steps inside)`,
 			);
-		}
-		if (isSwitch && step.stdin !== undefined && step.stdin !== null) {
-			throw new Error(
-				`Workflow step ${step.id} switch steps cannot define stdin (give it to the steps in the cases)`,
-			);
-		}
+		if (step.workflow_args !== undefined && !workflowRef)
+			throw new Error(`Workflow step ${step.id} workflow_args applies only to workflow steps`);
+		// A command or the steps inside use env and cwd; a gate or an approval alone would drop them.
+		const usesEnv = executionCount > 0 && !isSleep && !isWait;
+		for (const key of ["env", "cwd"] as const)
+			if (step[key] !== undefined && !usesEnv)
+				throw new Error(
+					`Workflow step ${step.id} ${key} applies only to steps that run a command or contain steps`,
+				);
 		if ((isSleep || isWait) && isApprovalStep(step.approval)) {
 			throw new Error(`Workflow step ${step.id} sleep and wait steps cannot define approval`);
 		}
@@ -382,10 +404,7 @@ function validateSteps(steps: WorkflowStep[], seen: Set<string>, known: Set<stri
 		if (step.input && typeof step.input.prompt !== "string") {
 			throw new Error(`Workflow step ${step.id} input.prompt must be a string`);
 		}
-		if (
-			step.input &&
-			(step.input.responseSchema === undefined || typeof step.input.responseSchema !== "object")
-		) {
+		if (step.input && !isPlainObject(step.input.responseSchema)) {
 			throw new Error(`Workflow step ${step.id} input.responseSchema must be an object`);
 		}
 		if (step.input) {
@@ -419,39 +438,13 @@ function validateSteps(steps: WorkflowStep[], seen: Set<string>, known: Set<stri
 			if (approval.items !== undefined && !Array.isArray(approval.items)) {
 				throw new Error(`Workflow step ${step.id} approval.items must be a list`);
 			}
-			if (approval.initiated_by !== undefined && typeof approval.initiated_by !== "string") {
-				throw new Error(`Workflow step ${step.id} approval.initiated_by must be a string`);
-			}
-			if (approval.initiatedBy !== undefined && typeof approval.initiatedBy !== "string") {
-				throw new Error(`Workflow step ${step.id} approval.initiatedBy must be a string`);
-			}
-			if (
-				approval.required_approver !== undefined &&
-				typeof approval.required_approver !== "string"
-			) {
-				throw new Error(`Workflow step ${step.id} approval.required_approver must be a string`);
-			}
-			if (
-				approval.requiredApprover !== undefined &&
-				typeof approval.requiredApprover !== "string"
-			) {
-				throw new Error(`Workflow step ${step.id} approval.requiredApprover must be a string`);
-			}
-			if (
-				approval.require_different_approver !== undefined &&
-				typeof approval.require_different_approver !== "boolean"
-			) {
-				throw new Error(
-					`Workflow step ${step.id} approval.require_different_approver must be a boolean`,
-				);
-			}
-			if (
-				approval.requireDifferentApprover !== undefined &&
-				typeof approval.requireDifferentApprover !== "boolean"
-			) {
-				throw new Error(
-					`Workflow step ${step.id} approval.requireDifferentApprover must be a boolean`,
-				);
+			for (const [snake, camel, type] of APPROVAL_IDENTITY_SPELLINGS) {
+				for (const key of [snake, camel])
+					if (approval[key] !== undefined && typeof approval[key] !== type)
+						throw new Error(`Workflow step ${step.id} approval.${key} must be a ${type}`);
+				// Only one is read: the other would be dropped without a word.
+				if (approval[snake] !== undefined && approval[camel] !== undefined)
+					throw new Error(`Workflow step ${step.id} approval takes ${snake} or ${camel}, not both`);
 			}
 			if (
 				approval.on_reject !== undefined &&
@@ -464,8 +457,12 @@ function validateSteps(steps: WorkflowStep[], seen: Set<string>, known: Set<stri
 		}
 		validateStepOptions(step, `Workflow step ${step.id}`, known);
 		if (seen.has(step.id)) {
-			throw new Error(`Duplicate workflow step id: ${step.id}`);
+			throw new Error(
+				`Duplicate workflow step id: ${step.id} (a step or loop variable in scope already has it)`,
+			);
 		}
+		// Taken before its switch cases or repeat steps are validated: none of them may reuse it.
+		seen.add(step.id);
 		if (isSwitch) {
 			// Validated after the switch's own condition: its cases run after that.
 			const before = new Set(seen);
@@ -484,7 +481,6 @@ function validateSteps(steps: WorkflowStep[], seen: Set<string>, known: Set<stri
 				known.add(branch.id);
 			}
 		}
-		seen.add(step.id);
 		known.add(step.id);
 	}
 }
@@ -582,6 +578,9 @@ function containsGate(steps: WorkflowStep[]): boolean {
 
 // Options every step accepts, wherever it is nested.
 function validateStepOptions(step: WorkflowStep, name: string, known: ReadonlySet<string>) {
+	checkStepRefs(step.stdin, `${name} stdin`, known);
+	checkStepRefs(step.for_each, `${name} for_each`, known);
+	if (isPlainObject(step.wait)) checkStepRefs(step.wait.match, `${name} wait.match`, known);
 	if (
 		step.timeout_ms !== undefined &&
 		(typeof step.timeout_ms !== "number" ||
@@ -662,18 +661,69 @@ function validateWaitTimeout(config: Record<string, unknown>, name: string) {
 		throw new Error(`${name}.on_timeout needs a timeout`);
 }
 
+/** What an event name may contain: `wait.event` and `lobster signal` check the same rule. */
+export const EVENT_NAME = /^[A-Za-z0-9_.:/-]+$/;
+export const EVENT_NAME_CHARS = "letters, digits and . _ : / -";
+
+/**
+ * `env` (an object of strings) and `cwd` (a string without NUL) on a workflow, step or branch.
+ * A YAML number or flag must be quoted: anything but a string would be dropped from the env.
+ */
+function validateEnvAndCwd(holder: Record<string, unknown>, name: string) {
+	const { env, cwd } = holder;
+	if (env !== undefined) {
+		if (!isPlainObject(env)) throw new Error(`${name} env must be an object of strings`);
+		for (const [key, value] of Object.entries(env)) {
+			if (typeof value !== "string")
+				throw new Error(`${name} env.${key} must be a string${envValueHint(value)}`);
+			if (key.includes("\0") || value.includes("\0"))
+				throw new Error(`${name} env.${key} cannot contain a NUL character`);
+		}
+	}
+	if (cwd !== undefined) {
+		if (typeof cwd !== "string") throw new Error(`${name} cwd must be a string`);
+		if (cwd.includes("\0")) throw new Error(`${name} cwd cannot contain a NUL character`);
+	}
+}
+
+/** How to fix a YAML value that is not a string: quote a number or flag; "" for empty. */
+function envValueHint(value: unknown) {
+	if (typeof value === "number" || typeof value === "boolean") return ` (quote it: "${value}")`;
+	if (value === null) return ' (use "" for empty)';
+	return "";
+}
+
 function validateEventWait(step: WorkflowStep, name: string) {
 	const wait = step.wait as unknown;
 	if (!isPlainObject(wait)) throw new Error(`${name} wait must be an object with an event name`);
-	if (typeof wait.event !== "string" || !/^[A-Za-z0-9_.:/-]+$/.test(wait.event))
-		throw new Error(`${name} wait.event must be an event name (letters, digits, . _ : / -)`);
+	if (typeof wait.event !== "string" || !EVENT_NAME.test(wait.event))
+		throw new Error(`${name} wait.event must be an event name (${EVENT_NAME_CHARS})`);
 	if (wait.match !== undefined && !isPlainObject(wait.match))
 		throw new Error(`${name} wait.match must be an object`);
 	validateWaitTimeout(wait, `${name} wait`);
 }
 
+/**
+ * An exact step reference (`$id.path`, alone) is read strictly: the step it names must run
+ * before this one, as a condition's must. Checked here, before earlier steps have acted.
+ * Strings inside objects (a wait's `match`) count too.
+ */
+function checkStepRefs(value: unknown, name: string, known: ReadonlySet<string>) {
+	if (isPlainObject(value)) {
+		for (const [key, item] of Object.entries(value)) checkStepRefs(item, `${name}.${key}`, known);
+		return;
+	}
+	if (typeof value !== "string") return;
+	const ref = parseStepRef(value.trim());
+	if (ref && !known.has(ref.id))
+		throw new Error(`${name} reads ${value.trim()}, but no step "${ref.id}" runs before it`);
+}
+
 // Checked here, not when the step is reached: by then earlier steps have had their effects.
 function validateCondition(step: WorkflowStep, name: string, known: ReadonlySet<string>) {
+	// Only one is read (`when` first): the other would be dropped without a word.
+	if (step.when != null && step.condition != null)
+		throw new Error(`${name} takes when or condition, not both`);
 	for (const key of ["when", "condition"] as const) {
 		const value = step[key];
 		if (
@@ -693,9 +743,9 @@ function validateCondition(step: WorkflowStep, name: string, known: ReadonlySet<
 	}
 }
 
-function validateRecovery(step: WorkflowStep) {
+function validateRecovery(step: { recovery?: unknown }, name: string) {
 	if (step.recovery !== undefined && step.recovery !== "repeat" && step.recovery !== "manual")
-		throw new Error("Workflow recovery must be repeat or manual");
+		throw new Error(`${name} recovery must be "repeat" or "manual"`);
 }
 
 // A misspelled key must not be ignored: `wehn:` would otherwise run its step unconditionally.
@@ -740,7 +790,14 @@ const REPEAT_KEYS = ["until", "max", "on_max"];
 const CASE_KEYS = ["when", "steps"];
 const RETRY_KEYS = ["max", "backoff", "delay_ms", "max_delay_ms", "jitter"];
 const COST_LIMIT_KEYS = ["max_usd", "action"];
+const ARG_KEYS = ["default", "description"];
 const INPUT_KEYS = ["prompt", "responseSchema", "defaults", "timeout", "on_timeout"];
+/** The approval identity settings, each accepted in either spelling (but not both). */
+const APPROVAL_IDENTITY_SPELLINGS = [
+	["initiated_by", "initiatedBy", "string"],
+	["required_approver", "requiredApprover", "string"],
+	["require_different_approver", "requireDifferentApprover", "boolean"],
+] as const;
 const APPROVAL_KEYS = [
 	"prompt",
 	"items",

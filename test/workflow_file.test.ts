@@ -332,10 +332,11 @@ test("workflow setup failure keeps the saved definition and consumes the accepte
 		const broken = {
 			steps: [
 				{ id: "approve", approval: "Continue?" },
+				// Loads, but fails once the approval's result is there: it is not a list.
 				{
 					id: "effect",
-					run: "node -e \"process.stdout.write('should not run')\"",
-					stdin: "$missing.stdout",
+					for_each: "$approve.approved",
+					steps: [{ id: "w", run: "node -e \"process.stdout.write('should not run')\"" }],
 				},
 			],
 		};
@@ -370,7 +371,7 @@ test("workflow setup failure keeps the saved definition and consumes the accepte
 					resume: payload,
 					approved: true,
 				}),
-			/Unknown step reference: missing\.stdout/,
+			/for_each: expected array/,
 		);
 		assert.equal(await readStateJson({ env, key: payload.stateKey! }), null);
 
@@ -396,7 +397,7 @@ test("workflow setup failure keeps the saved definition and consumes the accepte
 						mode: "tool",
 					},
 				}),
-			/Unknown step reference/,
+			/for_each: expected array/,
 		);
 		const restarted = await runWorkflowFile({
 			filePath,
@@ -408,7 +409,7 @@ test("workflow setup failure keeps the saved definition and consumes the accepte
 				mode: "tool",
 			},
 		});
-		const restartedPayload = decodeResumeToken(restarted.requiresApproval!.resumeToken!);
+		const restartedPayload = decodeResumeToken(restarted.requiresApproval!.resumeToken);
 		assert.equal(restartedPayload.kind, "workflow-file");
 		const retried = await runWorkflowFile({
 			filePath,
@@ -653,7 +654,7 @@ test("workflow resume can cancel a blocked checkpoint read without consuming the
 			mode: "tool" as const,
 		};
 		const first = await runWorkflowFile({ filePath, ctx });
-		const payload = decodeResumeToken(first.requiresApproval!.resumeToken!);
+		const payload = decodeResumeToken(first.requiresApproval!.resumeToken);
 		assert.equal(payload.kind, "workflow-file");
 		const lockPath = keyToPath(env.LOBSTER_STATE_DIR, payload.stateKey!) + ".lock";
 		await fsp.mkdir(lockPath);
@@ -1310,7 +1311,7 @@ test("workflow pipeline requestInput keeps full pipeline across repeated suspens
 	assert.equal(secondPayload.kind, "workflow-file");
 	const pipelineInput = await savedPipelineInput(env, secondPayload.stateKey!);
 	assert.equal(pipelineInput.resumeAtIndex, 1);
-	assert.equal(pipelineInput.pipeline.length, 2);
+	assert.equal(pipelineInput.stages.length, 2);
 
 	const done = await runWorkflowFile({
 		filePath,
@@ -1646,7 +1647,7 @@ test("workflow approval resumes require an explicit decision", async () => {
 				},
 				resume: payload,
 			}),
-		/requires --approve yes\|no/i,
+		/needs an approval: approved true or false \(`--approve yes\|no`\)/,
 	);
 });
 
@@ -2322,3 +2323,43 @@ async function closeServer(server: http.Server) {
 	if (!server.listening) return;
 	await new Promise<void>((resolve) => server.close(() => resolve()));
 }
+
+test("a step's output cannot replace the approval rules its workflow sets", async () => {
+	const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-workflow-"));
+	const stateDir = path.join(tmpDir, "state");
+	const filePath = path.join(tmpDir, "workflow.lobster");
+	await fsp.writeFile(
+		filePath,
+		JSON.stringify({
+			steps: [
+				{
+					id: "deploy",
+					command: `node -e "process.stdout.write(JSON.stringify({prompt:'Ship it?',requiredApprover:'mallory'}))"`,
+					approval: { prompt: "Deploy?", required_approver: "alice" },
+				},
+			],
+		}),
+		"utf8",
+	);
+	const env = { ...process.env, LOBSTER_STATE_DIR: stateDir };
+	const ctx = (extra: Record<string, string> = {}) => ({
+		stdin: process.stdin,
+		stdout: process.stdout,
+		stderr: process.stderr,
+		env: { ...env, ...extra },
+		mode: "tool" as const,
+	});
+	const paused = await runWorkflowFile({ filePath, ctx: ctx() });
+	assert.equal(paused.status, "needs_approval");
+	assert.equal(paused.requiresApproval?.prompt, "Deploy?");
+	assert.equal(paused.requiresApproval?.requiredApprover, "alice");
+	await assert.rejects(
+		runWorkflowFile({
+			filePath,
+			ctx: ctx({ LOBSTER_APPROVAL_APPROVED_BY: "mallory" }),
+			resume: decodeResumeToken(paused.requiresApproval?.resumeToken ?? ""),
+			approved: true,
+		}),
+		/requires approver 'alice', got 'mallory'/,
+	);
+});

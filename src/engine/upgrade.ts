@@ -12,7 +12,6 @@
 import { messageOf } from "../util/errors.js";
 import { promises as fs } from "node:fs";
 import path from "node:path";
-import { randomUUID } from "node:crypto";
 import { openStoreSession } from "../persistence/session.js";
 import { ensureDirectory } from "../state/atomic_file.js";
 import { reclaimOrphanedFileLock } from "../state/file_lock.js";
@@ -113,13 +112,7 @@ export async function upgradeStore({
 		.then(() => true)
 		.catch(() => false);
 	const session =
-		dryRun && !hasDatabase
-			? undefined
-			: await openStoreSession({
-					directory,
-					trackRuns: true,
-					readOnly: dryRun,
-				});
+		dryRun && !hasDatabase ? undefined : await openStoreSession({ directory, readOnly: dryRun });
 	const backup = path.join(directory, ".pre-upgrade", new Date().toISOString().replace(/:/g, "-"));
 	const keep = async (key: string) => {
 		if (dryRun) return;
@@ -170,10 +163,10 @@ export async function upgradeStore({
 					continue;
 				}
 				const runId = await session!.createWaitingRun({
-					id: randomUUID(),
 					kind: old.kind,
 					key,
 					execution: converted.execution,
+					records: converted.records,
 					continuation: converted.continuation,
 				});
 				report.converted.push({ checkpointId: key, workflow, runId });

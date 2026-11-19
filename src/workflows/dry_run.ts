@@ -1,55 +1,41 @@
 // `lobster run --dry-run`: the plan of a workflow, step by step, without running anything.
 // Conditions, templates and pipelines are checked as a run would check them; what depends on
 // output the plan does not have is marked as such.
-import { parsePipeline } from "../pipeline/parser.js";
+import { checkedStages } from "./pipeline_check.js";
 import { resolveRetryConfig } from "./retry.js";
 import type { CommandLookup } from "../commands/types.js";
-import { resolveArgsTemplate } from "./expressions.js";
+import { hasStepRef, resolveArgsTemplate } from "./expressions.js";
 import { checkConditionSyntax, conditionRefs, evaluateCondition } from "./conditions.js";
-import { createRecord, resolveInputValue } from "./values.js";
+import { createRecord } from "./values.js";
 import { getStepExecution, isApprovalStep, isInputStep, stepIds } from "./steps.js";
 import type { WorkflowStep, WorkflowStepResult, WorkflowRunResult } from "./types.js";
-import { messageOf } from "../util/errors.js";
 
+/** A step's stdin for the plan, when it is a step's output (which the plan does not have). */
 function dryRunStdinNote(stdin: unknown): string | null {
-	if (stdin === null || stdin === undefined) return null;
 	if (typeof stdin !== "string") return null;
 	const trimmed = stdin.trim();
-	// Strict step ref: '$step-id.stdout' or '$step-id.json'
-	if (/^\$[A-Za-z0-9_-]+\.(stdout|json)$/.test(trimmed)) {
+	// Exactly one step's output: '$step-id.stdout' or '$step-id.json'.
+	if (/^\$[A-Za-z0-9_-]+\.(stdout|json)$/.test(trimmed))
 		return `${trimmed}  [output unknown at plan time]`;
-	}
-	// Inline template ref: contains '$stepid.stdout' or '$stepid.json'
-	if (/\$[A-Za-z0-9_-]+\.(stdout|json)/.test(trimmed)) {
-		return `${trimmed}  [contains step output refs — unknown at plan time]`;
-	}
-	return null;
+	return hasStepRef(trimmed) ? annotated(trimmed) : null;
 }
 
-function dryRunTemplateNote(input: string): string | null {
-	if (/\$[A-Za-z0-9_-]+\.(stdout|json)/.test(input)) {
-		return "[contains step output refs — unknown at plan time]";
-	}
-	return null;
+/** `text` for the plan, marked when it holds step references the plan cannot fill in. */
+function annotated(text: string) {
+	return hasStepRef(text) ? `${text}  [contains step output refs — unknown at plan time]` : text;
 }
 
-function hasDeferredDryRunStageName(input: string) {
-	return /\$[A-Za-z0-9_-]+\.(stdout|json)/.test(input);
-}
-
+/** `input` with its args filled in, and the approvals of steps the plan has decided. */
 function resolveDryRunTemplate(
 	input: string,
 	args: Record<string, unknown>,
 	results: Record<string, WorkflowStepResult>,
 ) {
 	const withArgs = resolveArgsTemplate(input, args);
-	return withArgs.replace(/\$([A-Za-z0-9_-]+)\.(stdout|json|approved)/g, (match, id, field) => {
-		if (field === "approved") {
-			const step = results[id];
-			if (!step) return match;
-			return step.approved === true ? "true" : "false";
-		}
-		return match;
+	return withArgs.replace(/\$([A-Za-z0-9_-]+)\.approved/g, (match, id) => {
+		const step = results[id];
+		if (!step) return match;
+		return step.approved === true ? "true" : "false";
 	});
 }
 
@@ -162,8 +148,7 @@ function planSteps(
 		if (step.switch) {
 			lines.push(`  ${num}. ${step.id}  [switch]`);
 			planSwitch(step, resolvedArgs, results, ctx, undecided, lines, unknownCondition);
-			if (step.timeout_ms) lines.push(`     timeout: ${step.timeout_ms}ms`);
-			if (step.on_error && step.on_error !== "stop") lines.push(`     on_error: ${step.on_error}`);
+			lines.push(...stepSettingLines(step));
 			noteCondition();
 			continue;
 		}
@@ -179,8 +164,7 @@ function planSteps(
 			// Planned once; the last round's steps are what later steps see.
 			for (const line of planSteps(step.steps, resolvedArgs, results, ctx, undecided))
 				lines.push(`     ${line}`);
-			if (step.timeout_ms) lines.push(`     timeout: ${step.timeout_ms}ms`);
-			if (step.on_error && step.on_error !== "stop") lines.push(`     on_error: ${step.on_error}`);
+			lines.push(...stepSettingLines(step));
 			// How many rounds run, and what the last one produced, is known only when it runs.
 			undecided.add(step.id);
 			results[step.id] = { id: step.id };
@@ -191,15 +175,7 @@ function planSteps(
 		if (typeof step.for_each === "string" && Array.isArray(step.steps)) {
 			lines.push(`  ${num}. ${step.id}  [for_each]`);
 			const forEachRef = step.for_each;
-			const forEachNote = dryRunTemplateNote(forEachRef);
-			lines.push(`     for_each: ${forEachRef}${forEachNote ? `  ${forEachNote}` : ""}`);
-			if (forEachRef.trim().startsWith("$")) {
-				try {
-					resolveInputValue(forEachRef, resolvedArgs, results);
-				} catch (err) {
-					throw new Error(`Workflow step ${step.id} for_each: ${messageOf(err)}`);
-				}
-			}
+			lines.push(`     for_each: ${annotated(forEachRef)}`);
 			const dryItemVar = step.item_var ?? "item";
 			const dryIndexVar = step.index_var ?? "index";
 			lines.push(`     item_var: ${dryItemVar}, index_var: ${dryIndexVar}`);
@@ -214,25 +190,10 @@ function planSteps(
 			// The body is planned once, for an item the plan does not know.
 			for (const line of planSteps(step.steps, resolvedArgs, loopScopedResults, ctx, undecided))
 				lines.push(`     ${line}`);
-			if (step.timeout_ms) lines.push(`     timeout: ${step.timeout_ms}ms`);
-			if (step.on_error && step.on_error !== "stop") lines.push(`     on_error: ${step.on_error}`);
-			const retry = retryNote(step);
-			if (retry) lines.push(`     ${retry}`);
+			lines.push(...stepSettingLines(step));
 			results[step.id] = { id: step.id };
 			noteCondition();
 			continue;
-		}
-
-		// Validate stdin refs early — throws if a strict ref like '$missing.stdout'
-		// points to a step that doesn't exist at all (real execution would also fail).
-		// We call resolveInputValue with the current results so refs to steps we've
-		// already visited (placeholders) are accepted without throwing.
-		if (step.stdin !== undefined && step.stdin !== null) {
-			try {
-				resolveInputValue(step.stdin, resolvedArgs, results);
-			} catch (err) {
-				throw new Error(`Workflow step ${step.id} stdin: ${messageOf(err)}`);
-			}
 		}
 
 		const execution = getStepExecution(step);
@@ -246,23 +207,17 @@ function planSteps(
 			lines.push(`  ${num}. ${step.id}  [parallel]`);
 			lines.push(`     wait: ${step.parallel?.wait ?? "all"}`);
 			if (step.parallel?.timeout_ms) {
-				lines.push(`     timeout: ${step.parallel.timeout_ms}ms`);
+				lines.push(`     branches timeout: ${step.parallel.timeout_ms}ms`);
 			}
 			for (const branch of step.parallel?.branches ?? []) {
-				const branchShell = typeof branch.run === "string" ? branch.run : branch.command;
-				if (typeof branch.pipeline === "string" && branch.pipeline.trim()) {
-					const pipelineText = resolveDryRunTemplate(branch.pipeline, resolvedArgs, results);
-					const pipelineNote = dryRunTemplateNote(pipelineText);
-					checkedStages(pipelineText, ctx, `Parallel branch ${branch.id}`);
-					lines.push(
-						`     branch ${branch.id}: [pipeline] ${pipelineText}${pipelineNote ? `  ${pipelineNote}` : ""}`,
-					);
-				} else if (typeof branchShell === "string" && branchShell.trim()) {
-					const command = resolveDryRunTemplate(branchShell, resolvedArgs, results);
-					const commandNote = dryRunTemplateNote(command);
-					lines.push(
-						`     branch ${branch.id}: [shell] ${command}${commandNote ? `  ${commandNote}` : ""}`,
-					);
+				const branchExecution = getStepExecution(branch);
+				if (branchExecution.kind === "pipeline") {
+					const pipelineText = resolveDryRunTemplate(branchExecution.value, resolvedArgs, results);
+					checkedStages(pipelineText, ctx.registry, `Parallel branch ${branch.id}`);
+					lines.push(`     branch ${branch.id}: [pipeline] ${annotated(pipelineText)}`);
+				} else if (branchExecution.kind === "shell") {
+					const command = resolveDryRunTemplate(branchExecution.value, resolvedArgs, results);
+					lines.push(`     branch ${branch.id}: [shell] ${annotated(command)}`);
 				} else {
 					lines.push(`     branch ${branch.id}: [no-op]`);
 				}
@@ -270,9 +225,8 @@ function planSteps(
 			}
 		} else if (execution.kind === "workflow") {
 			const workflowPath = resolveDryRunTemplate(execution.value, resolvedArgs, results);
-			const pathNote = dryRunTemplateNote(workflowPath);
 			lines.push(`  ${num}. ${step.id}  [workflow]`);
-			lines.push(`     workflow: ${workflowPath}${pathNote ? `  ${pathNote}` : ""}`);
+			lines.push(`     workflow: ${annotated(workflowPath)}`);
 			if (step.workflow_args && typeof step.workflow_args === "object") {
 				const argKeys = Object.keys(step.workflow_args);
 				if (argKeys.length) {
@@ -281,16 +235,14 @@ function planSteps(
 			}
 		} else if (execution.kind === "shell") {
 			const command = resolveDryRunTemplate(execution.value, resolvedArgs, results);
-			const commandNote = dryRunTemplateNote(command);
 			lines.push(`  ${num}. ${step.id}  [shell]`);
-			lines.push(`     run: ${command}${commandNote ? `  ${commandNote}` : ""}`);
+			lines.push(`     run: ${annotated(command)}`);
 		} else if (execution.kind === "pipeline") {
 			const pipelineText = resolveDryRunTemplate(execution.value, resolvedArgs, results);
-			const pipelineNote = dryRunTemplateNote(pipelineText);
-			const stages = checkedStages(pipelineText, ctx, `Workflow step ${step.id}`);
+			const stages = checkedStages(pipelineText, ctx.registry, `Workflow step ${step.id}`);
 			lines.push(`  ${num}. ${step.id}  [pipeline]`);
-			lines.push(`     pipeline: ${pipelineText}${pipelineNote ? `  ${pipelineNote}` : ""}`);
-			if (stages.some((stage) => hasDeferredDryRunStageName(stage.name))) {
+			lines.push(`     pipeline: ${annotated(pipelineText)}`);
+			if (stages.some((stage) => hasStepRef(stage.name))) {
 				lines.push("     [command validation deferred — stage name depends on step output]");
 			}
 		} else {
@@ -298,10 +250,7 @@ function planSteps(
 		}
 
 		if (stdinNote) lines.push(`     stdin: ${stdinNote}`);
-		if (step.timeout_ms) lines.push(`     timeout: ${step.timeout_ms}ms`);
-		if (step.on_error && step.on_error !== "stop") lines.push(`     on_error: ${step.on_error}`);
-		const retry = retryNote(step);
-		if (retry) lines.push(`     ${retry}`);
+		lines.push(...stepSettingLines(step));
 		if (isApprovalStep(step.approval)) {
 			lines.push(`     [approval required]`);
 		}
@@ -311,7 +260,7 @@ function planSteps(
 		// Record a placeholder result so later steps can reference this step in conditions.
 		// For approval steps, model approval as granted so downstream conditions like
 		// $step.approved evaluate correctly in the plan (rather than always being false).
-		// We intentionally omit stdout/json — dryRunStdinNote() surfaces that gap.
+		// We intentionally omit stdout/json — dryRunStdinNote() marks that gap.
 		results[step.id] = isApprovalStep(step.approval)
 			? { id: step.id, approved: true }
 			: { id: step.id };
@@ -372,22 +321,15 @@ function planSwitch(
 	results[step.id] = { id: step.id };
 }
 
-/** The retry line of a step's plan, when it retries. */
-function retryNote(step: WorkflowStep) {
+/** The lines of a step's plan for its timeout, on_error and retry settings. */
+function stepSettingLines(step: WorkflowStep): string[] {
+	const lines: string[] = [];
+	if (step.timeout_ms) lines.push(`     timeout: ${step.timeout_ms}ms`);
+	if (step.on_error && step.on_error !== "stop") lines.push(`     on_error: ${step.on_error}`);
 	const retry = resolveRetryConfig(step.retry);
-	if (retry.max <= 1) return undefined;
-	return `retry: up to ${retry.max} attempts, ${retry.backoff} backoff (base: ${retry.delay_ms}ms${retry.jitter ? ", jitter" : ""})`;
-}
-
-/**
- * A pipeline's stages, checked as a run would check them: it parses, and every stage names a
- * known command (unless its name depends on output the plan does not have).
- */
-function checkedStages(pipelineText: string, ctx: PlanContext, what: string) {
-	if (!ctx.registry) throw new Error(`${what} requires a command registry for pipeline execution`);
-	const stages = parsePipeline(pipelineText, ctx.registry);
-	for (const stage of stages)
-		if (!hasDeferredDryRunStageName(stage.name) && !ctx.registry.get(stage.name))
-			throw new Error(`${what} pipeline references unknown command: ${stage.name}`);
-	return stages;
+	if (retry.max > 1)
+		lines.push(
+			`     retry: up to ${retry.max} attempts, ${retry.backoff} backoff (base: ${retry.delay_ms}ms${retry.jitter ? ", jitter" : ""})`,
+		);
+	return lines;
 }

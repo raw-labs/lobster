@@ -4,6 +4,7 @@ import { parseDuration, sleepUntil } from "../../util/duration.js";
 import { activation } from "../checkpoint.js";
 import type { Machine } from "../machine.js";
 import type { Scope } from "../scope.js";
+import { deliberateWait } from "../step_clock.js";
 import { publishWait, resolveWait, suspend, waitOf } from "../waits.js";
 
 const DEFAULT_INLINE_SLEEP_MS = 60_000;
@@ -31,8 +32,10 @@ export async function sleepStep(machine: Machine, step: WorkflowStep, key: strin
 	if (remaining > 0) {
 		if (remaining > inlineSleepMs(scope.ctx.env)) await suspend(machine, key, frame);
 		// Saved first: a crash or Ctrl-C while waiting leaves an ordinary sleeping run.
-		await publishWait(machine, key, frame);
-		await sleepUntil(until, scope.ctx.signal);
+		await deliberateWait(scope.holdClocks, async () => {
+			await publishWait(machine, key, frame);
+			await sleepUntil(until, scope.ctx.signal);
+		});
 	}
 	return resolveWait(machine, frame, {
 		id: step.id,

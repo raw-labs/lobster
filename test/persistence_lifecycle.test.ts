@@ -127,7 +127,7 @@ for (const backend of ["sqlite"] as const) {
 		test(`${backend}: pruning a failed resumed pipeline cannot revive its token, history=${history}`, async (t) => {
 			const directory = await fs.mkdtemp(path.join(os.tmpdir(), "lobster-failed-retention-"));
 			t.after(() => fs.rm(directory, { recursive: true, force: true }));
-			const store = await openStoreSession({ directory, trackRuns: true, history });
+			const store = await openStoreSession({ directory, history });
 			t.after(() => store.close());
 			let effects = 0;
 			const defaults = createDefaultRegistry();
@@ -163,7 +163,7 @@ for (const backend of ["sqlite"] as const) {
 	test(`${backend}: cancelling tracked SDK command input competes with answering it`, async (t) => {
 		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "lobster-sdk-decision-race-"));
 		t.after(() => fs.rm(directory, { recursive: true, force: true }));
-		const store = await openStoreSession({ directory, trackRuns: true });
+		const store = await openStoreSession({ directory });
 		t.after(() => store.close());
 		for (let iteration = 0; iteration < 3; iteration++) {
 			let effects = 0;
@@ -263,7 +263,7 @@ for (const backend of ["sqlite"] as const) {
 	test(`${backend}: an SDK cancellation that loses to an answer cannot report success`, async (t) => {
 		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "lobster-sdk-late-cancel-"));
 		t.after(() => fs.rm(directory, { recursive: true, force: true }));
-		const store = await openStoreSession({ directory, trackRuns: true });
+		const store = await openStoreSession({ directory });
 		t.after(() => store.close());
 		let effects = 0;
 		const sdk = new Lobster({ storeSession: store }).pipe({

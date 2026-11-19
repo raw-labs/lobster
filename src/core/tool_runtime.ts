@@ -1,31 +1,42 @@
 // Tool mode: a host (an agent's tool call, `lobster --mode tool`) runs a pipeline or workflow
 // file, or answers a wait, and gets one JSON envelope back: ok, the status, the output, and
 // what it waits for.
+import type { RunHooks } from "../engine/context.js";
 import type { WorkflowRunResult, WorkflowWaitingFor } from "../workflows/types.js";
-import { decisionCount, type ResumeDecision, type ResumeTarget } from "../resume/options.js";
-import { discardStream } from "../io/terminal.js";
+import {
+	decisionCount,
+	type Decision,
+	type ResumeDecision,
+	type ResumeTarget,
+} from "../resume/options.js";
+import { discardStream } from "../io/streams.js";
+import { approvalIndexKey, findStateKeyByApprovalId } from "../state/store.js";
+import { isApprovalId } from "../state/approval_id.js";
 import { createDefaultRegistry } from "../commands/registry.js";
-import { parsePipeline } from "../pipeline/parser.js";
+import { checkStages, parsePipeline } from "../pipeline/parser.js";
 import { runtimeErrorDetails } from "../persistence/backend.js";
 import { bindResumeGuard, sessionFromEnv } from "../persistence/context.js";
-import { findWaitAtRevision, callerId } from "../persistence/waits.js";
-import { encodeToken } from "../resume/token.js";
+import {
+	findWaitAtRevision,
+	callerId,
+	checkWaitReference,
+	visibleTo,
+} from "../persistence/waits.js";
 import { withExecution, withStoreContext } from "../persistence/execution.js";
 import type { PersistenceOptions } from "../persistence/context.js";
-import { decodeResumeToken, resolveApprovalId } from "../resume/resume.js";
-import { deleteApprovalId, cleanupApprovalIndexByStateKey } from "../state/store.js";
+import { decodeResumeToken } from "../resume/resume.js";
+import { workflowResumePayload } from "../resume/token.js";
 import { runWorkflowFile, runPipelineText, runIdOf } from "../engine/runner.js";
 import { InvalidAnswerError, UpgradeRequiredError } from "../engine/errors.js";
 import { savedByOlderVersion } from "../engine/upgrade.js";
 import { resolveWorkflowFile } from "../workflows/load.js";
 import { messageOf } from "../util/errors.js";
+import { isPlainObject } from "../util/objects.js";
 import type { CommandLookup } from "../commands/types.js";
 
 export type ToolRunContext = PersistenceOptions & {
-	_resumeSignalAborted?: boolean;
 	cwd?: string;
 	env?: Record<string, string | undefined>;
-	mode?: "tool" | "human" | "sdk";
 	stdin?: NodeJS.ReadableStream;
 	stdout?: NodeJS.WritableStream;
 	stderr?: NodeJS.WritableStream;
@@ -35,32 +46,21 @@ export type ToolRunContext = PersistenceOptions & {
 	/** The commands pipelines may use (default: the built-in packs). */
 	registry?: CommandLookup;
 	llmAdapters?: Record<string, unknown>;
+	/** Called as the run works (see RunHooks). */
+	hooks?: RunHooks;
 };
 
 export type ToolEnvelope = {
 	protocolVersion: 1;
 	runId?: string;
 	ok: boolean;
-	status?: "ok" | "needs_approval" | "needs_input" | "waiting" | "cancelled";
+	status?: WorkflowRunResult["status"];
 	output?: unknown[];
 	/** With `status: "waiting"`: the timer or event the run waits for. */
 	waitingFor?: WorkflowWaitingFor;
-	requiresApproval?: {
-		type?: "approval_request";
-		prompt: string;
-		items: unknown[];
-		preview?: string;
-		resumeToken?: string;
-		approvalId?: string;
-	} | null;
-	requiresInput?: {
-		type?: "input_request";
-		prompt: string;
-		responseSchema: unknown;
-		defaults?: unknown;
-		subject?: unknown;
-		resumeToken?: string;
-	} | null;
+	/** The question a paused run asks, as the run reports it. */
+	requiresApproval?: NonNullable<WorkflowRunResult["requiresApproval"]> | null;
+	requiresInput?: NonNullable<WorkflowRunResult["requiresInput"]> | null;
 	error?: {
 		type: string;
 		message: string;
@@ -69,78 +69,73 @@ export type ToolEnvelope = {
 	};
 };
 
-export async function runToolRequest(
-	options: Parameters<typeof runToolRequestInternal>[0],
-): Promise<ToolEnvelope> {
+/** What a tool request runs: a pipeline, or a workflow file with its args. */
+export type RunToolOptions = {
+	pipeline?: string;
+	filePath?: string;
+	args?: Record<string, unknown>;
+	ctx?: ToolRunContext;
+};
+
+export async function runToolRequest(options: RunToolOptions): Promise<ToolEnvelope> {
+	const ctx = createToolContext(options.ctx);
+	// The request is checked before a run is created: a refusal writes nothing.
+	const target = await toolRunTarget(options, ctx);
+	if ("protocolVersion" in target) return target;
 	try {
-		// Every run is recorded: pipelines run on the workflow engine as one-step workflows.
 		return await withExecution(
-			createToolContext({ ...options.ctx, trackRuns: true }),
-			options.filePath ? "workflow" : "pipeline",
-			(ctx) => runToolRequestInternal({ ...options, ctx }),
+			ctx,
+			"filePath" in target ? "workflow" : "pipeline",
+			async (bound) => {
+				try {
+					return runEnvelope(
+						"filePath" in target
+							? await runWorkflowFile({ filePath: target.filePath, args: options.args, ctx: bound })
+							: await runPipelineText({ pipeline: target.pipeline, ctx: bound }),
+					);
+				} catch (err) {
+					return errorEnvelope("runtime_error", err);
+				}
+			},
 		);
 	} catch (error) {
 		return errorEnvelope("runtime_error", error);
 	}
 }
 
-async function runToolRequestInternal({
-	pipeline,
-	filePath,
-	args,
-	ctx = {},
-}: {
-	pipeline?: string;
-	filePath?: string;
-	args?: Record<string, unknown>;
-	ctx?: ToolRunContext;
-}): Promise<ToolEnvelope> {
-	const runtime = createToolContext(ctx);
+/**
+ * What a tool request runs, checked without the store: one workflow file that exists (with
+ * `args`, an object, as the CLI's --args-json) or one pipeline that parses. A malformed
+ * request is a `parse_error` envelope.
+ */
+async function toolRunTarget(
+	{ pipeline, filePath, args }: RunToolOptions,
+	ctx: ToolContext,
+): Promise<{ filePath: string } | { pipeline: string } | ToolEnvelope> {
 	const hasPipeline = typeof pipeline === "string" && pipeline.trim().length > 0;
 	const hasFile = typeof filePath === "string" && filePath.trim().length > 0;
-
-	if (!hasPipeline && !hasFile) {
+	if (!hasPipeline && !hasFile)
 		return errorEnvelope("parse_error", "run requires either pipeline or filePath");
-	}
-	if (hasPipeline && hasFile) {
+	if (hasPipeline && hasFile)
 		return errorEnvelope("parse_error", "run accepts either pipeline or filePath, not both");
-	}
-
-	if (hasFile) {
-		let resolvedFilePath: string;
-		try {
-			resolvedFilePath = await resolveWorkflowFile(filePath!, runtime.cwd);
-		} catch (err) {
-			return errorEnvelope("parse_error", messageOf(err));
-		}
-
-		try {
-			return runEnvelope(await runWorkflowFile({ filePath: resolvedFilePath, args, ctx: runtime }));
-		} catch (err) {
-			return errorEnvelope("runtime_error", err);
-		}
-	}
-
+	if (args !== undefined && !isPlainObject(args))
+		return errorEnvelope("parse_error", "args must be a JSON object");
+	if (args !== undefined && hasPipeline)
+		return errorEnvelope(
+			"parse_error",
+			"args applies to a workflow file (filePath), not a pipeline",
+		);
 	try {
-		parsePipeline(String(pipeline), runtime.registry);
+		if (hasFile) return { filePath: await resolveWorkflowFile(filePath!, ctx.cwd) };
+		checkStages(parsePipeline(pipeline!, ctx.registry), ctx.registry);
+		return { pipeline: pipeline! };
 	} catch (err) {
 		return errorEnvelope("parse_error", messageOf(err));
-	}
-
-	try {
-		return runEnvelope(
-			await runPipelineText({
-				pipeline: String(pipeline),
-				ctx: { ...runtime, mode: "tool" },
-			}),
-		);
-	} catch (err) {
-		return errorEnvelope("runtime_error", err);
 	}
 }
 
 /** The tool envelope for a workflow or pipeline run result. */
-function runEnvelope(output: WorkflowRunResult & { runId?: string }): ToolEnvelope {
+export function runEnvelope(output: WorkflowRunResult & { runId?: string }): ToolEnvelope {
 	const runId = output.runId ? { runId: output.runId } : {};
 	if (output.status === "needs_approval")
 		return { ...okEnvelope("needs_approval", [], output.requiresApproval ?? null, null), ...runId };
@@ -155,159 +150,146 @@ function runEnvelope(output: WorkflowRunResult & { runId?: string }): ToolEnvelo
 
 export type ResumeToolOptions = ResumeTarget & ResumeDecision & { ctx?: ToolRunContext };
 
+/**
+ * Answer a wait, named by a resume token, a short approval ID, or a wait ID with the revision
+ * the answer is for. The reference is resolved once, to the key the wait is published under.
+ */
 export function resumeToolRequest(options: ResumeToolOptions): Promise<ToolEnvelope>;
 export async function resumeToolRequest(
-	options: Parameters<typeof resumeToolRequestInternal>[0] & {
+	options: {
+		token?: string;
+		approvalId?: string;
 		waitId?: string;
 		expectedRevision?: number;
-	},
+		ctx?: ToolRunContext;
+	} & Decision,
 ): Promise<ToolEnvelope> {
-	const entry = createToolContext(options.ctx);
-	entry._resumeSignalAborted = entry.signal?.aborted === true;
-	if (options.waitId !== undefined) entry.trackRuns = true;
+	// The request is checked before the store is opened: a refusal writes nothing.
+	const reference = resumeReference(options);
+	if ("protocolVersion" in reference) return reference;
 	try {
-		return await withStoreContext(entry, async (ctx) => {
-			let resolved = options;
-			if (options.waitId !== undefined) {
-				if (options.token || options.approvalId || options.expectedRevision === undefined) {
-					return errorEnvelope(
-						"parse_error",
-						"waitId requires expectedRevision and cannot be combined with token or approvalId",
-					);
+		return await withStoreContext(createToolContext(options.ctx), async (ctx) => {
+			const store = sessionFromEnv(ctx.env)!;
+			let stateKey: string;
+			if ("waitId" in reference) {
+				const { waitId, expectedRevision } = reference;
+				stateKey = (
+					await findWaitAtRevision(store, waitId, expectedRevision, callerId(ctx.runMetadata))
+				).key;
+				ctx = { ...ctx, env: bindResumeGuard(ctx.env, { key: stateKey, expectedRevision }) };
+			} else if ("stateKey" in reference) {
+				stateKey = reference.stateKey;
+			} else {
+				const { approvalId } = reference;
+				const notFound = () =>
+					errorEnvelope("parse_error", `Approval ID "${approvalId}" not found or expired`);
+				const found = await findStateKeyByApprovalId({ env: ctx.env, approvalId });
+				if (!found) {
+					const indexKey = approvalIndexKey(approvalId);
+					if (indexKey && (await savedByOlderVersion(store.directory, indexKey)))
+						return errorEnvelope("upgrade_required", new UpgradeRequiredError());
+					return notFound();
 				}
-				if (
-					decisionCount(options) !== 1 ||
-					!Number.isSafeInteger(options.expectedRevision) ||
-					options.expectedRevision < 0
-				) {
-					return errorEnvelope(
-						"parse_error",
-						"wait resume requires a non-negative revision and exactly one of approved, response, or cancel",
-					);
-				}
-				const store = sessionFromEnv(ctx.env);
-				if (!store) throw new Error("Wait resume requires a persistence session");
-				const wait = await findWaitAtRevision(
-					store,
-					options.waitId,
-					options.expectedRevision,
-					callerId(ctx.runMetadata),
-				);
-				ctx = {
-					...ctx,
-					env: bindResumeGuard(ctx.env, {
-						key: wait.key,
-						expectedRevision: options.expectedRevision,
-						admitted: false,
-					}),
-				};
-				resolved = {
-					...options,
-					token: encodeToken({
-						protocolVersion: 1,
-						v: 1,
-						kind: "workflow-file",
-						stateKey: wait.key,
-					}),
-				};
-			} else if (options.expectedRevision !== undefined) {
-				return errorEnvelope("parse_error", "expectedRevision requires waitId");
-			}
-			let key: string | undefined;
-			try {
-				const payload = resolved.token
-					? decodeResumeToken(resolved.token)
-					: resolved.approvalId
-						? decodeResumeToken(await resolveApprovalId(resolved.approvalId, ctx.env))
-						: undefined;
-				key = payload?.stateKey;
-			} catch {
-				/* normal parser reports the error */
+				// Another caller's approval reads like an unknown one: it tells nothing about that run.
+				const owner = (await store.read(found)).runId;
+				const run = owner ? await store.getRunState(owner) : null;
+				if (owner && (!run || !visibleTo(run, callerId(ctx.runMetadata)))) return notFound();
+				stateKey = found;
 			}
 			// Still in a file an older Lobster wrote: it has to be imported first.
-			const store = sessionFromEnv(ctx.env)!;
-			const unimported =
-				key !== undefined
-					? (await store.read(key)).text === null && key
-					: resolved.approvalId &&
-						`approval_${String(resolved.approvalId).replace(/[^a-f0-9]/g, "")}`;
-			if (unimported && (await savedByOlderVersion(store.directory, unimported)))
+			if (
+				(await store.read(stateKey)).text === null &&
+				(await savedByOlderVersion(store.directory, stateKey))
+			)
 				return errorEnvelope("upgrade_required", new UpgradeRequiredError());
-			return resumeToolRequestInternal({ ...resolved, ctx });
+			return answerWait(ctx, stateKey, options);
 		});
 	} catch (error) {
-		if (
-			entry.signal?.aborted &&
-			(options.cancel === true || (options.approved === false && !entry._resumeSignalAborted))
-		) {
-			throw error;
-		}
+		// Every failure is an envelope, a host's stop included, wherever it lands.
 		return errorEnvelope("runtime_error", error);
 	}
 }
 
-async function resumeToolRequestInternal({
-	token,
-	approvalId,
-	approved,
-	response,
-	cancel,
-	ctx = {},
-}: {
-	token?: string;
-	approvalId?: string;
-	approved?: boolean;
-	response?: unknown;
-	cancel?: boolean;
-	ctx?: ToolRunContext;
-}): Promise<ToolEnvelope> {
-	const runtime = createToolContext(ctx);
-	let payload: ReturnType<typeof decodeResumeToken>;
-	try {
-		let resolvedToken: string;
-		if (approvalId) {
-			resolvedToken = await resolveApprovalId(approvalId, runtime.env);
-		} else if (token) {
-			resolvedToken = token;
-		} else {
-			return errorEnvelope("parse_error", "resume requires token or approvalId");
+/**
+ * What a resume request names, checked without the store: a wait at a revision, the key a
+ * token encodes, or a short approval ID. A malformed request is a `parse_error` envelope.
+ */
+function resumeReference(
+	options: {
+		token?: string;
+		approvalId?: string;
+		waitId?: string;
+		expectedRevision?: number;
+	} & Decision,
+):
+	| { waitId: string; expectedRevision: number }
+	| { stateKey: string }
+	| { approvalId: string }
+	| ToolEnvelope {
+	const { token, approvalId, waitId, expectedRevision } = options;
+	// The same rule and words as the engine's (waits.answer), checked here before any store work.
+	// No decision at all is left to the question, which says what it needs.
+	if (decisionCount(options) > 1)
+		return errorEnvelope("parse_error", "resume takes only one of approved, response, or cancel");
+	if (waitId !== undefined) {
+		if (token || approvalId || expectedRevision === undefined)
+			return errorEnvelope(
+				"parse_error",
+				"waitId requires expectedRevision and cannot be combined with token or approvalId",
+			);
+		try {
+			checkWaitReference(waitId, expectedRevision);
+		} catch (err) {
+			return errorEnvelope("parse_error", messageOf(err));
 		}
-		payload = decodeResumeToken(resolvedToken);
-	} catch (err) {
-		return errorEnvelope("parse_error", messageOf(err));
+		return { waitId, expectedRevision };
 	}
+	if (expectedRevision !== undefined)
+		return errorEnvelope("parse_error", "expectedRevision requires waitId");
+	if (token && approvalId)
+		return errorEnvelope("parse_error", "resume takes a token or an approvalId, not both");
+	if (token) {
+		try {
+			return { stateKey: decodeResumeToken(token).stateKey };
+		} catch (err) {
+			return errorEnvelope("parse_error", messageOf(err));
+		}
+	}
+	if (approvalId) {
+		if (!isApprovalId(approvalId))
+			return errorEnvelope("parse_error", "Invalid approval ID (8 lowercase hex characters)");
+		return { approvalId };
+	}
+	return errorEnvelope("parse_error", "resume requires token or approvalId");
+}
 
-	// Pipelines and workflow files are both runs: one resume path for every token.
-	let stateKey = payload.stateKey;
+/**
+ * Answer the wait published under `stateKey`. Pipelines and workflow files are both runs: one
+ * resume path for every reference. Answering consumes the wait and withdraws its approval ID.
+ */
+async function answerWait(
+	ctx: ToolContext,
+	stateKey: string,
+	{ approved, response, cancel }: Decision,
+): Promise<ToolEnvelope> {
 	try {
-		const output = await runWorkflowFile({
-			filePath: payload.filePath,
-			ctx: {
-				...runtime,
-				hooks: {
-					onResumeStateResolved: (key) => {
-						stateKey = key;
-					},
-				},
-			},
-			resume: payload,
-			approved,
-			response,
-			cancel,
-		});
-		if (output.status !== "needs_approval" && output.status !== "needs_input") {
-			if (approvalId) await deleteApprovalId({ env: runtime.env, approvalId });
-			else if (stateKey) await cleanupApprovalIndexByStateKey({ env: runtime.env, stateKey });
-		}
-		return runEnvelope(output);
+		return runEnvelope(
+			await runWorkflowFile({
+				ctx,
+				resume: workflowResumePayload(stateKey),
+				approved,
+				response,
+				cancel,
+			}),
+		);
 	} catch (err) {
-		if (err instanceof InvalidAnswerError) {
-			return errorEnvelope("parse_error", err.message);
-		}
-		// Non-abort failures and cancellations before step execution remain retryable.
+		if (err instanceof InvalidAnswerError) return errorEnvelope("parse_error", err.message);
 		return errorEnvelope("runtime_error", err);
 	}
 }
+
+/** A tool request's context, with every default filled in. */
+type ToolContext = ReturnType<typeof createToolContext>;
 
 export function createToolContext(ctx: ToolRunContext = {}) {
 	return {
@@ -324,14 +306,13 @@ export function createToolContext(ctx: ToolRunContext = {}) {
 		llmAdapters: ctx.llmAdapters,
 		storeSession: ctx.storeSession,
 		history: ctx.history,
-		trackRuns: ctx.trackRuns,
 		runMetadata: ctx.runMetadata,
-		_resumeSignalAborted: ctx._resumeSignalAborted,
+		hooks: ctx.hooks,
 	};
 }
 
 function okEnvelope(
-	status: "ok" | "needs_approval" | "needs_input" | "waiting" | "cancelled",
+	status: WorkflowRunResult["status"],
 	output: unknown[],
 	requiresApproval: ToolEnvelope["requiresApproval"],
 	requiresInput: ToolEnvelope["requiresInput"],
@@ -346,7 +327,8 @@ function okEnvelope(
 	};
 }
 
-function errorEnvelope(type: string, error: unknown): ToolEnvelope {
+/** The envelope of a request that failed, naming its run when it has one. */
+export function errorEnvelope(type: string, error: unknown): ToolEnvelope {
 	// A run that failed names itself, so the caller can retry it with `runs advance`.
 	const runId = runIdOf(error);
 	return {

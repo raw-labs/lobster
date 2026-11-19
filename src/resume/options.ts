@@ -14,6 +14,9 @@ export type ResumeTarget =
 	| { approvalId: string; token?: undefined; waitId?: undefined; expectedRevision?: undefined }
 	| { waitId: string; expectedRevision: number; token?: undefined; approvalId?: undefined };
 
+/** An answer as callers pass it, checked to make exactly one decision (see decisionCount). */
+export type Decision = { approved?: boolean; response?: unknown; cancel?: boolean };
+
 /** How many decisions `options` makes (approve or reject, a response, a cancel): one is valid. */
 export function decisionCount(options: {
 	approved?: unknown;

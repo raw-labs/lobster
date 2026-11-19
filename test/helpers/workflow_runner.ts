@@ -8,7 +8,7 @@ import { PassThrough } from "node:stream";
 import { advanceWorkflowRun, runWorkflowFile } from "../../src/engine/runner.js";
 import { signalEvent } from "../../src/engine/due.js";
 import { openStoreSession } from "../../src/persistence/session.js";
-import { decodeToken } from "../../src/resume/token.js";
+import { decodeResumeToken } from "../../src/resume/resume.js";
 import type { WorkflowRunResult } from "../../src/workflows/types.js";
 import type { ExecutionState } from "../../src/engine/checkpoint.js";
 import { createFakeCommand, type FakeCommand } from "./fake_command.js";
@@ -90,7 +90,7 @@ export async function workflowFixture(t: TestContext, prefix = "lobster-contract
 		async resume(result: RunResult, answers: Answers & { cancel?: boolean } = {}) {
 			const token = result.requiresApproval?.resumeToken ?? result.requiresInput?.resumeToken ?? "";
 			assert(token, `run did not stop at a gate: ${JSON.stringify(result)}`);
-			const resume = decodeToken(token);
+			const resume = decodeResumeToken(token);
 			const decision = answers.cancel
 				? { cancel: true }
 				: result.status === "needs_approval"

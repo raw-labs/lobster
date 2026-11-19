@@ -66,7 +66,7 @@ steps:
         - when: $classify.json.label == refund && $classify.json.score >= 0.8
           steps:
             - id: confirm
-              approval: Issue the refund?
+              approval: { prompt: Issue the refund?, on_reject: continue }
             - id: refund
               run: billing refund --email ${email}
               when: $confirm.approved
@@ -117,7 +117,7 @@ lobster run --mode tool --file workflow.lobster --args-json '{"tag":"family"}'
 - **`runId`** names the run, also on failures, so `lobster runs advance <runId>` can retry it.
 
 A pipeline works the same way without a file: `lobster run --mode tool "exec --json --shell
-'echo [1,2,3]' | where '0>=0'"`. Hosts can embed Lobster through
+'echo [1,2,3]' | head --n 2"`. Hosts can embed Lobster through
 `@clawdbot/lobster/core` (`runToolRequest`, `resumeToolRequest`) or the SDK.
 
 ## Operating runs

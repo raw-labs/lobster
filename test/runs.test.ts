@@ -92,7 +92,7 @@ for (const backend of ["sqlite"] as const) {
 				.pipe(() => [1])
 				.pipe(approve({ prompt: "Continue?" }))
 				.pipe((items) => items.map((item) => item + 1));
-		let store = await openCoreStore({ directory, trackRuns: true });
+		let store = await openCoreStore({ directory });
 		try {
 			assert.equal("backend" in store, false);
 			assert.equal("transition" in store, false);
@@ -136,7 +136,7 @@ for (const backend of ["sqlite"] as const) {
 			t.after(() => fs.rm(directory, { recursive: true, force: true }));
 			const fixture = await reviewFixture(directory, true);
 			const state = path.join(directory, "state");
-			let store = await openStoreSession({ directory: state, trackRuns: true, history });
+			let store = await openStoreSession({ directory: state, history });
 			try {
 				const first = await runToolRequest({
 					filePath: fixture.filePath,
@@ -241,7 +241,6 @@ for (const backend of ["sqlite"] as const) {
 		);
 		let store = await openStoreSession({
 			directory: path.join(directory, "state"),
-			trackRuns: true,
 		});
 		try {
 			const first = await runToolRequest({ filePath, ctx: scoped(store) });
@@ -273,7 +272,7 @@ for (const backend of ["sqlite"] as const) {
 	test(`${backend}: scope all discovery and decisions to trusted caller context`, async (t) => {
 		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "lobster-discovery-scope-"));
 		t.after(() => fs.rm(directory, { recursive: true, force: true }));
-		const store = await openStoreSession({ directory, trackRuns: true });
+		const store = await openStoreSession({ directory });
 		try {
 			const a = await runToolRequest({
 				pipeline: 'ask --prompt "First" --schema \'{"type":"integer"}\'',
@@ -349,7 +348,6 @@ for (const backend of ["sqlite"] as const) {
 		);
 		const store = await openStoreSession({
 			directory: path.join(directory, "state"),
-			trackRuns: true,
 			history: true,
 		});
 		try {
@@ -386,7 +384,7 @@ for (const backend of ["sqlite"] as const) {
 	test(`${backend}: answer revision is checked atomically at checkpoint consumption`, async (t) => {
 		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "lobster-discovery-cas-"));
 		t.after(() => fs.rm(directory, { recursive: true, force: true }));
-		const store = await openStoreSession({ directory, trackRuns: true });
+		const store = await openStoreSession({ directory });
 		try {
 			const first = await runToolRequest({
 				pipeline: 'ask --prompt "Question" --schema \'{"type":"integer"}\'',
@@ -432,7 +430,6 @@ for (const backend of ["sqlite"] as const) {
 		const fixture = await reviewFixture(directory);
 		const store = await openStoreSession({
 			directory: path.join(directory, "state"),
-			trackRuns: true,
 		});
 		try {
 			const first = await runToolRequest({
@@ -469,7 +466,7 @@ for (const backend of ["sqlite"] as const) {
 	test(`${backend}: migration preserves discoverable wait identities and review context`, async (t) => {
 		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "lobster-discovery-migrate-"));
 		t.after(() => fs.rm(directory, { recursive: true, force: true }));
-		let store = await openStoreSession({ directory, trackRuns: true });
+		let store = await openStoreSession({ directory });
 		try {
 			const first = await runToolRequest({
 				pipeline: 'ask --prompt "Persisted question" --schema \'{"type":"integer"}\'',
@@ -500,7 +497,7 @@ for (const backend of ["sqlite"] as const) {
 		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "lobster-discovery-sdk-"));
 		t.after(() => fs.rm(directory, { recursive: true, force: true }));
 		let preparations = 0;
-		let store = await openStoreSession({ directory, trackRuns: true });
+		let store = await openStoreSession({ directory });
 		const workflow = () =>
 			new Lobster({ storeSession: store, runMetadata: { callerId: "logical-session-a" } })
 				.pipe(() => {
@@ -557,7 +554,6 @@ for (const backend of ["sqlite"] as const) {
 		const env = {
 			...process.env,
 			LOBSTER_STATE_DIR: directory,
-			LOBSTER_RUNS: "1",
 			LOBSTER_HISTORY: "0",
 		};
 		const cli = async (...args: string[]) =>
@@ -598,39 +594,29 @@ test("resume takes one reference of any kind and keeps the released flags", () =
 	const waitId = `${"0".repeat(8)}-0000-4000-8000-${"0".repeat(12)}.${"a".repeat(64)}`;
 	const token = Buffer.from('{"protocolVersion":1}').toString("base64url");
 	assert.deepEqual(parseResumeArgs([token, "--approve", "yes"]), {
-		token,
-		approvalId: null,
-		approved: true,
+		target: { token },
+		decision: { approved: true },
 	});
 	assert.deepEqual(parseResumeArgs(["a9d03673", "--approve", "no"]), {
-		token: null,
-		approvalId: "a9d03673",
-		approved: false,
+		target: { approvalId: "a9d03673" },
+		decision: { approved: false },
 	});
 	assert.deepEqual(parseResumeArgs([waitId, "--expected-revision=3", "--response-json", "42"]), {
-		token: null,
-		approvalId: null,
-		waitId,
-		expectedRevision: 3,
-		response: 42,
+		target: { waitId, expectedRevision: 3 },
+		decision: { response: 42 },
 	});
 	assert.deepEqual(parseResumeArgs(["--cancel", waitId]), {
-		token: null,
-		approvalId: null,
-		waitId,
-		expectedRevision: null,
-		cancel: true,
+		target: { waitId },
+		decision: { cancel: true },
 	});
 	// Released spellings.
 	assert.deepEqual(parseResumeArgs(["--token", "fixture", "--decision", "yes"]), {
-		token: "fixture",
-		approvalId: null,
-		approved: true,
+		target: { token: "fixture" },
+		decision: { approved: true },
 	});
 	assert.deepEqual(parseResumeArgs(["--id=a9d03673", "--cancel"]), {
-		token: null,
-		approvalId: "a9d03673",
-		cancel: true,
+		target: { approvalId: "a9d03673" },
+		decision: { cancel: true },
 	});
 	assert.throws(
 		() => parseResumeArgs(["--approve", "yes"]),

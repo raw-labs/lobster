@@ -1,39 +1,40 @@
-import { decodeToken, encodeToken } from "./token.js";
-import { decodeWorkflowResumePayload, type WorkflowResumePayload } from "./token.js";
-import { findStateKeyByApprovalId } from "../state/store.js";
+// `lobster resume`: its command line, the three kinds of reference it takes, and turning a
+// resume token into the key of the wait it answers.
+import { decodeToken, decodeWorkflowResumePayload, workflowResumePayload } from "./token.js";
+import type { ResumeDecision } from "./options.js";
 import { parseArgv } from "../util/argv.js";
-
-const APPROVAL_ID = /^[0-9a-f]{8}$/;
-const WAIT_ID = /^[0-9a-f-]{36}\.[0-9a-f]{64}$/;
+import { isPlainObject } from "../util/objects.js";
+import { yesOrNo } from "../io/terminal.js";
+import { isApprovalId } from "../state/approval_id.js";
+import { isWaitId } from "../persistence/model.js";
 
 /**
  * What a resume reference names. The three forms cannot be confused: a short approval ID is
  * 8 hex characters, a wait ID is `<run id>.<64 hex>`, and a token is base64url JSON.
  */
-export function classifyResumeRef(
+function classifyResumeRef(
 	ref: string,
 ): { approvalId: string } | { waitId: string } | { token: string } {
-	if (APPROVAL_ID.test(ref)) return { approvalId: ref };
-	if (WAIT_ID.test(ref)) return { waitId: ref };
+	if (isApprovalId(ref)) return { approvalId: ref };
+	if (isWaitId(ref)) return { waitId: ref };
 	return { token: ref };
 }
+
+/** A parsed `lobster resume`: the wait it answers, and the one decision. */
+export type ResumeArgs = {
+	/** A wait ID may carry the revision the answer is for (the stale-question guard). */
+	target:
+		| { token: string }
+		| { approvalId: string }
+		| { waitId: string; expectedRevision?: number };
+	decision: ResumeDecision;
+};
 
 /**
  * `lobster resume <ref> --approve yes|no | --response-json '{...}' | --cancel`.
  * `<ref>` is a resume token, a short approval ID or a wait ID. The released spellings
  * `--token <t>`, `--id <approvalId>` and `--decision` keep working.
  */
-/** A parsed `lobster resume`: one reference and one decision. */
-export type ResumeArgs = {
-	token: string | null;
-	approvalId: string | null;
-	waitId?: string;
-	expectedRevision?: number | null;
-	approved?: boolean;
-	response?: unknown;
-	cancel?: boolean;
-};
-
 export function parseResumeArgs(argv: string[]): ResumeArgs {
 	const { flags, positional } = parseArgv(
 		argv,
@@ -75,13 +76,10 @@ export function parseResumeArgs(argv: string[]): ResumeArgs {
 			: { approvalId: String(args.approvalId) };
 	if (args.expectedRevision !== null && !("waitId" in target))
 		throw new Error("resume --expected-revision applies only to a wait ID");
-	const base = {
-		token: "token" in target ? target.token : null,
-		approvalId: "approvalId" in target ? target.approvalId : null,
-		...("waitId" in target
-			? { waitId: target.waitId, expectedRevision: args.expectedRevision }
-			: {}),
-	};
+	const withRevision =
+		"waitId" in target && args.expectedRevision !== null
+			? { ...target, expectedRevision: args.expectedRevision }
+			: target;
 	const intentCount =
 		Number(Boolean(args.decision)) + Number(args.responseJson !== null) + Number(args.cancel);
 	if (intentCount > 1) {
@@ -91,55 +89,38 @@ export function parseResumeArgs(argv: string[]): ResumeArgs {
 		throw new Error("resume requires --approve yes|no, --response-json, or --cancel");
 	}
 
-	if (args.cancel) return { ...base, cancel: true };
+	return { target: withRevision, decision: parseDecision(args) };
+}
 
+function parseDecision(args: {
+	cancel: boolean;
+	responseJson: string | null;
+	decision: string | null;
+}): ResumeDecision {
+	if (args.cancel) return { cancel: true };
 	if (args.responseJson !== null) {
 		try {
-			return { ...base, response: JSON.parse(String(args.responseJson)) };
+			return { response: JSON.parse(args.responseJson) };
 		} catch {
 			throw new Error("resume --response-json must be valid JSON");
 		}
 	}
-
-	const decision = String(args.decision).toLowerCase();
-	if (!["yes", "y", "no", "n"].includes(decision))
-		throw new Error("resume --approve must be yes or no");
-	return { ...base, approved: decision === "yes" || decision === "y" };
+	const approved = yesOrNo(String(args.decision));
+	if (approved === undefined) throw new Error("resume --approve must be yes or no");
+	return { approved };
 }
 
-/** Resolve an approval ID to a resume token by looking up the state key. */
-export async function resolveApprovalId(
-	approvalId: string,
-	env: Record<string, string | undefined>,
-): Promise<string> {
-	const stateKey = await findStateKeyByApprovalId({ env, approvalId });
-	if (!stateKey) {
-		throw new Error(`Approval ID "${approvalId}" not found or expired`);
-	}
-
-	return encodeToken({
-		protocolVersion: 1,
-		v: 1,
-		kind: "workflow-file",
-		stateKey,
-	});
-}
-
+/** The workflow resume payload a token carries, checked. */
 export function decodeResumeToken(token: string) {
 	const payload = decodeToken(token);
-	if (!payload || typeof payload !== "object") throw new Error("Invalid token");
+	if (!isPlainObject(payload)) throw new Error("Invalid token");
 	if (payload.protocolVersion !== 1) throw new Error("Unsupported protocol version");
 	if (payload.v !== 1) throw new Error("Unsupported token version");
 	// Tokens handed out for paused pipelines before they became runs name their state key
 	// the same way; `lobster upgrade` converted that state into a run under the same key.
 	if (payload.kind === "pipeline-resume") {
 		if (!payload.stateKey || typeof payload.stateKey !== "string") throw new Error("Invalid token");
-		return {
-			protocolVersion: 1,
-			v: 1,
-			kind: "workflow-file",
-			stateKey: payload.stateKey,
-		} satisfies WorkflowResumePayload as WorkflowResumePayload;
+		return workflowResumePayload(payload.stateKey);
 	}
 	const workflowPayload = decodeWorkflowResumePayload(payload);
 	if (workflowPayload) return workflowPayload;

@@ -21,9 +21,9 @@ export function stepKind(step: WorkflowStep): StepKind {
 	if (step.switch) return "switch";
 	if (step.repeat) return "repeat";
 	if (step.for_each !== undefined) return "for_each";
-	if (typeof step.workflow === "string" && step.workflow.trim()) return "workflow";
-	if (typeof step.pipeline === "string" && step.pipeline.trim()) return "pipeline";
-	if (typeof step.run === "string" || typeof step.command === "string") return "run";
+	if (nonBlank(step.workflow)) return "workflow";
+	if (nonBlank(step.pipeline)) return "pipeline";
+	if (shellCommandOf(step)) return "run";
 	if (step.sleep !== undefined) return "sleep";
 	if (step.wait) return "wait";
 	if (isInputStep(step.input)) return "input";
@@ -43,21 +43,27 @@ export function isInputStep(input: WorkflowStep["input"]): input is WorkflowInpu
 	return Boolean(input && typeof input === "object" && !Array.isArray(input));
 }
 
+/** `value` when it is a string with something in it: a blank command is no command. */
+export function nonBlank(value: unknown) {
+	return typeof value === "string" && value.trim() ? value : undefined;
+}
+
+/** A step's shell command: `run`, or `command` when there is no `run`. */
+export function shellCommandOf(step: Pick<WorkflowStep, "run" | "command">) {
+	return nonBlank(typeof step.run === "string" ? step.run : step.command);
+}
+
 /** The command a step runs, if any: a shell command, a pipeline, a child workflow or branches. */
 export function getStepExecution(step: WorkflowStep) {
 	if (step.parallel && typeof step.parallel === "object" && !Array.isArray(step.parallel)) {
 		return { kind: "parallel" as const, value: step.parallel };
 	}
-	if (typeof step.workflow === "string" && step.workflow.trim()) {
-		return { kind: "workflow" as const, value: step.workflow };
-	}
-	if (typeof step.pipeline === "string" && step.pipeline.trim()) {
-		return { kind: "pipeline" as const, value: step.pipeline };
-	}
-	const shellCommand = typeof step.run === "string" ? step.run : step.command;
-	if (typeof shellCommand === "string" && shellCommand.trim()) {
-		return { kind: "shell" as const, value: shellCommand };
-	}
+	const workflow = nonBlank(step.workflow);
+	if (workflow) return { kind: "workflow" as const, value: workflow };
+	const pipeline = nonBlank(step.pipeline);
+	if (pipeline) return { kind: "pipeline" as const, value: pipeline };
+	const shellCommand = shellCommandOf(step);
+	if (shellCommand) return { kind: "shell" as const, value: shellCommand };
 	return { kind: "none" as const };
 }
 

@@ -2,9 +2,15 @@
 // them. Finding a wait by ID is checked against the caller that owns the run.
 import { createHash } from "node:crypto";
 import { WaitConflictError } from "./backend.js";
-import { runSummary, type RunMetadata, type RunState, type RunSummary } from "./model.js";
+import { isWaitId, runSummary, type RunMetadata, type RunState, type RunSummary } from "./model.js";
 import type { StoreSession } from "./session.js";
-import { nextRetryAt, unresolvedActivities, type WaitRequest } from "../engine/checkpoint.js";
+import {
+	asContinuation,
+	nextRetryAt,
+	unresolvedActivities,
+	type RunStatus,
+	type WaitRequest,
+} from "../engine/checkpoint.js";
 
 export type { WaitRequest };
 
@@ -21,7 +27,7 @@ export type RunView = RunSummary & {
 	historyEnabled: boolean;
 	execution?: {
 		version: number;
-		status: string;
+		status: RunStatus;
 		error?: string;
 		nextRetryAt?: number;
 		/** When `runs advance --due` next picks this run up (epoch ms). */
@@ -88,72 +94,27 @@ export function visibleTo(run: RunState, owner: string | undefined): boolean {
 	return owner === undefined || run.metadata?.callerId === owner;
 }
 
+/** A wait reference's shape: its ID and a non-negative revision. Checked before any lookup. */
+export function checkWaitReference(waitId: string, revision: number) {
+	runIdOfWait(waitId);
+	if (!Number.isSafeInteger(revision) || revision < 0)
+		throw new Error("Invalid expected wait revision");
+}
+
+/** The run a wait ID names (`<run id>.<64 hex>`); a malformed ID is refused. */
+export function runIdOfWait(id: string): string {
+	if (!isWaitId(id)) throw new Error("Invalid wait ID");
+	return id.slice(0, id.lastIndexOf("."));
+}
+
 export async function findWait(store: StoreSession, id: string, owner?: string) {
-	const match = /^([a-zA-Z0-9_-]{1,128})\.([a-f0-9]{64})$/.exec(id);
-	if (!match) throw new Error("Invalid wait ID");
-	const run = await store.getRunState(match[1]);
+	const run = await store.getRunState(runIdOfWait(id));
 	if (!run || !visibleTo(run, owner)) return null;
 	const key = Object.keys(run.waits).find((key) => waitId(run.id, key) === id);
 	if (!key || run.waits[key].status !== "pending" || !run.states[key]) return null;
-	const state = JSON.parse(run.states[key]);
-	return { run, key, view: { ...waitSummary(run, key), request: savedRequest(state) } };
-}
-
-function savedRequest(state: Record<string, unknown>): WaitRequest | null {
-	const request = state.wait as WaitRequest | undefined;
-	if (request?.kind === "timer" && Number.isFinite(request.until))
-		return { kind: "timer", until: request.until };
-	if (request?.kind === "event" && typeof request.event === "string")
-		return {
-			kind: "event",
-			event: request.event,
-			since: request.since,
-			...(request.match ? { match: request.match } : {}),
-			...(request.deadline !== undefined
-				? { deadline: request.deadline, onTimeout: request.onTimeout }
-				: {}),
-		};
-	if (
-		(request?.kind === "input" || request?.kind === "approval") &&
-		typeof request.prompt === "string"
-	) {
-		if (request.kind === "input" && request.responseSchema !== undefined) {
-			return {
-				kind: "input",
-				prompt: request.prompt,
-				responseSchema: request.responseSchema,
-				...(request.defaults !== undefined ? { defaults: request.defaults } : {}),
-				...(request.subject !== undefined ? { subject: request.subject } : {}),
-				...(request.deadline !== undefined
-					? { deadline: request.deadline, onTimeout: request.onTimeout }
-					: {}),
-			};
-		}
-		if (request.kind === "approval" && Array.isArray(request.items)) {
-			return {
-				kind: "approval",
-				prompt: request.prompt,
-				items: request.items,
-				...(typeof request.preview === "string" ? { preview: request.preview } : {}),
-				...(request.deadline !== undefined
-					? { deadline: request.deadline, onTimeout: request.onTimeout }
-					: {}),
-			};
-		}
-	}
-	// Older pipeline checkpoints saved the prompt and schema, but not the entire
-	// review context. Never reconstruct an old question from a changed workflow file.
-	if (typeof state.prompt === "string") {
-		if (state.inputSchema !== undefined) {
-			return { kind: "input", prompt: state.prompt, responseSchema: state.inputSchema };
-		}
-		return {
-			kind: "approval",
-			prompt: state.prompt,
-			items: Array.isArray(state.items) ? state.items : [],
-		};
-	}
-	return null;
+	// The question the wait's saved continuation asks (engine/checkpoint.ts writes it whole).
+	const request = asContinuation(JSON.parse(run.states[key]))?.wait ?? null;
+	return { run, key, view: { ...waitSummary(run, key), request } };
 }
 
 /** The wait `id`, which must still be at `revision`: an answer to an older question conflicts. */
@@ -163,8 +124,7 @@ export async function findWaitAtRevision(
 	revision: number,
 	owner?: string,
 ) {
-	if (!Number.isSafeInteger(revision) || revision < 0)
-		throw new Error("Invalid expected wait revision");
+	// The reference's shape was checked before the store was opened (checkWaitReference).
 	const wait = await findWait(store, id, owner);
 	if (!wait || wait.view.revision !== revision) throw new WaitConflictError();
 	return wait;

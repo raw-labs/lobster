@@ -12,8 +12,9 @@ import type { Worker } from "node:worker_threads";
 import { runToolRequest, resumeToolRequest } from "../src/core/tool_runtime.js";
 import { PersistenceOutcomeUnknown } from "../src/persistence/backend.js";
 import type { Transition } from "../src/persistence/model.js";
-import type { SqliteBackend } from "../src/persistence/sqlite.js";
-import { bindStoreSession, openStoreSession } from "../src/persistence/session.js";
+import { SqliteBackend } from "../src/persistence/sqlite.js";
+import { bindStoreSession } from "../src/persistence/context.js";
+import { openStoreSession } from "../src/persistence/session.js";
 import { decodeResumeToken } from "../src/resume/resume.js";
 import { Lobster } from "../src/sdk/Lobster.js";
 import { diffAndStore, readStateJsonWithLock, writeStateJson } from "../src/state/store.js";
@@ -210,7 +211,7 @@ test("SQLite sessions keep filesystem publication functions out of worker messag
 			key: "fixture",
 			value: 42,
 		});
-		assert.deepEqual(result, { signalAbortedAfterCommit: false });
+		assert.deepEqual(result, { signalAbortedAfterCommit: false, text: "42\n" });
 		assert.equal(JSON.parse((await store.read("fixture")).text), 42);
 	} finally {
 		await store.close();
@@ -243,12 +244,12 @@ for (const backend of ["sqlite"] as const) {
 		const listing = await session.listRuns();
 		assert.equal(listing.runs.length, 1);
 		const id = listing.runs[0].id;
-		const key = decodeResumeToken(first.requiresApproval!.resumeToken!).stateKey;
+		const key = decodeResumeToken(first.requiresApproval!.resumeToken).stateKey;
 		assert.equal((await session.read(key)).runId, id);
 		assert.equal((await session.getRun(id)).status, "waiting");
 		await session.close();
 		const resumed = await resumeToolRequest({
-			token: first.requiresApproval!.resumeToken!,
+			token: first.requiresApproval!.resumeToken,
 			approved: true,
 			ctx: { env },
 		});
@@ -268,7 +269,7 @@ for (const backend of ["sqlite"] as const) {
 			await reopened.close();
 		}
 		const stale = await resumeToolRequest({
-			token: first.requiresApproval!.resumeToken!,
+			token: first.requiresApproval!.resumeToken,
 			approved: true,
 			ctx: { env },
 		});
@@ -653,7 +654,9 @@ for (const backend of ["sqlite"] as const) {
 			[0, 1],
 		);
 		assert.equal(
-			run.attempts.filter((a) => /\/branches\/attempt-1\/[ab]\//.test(a.path)).length,
+			// A branch sits under its step's attempt, in `branches`: the parallel step here is
+			// also called `branches`.
+			run.attempts.filter((a) => /\/branches\/attempt-1\/branches\/[ab]\//.test(a.path)).length,
 			2,
 		);
 		const page = await session.inspect(run.id, { limit: 2 });
@@ -1099,7 +1102,7 @@ test("SQLite opening failure closes its connection and permits a clean retry", a
 	close.mock.restore();
 	const retried = await openStoreSession({ directory });
 	try {
-		assert.equal(retried.backend.kind, "sqlite");
+		assert.ok(retried.backend instanceof SqliteBackend);
 		await retried.write("fixture", "42");
 		assert.equal((await retried.read("fixture")).text, "42");
 	} finally {
@@ -1229,7 +1232,7 @@ for (const backend of ["sqlite"] as const) {
 			);
 			const transition = store.backend.transition.bind(store.backend);
 			let failedOperation: Transition | undefined;
-			t.mock.method(store.backend, "transition", async (request, signal) => {
+			t.mock.method(store.backend, "transition", async (request) => {
 				if (
 					!failedOperation &&
 					request.action.kind === "finish" &&
@@ -1237,7 +1240,7 @@ for (const backend of ["sqlite"] as const) {
 				) {
 					failedOperation = request;
 					if (unknown) {
-						await transition(request, signal);
+						await transition(request);
 						throw new PersistenceOutcomeUnknown(
 							request.operationId,
 							new Error("fixture lost reply"),
@@ -1246,7 +1249,7 @@ for (const backend of ["sqlite"] as const) {
 					}
 					throw new Error("fixture failed write");
 				}
-				return transition(request, signal);
+				return transition(request);
 			});
 			try {
 				const result = await runToolRequest({
@@ -1319,8 +1322,15 @@ for (const backend of ["sqlite"] as const) {
 			assert.equal(new Set(children.map((a) => a.path)).size, 4);
 			assert.ok(children.some((a) => a.path.includes("/loop/attempt-1/item-0/")));
 			assert.ok(children.some((a) => a.path.includes("/loop/attempt-1/item-1/")));
-			assert.ok(children.some((a) => a.path.includes("/branches/attempt-1/a/")));
-			assert.ok(children.some((a) => a.path.includes("/branches/attempt-1/b/")));
+			assert.ok(children.some((a) => a.path.includes("/branches/attempt-1/branches/a/")));
+			assert.ok(children.some((a) => a.path.includes("/branches/attempt-1/branches/b/")));
+			// A pipeline's stages are recorded under the activity that ran them.
+			assert.ok(children.every((a) => /\/attempt-\d+\/activity\/pipeline\/\d+$/.test(a.path)));
+			// History paths are the activation keys: no empty segment.
+			assert.deepEqual(
+				run.attempts.filter((a) => a.path.includes("//")).map((a) => a.path),
+				[],
+			);
 		} finally {
 			await store.close();
 		}
@@ -1377,3 +1387,50 @@ for (const backend of ["sqlite"] as const) {
 		}
 	});
 }
+
+test("a run's history page lists the waits it published and answered", async (t) => {
+	const directory = await fs.mkdtemp(path.join(os.tmpdir(), "lobster-history-waits-"));
+	t.after(() => fs.rm(directory, { recursive: true, force: true }));
+	const env = { ...process.env, LOBSTER_STATE_DIR: directory, LOBSTER_HISTORY: "1" };
+	const filePath = path.join(directory, "flow.lobster");
+	await fs.writeFile(
+		filePath,
+		JSON.stringify({
+			steps: [
+				{ id: "a", approval: "First?" },
+				{ id: "b", approval: "Second?" },
+			],
+		}),
+	);
+	const first = await runToolRequest({ filePath, ctx: { env } });
+	assert.equal(first.status, "needs_approval", JSON.stringify(first));
+	const second = await resumeToolRequest({
+		token: first.requiresApproval.resumeToken,
+		approved: true,
+		ctx: { env },
+	});
+	assert.equal(second.status, "needs_approval", JSON.stringify(second));
+	const store = await openStoreSession({ directory, readOnly: true });
+	try {
+		const page = await store.inspect(first.runId!);
+		const statuses = Object.values(page!.waits)
+			.map((wait) => wait.status)
+			.sort();
+		assert.deepEqual(statuses, ["pending", "retired"], JSON.stringify(page!.waits));
+	} finally {
+		await store.close();
+	}
+});
+
+test("a bad retention is reported under the name it was given by", async (t) => {
+	const directory = await fs.mkdtemp(path.join(os.tmpdir(), "lobster-retention-name-"));
+	t.after(() => fs.rm(directory, { recursive: true, force: true }));
+	await assert.rejects(
+		openStoreSession({ directory, retentionDays: -1 }),
+		/^Error: retentionDays must be/,
+	);
+	await assert.rejects(
+		openStoreSession({ directory, env: { LOBSTER_RUN_RETENTION_DAYS: "-1" } }),
+		/^Error: LOBSTER_RUN_RETENTION_DAYS must be/,
+	);
+});

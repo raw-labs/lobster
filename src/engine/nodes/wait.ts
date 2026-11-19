@@ -5,6 +5,7 @@ import type { InboxEvent } from "../../persistence/backend.js";
 import { activation, matchesEvent, type WaitRequest } from "../checkpoint.js";
 import type { Machine } from "../machine.js";
 import type { Scope } from "../scope.js";
+import { deliberateWait } from "../step_clock.js";
 import {
 	expired,
 	publishWait,
@@ -88,11 +89,14 @@ export async function waitStep(machine: Machine, step: WorkflowStep, key: string
 	if (event) return take(event);
 	if (expired(frame)) return timeOut(machine, frame, { id: step.id });
 	// Look once more after the wait is saved: an event signalled between the first look and
-	// the save found no waiting run to advance, and this run would otherwise miss it.
-	await publishWait(machine, key, frame);
-	const late = await findEvent(machine, wait);
-	if (late) return take(late);
-	return suspend(machine, key, frame);
+	// the save found no waiting run to advance, and this run would otherwise miss it. Saved
+	// inside a hold, so a crash before the pause leaves no deadline on the steps around it.
+	return deliberateWait(scope.holdClocks, async () => {
+		await publishWait(machine, key, frame);
+		const late = await findEvent(machine, wait);
+		if (late) return take(late);
+		return suspend(machine, key, frame);
+	});
 }
 
 /** The oldest inbox event matching `wait` that this run has not consumed yet. */

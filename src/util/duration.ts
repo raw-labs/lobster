@@ -2,7 +2,7 @@ const UNITS: Record<string, number> = { ms: 1, s: 1000, m: 60_000, h: 3_600_000,
 const MAX_MS = 366 * UNITS.d;
 
 /** Milliseconds from a number (taken as ms) or a string like "500ms", "30s", "5m", "2h", "3d". */
-export function parseDuration(value: unknown, what = "duration"): number {
+export function parseDuration(value: unknown, what: string): number {
 	const ms =
 		typeof value === "number"
 			? value

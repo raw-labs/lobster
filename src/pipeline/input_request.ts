@@ -1,6 +1,8 @@
+import { carryLlmProvenance } from "../llm/accounting.js";
 import { stableStringify } from "../util/serialization.js";
-import { prepareSchema, schemaValidationMessage } from "../util/validation.js";
-import { isInteractive } from "../io/terminal.js";
+import { prepareSchema, responseChecker } from "../util/validation.js";
+import { readLineFromStream } from "../io/read_line.js";
+import { approvalInputTimeoutMs, isInteractive } from "../io/terminal.js";
 
 export type RequestInputParams = {
 	prompt: string;
@@ -125,7 +127,8 @@ export function createInputTracker(input: AsyncIterable<unknown> | Iterable<unkn
 			}
 			snapshotKnownItemsThrough(knownItems.length - 1);
 			if (replaySnapshotError) throw replaySnapshotError;
-			return snapshotArray(replaySnapshotItems, "requestInput replay input");
+			// Copied and held to the replay limits as they streamed (snapshotKnownItemsThrough).
+			return [...replaySnapshotItems];
 		},
 		disableReplay() {
 			replayEnabled = false;
@@ -209,7 +212,7 @@ export function createStageRequestInput({
 			assertMetadataMatches(historical.requestIndex, historical.metadata, requestIndex, metadata);
 			assertSuspendedStateMatches(historical.suspendedState, requestedSuspendedState);
 			const response = snapshotJson(historical.response, "requestInput response");
-			validateRequestInputResponse(metadata.responseSchema, response, "requestInput");
+			responseChecker(metadata.responseSchema, "requestInput")(response);
 			requestIndex += 1;
 			await onResumedInput?.();
 			return response;
@@ -224,7 +227,7 @@ export function createStageRequestInput({
 			);
 			assertSuspendedStateMatches(resume.state.pending.suspendedState, requestedSuspendedState);
 			const response = snapshotJson(resume.response, "requestInput response");
-			validateRequestInputResponse(metadata.responseSchema, response, "requestInput");
+			responseChecker(metadata.responseSchema, "requestInput")(response);
 			const historyResponse = snapshotJson(response, "requestInput response");
 			resume.consumed = true;
 			history.push({
@@ -290,7 +293,7 @@ export function assertRequestInputResumeConsumed(resume?: CommandInputResume) {
 	}
 }
 
-export function snapshotRequestMetadata(params: RequestInputParams): RequestInputMetadata {
+function snapshotRequestMetadata(params: RequestInputParams): RequestInputMetadata {
 	validateRequestInputParams(params);
 	const responseSchema = snapshotJson(params.responseSchema, "requestInput responseSchema");
 	const defaults =
@@ -321,17 +324,6 @@ export function validateCommandInputState(value: unknown): CommandInputState {
 	}
 	data.history.forEach(validateHistoryEntry);
 	return data as CommandInputState;
-}
-
-export function validateRequestInputResponse(schema: unknown, response: unknown, label: string) {
-	let validator;
-	try {
-		validator = prepareSchema(schema);
-	} catch {
-		throw new Error(`${label} response schema is invalid`);
-	}
-	const result = validator.validate(response);
-	if (!result.ok) throw new Error(schemaValidationMessage(`${label} response`, result.errors));
 }
 
 function validateRequestInputParams(params: RequestInputParams) {
@@ -425,24 +417,14 @@ function snapshotOptionalState(state: unknown) {
 	return state === undefined ? undefined : snapshotJson(state, "requestInput suspendedState");
 }
 
-function snapshotArray(items: readonly unknown[], label: string) {
-	if (items.length > MAX_REPLAY_ITEMS) throw new Error("requestInput replay item limit exceeded");
-	let totalBytes = 0;
-	return items.map((item) => {
-		const snapshot = snapshotJson(item, label);
-		totalBytes += Buffer.byteLength(JSON.stringify(snapshot), "utf8");
-		if (totalBytes > MAX_REPLAY_BYTES) {
-			throw new Error("requestInput replay byte limit exceeded");
-		}
-		return snapshot;
-	});
-}
-
+/** A JSON copy of `value`, keeping the marks of the model calls it carries. */
 function snapshotJson(value: unknown, label: string): unknown {
 	assertJsonSerializable(value, label, new WeakSet());
 	const text = JSON.stringify(value);
 	if (text === undefined) throw new Error(`${label} must be JSON-serializable`);
-	return JSON.parse(text);
+	const copy = JSON.parse(text);
+	carryLlmProvenance(value, copy);
+	return copy;
 }
 
 function assertJsonSerializable(value: unknown, label: string, seen: WeakSet<object>) {
@@ -478,15 +460,17 @@ function assertJsonSerializable(value: unknown, label: string, seen: WeakSet<obj
 
 async function requestInputInteractively(ctx: any, metadata: RequestInputMetadata) {
 	ctx.stdout.write(`${metadata.prompt}\n> `);
-	const { readLineFromStream } = await import("../io/read_line.js");
-	const raw = await readLineFromStream(ctx.stdin, { timeoutMs: 0, signal: ctx.signal });
+	const raw = await readLineFromStream(ctx.stdin, {
+		timeoutMs: approvalInputTimeoutMs(ctx.env),
+		signal: ctx.signal,
+	});
 	let response;
 	try {
-		response = JSON.parse(String(raw ?? "").trim());
+		response = JSON.parse(raw.trim());
 	} catch {
 		throw new Error("requestInput response must be valid JSON");
 	}
-	validateRequestInputResponse(metadata.responseSchema, response, "requestInput");
+	responseChecker(metadata.responseSchema, "requestInput")(response);
 	return snapshotJson(response, "requestInput response");
 }
 

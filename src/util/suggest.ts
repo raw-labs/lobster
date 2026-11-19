@@ -1,9 +1,17 @@
-/** The candidate within two edits of `name`, used to suggest the intended spelling of a typo. */
+/**
+ * The candidate nearest to `name`, if it is within two edits: the intended spelling of a typo.
+ * Of candidates equally near, the first.
+ */
 export function closestMatch(name: string, candidates: readonly string[]): string | undefined {
-	return candidates.find((candidate) => editDistance(name, candidate) <= 2);
+	let best: { candidate: string; distance: number } | undefined;
+	for (const candidate of candidates) {
+		const distance = editDistance(name, candidate);
+		if (distance <= 2 && (!best || distance < best.distance)) best = { candidate, distance };
+	}
+	return best?.candidate;
 }
 
-export function editDistance(a: string, b: string): number {
+function editDistance(a: string, b: string): number {
 	let previous = Array.from({ length: b.length + 1 }, (_, i) => i);
 	for (let i = 1; i <= a.length; i++) {
 		const current = [i];

@@ -1,10 +1,13 @@
 // Listing and inspecting runs and waits, for hosts and the CLI (`runs list/show`, `waits show`).
-import { sessionFromEnv, resolveStoreSession } from "../persistence/context.js";
-import { openStoreSession, type StoreSession } from "../persistence/session.js";
-import type { RunStatus, RunSummary } from "../persistence/model.js";
+import { sessionFromEnv } from "../persistence/context.js";
+import { withStoreContext } from "../persistence/execution.js";
+import type { StoreSession } from "../persistence/session.js";
+import { checkRunId, isRunId, type RunStatus, type RunSummary } from "../persistence/model.js";
+import { isRunStatus } from "../engine/checkpoint.js";
 import {
 	callerId,
 	findWait,
+	runIdOfWait,
 	runView,
 	visibleTo,
 	type RunView,
@@ -21,18 +24,10 @@ async function readRuns<T>(
 	task: (store: StoreSession) => Promise<T>,
 ): Promise<T> {
 	ctx.signal?.throwIfAborted();
-	const store = ctx.storeSession ? resolveStoreSession(ctx.storeSession) : sessionFromEnv(ctx.env);
-	if (store) return task(store);
-	const owned = await openStoreSession({
-		env: { ...process.env, ...ctx.env },
-		readOnly: true,
-		signal: ctx.signal,
-	});
-	try {
-		return await task(owned);
-	} finally {
-		await owned.close();
-	}
+	return withStoreContext(
+		{ ...ctx, env: { ...process.env, ...ctx.env }, readOnly: true },
+		(bound) => task(sessionFromEnv(bound.env)!),
+	);
 }
 
 /** List persisted runs; callerId comes from trusted host context, not model arguments. */
@@ -42,16 +37,10 @@ export async function listRuns({
 	after,
 	limit,
 }: RunQuery = {}): Promise<RunPage> {
-	if (
-		status !== undefined &&
-		!["running", "waiting", "blocked", "completed", "failed", "cancelled"].includes(status)
-	) {
+	if (status !== undefined && !isRunStatus(status)) {
 		throw new Error("Invalid run status");
 	}
-	if (
-		after !== undefined &&
-		(typeof after !== "string" || (after !== "" && !/^[a-zA-Z0-9_-]{1,128}$/.test(after)))
-	) {
+	if (after !== undefined && (typeof after !== "string" || (after !== "" && !isRunId(after)))) {
 		throw new Error("Invalid run cursor");
 	}
 	return readRuns(ctx, (store) =>
@@ -66,8 +55,7 @@ export async function getRun({
 	runId: string;
 	ctx?: ToolRunContext;
 }): Promise<RunView | null> {
-	if (typeof runId !== "string" || !/^[a-zA-Z0-9_-]{1,128}$/.test(runId))
-		throw new Error("Invalid run ID");
+	checkRunId(runId);
 	return readRuns(ctx, async (store) => {
 		const run = await store.getRunState(runId);
 		return run && visibleTo(run, callerId(ctx.runMetadata)) ? runView(run) : null;
@@ -82,6 +70,7 @@ export async function getWait({
 	waitId: string;
 	ctx?: ToolRunContext;
 }): Promise<WaitView | null> {
+	runIdOfWait(waitId); // Refused before the store is opened, like a malformed run ID.
 	return readRuns(
 		ctx,
 		async (store) => (await findWait(store, waitId, callerId(ctx.runMetadata)))?.view ?? null,

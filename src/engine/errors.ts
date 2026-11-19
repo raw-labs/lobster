@@ -3,6 +3,7 @@
 import { PersistenceError, WaitConflictError } from "../persistence/backend.js";
 import { RequestInputResumeError } from "../pipeline/input_request.js";
 import { CostLimitExceededError } from "../llm/cost_tracker.js";
+import { keys } from "./checkpoint.js";
 import { messageOf } from "../util/errors.js";
 
 /** An error that stops the run where it is, instead of failing one step. */
@@ -23,7 +24,6 @@ export class RunSuspendedError extends RunStopError {
 
 /** A rejection or a passed deadline cancelled the run; already saved. */
 export class RunCancelledError extends RunStopError {
-	readonly code = "LOBSTER_RUN_CANCELLED";
 	constructor(message: string) {
 		super(message);
 		this.name = "RunCancelledError";
@@ -35,7 +35,7 @@ export class InterruptedActivityError extends RunStopError {
 	readonly code = "LOBSTER_ACTIVITY_OUTCOME_UNKNOWN";
 	constructor(readonly path: string) {
 		super(
-			`Activity ${path} was interrupted without a saved result; inspect its outcome before continuing`,
+			`Activity ${keys.describe(path)} was interrupted without a saved result; inspect its outcome before continuing`,
 		);
 		this.name = "InterruptedActivityError";
 	}
@@ -55,6 +55,18 @@ export class ExecutionConflictError extends RunStopError {
 	constructor() {
 		super("Workflow is owned by another executor or its saved state changed");
 		this.name = "ExecutionConflictError";
+	}
+}
+
+/**
+ * A step or a pipeline asked a person, or waited, where steps cannot pause (see
+ * GATES_REFUSED). It stops the run: a retry would only be refused again, and `on_error`
+ * must not hide a workflow that cannot run as written.
+ */
+export class GateRefusedError extends RunStopError {
+	constructor(message: string) {
+		super(message);
+		this.name = "GateRefusedError";
 	}
 }
 

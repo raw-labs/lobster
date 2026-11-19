@@ -255,19 +255,24 @@ finally { await store.close(); }
 			const recorder = await session.createRun("workflow");
 			const first = new ExecutionStore(session, recorder.runId);
 			await first.claim();
-			await first.save({
-				version: 1,
-				revision: 0,
-				definition: {
-					filePath: f.filePath,
-					hash: "fixture",
-					workflow: { steps: [{ id: "safe", run: "true" }] },
-					children: {},
+			await first.save(
+				{
+					version: 1,
+					revision: 0,
+					definition: {
+						filePath: f.filePath,
+						hash: "fixture",
+						workflow: { steps: [{ id: "safe", run: "true" }] },
+						children: {},
+					},
+					args: {},
+					activations: {},
+					status: "running",
 				},
-				args: {},
-				activations: {},
-				status: "running",
-			});
+				{},
+				undefined,
+				(execution) => ({ execution, put: {}, drop: [] }),
+			);
 			const second = new ExecutionStore(session, recorder.runId);
 			await assert.rejects(second.claim(), /owned by another executor/);
 			await first.close();
@@ -393,7 +398,7 @@ finally { await store.close(); }
 				boundary === "question"
 					? started
 					: await resumeToolRequest({
-							token: started.requiresApproval!.resumeToken!,
+							token: started.requiresApproval!.resumeToken,
 							approved: true,
 							ctx,
 						});
@@ -410,7 +415,7 @@ finally { await store.close(); }
 				assert.equal(calls, 0);
 				assert.equal(next.status, "needs_approval");
 				const approved = await resumeToolRequest({
-					token: next.requiresApproval!.resumeToken!,
+					token: next.requiresApproval!.resumeToken,
 					approved: true,
 					ctx: { ...ctx, signal: undefined },
 				});
@@ -418,7 +423,7 @@ finally { await store.close(); }
 			} else {
 				assert.equal(next.status, "ok");
 				const duplicate = await resumeToolRequest({
-					token: started.requiresApproval!.resumeToken!,
+					token: started.requiresApproval!.resumeToken,
 					approved: true,
 					ctx: { ...ctx, signal: undefined },
 				});
@@ -461,13 +466,13 @@ finally { await store.close(); }
 		const ctx = { env: f.env, registry };
 		const first = await runToolRequest({ filePath: f.filePath, ctx });
 		const pending = resumeToolRequest({
-			token: first.requiresApproval!.resumeToken!,
+			token: first.requiresApproval!.resumeToken,
 			approved: true,
 			ctx,
 		});
 		await startedEffect;
 		const competing = await resumeToolRequest({
-			approvalId: first.requiresApproval!.approvalId!,
+			approvalId: first.requiresApproval!.approvalId,
 			approved: true,
 			ctx,
 		});
@@ -549,7 +554,7 @@ finally { await store.close(); }
 				return result;
 			};
 			const failed = await resumeToolRequest({
-				token: started.requiresApproval!.resumeToken!,
+				token: started.requiresApproval!.resumeToken,
 				approved: true,
 				ctx,
 			});
@@ -561,7 +566,7 @@ finally { await store.close(); }
 			const resumed =
 				boundary === "answer"
 					? await resumeToolRequest({
-							token: started.requiresApproval!.resumeToken!,
+							token: started.requiresApproval!.resumeToken,
 							approved: true,
 							ctx,
 						})

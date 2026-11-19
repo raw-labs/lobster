@@ -18,7 +18,7 @@
  * A comparison does not chain. `matches` takes a regular expression as a quoted string.
  */
 import { isDeepStrictEqual } from "node:util";
-import { getStepRefValue } from "./expressions.js";
+import { getStepRefValue, STEP_REF } from "./expressions.js";
 import type { WorkflowStepResult } from "./types.js";
 
 export type ComparisonOperator =
@@ -69,7 +69,7 @@ export function checkConditionSyntax(condition: unknown) {
 /**
  * Check a condition before any step runs: its syntax, that every step it reads is one of
  * `known` (the steps that run before it), and that no literal operand makes it fail on
- * every run (`$a.json.n > "high"`, `$a.json.tags contains 3`, `5 matches "x"`).
+ * every run (`$a.json.n > "high"`, `$a.json.n in 5`, `5 matches "x"`).
  */
 export function checkCondition(condition: unknown, known?: ReadonlySet<string>) {
 	if (typeof condition !== "string") return;
@@ -342,7 +342,7 @@ function describe(token: Token) {
 	return `"${token.type}"`;
 }
 
-const STEP_REF = /^\$([A-Za-z0-9_-]+)\.([A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)*)/;
+const STEP_REF_AHEAD = new RegExp(`^${STEP_REF.source}`);
 const NUMBER = /^-?\d+(?:\.\d+)?/;
 const WORD = /^[A-Za-z_][A-Za-z0-9_-]*/;
 
@@ -362,7 +362,7 @@ function tokenize(source: string, fail: (reason: string) => never): Token[] {
 			continue;
 		}
 		if (rest[0] === "$") {
-			const ref = STEP_REF.exec(rest);
+			const ref = STEP_REF_AHEAD.exec(rest);
 			if (!ref) fail(`a step reference at character ${at + 1} must look like $step.field`);
 			tokens.push({ type: "ref", at, id: ref[1], path: ref[2] });
 			at += ref[0].length;

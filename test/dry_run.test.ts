@@ -323,7 +323,7 @@ test("dry-run throws on stdin ref to non-existent step", async () => {
 					dryRun: true,
 				},
 			}),
-		/Unknown step reference: missing\.stdout/,
+		/stdin reads \$missing\.stdout, but no step "missing" runs before it/,
 	);
 });
 
@@ -449,6 +449,84 @@ test("dry-run throws on pipeline step with unknown command", async () => {
 				},
 			}),
 		/unknown command: not_a_real_command/,
+	);
+});
+
+test("dry-run refuses a pipeline step's unknown flag, as the run would", async () => {
+	const workflow = { steps: [{ id: "step1", pipeline: "exec --json --bogus 'echo [1]'" }] };
+	const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-dry-badflag-"));
+	const filePath = path.join(tmpDir, "workflow.lobster");
+	await fsp.writeFile(filePath, JSON.stringify(workflow, null, 2), "utf8");
+	const { stdout, stderr } = createStreams();
+	await assert.rejects(
+		() =>
+			runWorkflowFile({
+				filePath,
+				ctx: {
+					stdin: process.stdin,
+					stdout,
+					stderr,
+					env: { ...process.env },
+					mode: "human",
+					registry: createDefaultRegistry(),
+					dryRun: true,
+				},
+			}),
+		/exec has no flag --bogus/,
+	);
+});
+
+test("dry-run leaves a flag value built from step output to the run", async () => {
+	const workflow = {
+		steps: [
+			{ id: "fmt", run: "echo json" },
+			{ id: "p", pipeline: "exec --stdin $fmt.stdout cat" },
+		],
+	};
+	const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-dry-refflag-"));
+	const filePath = path.join(tmpDir, "workflow.lobster");
+	await fsp.writeFile(filePath, JSON.stringify(workflow, null, 2), "utf8");
+	const { stdout, stderr } = createStreams();
+	const plan = await runWorkflowFile({
+		filePath,
+		ctx: {
+			stdin: process.stdin,
+			stdout,
+			stderr,
+			env: { ...process.env },
+			mode: "human",
+			registry: createDefaultRegistry(),
+			dryRun: true,
+		},
+	});
+	assert.equal(plan.status, "ok");
+});
+
+test("dry-run still checks the name of a flag whose value comes from step output", async () => {
+	const workflow = {
+		steps: [
+			{ id: "a", run: "echo hi" },
+			{ id: "b", pipeline: 'approve --promt "$a.stdout"' },
+		],
+	};
+	const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-dry-refname-"));
+	const filePath = path.join(tmpDir, "workflow.lobster");
+	await fsp.writeFile(filePath, JSON.stringify(workflow, null, 2), "utf8");
+	const { stdout, stderr } = createStreams();
+	await assert.rejects(
+		runWorkflowFile({
+			filePath,
+			ctx: {
+				stdin: process.stdin,
+				stdout,
+				stderr,
+				env: { ...process.env },
+				mode: "human",
+				registry: createDefaultRegistry(),
+				dryRun: true,
+			},
+		}),
+		/approve has no flag --promt/,
 	);
 });
 
@@ -615,4 +693,64 @@ test("dry-run evaluates compound conditions with approvals, input placeholders, 
 	const output = getStderr();
 	assert.doesNotMatch(output, /deploy.*skipped/);
 	assert.match(output, /deploy\s+\[shell\]/);
+});
+
+test("dry-run shows retry on switch and repeat steps too", async () => {
+	const retry = { max: 3, delay_ms: 10 };
+	const workflow = {
+		steps: [
+			{
+				id: "pick",
+				retry,
+				switch: { cases: [{ when: "true", steps: [{ id: "a", run: "echo a" }] }] },
+			},
+			{
+				id: "poll",
+				retry,
+				repeat: { until: "$check.json == 1", max: 2 },
+				steps: [{ id: "check", run: "echo 1" }],
+			},
+		],
+	};
+	const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-dry-"));
+	const filePath = path.join(tmpDir, "workflow.lobster");
+	await fsp.writeFile(filePath, JSON.stringify(workflow), "utf8");
+	const { stdout, stderr, getStderr } = createStreams();
+	await runWorkflowFile({
+		filePath,
+		ctx: {
+			stdin: process.stdin,
+			stdout,
+			stderr,
+			env: { ...process.env },
+			mode: "human",
+			dryRun: true,
+			registry: createDefaultRegistry(),
+		},
+	});
+	assert.equal(getStderr().match(/retry: up to 3 attempts/g)?.length, 2);
+});
+
+test("dry-run checks the child workflows and their pipelines as a start does", async () => {
+	const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-dryrun-child-"));
+	await fsp.writeFile(
+		path.join(dir, "child.lobster"),
+		JSON.stringify({ steps: [{ id: "bad", pipeline: "nosuchcmd" }] }),
+	);
+	const parent = path.join(dir, "parent.lobster");
+	await fsp.writeFile(
+		parent,
+		JSON.stringify({ steps: [{ id: "kid", workflow: "child.lobster" }] }),
+	);
+	const unknown = runLobster(["run", "--mode", "tool", "--dry-run", "--file", parent]);
+	assert.notEqual(unknown.status, 0);
+	assert.match(unknown.stdout, /unknown command: nosuchcmd/);
+
+	const missing = path.join(dir, "missing.lobster");
+	await fsp.writeFile(
+		missing,
+		JSON.stringify({ steps: [{ id: "kid", workflow: "gone.lobster" }] }),
+	);
+	const absent = runLobster(["run", "--mode", "tool", "--dry-run", "--file", missing]);
+	assert.notEqual(absent.status, 0, absent.stdout);
 });

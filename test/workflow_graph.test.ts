@@ -124,3 +124,48 @@ test("cli graph rejects unsupported formats", async () => {
 	assert.equal(result.status, 2);
 	assert.match(result.stderr, /graph --format must be one of: mermaid, dot, ascii/);
 });
+
+test("an edge from a step inside a repeat or a parallel step starts at that step's node", () => {
+	const workflow = {
+		steps: [
+			{
+				id: "poll",
+				repeat: { until: "$check.json.done", max: 3 },
+				steps: [{ id: "check", run: "echo '{\"done\":true}'" }],
+			},
+			{ id: "fan", parallel: { branches: [{ id: "a", run: "echo a" }] } },
+			{ id: "report", run: "cat", stdin: "$check.json", when: "$a.stdout == a" },
+		],
+	};
+	const output = renderWorkflowGraph({ workflow: workflow as any, format: "dot" });
+	assert.match(output, /"poll" -> "report" \[label="stdin"\]/);
+	assert.match(output, /"fan" -> "report" \[label="when: \$a\.stdout == a"\]/);
+	assert.doesNotMatch(output, /"poll" -> "poll"/, "a repeat reading its own step draws no loop");
+});
+
+test("what a compound step's inside reads is drawn as edges into that step", () => {
+	const workflow = {
+		steps: [
+			{ id: "fetch", run: "echo '[1]'" },
+			{ id: "par", parallel: { branches: [{ id: "b", run: "cat", stdin: "$fetch.stdout" }] } },
+			{
+				id: "poll",
+				repeat: { until: "$check.json.done", max: 2 },
+				steps: [{ id: "check", run: "cat", stdin: "$fetch.json" }],
+			},
+			{
+				id: "each",
+				for_each: "[1]",
+				steps: [
+					{ id: "use", run: "cat", stdin: "$item.json" },
+					{ id: "again", run: "cat", stdin: "$use.stdout", when: "$fetch.json" },
+				],
+			},
+		],
+	};
+	const output = renderWorkflowGraph({ workflow: workflow as any, format: "dot" });
+	assert.match(output, /"fetch" -> "par" \[label="stdin"\]/);
+	assert.match(output, /"fetch" -> "poll" \[label="stdin"\]/);
+	assert.match(output, /"fetch" -> "each" \[label="when: \$fetch\.json"\]/);
+	assert.doesNotMatch(output, /"(use|item|check)" ->/, "names local to a node draw no edge");
+});

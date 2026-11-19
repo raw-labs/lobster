@@ -1,6 +1,6 @@
 import { defineCommand } from "../../commands/define.js";
 import { httpResponseLimitFromEnv, readResponseTextCapped } from "../../io/read_response_text.js";
-import { streamOf } from "../../io/terminal.js";
+import { streamOf } from "../../io/streams.js";
 
 export const openclawInvokeCommand = defineCommand({
 	name: "openclaw.invoke",

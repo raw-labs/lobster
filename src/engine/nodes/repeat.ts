@@ -4,7 +4,7 @@ import { evaluateCondition } from "../../workflows/conditions.js";
 import { createRecord } from "../../workflows/values.js";
 import { activation, keys } from "../checkpoint.js";
 import type { Machine } from "../machine.js";
-import { bodyGatesRefused, type Scope } from "../scope.js";
+import { bodyGatesRefused, innerSettings, type Scope } from "../scope.js";
 import { resultOfLastStep } from "../results.js";
 import { sequence } from "./sequence.js";
 
@@ -12,8 +12,9 @@ import { sequence } from "./sequence.js";
  * Run the steps in rounds. After each round, `until` is checked against that round's
  * results; when it holds the loop ends, and after `max` rounds it fails (or, with
  * `on_max: continue`, ends). A round sees the results of the round before it, and only
- * the last round's results are kept: earlier rounds are forgotten as they finish, so a
- * long loop does not grow the saved state.
+ * the last round's results are kept: earlier rounds are forgotten as they finish, so the
+ * checkpoint stays the same size however many rounds run (step outputs over 1 KB are records,
+ * kept until the run ends).
  *
  * Afterwards the last round's steps are visible to later steps, and the repeat's own
  * result is the result of the last step that ran in it, with `rounds`.
@@ -41,8 +42,7 @@ export async function repeatStep(machine: Machine, step: WorkflowStep, key: stri
 			...scope,
 			results: seen,
 			gatesRefused,
-			env: { ...scope.env, ...step.env },
-			cwd: step.cwd ?? scope.cwd,
+			...innerSettings(step, scope),
 		});
 		const body = activation(machine.state, bodyKey);
 		frame.results = Object.assign(createRecord(), body.results);

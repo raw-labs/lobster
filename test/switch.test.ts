@@ -131,7 +131,7 @@ test("an approval inside a case pauses the run and resumes in the same case", as
 	const paused = await runToolRequest({ filePath, ctx: { env } });
 	assert.equal(paused.status, "needs_approval", JSON.stringify(paused));
 	const resumed = await resumeToolRequest({
-		token: paused.requiresApproval!.resumeToken!,
+		token: paused.requiresApproval!.resumeToken,
 		approved: true,
 		ctx: { env },
 	});
@@ -252,4 +252,108 @@ test("dry-run follows a case it can decide and lists every case it cannot", asyn
 	assert.match(open, /case 1: .* {2}\[may run — depends on step output\]/);
 	assert.match(open, /else {2}\[may run — depends on step output\]/);
 	assert.match(open, /after {2}\[shell\]\n\s+when: \$x\.skipped {2}\[depends on step output/);
+});
+
+test("a switch runs its case with the switch's env and cwd, as other compound steps do", async (t) => {
+	const { dir, filePath, env } = await setup(t, {
+		steps: [
+			{
+				id: "route",
+				env: { GREETING: "hello" },
+				switch: {
+					cases: [{ when: "true", steps: [{ id: "say", command: 'echo "$GREETING $(pwd)"' }] }],
+				},
+			},
+		],
+	});
+	const sub = path.join(dir, "sub");
+	await fsp.mkdir(sub);
+	const workflow = JSON.parse(await fsp.readFile(filePath, "utf8"));
+	workflow.steps[0].cwd = sub;
+	await fsp.writeFile(filePath, JSON.stringify(workflow), "utf8");
+	const result = await runToolRequest({ filePath, ctx: { env } });
+	assert.equal(result.status, "ok", JSON.stringify(result));
+	assert.deepEqual(result.output, [`hello ${await fsp.realpath(sub)}\n`]);
+});
+
+test("steps skip_rest left unrun are skipped, so later steps can read them", async (t) => {
+	const { filePath, env } = await setup(t, {
+		steps: [
+			{
+				id: "route",
+				switch: {
+					cases: [
+						{
+							when: "true",
+							steps: [
+								{ id: "a", run: "exit 1", on_error: "skip_rest" },
+								{ id: "b", run: "echo b" },
+							],
+						},
+					],
+				},
+			},
+			{ id: "c", when: "$b.skipped", run: "echo b-was-skipped" },
+		],
+	});
+	const result = await runToolRequest({ filePath, ctx: { env } });
+	assert.equal(result.status, "ok", JSON.stringify(result));
+	assert.deepEqual(result.output, ["b-was-skipped\n"]);
+});
+
+test("a typo in a later pipeline step is refused before any step acts", async (t) => {
+	const { dir, filePath, env } = await setup(t, { steps: [] });
+	const marker = path.join(dir, "acted");
+	await fsp.writeFile(
+		filePath,
+		JSON.stringify({
+			steps: [
+				{ id: "first", run: `echo acted > ${JSON.stringify(marker)}` },
+				{
+					id: "route",
+					switch: {
+						cases: [{ when: "true", steps: [{ id: "bad", pipeline: "exec --jsn echo 1" }] }],
+					},
+				},
+			],
+		}),
+	);
+	const result = await runToolRequest({ filePath, ctx: { env } });
+	assert.equal(result.ok, false);
+	assert.match(result.error?.message ?? "", /exec has no flag --jsn/);
+	await assert.rejects(fsp.access(marker), "the first step did not run");
+});
+
+test("a compound step whose failure on_error tolerates leaves its inner steps skipped", async (t) => {
+	const failing: Record<string, unknown> = {
+		switch: {
+			id: "s",
+			on_error: "continue",
+			switch: { cases: [{ when: "true", steps: [{ id: "inner", run: "exit 3" }] }] },
+		},
+		parallel: {
+			id: "s",
+			on_error: "continue",
+			parallel: {
+				branches: [
+					{ id: "inner", run: "echo ok" },
+					{ id: "bad", run: "exit 3" },
+				],
+			},
+		},
+		repeat: {
+			id: "s",
+			on_error: "continue",
+			repeat: { until: "true", max: 2 },
+			steps: [{ id: "inner", run: "exit 3" }],
+		},
+	};
+	for (const [kind, step] of Object.entries(failing)) {
+		const { filePath, env } = await setup(t, {
+			steps: [step, { id: "after", when: "$inner.skipped", run: "echo skipped" }],
+		});
+		const result = await runToolRequest({ filePath, ctx: { env } });
+		assert.equal(result.status, "ok", `${kind}: ${JSON.stringify(result)}`);
+		assert.deepEqual(result.output, ["skipped\n"], kind);
+	}
 });

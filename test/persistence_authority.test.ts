@@ -11,7 +11,7 @@ for (const backend of ["sqlite"] as const) {
 	test(`${backend}: retirement during state preparation prevents the write`, async (t) => {
 		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "lobster-store-authority-"));
 		t.after(() => fs.rm(directory, { recursive: true, force: true }));
-		const store = await openStoreSession({ directory, trackRuns: true });
+		const store = await openStoreSession({ directory });
 		t.after(() => store.close());
 		const write = store.backend.write.bind(store.backend);
 		let current = true;
@@ -38,7 +38,7 @@ for (const backend of ["sqlite"] as const) {
 			test(`${backend}: host retirement ${boundary} a handoff keeps the saved answer, history=${history}`, async (t) => {
 				const directory = await fs.mkdtemp(path.join(os.tmpdir(), "lobster-handoff-authority-"));
 				t.after(() => fs.rm(directory, { recursive: true, force: true }));
-				const store = await openStoreSession({ directory, trackRuns: true, history });
+				const store = await openStoreSession({ directory, history });
 				t.after(() => store.close());
 				const ctx = { storeSession: store };
 				const first = await runToolRequest({

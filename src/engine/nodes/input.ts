@@ -4,18 +4,22 @@ import { resolveInputValue } from "../../workflows/values.js";
 import { activation, type WaitRequest } from "../checkpoint.js";
 import type { Machine } from "../machine.js";
 import type { Scope } from "../scope.js";
+import { firstAccepted, textAnswerCandidates } from "../../io/terminal.js";
 import { validateInputResponse } from "../asking.js";
-import { askAtTerminal, resolveWait, waitDeadline, waitOf } from "../waits.js";
+import { askAtTerminal, failOnlyTheQuestion, resolveWait, waitDeadline, waitOf } from "../waits.js";
 
 type InputWait = Extract<WaitRequest, { kind: "input" }>;
 
-/** Ask for an answer to the step's question (or to `request`, a pipeline's). */
+/**
+ * Ask for an answer to the step's question, or to `asked.request`, a pipeline's. An answer is
+ * typed as JSON, unless the question `acceptsText` (`ask`'s): then as `ask` reads it.
+ */
 export async function inputStep(
 	machine: Machine,
 	step: WorkflowStep,
 	key: string,
 	scope: Scope,
-	request?: InputWait,
+	asked?: { request: InputWait; acceptsText: boolean },
 ) {
 	const frame = activation(machine.state, key);
 	if (frame.phase === "completed") return frame.result!;
@@ -24,7 +28,7 @@ export async function inputStep(
 		"input",
 		step.id,
 		() =>
-			request ?? {
+			asked?.request ?? {
 				kind: "input",
 				prompt: step.input!.prompt,
 				responseSchema: step.input!.responseSchema,
@@ -34,24 +38,30 @@ export async function inputStep(
 			},
 	);
 	const unanswered = { id: step.id, subject: wait.subject };
-	const read = await askAtTerminal(
-		machine,
-		key,
-		frame,
-		scope,
-		wait.prompt + "\nEnter JSON response: ",
-		unanswered,
-	);
-	if ("timedOut" in read) return read.timedOut;
-	const response = parseResponseJson(read.answer);
-	validateInputResponse({
-		schema: wait.responseSchema,
-		response,
-		stepId: step.id,
-		standalone: scope.definition.standalone,
+	return failOnlyTheQuestion(machine, key, frame, scope, async () => {
+		const read = await askAtTerminal(
+			machine,
+			key,
+			frame,
+			scope,
+			wait.prompt + (asked?.acceptsText ? "\n> " : "\nEnter JSON response: "),
+			unanswered,
+		);
+		if ("timedOut" in read) return read.timedOut;
+		const candidates = asked?.acceptsText
+			? textAnswerCandidates(read.answer)
+			: [parseResponseJson(read.answer)];
+		const response = firstAccepted(candidates, (candidate) =>
+			validateInputResponse({
+				schema: wait.responseSchema,
+				response: candidate,
+				stepId: step.id,
+				standalone: scope.definition.standalone,
+			}),
+		);
+		// Through resolveWait: a question published earlier (in tool mode) is consumed with it.
+		return resolveWait(machine, frame, { ...unanswered, response });
 	});
-	// Through resolveWait: a question published earlier (in tool mode) is consumed with it.
-	return resolveWait(machine, frame, { ...unanswered, response });
 }
 
 /** What an input step shows with its question: its `stdin:`, or the last step's value. */

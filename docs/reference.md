@@ -23,6 +23,7 @@ The full reference for Lobster. Start with the [README](../README.md) for what L
   - [Commands](#commands)
     - [Command packs](#command-packs)
   - [Process output limits](#process-output-limits)
+  - [Question limits](#question-limits)
   - [HTTP response limits](#http-response-limits)
   - [Args and shell-safety](#args-and-shell-safety)
 - **LLMs and OpenClaw**
@@ -53,7 +54,9 @@ lobster run path/to/workflow.lobster
 lobster run --file path/to/workflow.lobster --args-json '{"tag":"family"}'
 ```
 
-`--args-json` must be a JSON object. Anything else (an array, a string, `null`, an empty value) is an input error (exit code 2, `parse_error` in tool mode) and no step runs.
+`--args-json` must be a JSON object. Anything else (an array, a string, `null`, an empty value) is an input error (exit code 2, `parse_error` in tool mode) and no step runs. A workflow that declares `args:` takes only those names: an arg it does not declare, or a declared arg with no `default` that is not given, is refused before any step runs (for a child workflow too, with its `workflow_args`). A workflow without `args:` takes any args.
+
+Invalid workflow file paths are reported as input errors (exit code 2), whether passed with `--file` or as a single positional path (no whitespace; contains a path separator or ends in `.lobster`, `.yaml`, `.yml`, or `.json`). In `--mode tool`, these failures use the same JSON error envelope as other parsing errors.
 
 Example file:
 
@@ -67,7 +70,7 @@ steps:
     run: weather --json ${location}
 
   - id: confirm
-    approval: Want jacket advice from the LLM?
+    approval: { prompt: Want jacket advice from the LLM?, on_reject: continue }
     stdin: $fetch.json
 
   - id: advice
@@ -87,18 +90,19 @@ Notes:
 - Unknown keys are rejected when the file loads, with a suggestion for likely typos, so a misspelled `when:` cannot make a step run unconditionally.
 - `<`, `<=`, `>` and `>=` compare numbers (numeric strings such as `"0.9"` count). Comparing anything else, including a missing value or `null`, fails the step with an error rather than evaluating to false. Guard optional values with `&&` or `||`, which skip the right side when the left decides the result; compared with the literal `null` (also in parentheses), a missing field counts as null; two fields never match on "no value": `$score.json.value != null && $score.json.value > 0.8`.
 - Use `retry`, `timeout_ms`, and `on_error` per step to control transient-failure behavior and recovery.
-- On `for_each` and `repeat`, these policies cover the entire loop: each attempt gets one timeout budget (including batch pauses), and retry restarts at the first item or round. Previously completed children may run again, so only enable loop retries for work that is safe to repeat. A `cost_limit` stop or an attempted OpenClaw dispatch prevents retries; paid LLM usage is checked even when a later pipeline command fails. `on_error: continue` records `$loop.error` and proceeds to the next workflow step; `skip_rest` skips the remaining workflow steps.
+- On `for_each` and `repeat`, these policies cover the entire loop: each attempt gets one timeout budget (`pause_ms` pauses between batches do not count against it), and retry restarts at the first item or round. Previously completed children may run again, so only enable loop retries for work that is safe to repeat. A `cost_limit` stop or an attempted OpenClaw dispatch prevents retries; paid LLM usage is checked even when a later pipeline command fails. `on_error: continue` records `$loop.error` and proceeds to the next workflow step; `skip_rest` skips the remaining workflow steps.
 - Approval steps can optionally enforce identity constraints:
   - `approval.required_approver` (or `requiredApprover`) requires an exact approver id.
   - `approval.require_different_approver` (or `requireDifferentApprover`) requires approver id to differ from initiator.
   - `approval.initiated_by` (or `initiatedBy`) sets the initiator id for comparison.
-  - `LOBSTER_APPROVAL_INITIATED_BY` can provide a default initiator id at run time.
+  - `LOBSTER_APPROVAL_INITIATED_BY`, `LOBSTER_APPROVAL_REQUIRED_APPROVER` and `LOBSTER_APPROVAL_REQUIRE_DIFFERENT_APPROVER` give the host's defaults at run time, for step approvals and for an `approve` inside a pipeline alike; a step's own `approval:` settings take precedence over them.
   - `LOBSTER_APPROVAL_APPROVED_BY` is used at resume/approval time for identity checks.
-- A rejected approval cancels the run, whether the "no" is typed at the terminal or sent with `resume --approve no`. In human mode, `lobster run` reports a cancelled run on stderr and exits 1. With `approval: { prompt: ..., on_reject: continue }`, a "no" completes the step with `approved: false` and the run goes on, so later steps can check `when: $step.approved`. Such a rejection is a decision like an approval: the identity rules above apply to it.
+  - A step whose output asks for approval itself (`{ prompt, requiredApprover, ... }`) only fills in what the step's settings and these variables leave unset.
+- A rejected approval cancels the run, whether the "no" is typed at the terminal or sent with `resume --approve no`. At the terminal, an approval takes `y`/`yes` or `n`/`no` (an empty line is no); any other answer is refused, as `resume --approve` refuses it, and asked again when the run is advanced. In human mode, `lobster run` reports a cancelled run on stderr and exits 1. With `approval: { prompt: ..., on_reject: continue }`, a "no" completes the step with `approved: false` and the run goes on, so later steps can check `when: $step.approved`. Such a rejection is a decision like an approval: the identity rules above apply to it.
 
 ### Conditions
 
-`when:`, `condition:` and switch cases take a condition:
+`when:` (or its older spelling `condition:`; a step takes one, not both) and switch cases take a condition:
 
 - **Values:** step fields (`$classify.json.label`, `$confirm.approved`, `$route.case`), strings in quotes, numbers, `true`, `false`, `null`, and lists (`[refund, spam]`). On the right of an operator, a bare word is a string: `$review.response.decision == approve`.
 - **Operators:** `==`, `!=`, `<`, `<=`, `>`, `>=`, `in`, `contains`, `matches`, then `!`, `&&`, `||` and parentheses. A comparison does not chain.
@@ -121,7 +125,7 @@ steps:
         - when: $classify.json.label == refund && $classify.json.score >= 0.8
           steps:
             - id: confirm
-              approval: Issue the refund?
+              approval: { prompt: Issue the refund?, on_reject: continue }
             - id: refund
               run: billing refund --order ${order}
               when: $confirm.approved
@@ -177,11 +181,11 @@ steps:
 ```
 
 - The steps inside a loop are steps like any other: approvals, input, sleeps, waits, switches, child workflows and loops. A question inside a loop is asked once per item or round, and the run pauses until it is answered.
-- **`for_each`:** inside, `$item` and `$index` are the current item and its position. `$each.json` is a list with one entry per item: the item, its index and the output of each step. The steps' own ids are visible only inside the loop.
+- **`for_each`:** inside, `$item` and `$index` are the current item and its position. `$each.json` is a list with one entry per item: the item, its index and the output of each step. The steps' own ids are visible only inside the loop. Inside the loop, `$item` and `$index` (or the names `item_var` and `index_var` give) mean the loop's own variables, even when an earlier step or an outer loop's variable has the same name; no step inside the loop may take one of those names, or the name of a step before the loop.
 - **`concurrency: N`** on a `for_each` runs up to N items at once (default 1; at most 1000). `$each.json` keeps item order whichever finishes first. If an item fails, no new item starts, the items already running finish, and then the loop fails; their outputs are kept, so a retry (`lobster runs advance`) runs only the items that did not finish. A loop that runs items at once cannot contain approvals, input, sleeps or waits (several items would wait at once), and cannot use `pause_ms`/`batch_size`, which pace items one at a time. Loops nest: `concurrency: 4` inside `concurrency: 4` can run 16 items at once.
 - **`repeat`:** `until` is checked after each round, so the steps run at least once. `max` is required: after that many rounds the step fails, or ends with `on_max: continue`. A round sees the results of the round before it (`$check.json` in round 2 is round 1's until `check` runs again). Only the last round's results are kept, so a long loop does not grow the saved run. Afterwards later steps see the last round's steps, and `$ci.rounds` says how many rounds ran; `$ci.json` is the output of the last step that ran.
-- A loop with `retry` cannot contain approvals, input, sleeps or waits, nor a pipeline that asks: a retry runs the loop again from its start, so it would ask again. This is refused when the file loads, or, for a pipeline, when it asks.
-- A step's `timeout_ms` covers its work, not pauses: when a run pauses inside a loop, a switch or any step that encloses the pause, those steps get a fresh budget when the run continues.
+- A loop or a `switch` with `retry` cannot contain approvals, input, sleeps or waits, nor a pipeline that asks: a retry runs it again from its start, so it would ask again. This is refused when the file loads, or, for a pipeline, when it asks.
+- A step's `timeout_ms` covers its work, not pauses: when a run pauses inside a loop, a switch or any step that encloses the pause, those steps get a fresh budget when the run continues. Waits that do not pause the run do not count either: a question answered at the terminal, a `pause_ms` between batches, a short `sleep` waited in place, a retry delay. (Inside a `parallel` step or a `for_each` with `concurrency`, a retry delay in one branch still counts: the other branches are working.)
 
 ### Recipes
 
@@ -367,8 +371,8 @@ steps:
   reaches only that caller's runs, and its delivery `--id` cannot collide with
   another caller's. An unscoped caller (the CLI, a trusted host) reaches any run.
 - Sleeps, waits and deadlines are gates: like approvals they are allowed inside
-  `switch` cases and loops, but not inside `parallel` branches, child workflows or a loop
-  with `retry`.
+  `switch` cases and loops, but not inside `parallel` branches, child workflows, a
+  `for_each` with `concurrency`, or a loop or `switch` with `retry`.
 
 Something outside continues these runs:
 
@@ -421,7 +425,9 @@ A shell command (or `exec`) shows progress by touching the file named in
 `LOBSTER_HEARTBEAT_FILE`; a pipeline command calls `ctx.heartbeat()`. Silence for
 longer than the limit stops the step like a timeout (its process tree is killed),
 after which `retry`, `on_error` and the repeatable rules apply. A dead process is
-already covered by the run's lease and `runs advance --due`.
+already covered by the run's lease and `runs advance --due`. Deliberate waits
+inside the step (a question at the terminal, a `pause_ms` between batches, a short
+`sleep`, a retry delay) are not silence: waiting is not hanging.
 
 ## Restarting workflow-file runs
 
@@ -503,10 +509,14 @@ lobster graph --file path/to/workflow.lobster --args-json '{"location":"Seattle"
 
 What gets visualized:
 
-- each workflow step as a node (`run`, `pipeline`, `approval`, etc.)
-- data-flow edges from `stdin: $step.stdout` / `$step.json` references
+- each workflow step as a node (`run`, `pipeline`, `approval`, etc.), in order, joined by `next` edges
+- data-flow edges from `stdin: $step.stdout` / `$step.json` references and from a `for_each` list
 - conditional dependencies from `when:` / `condition:` expressions
-- approval gates as diamond-shaped nodes in `mermaid` and `dot` output
+- a `switch` and its cases: each case's steps are nodes of their own, entered by an edge labelled with the case's condition
+- a `parallel`, `repeat` or `for_each` step as one node: a later step that reads one of its branches or inner steps gets an edge from that node, and what its insides read (a branch's `stdin`, the steps' `stdin` and conditions, a repeat's `until`) is drawn as edges into it; names local to it (its own steps, loop variables) draw none
+- approval gates and switches as diamond-shaped nodes in `mermaid` and `dot` output
+
+References inside `run` commands and pipeline text are not drawn.
 
 Format notes:
 
@@ -576,14 +586,14 @@ its records; a failed run keeps them for a retry until retention deletes it, and
 `storage export` includes them. New tracked tokens require this runtime; older
 binaries cannot understand the new execution state. State saved by older
 versions as loose JSON files needs `lobster upgrade` once (see
-[Upgrading from an older version](#upgrading-from-an-older-version)). History enables run tracking. To track
-standalone pipeline/SDK status without detailed history, use `LOBSTER_RUNS=1` or
-`trackRuns: true`. Each run retains its original history setting when resumed.
+[Upgrading from an older version](#upgrading-from-an-older-version)). Every run is
+recorded; `history: true` (`LOBSTER_HISTORY=1`) only adds diagnostic events, and each
+run keeps its original history setting when resumed.
 
 ### Run and pending review API
 
-Workflow-file runs are recorded automatically. For standalone pipelines/SDK stages,
-enable recording with `trackRuns: true`; add `history: true` for diagnostic events. A pending question is saved
+Every run is recorded: workflow files, standalone pipelines and SDK pipelines alike;
+add `history: true` for diagnostic events. A pending question is saved
 with its original prompt, schema, defaults, and full review subject. Discovery
 reads that snapshot, rather than rebuilding it from chat or a workflow file.
 
@@ -592,9 +602,7 @@ import {
   openStoreSession, listRuns, getRun, getWait, resumeToolRequest,
 } from '@clawdbot/lobster/core';
 
-const store = await openStoreSession({
-  directory: '/path/to/state', trackRuns: true,
-});
+const store = await openStoreSession({ directory: '/path/to/state' });
 const ctx = {
   storeSession: store,
   runMetadata: { callerId: 'host:stable-logical-session' },
@@ -687,7 +695,7 @@ history pruning. Runs can also continue through `advanceWorkflowRun` or
 `lobster runs advance`, subject to interrupted-activity recovery policy. A failed run
 is retried from the step that failed: steps that completed keep their results, and a
 step that reported dispatch of a command that may not be repeated is not run again.
-A failed run or resume reports the run's `runId` in its envelope; once a resume is
+A failed run or resume reports the run's `runId` in its envelope (in human mode, `lobster run` prints `Run <runId>: ...`); once a resume is
 accepted its token is spent, so retry with `lobster runs advance <runId>`. Failed runs keep their step records for this until retention deletes them.
 No background dispatcher is included.
 
@@ -716,9 +724,11 @@ the same position, is moved to `.upgrade-skipped/` and listed in the report, as 
 a value whose key already holds something different. Running it again does nothing.
 It refuses while an older Lobster process holds a state lock.
 
-Until then, `lobster run` asks on a terminal whether to import now, other commands
-print a one-line reminder on stderr, and resuming something not yet imported fails
-with error type `upgrade_required`. Hosts embedding Lobster can call
+Until then, commands that run or continue workflows (`run`, a bare pipeline, `signal`,
+`runs advance`) ask on a terminal whether to import now; `resume`, tool mode and a run
+without a terminal print a one-line reminder on stderr instead. Inspection commands
+(`runs list`/`show`/`abandon`, `waits`, `history`, `storage`, `doctor`) do not check.
+Resuming something not yet imported fails with error type `upgrade_required`. Hosts embedding Lobster can call
 `upgradeStore({ directory })` from the core or SDK entry point instead.
 
 ```sh
@@ -786,7 +796,7 @@ try {
 the database connection.
 
 The public `StoreSession` handle exposes lifecycle and inspection only:
-`directory`, `history`, `trackRuns`, `readOnly`, `listRuns`, `getRun`, `getWait`, `inspect`, `retain`,
+`directory`, `history`, `readOnly`, `listRuns`, `getRun`, `getWait`, `inspect`, `retain`,
 `reconcile`, `acknowledge`, and `close`. Use the execution APIs for
 resume, and SDK state primitives for ordinary state. Backend access, raw
 checkpoints, and executor transitions are internal, not package API.
@@ -817,11 +827,11 @@ IDs as cursors, so new IDs before an existing cursor appear on a fresh scan.
 Event pagination uses committed run-local sequence numbers and reads current
 attempt/wait status for the returned references.
 
-`new Lobster({ storeSession: store })` or `new Lobster({ history: true, stateDir })`
-tracks SDK runs with additive stored tokens. Resume still requires an instance
-with the original JavaScript stages; closures are not serialized. Untracked
-legacy SDK tokens retain their decoder and behavior. Applications must obtain a
-user decision before resuming any approval, as before.
+An SDK run is recorded like any other (in `stateDir`, or a given `storeSession`). Resume
+still requires an instance with the original JavaScript stages; closures are not
+serialized. A token from an older SDK is converted into a run on its first resume and
+honoured once. Applications must obtain a user decision before resuming any approval, as
+before.
 
 # Commands and pipelines
 
@@ -926,6 +936,11 @@ keep pipes open after overflow. Calls without an AbortSignal relay terminal
 interrupts to that group and retain the host's existing signal handlers or
 conventional interrupt exit status.
 
+## Question limits
+
+- `LOBSTER_APPROVAL_INPUT_TIMEOUT_MS`: how long a question asked at a terminal (an approval, an `input:` step, `ask`, `requestInput`) waits for its answer. Unset, zero or not a positive number means no limit. A read that times out fails only the question: `lobster runs advance` asks it again without running the step before it again.
+- `LOBSTER_MAX_TOOL_ENVELOPE_BYTES`: the largest `needs_input` tool envelope a host accepts (default 512000 bytes; values under 1024 are ignored). A question's subject that does not fit is cut to a preview, then left out; a question that still does not fit is an error.
+
 ## HTTP response limits
 
 HTTP response bodies remain unlimited by default. Set
@@ -1003,7 +1018,7 @@ A host embedding Lobster can supply its own adapters through `ctx.llmAdapters`. 
 
 Workflow `_meta.cost` and `cost_limit` use a static pricing table plus optional overrides from `LOBSTER_LLM_PRICING_JSON`, for example `{"my-model":{"input":1.0,"output":2.0}}` in USD per million tokens. Unknown or missing model IDs still record token counts with zero estimated cost, but Lobster warns on stderr so stale or missing pricing does not fail silently.
 
-A cached or replayed answer is not billed again: a model call is counted once, in the run that made it, however many later steps re-emit its answer. This holds while the answer stays inside Lobster: through pipelines, renderers, projections, run state, `workflow:` steps and a resume. It does not survive a stage that hands the items to an external process and reads them back — `exec --stdin json --json ...` — because what comes back is whatever that process printed, and Lobster cannot tell a faithful copy of a replay from a fresh claim to have made the call. Such a step is billed as a call, which is what earlier versions did everywhere. A `workflow:` step counts what its sub-workflow spent, and a replay the sub-workflow returned is not billed a second time by the run that composed it. Spend also survives a pause — a workflow that stops at an approval or `input` gate keeps what it has recorded, so `_meta.cost` covers the whole run after a resume and `cost_limit` applies to the whole run rather than to the steps after the last gate.
+A cached or replayed answer is not billed again: a model call is counted once, in the run that made it, however many later steps re-emit its answer. This holds while the answer stays inside Lobster: through pipelines, renderers, projections, run state, `workflow:` steps and a resume. It does not survive a stage that hands the items to an external process and reads them back — `exec --stdin json --json ...` — because what comes back is whatever that process printed, and Lobster cannot tell a faithful copy of a replay from a fresh claim to have made the call. Such a step is billed as a call, which is what earlier versions did everywhere. A run saves where its paid answers are, with its own state, so an answer is still known to be paid after a pause however many calls the run made, and a value that merely copies an answer's public fields is not. A `workflow:` step counts what its sub-workflow spent, and a replay the sub-workflow returned is not billed a second time by the run that composed it. Spend also survives a pause — a workflow that stops at an approval or `input` gate keeps what it has recorded, so `_meta.cost` covers the whole run after a resume and `cost_limit` applies to the whole run rather than to the steps after the last gate.
 
 `llm_task.invoke` remains available as a backward-compatible alias for the OpenClaw provider.
 
@@ -1082,9 +1097,8 @@ has retired an invocation. Lobster rechecks it before built-in process, network,
 and state effects, including after asynchronous resume preparation. Keep passing
 an `AbortSignal` to cancel work that has already started.
 
-For standalone pipelines, a retired resume restores its caller-owned checkpoint
-when no unsafe dispatch has started. Workflow-file decisions follow a different
-rule: a committed answer remains accepted; later host retirement cannot undo it.
+For every run, workflow file or pipeline, a committed answer remains accepted; later
+host retirement cannot undo it.
 Authority is checked again before activity dispatch and question publication.
 Recovery uses saved execution rather than asking for the same decision again.
 Custom commands and injected adapters must check the callback after asynchronous
@@ -1138,13 +1152,12 @@ Requires Node.js >=24.16.0 <25 or >=26.1.0 and the pnpm version pinned in `packa
 - `pnpm lint`
 - `node ./bin/lobster.js --help`
 - `node ./bin/lobster.js doctor`
-- `node ./bin/lobster.js "exec --json --shell 'echo [1,2,3]' | where '0>=0' | json"`
+- `node ./bin/lobster.js "exec --json --shell 'echo [1,2,3]' | head --n 2 | json"` (prints `[1, 2]`)
 
 ### Notes
 
 - `pnpm test` runs `tsc` and then executes tests against `dist/`.
 - `bin/lobster.js` runs the compiled entrypoint in `dist/`; build after changing source files.
-Invalid workflow file paths are reported as input errors (exit code 2), whether passed with `--file` or as a single positional path (no whitespace; contains a path separator or ends in `.lobster`, `.yaml`, `.yml`, or `.json`). In `--mode tool`, these failures use the same JSON error envelope as other parsing errors.
 
 ## Source layout and checks
 
@@ -1156,11 +1169,11 @@ The source is one TypeScript package; only `src/cli.ts` sits at the top of `src`
 | `src/sdk` | Pipeline composition for the SDK entry point |
 | `src/commands` | The command contract (`defineCommand`), the pack registry and the `stdlib` pack |
 | `src/packs` | The `openclaw`, `google` and `github` packs |
-| `src/pipeline` | Pipeline parsing, the stage runtime, input requests and pipeline resume state |
-| `src/workflows` | Workflow loading, expressions, definition snapshots, dry runs, graphs and `lobster upgrade` |
-| `src/engine` | Saved execution, node handlers, activities, the retry policy, and the run API (`runner.ts`: start, resume, advance, abandon, due runs, events) |
+| `src/pipeline` | Pipeline parsing and stage checks, the stage runtime, the one-shot runner (`runPipeline`), input requests and pipeline resume state |
+| `src/workflows` | Workflow loading, expressions, definition snapshots, dry runs, graphs and the retry policy |
+| `src/engine` | Saved execution, node handlers, activities, `lobster upgrade`, and the run API (`runner.ts`: start, resume, advance, abandon; `due.ts`: due runs and events) |
 | `src/persistence` | The SQLite run store, sessions, history and waits |
-| `src/state` | State keys, file locks and atomic writes |
+| `src/state` | Stored values (`state.get`/`state.set`), short approval IDs, state keys, file locks and atomic writes |
 | `src/resume` | Resume arguments, options and tokens |
 | `src/llm` | `llm.invoke`'s protocol, adapters, answer cache and flags; LLM spend accounting and cost tracking |
 | `src/process`, `src/io`, `src/util` | Child processes, stream and HTTP reads, small shared helpers |

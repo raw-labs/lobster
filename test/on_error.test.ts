@@ -166,7 +166,7 @@ test("an approval inside a pipeline step pauses the run; on_error does not answe
 		registry: createDefaultRegistry(),
 	};
 	const token = JSON.parse(
-		Buffer.from(asked.requiresApproval!.resumeToken!, "base64url").toString("utf8"),
+		Buffer.from(asked.requiresApproval!.resumeToken, "base64url").toString("utf8"),
 	);
 	const rejected = await runWorkflowFile({ resume: token, approved: false, ctx } as any);
 	assert.equal(rejected.status, "cancelled", "a rejection cancels the run, it is not an error");

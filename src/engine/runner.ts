@@ -1,47 +1,47 @@
 // The run API: start a run (a workflow file, a standalone pipeline, an SDK pipeline), answer
 // a wait, advance a run that stopped, and abandon one. Each holds the run's execution lease
 // while it works. Many runs at once: due.ts.
-import path from "node:path";
+import { checkPipelineSteps } from "../workflows/pipeline_check.js";
 import { withStoreContext } from "../persistence/execution.js";
 import { bindRecorder, recorderFromEnv, sessionFromEnv } from "../persistence/context.js";
-import { readStateJsonWithLock } from "../state/store.js";
-import { loadWorkflowFile } from "../workflows/load.js";
 import { dryRunWorkflow } from "../workflows/dry_run.js";
 import { resolveWorkflowArgs } from "../workflows/args.js";
+import { assertSavable } from "../util/serialization.js";
 import { pipelineDefinition, snapshotDefinition } from "../workflows/definition.js";
-import { ExecutionStore } from "./store.js";
+import { checkLeaseMs, ExecutionStore } from "./store.js";
 import { Machine } from "./machine.js";
-import { answer, cancelWithdrawing } from "./waits.js";
-import type { RunContext } from "./context.js";
+import { answer, cancelWithdrawing, waitGone } from "./waits.js";
+import { inRunDirectory, type RunContext } from "./context.js";
 import {
 	asContinuation,
 	isFinished,
 	keys,
 	unresolvedActivities,
 	type ExecutionState,
+	type RunStatus,
 } from "./checkpoint.js";
 import type { Definition } from "../workflows/definition.js";
 import type { WorkflowRunResult } from "../workflows/types.js";
 import { visibleTo, callerId } from "../persistence/waits.js";
+import { checkRunId, type RunKind } from "../persistence/model.js";
 import type { StoreSession } from "../persistence/session.js";
 import { ExecutionRecorder } from "../persistence/session.js";
 import { ResumeRefusedError, UpgradeRequiredError } from "./errors.js";
 import type { WorkflowResumePayload } from "../resume/token.js";
+import { decisionCount, type Decision } from "../resume/options.js";
 
-export type WorkflowRunOptions = {
+/** What to run: a workflow file or definition to start, or a wait to answer (`resume` and a decision). */
+export type WorkflowRunOptions = Decision & {
 	filePath?: string;
 	args?: Record<string, unknown>;
 	ctx: RunContext;
 	resume?: WorkflowResumePayload;
-	approved?: boolean;
-	response?: unknown;
-	cancel?: boolean;
 	/** Host execution lease; not a workflow setting. */
 	leaseMs?: number;
 	/** Run this definition instead of loading `filePath` (a standalone pipeline). */
 	definition?: Definition;
 	/** The kind recorded for a new run (default "workflow"). */
-	kind?: "workflow" | "pipeline" | "sdk";
+	kind?: RunKind;
 	/**
 	 * Set by the Lobster SDK, whose stages are closures only its host has: the run's pipeline
 	 * must name exactly these stages. Runs of kind "sdk" are refused without it.
@@ -50,7 +50,7 @@ export type WorkflowRunOptions = {
 };
 
 const SDK_RUN_ELSEWHERE =
-	"This run was started by the Lobster SDK: resume it with Lobster.resume on an instance with the same stages";
+	"This run was started by the Lobster SDK: continue it with Lobster.resume or Lobster.advance on an instance with the same stages";
 
 /** SDK runs need their host's stages; everything else must not claim to be one. */
 function assertRunnableHere(kind: string, sdk: WorkflowRunOptions["sdk"]) {
@@ -65,53 +65,76 @@ function assertRunnableHere(kind: string, sdk: WorkflowRunOptions["sdk"]) {
  */
 export async function runPipelineText(options: {
 	pipeline: string;
-	input?: unknown[];
 	ctx: RunContext;
-	leaseMs?: number;
 }): Promise<WorkflowRunResult & { runId?: string }> {
 	return runWorkflowFile({
-		definition: pipelineDefinition(options.pipeline, options.input),
+		definition: pipelineDefinition(options.pipeline),
 		kind: "pipeline",
 		ctx: options.ctx,
-		leaseMs: options.leaseMs,
 	});
 }
 
 export async function runWorkflowFile(
 	options: WorkflowRunOptions,
 ): Promise<WorkflowRunResult & { runId?: string }> {
+	// A decision answers a paused run; args or a definition start a new one. Mixed, one half
+	// would be dropped without a word. (A resumed run keeps its own definition: a `filePath`
+	// given with a resume names it and changes nothing.)
+	if (options.resume) {
+		if (options.args !== undefined || options.definition !== undefined)
+			throw new Error("A resume takes no args or definition: the run keeps its own");
+	} else if (decisionCount(options) > 0) {
+		throw new Error("approved, response and cancel apply to a resume");
+	}
+	// A relative path is the run's directory's, as for every entry point.
+	const filePath = options.filePath && inRunDirectory(options.ctx, options.filePath);
 	if (options.ctx.dryRun) {
-		const workflow = await loadWorkflowFile(options.filePath!);
+		// A dry run plans a workflow file; there is nothing to plan for a resume or a definition.
+		if (!filePath || options.resume)
+			throw new Error("A dry run applies to starting a workflow file");
+		// Checked as a start checks it: the child workflows it names load, and every pipeline
+		// step (theirs included) names known commands and flags.
+		const definition = await snapshotDefinition(filePath, options.args ?? {});
+		const args = resolveWorkflowArgs(definition.workflow.args, options.args);
+		if (options.ctx.registry) checkPipelineSteps(definition, args, options.ctx.registry);
 		return dryRunWorkflow({
-			steps: workflow.steps,
-			resolvedArgs: resolveWorkflowArgs(workflow.args, options.args),
+			steps: definition.workflow.steps,
+			resolvedArgs: args,
 			ctx: options.ctx,
 		});
 	}
 	return ownFailure((label) =>
-		withStoreContext({ ...options.ctx, trackRuns: true }, async (ctx) => {
+		withStoreContext(options.ctx, async (ctx) => {
 			const session = sessionFromEnv(ctx.env)!;
-			let recorder = recorderFromEnv(ctx.env);
+			let recorder = options.resume ? undefined : await recorderForThisRun(session, ctx.env);
 			let runId: string;
 			let fresh: Pick<ExecutionState, "definition" | "args"> | undefined;
 			const stateKey = options.resume?.stateKey;
 			if (options.resume) {
-				runId = await resumedRunId(stateKey, ctx);
-				ctx.hooks?.onResumeStateResolved?.(stateKey!);
+				runId = await resumedRunId(session, options.resume.stateKey, ctx);
 			} else {
 				// Load and validate first: a workflow that cannot start leaves no run behind.
-				if (!options.filePath && !options.definition)
-					throw new Error("Workflow file path required");
+				if (!filePath && !options.definition) throw new Error("Workflow file path required");
 				const definition =
-					options.definition ?? (await snapshotDefinition(options.filePath!, options.args ?? {}));
+					options.definition ?? (await snapshotDefinition(filePath!, options.args ?? {}));
 				fresh = { definition, args: resolveWorkflowArgs(definition.workflow.args, options.args) };
-				recorder ??= await session.createRun(options.kind ?? "workflow", ctx.runMetadata);
+				// Refused before the run exists: args the run cannot save would leave it stuck.
+				assertSavable(fresh.args, "Workflow args");
+				// A workflow file's pipeline steps are checked before any of its steps acts.
+				if (!options.definition && ctx.registry)
+					checkPipelineSteps(definition, fresh.args, ctx.registry);
+				if (!recorder) {
+					// Refused before the run exists, so a refusal leaves no run behind either.
+					assertRunnableHere(options.kind ?? "workflow", options.sdk);
+					if (options.leaseMs !== undefined) checkLeaseMs(options.leaseMs);
+					recorder = await session.createRun(options.kind ?? "workflow", ctx.runMetadata);
+				}
 				runId = recorder.runId;
 			}
 			const run = await findRun(session, runId, ctx);
 			assertRunnableHere(run.kind, options.sdk);
-			recorder ??= await session.recorderForState(stateKey!);
-			const bound = { ...ctx, env: recorder ? bindRecorder(ctx.env, recorder) : ctx.env };
+			recorder ??= new ExecutionRecorder(session, run.id, "", run.historyEnabled !== false);
+			const bound = { ...ctx, env: bindRecorder(ctx.env, recorder) };
 			return withClaimedRun(session, runId, options, label, async (store, saved) => {
 				let state = saved;
 				if (!state) {
@@ -120,14 +143,14 @@ export async function runWorkflowFile(
 						version: 1,
 						revision: 0,
 						...fresh,
-						cwd: path.resolve(ctx.cwd ?? process.cwd()),
+						cwd: inRunDirectory(ctx),
 						activations: {},
 						status: "running",
 						startedAt: Date.now(),
 					};
 				}
 				checkExecution(state, options.sdk);
-				const machine = new Machine(state, store, bound);
+				const machine = await Machine.load(state, store, bound);
 				if (!state.revision) await machine.save();
 				if (stateKey) await answer(machine, stateKey, options);
 				return { ...(await machine.run()), runId };
@@ -147,8 +170,11 @@ export async function advanceWorkflowRun(options: {
 	/** Set by the Lobster SDK for its own runs (see `WorkflowRunOptions.sdk`). */
 	sdk?: { pipeline: string };
 }): Promise<WorkflowRunResult & { runId: string }> {
+	checkRunId(options.runId);
+	// Advancing runs steps for real: a dry run is refused, never ignored.
+	if (options.ctx.dryRun) throw new Error("A dry run applies to starting a workflow file");
 	return ownFailure((label) =>
-		withStoreContext({ ...options.ctx, trackRuns: true }, async (ctx) => {
+		withStoreContext(options.ctx, async (ctx) => {
 			const session = sessionFromEnv(ctx.env)!;
 			const run = await findRun(session, options.runId, ctx);
 			if (!run.execution)
@@ -160,7 +186,10 @@ export async function advanceWorkflowRun(options: {
 				const state = saved!;
 				checkExecution(state, options.sdk);
 				const recorder = new ExecutionRecorder(session, run.id, "", run.historyEnabled !== false);
-				const machine = new Machine(state, store, { ...ctx, env: bindRecorder(ctx.env, recorder) });
+				const machine = await Machine.load(state, store, {
+					...ctx,
+					env: bindRecorder(ctx.env, recorder),
+				});
 				if (state.status === "failed") {
 					machine.retryFailed();
 					await machine.save();
@@ -182,8 +211,11 @@ export async function abandonWorkflowRun(options: {
 	runId: string;
 	ctx: RunContext;
 	leaseMs?: number;
-}): Promise<{ runId: string; status: string; abandoned: string[] }> {
-	return withStoreContext({ ...options.ctx, trackRuns: true }, async (ctx) => {
+}): Promise<{ runId: string; status: RunStatus; abandoned: string[] }> {
+	checkRunId(options.runId);
+	// Abandoning cancels the run for real: a dry run is refused, never ignored.
+	if (options.ctx.dryRun) throw new Error("A dry run applies to starting a workflow file");
+	return withStoreContext(options.ctx, async (ctx) => {
 		const session = sessionFromEnv(ctx.env)!;
 		const run = await findRun(session, options.runId, ctx);
 		if (!run.execution) throw new Error("Run has no workflow execution to abandon");
@@ -201,7 +233,7 @@ export async function abandonWorkflowRun(options: {
 				// A cancelled run never runs again; its error keeps what was abandoned.
 				const abandoned = unresolvedActivities(state);
 				await cancelWithdrawing(
-					new Machine(state, store, ctx),
+					await Machine.load(state, store, ctx),
 					"Abandoned" +
 						(abandoned.length
 							? `; outcome unknown for ${abandoned.map(keys.describe).join(", ")}`
@@ -218,23 +250,21 @@ function settled(state: ExecutionState) {
 	return isFinished(state) && !unresolvedActivities(state).length;
 }
 
-/** The run a resume token's continuation belongs to. */
-async function resumedRunId(stateKey: string | undefined, ctx: RunContext) {
-	if (!stateKey)
-		throw new Error(
-			"This resume token is from a Lobster version that kept workflow state inside the token; it cannot be resumed",
-		);
-	const saved = (await readStateJsonWithLock({
-		env: ctx.env,
-		key: stateKey,
-		signal: ctx.signal,
-	})) as {
-		type?: string;
-	} | null;
+/**
+ * The run a resume token's continuation belongs to. A token for a run this caller cannot see
+ * is refused like an unknown one: it tells nothing about that run.
+ */
+async function resumedRunId(session: StoreSession, stateKey: string, ctx: RunContext) {
+	// Continuations are written by store transitions only: a plain read sees them whole.
+	const text = (await session.read(stateKey)).text;
+	const saved = (text === null ? null : JSON.parse(text)) as { type?: string } | null;
 	// A token an older Lobster already used left this marker behind.
-	if (!saved || saved.type === "lobster.consumed-resume-state.v1") throw new ResumeRefusedError();
+	if (!saved || saved.type === "lobster.consumed-resume-state.v1")
+		throw waitGone(ctx.env, stateKey);
 	const continuation = asContinuation(saved);
 	if (!continuation) throw new UpgradeRequiredError();
+	const run = await session.getRunState(continuation.runId);
+	if (!run || !visibleTo(run, callerId(ctx.runMetadata))) throw new ResumeRefusedError();
 	return continuation.runId;
 }
 
@@ -264,6 +294,18 @@ async function withClaimedRun<T>(
 	} finally {
 		await store.close();
 	}
+}
+
+/**
+ * The recorder of the run a host created for this call (`withExecution`), which nothing has
+ * started yet. One inherited from a run in progress (a step's command starting a run of its
+ * own) belongs to that run, not to this one.
+ */
+async function recorderForThisRun(session: StoreSession, env: RunContext["env"]) {
+	const recorder = recorderFromEnv(env);
+	if (!recorder) return undefined;
+	const run = await session.getRunState(recorder.runId);
+	return run && !run.execution ? recorder : undefined;
 }
 
 /** A checkpoint this version can continue, of the SDK instance's stages if it is one. */

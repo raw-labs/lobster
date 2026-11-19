@@ -4,10 +4,13 @@ import { createRecord, resolveInputValue } from "../../workflows/values.js";
 import { sleepUntil } from "../../util/duration.js";
 import { activation, keys, type Activation } from "../checkpoint.js";
 import type { Machine } from "../machine.js";
-import { bodyGatesRefused, GATES_REFUSED, type Scope } from "../scope.js";
+import { bodyGatesRefused, GATES_REFUSED, innerSettings, type Scope } from "../scope.js";
 import { stopsRun } from "../errors.js";
 import { valueResult } from "../results.js";
+import { deliberateWait } from "../step_clock.js";
 import { sequence } from "./sequence.js";
+import { carryLlmProvenance } from "../../llm/accounting.js";
+import { concurrentLedger } from "../accounting.js";
 
 type Progress = NonNullable<Activation["forEach"]>;
 
@@ -26,6 +29,8 @@ export async function forEachStep(machine: Machine, step: WorkflowStep, key: str
 		if (!Array.isArray(resolved))
 			throw new Error(`Workflow step ${step.id} for_each: expected array, got ${typeof resolved}`);
 		items = structuredClone(resolved);
+		// The clone drops the marks of model calls; the record keeps them (records.ts).
+		carryLlmProvenance(resolved, items);
 		machine.records.put(itemsKey, items);
 		frame.forEach = { count: items.length, cursor: 0 };
 	}
@@ -58,9 +63,12 @@ export async function forEachStep(machine: Machine, step: WorkflowStep, key: str
 			...scope,
 			results,
 			gatesRefused,
-			env: { ...scope.env, ...step.env },
-			cwd: step.cwd ?? scope.cwd,
+			...innerSettings(step, scope),
 			costPrefix: scope.costPrefix + step.id + ".",
+			// Items at once: each settles only the calls it made.
+			ledger: concurrency > 1 ? concurrentLedger(scope.ledger) : scope.ledger,
+			// Several items at once: a wait in one is not a wait of the loop.
+			holdClocks: concurrency > 1 ? undefined : scope.holdClocks,
 		});
 		const body = activation(machine.state, bodyKey);
 		const output: Record<string, unknown> = { [itemVar]: item, [indexVar]: index };
@@ -78,7 +86,7 @@ export async function forEachStep(machine: Machine, step: WorkflowStep, key: str
 	else
 		while (progress.cursor < progress.count) {
 			const index = progress.cursor;
-			await pauseBetweenBatches(machine, step, progress, index, scope.ctx.signal);
+			await pauseBetweenBatches(machine, step, progress, index, scope);
 			// The output and the position move together, in the next save.
 			await runItem(index, () => {
 				progress.cursor++;
@@ -104,13 +112,15 @@ async function pauseBetweenBatches(
 	step: WorkflowStep,
 	progress: Progress,
 	index: number,
-	signal: AbortSignal | undefined,
+	scope: Scope,
 ) {
 	if (!step.pause_ms || index === 0 || index % (step.batch_size ?? 1) !== 0) return;
 	if (progress.pausedBefore === index) return;
-	progress.pauseUntil ??= Date.now() + step.pause_ms;
-	await machine.save();
-	await sleepUntil(progress.pauseUntil, signal);
+	const until = (progress.pauseUntil ??= Date.now() + step.pause_ms);
+	await deliberateWait(scope.holdClocks, async () => {
+		await machine.save();
+		await sleepUntil(until, scope.ctx.signal);
+	});
 	delete progress.pauseUntil;
 	progress.pausedBefore = index;
 }

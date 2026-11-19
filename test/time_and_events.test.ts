@@ -8,7 +8,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { setTimeout as sleep } from "node:timers/promises";
-import { advanceWorkflowRun, runWorkflowFile } from "../src/engine/runner.js";
+import { abandonWorkflowRun, advanceWorkflowRun, runWorkflowFile } from "../src/engine/runner.js";
 import { advanceDueRuns, signalEvent } from "../src/engine/due.js";
 import { openStoreSession } from "../src/persistence/session.js";
 import { decodeToken } from "../src/resume/token.js";
@@ -278,6 +278,257 @@ test("a step without heartbeats is stopped; one that keeps beating finishes", as
 	assert.deepEqual(ok.output, ["done"]);
 });
 
+test("a step's progress counts for the loop around it too", async (t) => {
+	const fx = await workflowFixture(t);
+	const script = path.join(fx.dir, "beat.mjs");
+	await fs.writeFile(
+		script,
+		`import fs from "node:fs";\n` +
+			`for (let i = 0; i < 10; i++) { fs.writeFileSync(process.env.LOBSTER_HEARTBEAT_FILE, String(i)); await new Promise(r => setTimeout(r, 80)); }\n` +
+			`process.stdout.write("done");\n`,
+	);
+	// The loop's limit is shorter than the step's run; the step beats against its own limit.
+	const result = await fx.run({
+		steps: [
+			{ id: "items", run: "echo '[1]'" },
+			{
+				id: "loop",
+				for_each: "$items.json",
+				heartbeat_timeout_ms: 400,
+				steps: [
+					{
+						id: "work",
+						run: `${JSON.stringify(process.execPath)} ${JSON.stringify(script)}`,
+						heartbeat_timeout_ms: 300,
+					},
+				],
+			},
+		],
+	});
+	assert.equal(result.status, "ok");
+});
+
+test("a loop's deliberate waits are not a hang: batch pauses, short sleeps, retry delays", async (t) => {
+	const loop = (extra: Record<string, unknown>, steps: unknown[]) => ({
+		steps: [
+			{ id: "items", run: "echo '[1, 2]'" },
+			{ id: "loop", for_each: "$items.json", heartbeat_timeout_ms: 200, steps, ...extra },
+		],
+	});
+	const pause = await (
+		await workflowFixture(t)
+	).run(loop({ pause_ms: 600 }, [{ id: "hi", run: "echo hi" }]));
+	assert.equal(pause.status, "ok", "a pause between batches");
+
+	const sleep = await (await workflowFixture(t)).run(loop({}, [{ id: "nap", sleep: "600ms" }]));
+	assert.equal(sleep.status, "ok", "a sleep inside the loop, waited in place");
+
+	const fx = await workflowFixture(t);
+	const marker = path.join(fx.dir, "failed-once");
+	const retry = await fx.run(
+		loop({}, [
+			{
+				id: "flaky",
+				run: `test -f ${JSON.stringify(marker)} || (touch ${JSON.stringify(marker)}; exit 1)`,
+				retry: { max: 2, delay_ms: 600 },
+			},
+		]),
+	);
+	assert.equal(retry.status, "ok", "a retry delay of a step inside the loop");
+});
+
+test("a deliberate wait does not count against an enclosing step's timeout_ms", async (t) => {
+	// The same as a pause: a sleep waited in place, or a retry delay, is not the step's work.
+	const sleep = await (
+		await workflowFixture(t)
+	).run({
+		steps: [
+			{
+				id: "sw",
+				timeout_ms: 400,
+				switch: { cases: [{ when: "true", steps: [{ id: "nap", sleep: "700ms" }] }] },
+			},
+			{ id: "after", run: "echo done" },
+		],
+	});
+	assert.equal(sleep.status, "ok", JSON.stringify(sleep));
+
+	const fx = await workflowFixture(t);
+	const marker = path.join(fx.dir, "failed-once");
+	const retry = await fx.run({
+		steps: [
+			{ id: "items", run: "echo '[1]'" },
+			{
+				id: "loop",
+				for_each: "$items.json",
+				timeout_ms: 400,
+				steps: [
+					{
+						id: "flaky",
+						run: `test -f ${JSON.stringify(marker)} || (touch ${JSON.stringify(marker)}; exit 1)`,
+						retry: { max: 2, delay_ms: 700 },
+					},
+				],
+			},
+		],
+	});
+	assert.equal(retry.status, "ok", JSON.stringify(retry));
+});
+
+test("a crash or a stop during a deliberate wait leaves the steps around it a fresh budget", async (t) => {
+	const savedDeadlines = async (fx: Awaited<ReturnType<typeof workflowFixture>>) =>
+		Object.entries((await fx.execution()).activations)
+			.filter(([, frame]) => frame.timeoutAt !== undefined)
+			.map(([key]) => key);
+	const loop = (extra: Record<string, unknown>, steps: unknown[]) => ({
+		steps: [
+			{ id: "items", run: "echo '[1, 2]'" },
+			{ id: "loop", for_each: "$items.json", timeout_ms: 600, steps, ...extra },
+		],
+	});
+	// Each case touches `started` just before its wait begins.
+	const started = (dir: string) => JSON.stringify(path.join(dir, "started"));
+	const cases: Array<[string, (dir: string) => unknown]> = [
+		[
+			"a batch pause",
+			(dir) => loop({ pause_ms: 800 }, [{ id: "hi", run: `touch ${started(dir)}` }]),
+		],
+		[
+			"a sleep waited in place",
+			(dir) =>
+				loop({}, [
+					{ id: "go", run: `touch ${started(dir)}` },
+					{ id: "nap", sleep: "800ms" },
+				]),
+		],
+		[
+			"a retry delay",
+			(dir) =>
+				loop({}, [
+					{
+						id: "flaky",
+						run: `test -f ${started(dir)} || (touch ${started(dir)}; exit 1)`,
+						retry: { max: 2, delay_ms: 800 },
+					},
+				]),
+		],
+	];
+	for (const [what, workflow] of cases) {
+		const fx = await workflowFixture(t);
+		const controller = new AbortController();
+		const running = fx.run(workflow(fx.dir), { signal: controller.signal });
+		// Inside the wait, however long the run took to reach it.
+		while (!(await fs.stat(path.join(fx.dir, "started")).catch(() => null))) await sleep(20);
+		await sleep(150);
+		// What a crash would leave: the wait saved, the enclosing deadline not.
+		assert.deepEqual(await savedDeadlines(fx), [], `${what}: saved during the wait`);
+		controller.abort(new Error("stopped by host"));
+		await assert.rejects(running, /stopped by host/);
+		assert.deepEqual(await savedDeadlines(fx), [], `${what}: saved by the stop`);
+		await sleep(700);
+		const continued = await advanceWorkflowRun({ runId: await fx.runId(), ctx: fx.ctx() as any });
+		assert.equal(continued.status, "ok", `${what}: ${JSON.stringify(continued)}`);
+	}
+});
+
+test("a wait in one of several items running at once does not hold the loop's timeout", async (t) => {
+	const fx = await workflowFixture(t);
+	const marker = JSON.stringify(path.join(fx.dir, "failed-once"));
+	// Item 0 works past the loop's limit while item 1 waits to retry: the loop is still working.
+	await assert.rejects(
+		fx.run({
+			steps: [
+				{ id: "items", run: "echo '[0, 1]'" },
+				{
+					id: "each",
+					for_each: "$items.json",
+					concurrency: 2,
+					timeout_ms: 500,
+					steps: [
+						{
+							id: "work",
+							run: `if [ "$LOBSTER_ARG_N" = 0 ]; then sleep 1.2; else test -f ${marker} || (touch ${marker}; exit 1); fi`,
+							env: { LOBSTER_ARG_N: "$item.json" },
+							retry: { max: 2, delay_ms: 1000 },
+						},
+					],
+				},
+			],
+		}),
+		/Step 'each' timed out after 500ms/,
+	);
+});
+
+test("a stop while a timed-out loop waits to retry leaves a run that continues, not a blocked one", async (t) => {
+	const fx = await workflowFixture(t);
+	const controller = new AbortController();
+	const running = fx.run(
+		{
+			steps: [
+				{ id: "items", run: "echo '[1]'" },
+				{
+					id: "loop",
+					for_each: "$items.json",
+					timeout_ms: 300,
+					retry: { max: 2, delay_ms: 2000 },
+					steps: [{ id: "work", run: "sleep 5" }],
+				},
+			],
+		},
+		{ signal: controller.signal },
+	);
+	// The loop's timeout stops the command; the loop waits to try again. Nothing is running.
+	await sleep(900);
+	controller.abort(new Error("stopped by host"));
+	await assert.rejects(running, /stopped by host/);
+	const saved = await fx.execution();
+	assert.equal(saved.status, "running", saved.error);
+	assert.deepEqual(
+		Object.entries(saved.activations)
+			.map(([key]) => key)
+			.filter((key) => key.includes("/attempt-1")),
+		[],
+		"the timed-out attempt is forgotten",
+	);
+});
+
+test("a step waiting for an event inside a timed step gives that step a fresh budget", async (t) => {
+	const fx = await workflowFixture(t);
+	const waiting = await fx.run({
+		steps: [
+			{
+				id: "sw",
+				timeout_ms: 400,
+				switch: {
+					cases: [
+						{
+							when: "true",
+							steps: [
+								{ id: "go", wait: { event: "go" } },
+								{ id: "after", run: "echo done" },
+							],
+						},
+					],
+				},
+			},
+		],
+	});
+	assert.equal(waiting.status, "waiting");
+	// The pause clears the switch's deadline, in what it saves too.
+	const saved = Object.values((await fx.execution()).activations);
+	assert.deepEqual(
+		saved.filter((frame) => frame.timeoutAt !== undefined),
+		[],
+	);
+	await sleep(600);
+	const delivered = await signalEvent({ name: "go", ctx: fx.ctx() as any });
+	assert.deepEqual(
+		delivered.advanced.map((a) => a.status),
+		["ok"],
+		JSON.stringify(delivered.advanced),
+	);
+});
+
 test("a pipeline command shows progress with ctx.heartbeat()", async (t) => {
 	const fx = await workflowFixture(t);
 	const worker = (beat: boolean) =>
@@ -432,5 +683,94 @@ test("answering a published question at a terminal consumes its wait", async (t)
 		Object.values(run.waits).filter((w) => w.status === "pending"),
 		[],
 		"no question is left pending",
+	);
+});
+
+test("signal and advance --due refuse bad settings before touching the store", async (t) => {
+	const fx = await workflowFixture(t);
+	await assert.rejects(
+		signalEvent({ name: "go", leaseMs: 5, ctx: fx.ctx() as any }),
+		/lease must be at least 100ms/,
+	);
+	// The refused signal stored nothing: a later run does not take that event.
+	const waiting = await fx.run({ steps: [{ id: "go", wait: { event: "go" } }] });
+	assert.equal(waiting.status, "waiting");
+	for (const options of [{ limit: -1 }, { limit: 0 }, { leaseMs: 5 }])
+		await assert.rejects(
+			advanceDueRuns({ ctx: fx.ctx() as any, ...options }),
+			/must be a positive integer|lease must be at least 100ms/,
+		);
+});
+
+test("signal refuses a blank or non-string delivery ID before storing the event", async (t) => {
+	const fx = await workflowFixture(t);
+	for (const id of ["", "   ", 12, { a: 1 }])
+		await assert.rejects(
+			signalEvent({ name: "go", id: id as any, ctx: fx.ctx() as any }),
+			/Event ID must be a non-empty string/,
+		);
+	const first = await signalEvent({ name: "go", id: "build-1", ctx: fx.ctx() as any });
+	assert.equal(first.event.inserted, true);
+});
+
+test("signal refuses a non-string event name before storing anything", async (t) => {
+	const fx = await workflowFixture(t);
+	for (const name of [42, null, undefined])
+		await assert.rejects(
+			signalEvent({ name: name as any, ctx: fx.ctx() as any }),
+			/Event names use/,
+		);
+});
+
+test("a dry run is refused where it would not be honoured", async (t) => {
+	const fx = await workflowFixture(t);
+	const waiting = await fx.run({ steps: [{ id: "go", wait: { event: "go" } }] });
+	await assert.rejects(
+		advanceWorkflowRun({ runId: waiting.runId!, ctx: { ...(fx.ctx() as any), dryRun: true } }),
+		/A dry run applies to starting a workflow file/,
+	);
+	await assert.rejects(
+		runWorkflowFile({
+			resume: { protocolVersion: 1, v: 1, kind: "workflow-file", stateKey: "x" },
+			ctx: { ...(fx.ctx() as any), dryRun: true },
+		}),
+		/A dry run applies to starting a workflow file/,
+	);
+	assert.deepEqual(
+		(await advanceDueRuns({ ctx: { ...(fx.ctx() as any), dryRun: true } })).advanced,
+		[],
+	);
+	await assert.rejects(
+		abandonWorkflowRun({ runId: waiting.runId!, ctx: { ...(fx.ctx() as any), dryRun: true } }),
+		/A dry run applies to starting a workflow file/,
+	);
+	await assert.rejects(
+		signalEvent({ name: "go", ctx: { ...(fx.ctx() as any), dryRun: true } }),
+		/A dry run applies to starting a workflow file/,
+	);
+	// Nothing was stored: the run still waits, and a real signal finds it.
+	const delivered = await signalEvent({ name: "go", ctx: fx.ctx() as any });
+	assert.deepEqual(
+		delivered.advanced.map((a) => a.status),
+		["ok"],
+	);
+});
+
+test("runWorkflowFile refuses a decision without a resume, and args with one", async (t) => {
+	const fx = await workflowFixture(t);
+	const filePath = await fx.write("flow.lobster", { steps: [{ id: "ask", approval: "Go?" }] });
+	await assert.rejects(
+		runWorkflowFile({ filePath, approved: true, ctx: fx.ctx() as any }),
+		/apply to a resume/,
+	);
+	await assert.rejects(
+		runWorkflowFile({
+			filePath,
+			args: { n: 1 },
+			resume: { protocolVersion: 1, v: 1, kind: "workflow-file", stateKey: "x" },
+			approved: true,
+			ctx: fx.ctx() as any,
+		}),
+		/A resume takes no args or definition/,
 	);
 });

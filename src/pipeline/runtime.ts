@@ -1,4 +1,3 @@
-import { assertKnownFlags } from "../commands/define.js";
 import { PersistenceError } from "../persistence/backend.js";
 import type { LlmSpendLedger } from "../llm/accounting.js";
 import {
@@ -11,6 +10,8 @@ import {
 } from "./input_request.js";
 import { recorderFromEnv } from "../persistence/context.js";
 import { createJsonRenderer } from "./render_json.js";
+import { checkStages } from "./parser.js";
+import { streamOf } from "../io/streams.js";
 
 export async function runPipeline({
 	pipeline,
@@ -62,8 +63,10 @@ export async function runPipeline({
 	assertInvocationCurrent?: (() => void) | undefined;
 	onUnsafeCommandDispatch?: (() => void) | undefined;
 }) {
+	// Every stage is checked before the first runs (or is planned).
+	const commands = checkStages(pipeline, registry);
 	if (dryRun) {
-		return dryRunPipeline({ pipeline, registry, stderr });
+		return dryRunPipeline({ pipeline, stderr });
 	}
 
 	await recorderFromEnv(env)?.definition(pipeline);
@@ -105,14 +108,6 @@ export async function runPipeline({
 		heartbeat: heartbeat ?? (() => {}),
 	};
 
-	// Every stage is checked before the first runs: a typo in a later stage must not fail
-	// the pipeline after an earlier one has already acted (sent a message, called a tool).
-	for (const stage of pipeline) {
-		const command = registry.get(stage.name);
-		if (!command) throw new Error(`Unknown command: ${stage.name}`);
-		assertKnownFlags(command, stage.name, stage.args ?? {});
-	}
-
 	const unfinishedStages = new Set<() => Promise<void>>();
 	try {
 		const result = await executeStages();
@@ -133,11 +128,7 @@ export async function runPipeline({
 		for (let idx = 0; idx < pipeline.length; idx++) {
 			if (haltAfterStageOnAbort) signal?.throwIfAborted();
 			const stage = pipeline[idx];
-			const command = registry.get(stage.name);
-			if (!command) {
-				throw new Error(`Unknown command: ${stage.name}`);
-			}
-			assertKnownFlags(command, stage.name, stage.args ?? {});
+			const command = commands[idx];
 			const history = recorderFromEnv(env);
 			const attemptId = await history?.start(
 				`pipeline/${history.pipelineOffset + idx}`,
@@ -346,30 +337,17 @@ export async function runPipeline({
 			stage: pipeline[stageIndex],
 			inPlace: true,
 		};
-		stream = streamFromItems([err.request]);
+		stream = streamOf([err.request]);
 		return true;
 	}
 }
 
-function dryRunPipeline({
-	pipeline,
-	registry,
-	stderr,
-}: {
-	pipeline: any[];
-	registry: any;
-	stderr: any;
-}) {
+function dryRunPipeline({ pipeline, stderr }: { pipeline: any[]; stderr: any }) {
 	const lines: string[] = [];
 	lines.push(`[DRY RUN] Pipeline (${pipeline.length} stage${pipeline.length !== 1 ? "s" : ""}):`);
 
 	for (let idx = 0; idx < pipeline.length; idx++) {
 		const stage = pipeline[idx];
-		const command = registry.get(stage.name);
-		if (!command) {
-			throw new Error(`Unknown command: ${stage.name}`);
-		}
-		assertKnownFlags(command, stage.name, stage.args ?? {});
 		const formattedArgs = stage.args ? formatStageArgs(stage.args) : "";
 		const argsStr = formattedArgs ? `  args: ${formattedArgs}` : "";
 		lines.push(`  ${idx + 1}. ${stage.name}${argsStr}`);
@@ -420,12 +398,6 @@ function createRecordingJsonRenderer(stdout: any, collected: unknown[]) {
 			return renderer.json(items);
 		},
 	};
-}
-
-function streamFromItems(items: unknown[]) {
-	return (async function* () {
-		for (const item of items) yield item;
-	})();
 }
 
 function throwIfAbortedAfterDrain(input: AsyncIterable<unknown>, signal?: AbortSignal) {

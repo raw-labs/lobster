@@ -2,7 +2,7 @@ import { defineCommand } from "../define.js";
 import { markLlmItem } from "../../llm/accounting.js";
 import type { LlmChargeCost, LlmSpendLedger, LlmProvenance } from "../../llm/accounting.js";
 import { formatSchemaError, prepareSchema, type SchemaValidator } from "../../util/validation.js";
-import { streamOf } from "../../io/terminal.js";
+import { streamOf } from "../../io/streams.js";
 import {
 	payloadValidator,
 	responseEnvelopeValidator,

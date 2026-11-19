@@ -42,5 +42,3 @@ export function createRegistry({ packs }: { packs: CommandPack[] }): CommandRegi
 export function createDefaultRegistry(): CommandRegistry {
 	return createRegistry({ packs: builtinPacks });
 }
-
-export { registryWorkflows } from "./named_workflows.js";

@@ -1,21 +1,25 @@
 // What a run that paused reports to its caller: the question and how to answer it (a resume
 // token, an approval ID), or what it waits for. The request must fit in a tool envelope.
 import { PREVIEW_CHARS } from "../io/terminal.js";
-import { encodeToken } from "../resume/token.js";
+import { encodeToken, workflowResumePayload } from "../resume/token.js";
 import { createApprovalIndex, findApprovalIdByStateKey } from "../state/store.js";
 import type { WorkflowRunResult } from "../workflows/types.js";
+import { inputAsker } from "./asking.js";
 import type { Activation } from "./checkpoint.js";
 
 const MAX_NEEDS_INPUT_SUBJECT_BYTES = 192_000;
 const DEFAULT_TOOL_ENVELOPE_MAX_BYTES = 512_000;
 const RESUME_TOKEN_PLACEHOLDER = "x".repeat(220);
 
-/** The result of a run paused at `frame`. `fresh`: the question was asked by this call. */
+/**
+ * The result of a run paused at `frame`. `fresh`: the question was asked by this call;
+ * `standalone`: the run is a standalone pipeline, whose one step messages do not name.
+ */
 export async function pausedResult(
 	frame: Activation,
-	env: Record<string, string | undefined>,
-	fresh: boolean,
+	run: { env: Record<string, string | undefined>; fresh: boolean; standalone?: boolean },
 ): Promise<WorkflowRunResult> {
+	const { env, fresh } = run;
 	const { request: wait, stepId, key } = frame.wait!;
 	if (wait.kind === "timer")
 		return {
@@ -35,7 +39,7 @@ export async function pausedResult(
 			},
 		};
 	const stateKey = key!;
-	const resumeToken = encodeToken({ protocolVersion: 1, v: 1, kind: "workflow-file", stateKey });
+	const resumeToken = encodeToken(workflowResumePayload(stateKey));
 	if (wait.kind === "approval") {
 		// A question asked before keeps its short ID instead of minting another.
 		const approvalId =
@@ -52,13 +56,14 @@ export async function pausedResult(
 				...(wait.initiatedBy ? { initiatedBy: wait.initiatedBy } : {}),
 				...(wait.requiredApprover ? { requiredApprover: wait.requiredApprover } : {}),
 				...(wait.requireDifferentApprover ? { requireDifferentApprover: true } : {}),
+				...(wait.onReject ? { onReject: wait.onReject } : {}),
 				resumeToken,
 				approvalId,
 			},
 		};
 	}
 	const request = needsInputRequest({
-		stepId,
+		asker: inputAsker(stepId, run.standalone),
 		prompt: wait.prompt,
 		responseSchema: wait.responseSchema,
 		defaults: wait.defaults,
@@ -80,7 +85,7 @@ function toolEnvelopeMaxBytes(env: Record<string, string | undefined>) {
  * subject whole, else truncated to a preview, else omitted.
  */
 function needsInputRequest(params: {
-	stepId: string;
+	asker: string;
 	prompt: string;
 	responseSchema: unknown;
 	defaults: unknown;
@@ -103,7 +108,7 @@ function needsInputRequest(params: {
 		if (fitsEnvelope(request, params.maxEnvelopeBytes)) return request;
 	}
 	throw new Error(
-		`Workflow input step ${params.stepId} needs_input envelope exceeds ${params.maxEnvelopeBytes} bytes even after subject truncation`,
+		`${params.asker} needs_input envelope exceeds ${params.maxEnvelopeBytes} bytes even after subject truncation`,
 	);
 }
 

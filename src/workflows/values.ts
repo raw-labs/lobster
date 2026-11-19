@@ -26,6 +26,23 @@ export function parseWorkflowArgsJson(raw: string, label: string): Record<string
 	return value as Record<string, unknown>;
 }
 
+/**
+ * `env` without the variables `args` put there (`LOBSTER_ARG_*`, `LOBSTER_ARGS_JSON`): a child
+ * workflow sees its own args, never the ones its parent did not pass it.
+ */
+export function withoutArgEnv(
+	env: Record<string, string | undefined>,
+	args: Record<string, unknown>,
+) {
+	const rest = createRecord(env);
+	delete rest.LOBSTER_ARGS_JSON;
+	for (const key of Object.keys(args)) {
+		const normalized = normalizeArgEnvKey(key);
+		if (normalized) delete rest[`LOBSTER_ARG_${normalized}`];
+	}
+	return rest;
+}
+
 export function mergeEnv(
 	base: Record<string, string | undefined>,
 	workflowEnv: WorkflowFile["env"],
@@ -34,9 +51,6 @@ export function mergeEnv(
 	results: Record<string, WorkflowStepResult>,
 ) {
 	const env = createRecord(base);
-	for (const symbol of Object.getOwnPropertySymbols(base)) {
-		(env as any)[symbol] = (base as any)[symbol];
-	}
 
 	// Expose resolved args as env vars so shell commands can safely reference them
 	// without embedding raw values into the command string.

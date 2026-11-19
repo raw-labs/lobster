@@ -1,3 +1,4 @@
+import { messageOf } from "../util/errors.js";
 import type {
 	HistoryPage,
 	LogicalArchive,
@@ -15,8 +16,6 @@ import type {
  * cross the worker thread as a message and a code, so a code (not a class) says what happened.
  */
 export const STATE_EXISTS = "LOBSTER_STATE_EXISTS";
-
-type BackendKind = "sqlite";
 
 export type StateWriteOptions = {
 	exclusive?: boolean;
@@ -44,17 +43,11 @@ export type StateWriteResult = StateWriteCommit & {
 export type InboxEvent = { id: string; name: string; data: unknown; at: number; owner: string };
 
 export interface Backend {
-	readonly kind: BackendKind;
-
 	read(key: string): Promise<StateRecord>;
 	listState(prefix: string): Promise<Record<string, string>>;
 	write(key: string, text: string | null, options?: StateWriteOptions): Promise<StateWriteResult>;
 
-	transition(
-		request: Transition,
-		signal?: AbortSignal,
-		assertInvocationCurrent?: () => void,
-	): Promise<TransitionResult>;
+	transition(request: Transition, assertInvocationCurrent?: () => void): Promise<TransitionResult>;
 	acknowledge(runId: string, operationId: string): Promise<void>;
 	getRun(id: string): Promise<RunRecord | null>;
 	getRunState(id: string): Promise<RunState | null>;
@@ -92,7 +85,7 @@ export class PersistenceError extends Error {
 		readonly operationId: string,
 		readonly runId: string | undefined,
 		cause: unknown,
-		message = `Execution history write failed: ${errorMessage(cause)}`,
+		message = `Execution history write failed: ${messageOf(cause)}`,
 	) {
 		super(message, { cause });
 		this.name = "PersistenceError";
@@ -118,18 +111,6 @@ type RuntimeErrorDetails = {
 	runId?: string;
 };
 
-function errorMessage(error: unknown): string {
-	if (
-		error &&
-		typeof error === "object" &&
-		"message" in error &&
-		typeof error.message === "string"
-	) {
-		return error.message;
-	}
-	return String(error);
-}
-
 export function runtimeErrorDetails(error: unknown, type = "runtime_error"): RuntimeErrorDetails {
 	if (
 		error instanceof WaitConflictError ||
@@ -150,7 +131,7 @@ export function runtimeErrorDetails(error: unknown, type = "runtime_error"): Run
 
 	return {
 		type,
-		message: errorMessage(error),
+		message: messageOf(error),
 		...(error instanceof PersistenceError
 			? { operationId: error.operationId, ...(error.runId ? { runId: error.runId } : {}) }
 			: {}),

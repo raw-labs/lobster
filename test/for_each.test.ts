@@ -101,7 +101,7 @@ test("a pipeline that asks inside a for_each pauses the run for that item", asyn
 	// A retry would run the loop again and ask again, so a retried loop cannot ask.
 	await assert.rejects(
 		() => runWorkflow(loop({ retry: { max: 2 } })),
-		/halted for approval inside pipeline|requestInput is not supported in this pipeline context/,
+		/halted for input inside pipeline stage ask; .*retr/,
 	);
 });
 
@@ -199,7 +199,7 @@ test("for_each validation rejects duplicate sub-step ids", async () => {
 		}),
 		"utf8",
 	);
-	await assert.rejects(() => loadWorkflowFile(filePath), /duplicate for_each sub-step id/);
+	await assert.rejects(() => loadWorkflowFile(filePath), /Duplicate workflow step id: dup/);
 });
 
 test("for_each validation rejects item_var/index_var collisions", async () => {
@@ -253,6 +253,7 @@ test("for_each dry-run renders loop structure", async () => {
 				id: "loop",
 				for_each: "$vals.json",
 				batch_size: 2,
+				pause_ms: 10,
 				steps: [{ id: "emit", command: "echo hi" }],
 			},
 		],

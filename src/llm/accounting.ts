@@ -68,70 +68,62 @@ export function carryLlmProvenance(source: unknown, target: unknown) {
 	}
 }
 
+/** Where the marks of model calls sit in a value: the path of keys to each marked object. */
+export type LlmMarks = Array<[path: Array<string | number>, mark: LlmProvenance]>;
+
 /**
- * Restores private replay provenance on completed step results loaded from Lobster's own
- * workflow-resume state. Resume state is the narrow trusted boundary: ordinary command JSON
- * never reaches this helper, so copying a public cache key cannot suppress its usage record.
+ * The marks of model calls in `value`, to save with it: JSON drops them. Read from the
+ * in-process marks only, so nothing a command prints can add one.
  */
-export function restoreLlmProvenance(
-	target: unknown,
-	charges: readonly LlmOutstandingCharge[] | undefined,
-) {
-	if (!target || typeof target !== "object" || !Array.isArray(charges)) return;
-	const settled = charges.filter(
-		(charge) =>
-			charge &&
-			typeof charge === "object" &&
-			typeof charge.cacheKey === "string" &&
-			charge.cacheKey &&
-			charge.usage &&
-			typeof charge.usage === "object",
-	);
-	if (!settled.length) return;
-
-	const visit = (value: unknown) => {
-		if (!value || typeof value !== "object") return;
-		if (Array.isArray(value)) {
-			for (const item of value) visit(item);
-			return;
-		}
-
-		const record = value as Record<string, unknown>;
-		const cacheKey = typeof record.cacheKey === "string" ? record.cacheKey : null;
-		const model = typeof record.model === "string" ? record.model : null;
-		const usage = record.usage;
-		if (cacheKey && usage && typeof usage === "object") {
-			const matches = settled.some(
-				(charge) =>
-					charge.cacheKey === cacheKey &&
-					(charge.model ?? null) === model &&
-					sameBillableUsage(charge.usage, usage),
-			);
-			if (matches) {
-				const provenance = { cacheKey, replayed: true };
-				markProvenance(usage as object, provenance);
-				markProvenance(record, provenance);
-			}
-		}
-
-		for (const child of Object.values(record)) visit(child);
+export function llmMarksOf(value: unknown): LlmMarks {
+	const marks: LlmMarks = [];
+	const visit = (node: unknown, path: Array<string | number>) => {
+		if (!node || typeof node !== "object") return;
+		const mark = llmProvenanceOf(node);
+		if (mark) marks.push([path, mark]);
+		if (Array.isArray(node)) node.forEach((item, index) => visit(item, [...path, index]));
+		else for (const [key, child] of Object.entries(node)) visit(child, [...path, key]);
 	};
-	visit(target);
+	visit(value, []);
+	return marks;
+}
+
+/**
+ * Put `marks` (llmMarksOf) back on `value`, read back from Lobster's own saved state: exactly
+ * where they were, through its own keys only, and nowhere else. A saved live mark stays live
+ * only where `mayBeLive` says its call may still be unbilled: a value saved before its step was
+ * billed is a replay once the step is.
+ */
+export function restoreLlmMarks(
+	value: unknown,
+	marks: LlmMarks | undefined,
+	mayBeLive: (path: Array<string | number>, cacheKey: string) => boolean,
+) {
+	for (const [path, { cacheKey, replayed }] of marks ?? []) {
+		let node: unknown = value;
+		for (const key of path)
+			node =
+				node && typeof node === "object" && Object.hasOwn(node, key)
+					? (node as Record<string, unknown>)[key]
+					: undefined;
+		if (node && typeof node === "object")
+			markProvenance(node, { cacheKey, replayed: replayed || !mayBeLive(path, cacheKey) });
+	}
 }
 
 // Track provider charges separately from output: failed or suspended steps can lose their items.
 export type LlmSpendLedger = {
 	record: (cacheKey: string, charge?: LlmChargeCost) => void;
 	claim: (cacheKey: string, cost?: LlmChargeCost) => LlmChargeCost | null;
-	billCopy: (
+	settleCopy: (
 		cacheKey: string | null,
 		model: string | null,
 		usage: Record<string, unknown>,
-	) => boolean;
+	) => void;
 	outstanding: () => LlmOutstandingCharge[];
+	/** Whether a charge under `cacheKey` is still open (made, not yet billed). */
+	isOpen: (cacheKey: string) => boolean;
 	restore: (charges: readonly LlmOutstandingCharge[] | undefined) => void;
-	settled: () => LlmOutstandingCharge[];
-	restoreSettled: (charges: readonly LlmOutstandingCharge[] | undefined) => void;
 };
 
 // Retain cost even if a renderer, input gate, or composed workflow consumes the item.
@@ -149,30 +141,16 @@ export type LlmOutstandingCharge = { cacheKey: string; count: number } & LlmChar
 // oldest are dropped to keep a long run's ledger bounded.
 const MAX_UNBILLED_LIVE_INVOCATIONS = 256;
 
-/** Each run settles its own charges once; composed runs also record charges in their parent. */
-export function createLlmSpendLedger(parent?: LlmSpendLedger | null): LlmSpendLedger {
+/** A run's ledger: each charge is settled once. */
+export function createLlmSpendLedger(): LlmSpendLedger {
 	// Outstanding charges per cache key, held one entry per call rather than as a count: two
 	// identical calls that race on a cold cache are two provider charges under one key, the
 	// replays that later stand in for them have to be able to settle both, and each carries the
 	// cost of the call that opened it.
 	const unbilled = new Map<string, LlmChargeCost[]>();
-	// Charges this run has already accounted for. A copy of an item that lost its mark can turn
-	// up in any later step, and the only way to tell it from a call nobody has billed yet is to
-	// remember what has been billed. Bounded like the open charges, oldest key first.
-	const billed = new Map<string, LlmChargeCost[]>();
-	function settle(cacheKey: string, charge: LlmChargeCost | undefined) {
-		const seen = billed.get(cacheKey) ?? [];
-		seen.push(charge ?? {});
-		billed.set(cacheKey, seen);
-		for (const oldest of billed.keys()) {
-			if (billed.size <= MAX_UNBILLED_LIVE_INVOCATIONS) break;
-			billed.delete(oldest);
-		}
-	}
 	return {
 		record(cacheKey: string, charge?: LlmChargeCost) {
 			if (!cacheKey) return;
-			parent?.record(cacheKey, charge);
 			const open = unbilled.get(cacheKey) ?? [];
 			open.push({ ...charge });
 			unbilled.set(cacheKey, open);
@@ -218,16 +196,15 @@ export function createLlmSpendLedger(parent?: LlmSpendLedger | null): LlmSpendLe
 						);
 			const [charge] = open.splice(index, 1);
 			if (!open.length) unbilled.delete(cacheKey);
-			settle(cacheKey, charge);
 			return charge ?? {};
 		},
 		/**
-		 * Whether an item carrying a call's numbers but not its in-process mark should be billed.
-		 * A matching open charge is settled so the same provider call is not recorded again by
-		 * end-of-step cleanup. Once no charge is open, however, public fields can never suppress
-		 * usage: only the private provenance symbol can prove an item is a replay.
+		 * An item carrying a call's numbers but not its in-process mark is always billed: once
+		 * no charge is open, public fields can never suppress usage, as only the private
+		 * provenance symbol can prove an item is a replay. A matching open charge is settled
+		 * here, so end-of-step cleanup does not bill the same provider call again.
 		 */
-		billCopy(cacheKey: string | null, model: string | null, usage: Record<string, unknown>) {
+		settleCopy(cacheKey: string | null, model: string | null, usage: Record<string, unknown>) {
 			const isSameCall = (charge: LlmChargeCost) =>
 				(charge.model ?? null) === model && sameBillableUsage(charge.usage, usage);
 			// A copy that still names a cache key is read against that key alone: the key is
@@ -238,11 +215,13 @@ export function createLlmSpendLedger(parent?: LlmSpendLedger | null): LlmSpendLe
 				const open = unbilled.get(key);
 				const index = open?.findIndex(isSameCall) ?? -1;
 				if (!open || index < 0) continue;
-				settle(key, open.splice(index, 1)[0]);
+				open.splice(index, 1);
 				if (!open.length) unbilled.delete(key);
-				return true;
+				return;
 			}
-			return true;
+		},
+		isOpen(cacheKey: string) {
+			return unbilled.has(cacheKey);
 		},
 		outstanding() {
 			const charges: LlmOutstandingCharge[] = [];
@@ -269,42 +248,6 @@ export function createLlmSpendLedger(parent?: LlmSpendLedger | null): LlmSpendLe
 				const { cacheKey, count: _count, ...cost } = charge;
 				const restored = sanitizeChargeCost(cost);
 				for (let i = 0; i < count; i++) this.record(cacheKey, restored);
-			}
-		},
-		/**
-		 * The calls this run has already billed. A run that pauses carries this the way it carries
-		 * what it spent: the total says how much, and this says which calls it was for.
-		 */
-		settled() {
-			const charges: LlmOutstandingCharge[] = [];
-			for (const [cacheKey, seen] of billed) {
-				for (const charge of seen) charges.push({ cacheKey, count: 1, ...charge });
-			}
-			return charges;
-		},
-		/**
-		 * Restores what a paused run had billed, so the two halves of its accounting agree after
-		 * the pause. `cost` brings the money back; without this the run that resumes has no record
-		 * of what the money was for, and a later step that re-emits a completed LLM output — `head`
-		 * over `$live.json` — hands on a copy the fresh ledger has never heard of. It is billed on
-		 * top of the restored total: one provider call, twice in `_meta.cost` and against
-		 * `cost_limit`.
-		 *
-		 * A settled charge is only ever read against a cache key, so what this restores can excuse
-		 * a copy of a named call and nothing else. It cannot touch a live call — those settle out
-		 * of the open charges — and the spend it is reconstructing is already in the `cost` this
-		 * same state carries.
-		 */
-		restoreSettled(charges: readonly LlmOutstandingCharge[] | undefined) {
-			if (!Array.isArray(charges)) return;
-			for (const charge of charges) {
-				if (!charge || typeof charge !== "object") continue;
-				if (typeof charge.cacheKey !== "string" || !charge.cacheKey) continue;
-				const count = Math.floor(Number(charge.count ?? 0));
-				if (!Number.isFinite(count) || count < 1) continue;
-				const { cacheKey, count: _count, ...cost } = charge;
-				const restored = sanitizeChargeCost(cost);
-				for (let i = 0; i < count; i++) settle(cacheKey, restored);
 			}
 		},
 	};

@@ -30,7 +30,7 @@ export type ParsedArgs = {
 export function parseArgv(
 	argv: string[],
 	spec: Record<string, FlagSpec>,
-	options: { usage: string; passthrough?: boolean } = { usage: "" },
+	options: { usage: string; passthrough?: boolean },
 ): ParsedArgs {
 	const names = new Map<string, string>();
 	for (const [name, flag] of Object.entries(spec)) {
@@ -38,7 +38,7 @@ export function parseArgv(
 		for (const alias of flag.aliases ?? []) names.set(alias, name);
 	}
 	const fail = (message: string): never => {
-		throw new UsageError(options.usage ? `${message}. Usage: ${options.usage}` : message);
+		throw new UsageError(`${message}. Usage: ${options.usage}`);
 	};
 	const flags: ParsedArgs["flags"] = {};
 	const positional: string[] = [];

@@ -5,15 +5,22 @@ import { listRuns, getRun, getWait } from "./core/runs.js";
 import { forceTerminateAbortableProcesses } from "./process/abortable_process.js";
 import { createDefaultRegistry } from "./commands/registry.js";
 import type { CommandRegistry } from "./commands/types.js";
-import { resumeToolRequest, createToolContext } from "./core/tool_runtime.js";
-import { parsePipeline } from "./pipeline/parser.js";
-import { runtimeErrorDetails } from "./persistence/backend.js";
-import { recorderFromEnv } from "./persistence/context.js";
+import {
+	resumeToolRequest,
+	createToolContext,
+	runEnvelope,
+	errorEnvelope,
+	type ToolEnvelope,
+} from "./core/tool_runtime.js";
+import { checkStages, parsePipeline } from "./pipeline/parser.js";
+import { runtimeErrorDetails, WaitConflictError } from "./persistence/backend.js";
 import { withExecution } from "./persistence/execution.js";
+import { checkRunId, isRunId, type RunStatus } from "./persistence/model.js";
 import { openStoreSession } from "./persistence/session.js";
 import { parseResumeArgs } from "./resume/resume.js";
 import type { ResumeTarget } from "./resume/options.js";
 import { readLineFromStream } from "./io/read_line.js";
+import { yesOrNoPrompt } from "./io/terminal.js";
 import { defaultStateDir } from "./state/store.js";
 import { pendingUpgrade, upgradeStore, type UpgradeReport } from "./engine/upgrade.js";
 import { runPipeline } from "./pipeline/runtime.js";
@@ -22,14 +29,19 @@ import {
 	advanceWorkflowRun,
 	abandonWorkflowRun,
 	runPipelineText,
+	runIdOf,
 } from "./engine/runner.js";
 import { advanceDueRuns, signalEvent } from "./engine/due.js";
-import { loadWorkflowFile } from "./workflows/load.js";
 import { resolveWorkflowArgs } from "./workflows/args.js";
 import { renderWorkflowGraph } from "./workflows/graph.js";
 import { parseWorkflowArgsJson } from "./workflows/values.js";
 import type { WorkflowGraphFormat } from "./workflows/graph.js";
-import { resolveWorkflowFile, WORKFLOW_FILE_EXTENSIONS } from "./workflows/load.js";
+import type { WorkflowRunResult } from "./workflows/types.js";
+import {
+	loadWorkflowFile,
+	resolveWorkflowFile,
+	WORKFLOW_FILE_EXTENSIONS,
+} from "./workflows/load.js";
 import { parseArgv, UsageError } from "./util/argv.js";
 import { messageOf } from "./util/errors.js";
 
@@ -51,7 +63,7 @@ const USAGE_TOPICS = new Set([
 export async function runCli(argv: string[]) {
 	const cancellation = createCliCancellation();
 	try {
-		await runCliWithSignal(argv, cancellation.signal, cancellation.signal);
+		await runCliWithSignal(argv, cancellation.signal);
 	} catch (error) {
 		// Whatever reaches here is reported as one line, not a stack trace; LOBSTER_DEBUG shows it.
 		if (cancellation.signal.aborted) throw error;
@@ -67,11 +79,11 @@ export async function runCli(argv: string[]) {
 	}
 }
 
-async function runCliWithSignal(
-	argv: string[],
-	signal: AbortSignal,
-	forceTerminationSignal: AbortSignal = signal,
-) {
+/**
+ * `signal` is the CLI's cancellation. Every context also passes it as `forceTerminationSignal`:
+ * a step's process watches a narrower signal of its own, and a second Ctrl-C must reach it.
+ */
+async function runCliWithSignal(argv: string[], signal: AbortSignal) {
 	const registry = createDefaultRegistry();
 
 	if (argv[0] === "graph") {
@@ -127,31 +139,8 @@ async function runCliWithSignal(
 		await offerUpgrade(argv, signal);
 	}
 
-	if (argv[0] === "runs" && argv[1] === "advance" && argv.includes("--due")) {
-		try {
-			const { flags, positional } = parseArgv(
-				argv.slice(2),
-				{
-					due: { type: "boolean" },
-					limit: { type: "integer", min: 1 },
-					concurrency: { type: "integer", min: 1 },
-					"dry-run": { type: "boolean" },
-				},
-				{ usage: "runs advance --due [--limit <n>] [--concurrency <n>] [--dry-run]" },
-			);
-			if (positional.length) throw new UsageError("runs advance --due takes no run ID");
-			const result = await advanceDueRuns({
-				ctx: createToolContext({ signal, forceTerminationSignal }),
-				limit: flags.limit as number | undefined,
-				concurrency: flags.concurrency as number | undefined,
-				dryRun: flags["dry-run"] === true,
-			});
-			process.stdout.write(JSON.stringify(result) + "\n");
-		} catch (error) {
-			if (error instanceof UsageError) throw error;
-			process.stderr.write(`runs advance --due: ${messageOf(error)}\n`);
-			process.exitCode = 1;
-		}
+	if (argv[0] === "runs" && argv[1] === "advance") {
+		await handleAdvance(argv.slice(2), signal);
 		return;
 	}
 
@@ -178,7 +167,7 @@ async function runCliWithSignal(
 				name,
 				data,
 				id,
-				ctx: createToolContext({ signal, forceTerminationSignal }),
+				ctx: createToolContext({ signal, forceTerminationSignal: signal }),
 			});
 			process.stdout.write(JSON.stringify(result) + "\n");
 		} catch (error) {
@@ -189,44 +178,12 @@ async function runCliWithSignal(
 		return;
 	}
 
-	if (argv[0] === "runs" && argv[1] === "advance") {
-		try {
-			const runId = oneId(argv.slice(2), "runs advance <runId>");
-			const result = await advanceWorkflowRun({
-				runId,
-				ctx: createToolContext({ signal, forceTerminationSignal }),
-			});
-			writeToolEnvelope({
-				ok: true,
-				status: result.status,
-				output: result.output,
-				requiresApproval: result.requiresApproval ?? null,
-				requiresInput: result.requiresInput ?? null,
-				...(result.waitingFor ? { waitingFor: result.waitingFor } : {}),
-				runId: result.runId,
-			});
-		} catch (error) {
-			// A command line it does not understand is reported like any other (exit code 2).
-			if (error instanceof UsageError) throw error;
-			writeToolEnvelope({
-				ok: false,
-				status: "error",
-				output: [],
-				requiresApproval: null,
-				requiresInput: null,
-				error: runtimeErrorDetails(error),
-			});
-			process.exitCode = 1;
-		}
-		return;
-	}
-
 	if (argv[0] === "runs" && argv[1] === "abandon") {
 		try {
 			const runId = oneId(argv.slice(2), "runs abandon <runId>");
 			const result = await abandonWorkflowRun({
 				runId,
-				ctx: createToolContext({ signal, forceTerminationSignal }),
+				ctx: createToolContext({ signal, forceTerminationSignal: signal }),
 			});
 			process.stdout.write(JSON.stringify(result) + "\n");
 		} catch (error) {
@@ -248,22 +205,22 @@ async function runCliWithSignal(
 	}
 
 	if (argv[0] === "doctor") {
-		await handleDoctor({ argv: argv.slice(1), registry, signal, forceTerminationSignal });
+		await handleDoctor({ argv: argv.slice(1), registry, signal });
 		return;
 	}
 
 	if (argv[0] === "run") {
-		await handleRun({ argv: argv.slice(1), registry, signal, forceTerminationSignal });
+		await handleRun({ argv: argv.slice(1), registry, signal });
 		return;
 	}
 
 	if (argv[0] === "resume") {
-		await handleResume({ argv: argv.slice(1), registry, signal, forceTerminationSignal });
+		await handleResume({ argv: argv.slice(1), registry, signal });
 		return;
 	}
 
 	// Default: treat argv as a pipeline string.
-	await handleRun({ argv, registry, signal, forceTerminationSignal });
+	await handleRun({ argv, registry, signal });
 }
 
 function createCliCancellation() {
@@ -339,8 +296,9 @@ async function handleGraph({ argv }: { argv: string[] }) {
 	try {
 		filePath = await resolveWorkflowFile(parsed.filePath);
 	} catch (err) {
+		// An input error, as for `lobster run`: exit 2.
 		process.stderr.write(`Error: ${messageOf(err)}\n`);
-		process.exitCode = 1;
+		process.exitCode = 2;
 		return;
 	}
 
@@ -360,296 +318,179 @@ function isWorkflowGraphFormat(value: string): value is WorkflowGraphFormat {
 	return value === "mermaid" || value === "dot" || value === "ascii";
 }
 
-type ToolPayload = Omit<Awaited<ReturnType<typeof resumeToolRequest>>, "protocolVersion">;
+type ToolPayload = Omit<ToolEnvelope, "protocolVersion">;
 
 type RunOptions = {
 	argv: string[];
-	registry: ReturnType<typeof createDefaultRegistry>;
+	registry: CommandRegistry;
 	signal: AbortSignal;
-	forceTerminationSignal: AbortSignal;
 };
 
-async function handleRun(options: RunOptions) {
+/** Whether a command line asks for tool mode (read before, or without, parsing it). */
+function isToolMode(argv: string[]) {
+	return argv.some(
+		(arg, index) => arg === "--mode=tool" || (arg === "--mode" && argv[index + 1] === "tool"),
+	);
+}
+
+async function handleRun(options: RunOptions): Promise<void> {
 	let parsed: ReturnType<typeof parseRunArgs>;
 	try {
 		parsed = parseRunArgs(options.argv);
 	} catch (error) {
 		// Reported like any parse error of the run: an envelope in tool mode.
-		const tool = options.argv.some(
-			(arg, index) =>
-				arg === "--mode=tool" || (arg === "--mode" && options.argv[index + 1] === "tool"),
-		);
-		reportRunError(tool ? "tool" : "human", "parse_error", error);
-		return { ok: false };
+		reportRunError(isToolMode(options.argv) ? "tool" : "human", "parse_error", error);
+		return;
 	}
-	const prepared = await prepareRunTarget(parsed).catch(() => undefined);
-	if (!prepared) {
-		return handleRunInternal({ ...options, env: process.env });
+	const { mode } = parsed;
+	let target: RunTarget;
+	let args: Record<string, unknown> = {};
+	try {
+		target = await prepareRunTarget(parsed, options.registry);
+	} catch (error) {
+		reportRunError(mode, "parse_error", error);
+		return;
+	}
+	try {
+		// Only a workflow file takes --args-json (prepareRunTarget refuses it otherwise).
+		if (parsed.argsJson !== null) args = parseWorkflowArgsJson(parsed.argsJson, "run");
+	} catch (error) {
+		reportRunError(mode, "parse_error", error, "");
+		return;
 	}
 	let envelope: ToolPayload | undefined;
 	try {
 		const result = await withExecution(
-			{
-				env: process.env,
-				signal: options.signal,
-				dryRun: prepared.dryRun,
-				// Every run is recorded: pipelines run on the engine as one-step workflows.
-				...(prepared.dryRun ? {} : { trackRuns: true }),
-			},
-			prepared.workflowFile ? "cli" : "pipeline",
+			{ env: process.env, signal: options.signal, dryRun: target.dryRun },
+			target.kind,
 			(ctx) =>
-				handleRunInternal({
+				runTarget({
 					...options,
 					env: ctx.env,
-					onEnvelope: (value) => {
+					mode,
+					args,
+					target,
+					emit: (value) => {
 						envelope = value;
 					},
 				}),
 		);
-		if (envelope) {
-			writeToolEnvelope(envelope);
-		}
-		return result;
+		// The run's ID is known only now: one that never started has been removed.
+		const runId = result.runId;
+		if (envelope) writeToolEnvelope({ ...envelope, ...(runId ? { runId } : {}) });
 	} catch (error) {
-		reportRunError(normalizeMode(parsed.mode), "runtime_error", error);
-		return { ok: false };
+		reportRunError(mode, "runtime_error", error);
 	}
 }
 
-async function handleRunInternal({
-	argv,
+/** Run what `lobster run` named, a workflow file or a pipeline, and report its result. */
+async function runTarget({
 	registry,
 	signal,
-	forceTerminationSignal,
-	onEnvelope,
 	env,
+	mode,
+	args,
+	target,
+	emit,
 }: RunOptions & {
 	env: NodeJS.ProcessEnv;
-	onEnvelope?: (envelope: ToolPayload) => void;
+	mode: "human" | "tool";
+	args: Record<string, unknown>;
+	target: RunTarget;
+	emit: (envelope: ToolPayload) => void;
 }) {
-	const emit = (envelope: ToolPayload) =>
-		(onEnvelope ?? writeToolEnvelope)({
-			...envelope,
-			...(recorderFromEnv(env) ? { runId: recorderFromEnv(env)!.runId } : {}),
-		});
-	const parsed = parseRunArgs(argv);
-	const { mode, argsJson } = parsed;
-	const normalizedMode = normalizeMode(mode);
-	let target: Awaited<ReturnType<typeof prepareRunTarget>>;
-	try {
-		target = await prepareRunTarget(parsed);
-	} catch (err) {
-		reportRunError(normalizedMode, "parse_error", err, undefined, emit);
-		return { ok: false };
-	}
-	const { rest, workflowFile, dryRun } = target;
-	if (workflowFile) {
-		let parsedArgs = {};
-		if (argsJson !== null) {
-			try {
-				parsedArgs = parseWorkflowArgsJson(argsJson, "run");
-			} catch (err) {
-				reportRunError(normalizedMode, "parse_error", err, "", emit);
-				return { ok: false };
-			}
-		}
-
+	const { dryRun } = target;
+	const ctx = {
+		stdin: process.stdin,
+		stdout: process.stdout,
+		stderr: process.stderr,
+		env,
+		mode,
+		registry,
+		signal,
+		forceTerminationSignal: signal,
+	};
+	if (target.kind === "workflow") {
 		try {
 			const output = await runWorkflowFile({
-				filePath: workflowFile,
-				args: parsedArgs,
-				ctx: {
-					stdin: process.stdin,
-					stdout: process.stdout,
-					stderr: process.stderr,
-					env: env,
-					mode: normalizedMode,
-					registry,
-					dryRun,
-					signal,
-					forceTerminationSignal,
-				},
+				filePath: target.workflowFile,
+				args,
+				ctx: { ...ctx, dryRun },
 			});
-
-			if (normalizedMode === "tool") {
-				if (output.status === "needs_approval") {
-					emit({
-						ok: true,
-						status: "needs_approval",
-						output: [],
-						requiresApproval: output.requiresApproval ?? null,
-						requiresInput: null,
-					});
-					return output;
-				}
-
-				if (output.status === "needs_input") {
-					emit({
-						ok: true,
-						status: "needs_input",
-						output: [],
-						requiresApproval: null,
-						requiresInput: output.requiresInput ?? null,
-					});
-					return output;
-				}
-
-				if (output.status === "waiting") {
-					emit({
-						ok: true,
-						status: "waiting",
-						output: [],
-						requiresApproval: null,
-						requiresInput: null,
-						waitingFor: output.waitingFor,
-					});
-					return output;
-				}
-
-				emit({
-					ok: true,
-					status: "ok",
-					output: output.output,
-					requiresApproval: null,
-					requiresInput: null,
-				});
-				return output;
-			}
-
-			if (output.status === "waiting") {
-				const waiting = output.waitingFor!;
-				process.stderr.write(
-					waiting.kind === "timer"
-						? `Run ${output.runId ?? ""} sleeps until ${waiting.until}; \`lobster runs advance --due\` continues it then.\n`
-						: `Run ${output.runId ?? ""} waits for the event "${waiting.event}"${waiting.until ? ` until ${waiting.until}` : ""}; deliver it with \`lobster signal ${waiting.event}\`.\n`,
-				);
-				return output;
-			}
-
-			if (output.status === "cancelled") return reportCancelled(output);
-
-			if (output.status === "needs_approval" || output.status === "needs_input") {
-				process.stdout.write(
-					JSON.stringify(
-						{
-							status: output.status,
-							output: [],
-							requiresApproval: output.requiresApproval ?? null,
-							requiresInput: output.requiresInput ?? null,
-						},
-						null,
-						2,
-					),
-				);
-				process.stdout.write("\n");
-				return output;
-			}
-
-			if (output.status === "ok" && output.output.length) {
-				process.stdout.write(JSON.stringify(output.output, null, 2));
-				process.stdout.write("\n");
-			}
+			if (mode === "tool") emit(runEnvelope(output));
+			else printRunResult(output, output.output.length > 0);
 			return output;
 		} catch (err) {
-			reportRunError(normalizedMode, "runtime_error", err, undefined, emit);
+			reportRunError(mode, "runtime_error", err, runPrefix(err), emit);
 			return { ok: false, error: runtimeErrorDetails(err) };
 		}
 	}
 
-	const pipelineString = rest.join(" ");
-
-	let pipeline;
 	try {
-		pipeline = parsePipeline(pipelineString, registry);
-	} catch (err) {
-		reportRunError(normalizedMode, "parse_error", err, undefined, emit);
-		return { ok: false };
-	}
-
-	if (dryRun) {
-		try {
+		if (dryRun) {
 			const output = await runPipeline({
-				pipeline,
-				registry,
+				...ctx,
+				pipeline: target.pipeline,
 				input: [],
-				stdin: process.stdin,
-				stdout: process.stdout,
-				stderr: process.stderr,
-				env: env,
-				mode: normalizedMode,
-				renderOutput: normalizedMode !== "tool",
+				renderOutput: mode !== "tool",
 				dryRun,
-				signal,
-				forceTerminationSignal,
 				haltAfterStageOnAbort: true,
 			});
-			if (normalizedMode === "tool") emit({ ok: true, status: "ok", output: output.items });
+			if (mode === "tool") emit(runEnvelope({ status: "ok", output: output.items }));
 			return { status: "ok", output: output.items };
-		} catch (err) {
-			reportRunError(normalizedMode, "runtime_error", err, undefined, emit);
-			return { ok: false, error: runtimeErrorDetails(err) };
 		}
-	}
-
-	try {
-		const output = await runPipelineText({
-			pipeline: pipelineString,
-			ctx: {
-				stdin: process.stdin,
-				stdout: process.stdout,
-				stderr: process.stderr,
-				env: env,
-				mode: normalizedMode,
-				registry,
-				signal,
-				forceTerminationSignal,
-			},
-		});
-		if (normalizedMode === "tool") {
-			emit({
-				ok: true,
-				status: output.status,
-				output: output.status === "ok" ? output.output : [],
-				requiresApproval: output.requiresApproval ?? null,
-				requiresInput: output.requiresInput ?? null,
-				...(output.waitingFor ? { waitingFor: output.waitingFor } : {}),
-			});
-			return output;
-		}
-		if (output.status === "cancelled") return reportCancelled(output);
-		if (output.status === "needs_approval" || output.status === "needs_input") {
-			process.stdout.write(
-				JSON.stringify(
-					{
-						status: output.status,
-						output: [],
-						requiresApproval: output.requiresApproval ?? null,
-						requiresInput: output.requiresInput ?? null,
-					},
-					null,
-					2,
-				) + "\n",
-			);
-			return output;
-		}
-		// Human mode: if the last command didn't render, print JSON.
-		if (output.status === "ok" && !output.rendered) {
-			process.stdout.write(JSON.stringify(output.output, null, 2));
-			process.stdout.write("\n");
-		}
+		const output = await runPipelineText({ pipeline: target.text, ctx });
+		if (mode === "tool") emit(runEnvelope(output));
+		// If the last command did not render its output, print it as JSON.
+		else printRunResult(output, !output.rendered);
 		return output;
 	} catch (err) {
-		reportRunError(normalizedMode, "runtime_error", err, undefined, emit);
+		reportRunError(mode, "runtime_error", err, runPrefix(err), emit);
 		return { ok: false, error: runtimeErrorDetails(err) };
 	}
 }
 
+/**
+ * A run's result for a person: what it waits on, why it stopped, the question it asks, or (when
+ * `printOutput`) its output as JSON.
+ */
+function printRunResult(output: WorkflowRunResult & { runId?: string }, printOutput: boolean) {
+	if (output.status === "waiting") {
+		const waiting = output.waitingFor!;
+		process.stderr.write(
+			waiting.kind === "timer"
+				? `Run ${output.runId ?? ""} sleeps until ${waiting.until}; \`lobster runs advance --due\` continues it then.\n`
+				: `Run ${output.runId ?? ""} waits for the event "${waiting.event}"${waiting.until ? ` until ${waiting.until}` : ""}; deliver it with \`lobster signal ${waiting.event}\`.\n`,
+		);
+	} else if (output.status === "cancelled") {
+		reportCancelled(output);
+	} else if (output.status === "needs_approval" || output.status === "needs_input") {
+		const question = {
+			status: output.status,
+			output: [],
+			requiresApproval: output.requiresApproval ?? null,
+			requiresInput: output.requiresInput ?? null,
+		};
+		process.stdout.write(JSON.stringify(question, null, 2) + "\n");
+	} else if (output.status === "ok" && printOutput) {
+		process.stdout.write(JSON.stringify(output.output, null, 2) + "\n");
+	}
+}
+
+/**
+ * A run that ended in an error is named, so it can be looked at (`runs show`) and continued.
+ * Its status is not stated: a stopped run is blocked or still running, not failed.
+ */
+function runPrefix(error: unknown) {
+	const runId = runIdOf(error);
+	return runId ? `Run ${runId}: ` : undefined;
+}
+
 /** A run that ended cancelled (a "no", a deadline): it did not complete, so exit 1. */
-function reportCancelled<T extends { runId?: string; reason?: string }>(output: T): T {
+function reportCancelled(output: { runId?: string; reason?: string }) {
 	const run = output.runId ? `Run ${output.runId}` : "The run";
 	process.stderr.write(`${run} was cancelled${output.reason ? `: ${output.reason}` : ""}.\n`);
 	process.exitCode = 1;
-	return output;
 }
 
 function reportRunError(
@@ -668,13 +509,44 @@ function reportRunError(
 	process.exitCode = type === "parse_error" ? 2 : 1;
 }
 
-async function prepareRunTarget(parsed: ReturnType<typeof parseRunArgs>) {
-	const { rest, filePath, dryRun } = await resolveRunTarget(parsed);
-	const workflowFile = filePath
-		? await resolveWorkflowFile(filePath)
-		: await detectWorkflowFile(rest);
-	return { rest, workflowFile, dryRun };
+/**
+ * What `lobster run` names: a workflow file (`--file`, or the one word of the command line) or
+ * a pipeline. A `--dry-run` after a lone workflow file is Lobster's too; after a pipeline it
+ * may belong to the last command, so it stays in the pipeline. Words or flags the target would
+ * not use are refused: running with other inputs than the ones typed is worse than not running.
+ */
+async function prepareRunTarget(
+	parsed: ReturnType<typeof parseRunArgs>,
+	registry: CommandRegistry,
+): Promise<RunTarget> {
+	const { rest, dryRun } = parsed;
+	const words = rest.filter((token) => token !== "--dry-run");
+	if (parsed.filePath) {
+		if (words.length)
+			throw new Error(
+				`run --file takes no pipeline (got "${words.join(" ")}"); give workflow args with --args-json, or quote the pipeline to give a command its own --file`,
+			);
+		return { kind: "workflow", workflowFile: await resolveWorkflowFile(parsed.filePath), dryRun };
+	}
+	const workflowFile = words.length === 1 ? await workflowFileNamed(words[0]) : null;
+	if (workflowFile)
+		return { kind: "workflow", workflowFile, dryRun: dryRun || words.length !== rest.length };
+	if (parsed.argsJson !== null)
+		throw new Error(
+			"run --args-json applies to a workflow file; quote the pipeline to give a command its own --args-json",
+		);
+	// Parsed here, before a run exists: a pipeline that does not parse writes nothing.
+	const text = rest.join(" ");
+	const pipeline = parsePipeline(text, registry);
+	checkStages(pipeline, registry);
+	return { kind: "pipeline", text, pipeline, dryRun };
 }
+
+/** What `lobster run` runs: a workflow file, or a pipeline (its text, and its parsed stages). */
+type RunTarget = { dryRun: boolean } & (
+	| { kind: "workflow"; workflowFile: string }
+	| { kind: "pipeline"; text: string; pipeline: ReturnType<typeof parsePipeline> }
+);
 
 /**
  * `lobster run`'s own flags. Everything else is the pipeline (or workflow file), whose words may
@@ -694,7 +566,7 @@ function parseRunArgs(argv: string[]) {
 	const lead = positional.findIndex((token) => token !== "--dry-run");
 	const leading = lead === -1 ? positional.length : lead;
 	return {
-		mode: (flags.mode as string | undefined) || "human",
+		mode: runMode(flags.mode as string | undefined),
 		rest: positional.slice(leading),
 		filePath: (flags.file as string | undefined) ?? null,
 		argsJson: (flags["args-json"] as string | undefined) ?? null,
@@ -708,51 +580,41 @@ function parseGraphArgs(argv: string[]) {
 			file: { type: "string" },
 			format: { type: "string" },
 			"args-json": { type: "string" },
-			help: { type: "boolean", aliases: ["h"] },
+			help: { type: "boolean" },
 		},
 		{
 			usage: "lobster graph <workflow.lobster> [--format mermaid|dot|ascii] [--args-json '{...}']",
 		},
 	);
+	const words = positional.filter((word) => word !== "-h");
+	const file = flags.file as string | undefined;
+	// One workflow file, by --file or by name: other words would be dropped.
+	if (words.length > (file === undefined ? 1 : 0))
+		throw new UsageError(
+			"Usage: lobster graph <workflow.lobster> [--format mermaid|dot|ascii] [--args-json '{...}']",
+		);
 	return {
-		filePath: (flags.file as string | undefined) ?? positional[0] ?? null,
+		filePath: file ?? words[0] ?? null,
 		format: (flags.format as string | undefined) || "mermaid",
 		argsJson: (flags["args-json"] as string | undefined) ?? null,
 		help: flags.help === true || positional.includes("-h"),
 	};
 }
 
-async function resolveRunTarget(parsed: {
-	rest: string[];
-	filePath: string | null;
-	dryRun: boolean;
-}) {
-	if (parsed.filePath) return parsed;
-	const restWithoutDryRun = parsed.rest.filter((token) => token !== "--dry-run");
-	if (restWithoutDryRun.length === 1 && restWithoutDryRun.length !== parsed.rest.length) {
-		try {
-			const workflowFile = await resolveWorkflowFile(restWithoutDryRun[0]);
-			return { ...parsed, filePath: workflowFile, rest: [], dryRun: true };
-		} catch (err) {
-			if (isWorkflowPathLike(restWithoutDryRun[0])) throw err;
-			return parsed;
-		}
-	}
-	return parsed;
+/** `--mode`: `human` (the default) or `tool`. A misspelled mode is refused, not read as human. */
+function runMode(mode: string | undefined): "human" | "tool" {
+	if (mode === undefined || mode === "human") return "human";
+	if (mode === "tool") return "tool";
+	throw new UsageError(`--mode must be human or tool (got "${mode}")`);
 }
 
-function normalizeMode(mode: string) {
-	return mode === "tool" ? "tool" : "human";
-}
-
-async function detectWorkflowFile(rest: string[]) {
-	if (rest.length !== 1) return null;
-	const candidate = rest[0];
-	if (!candidate || candidate.includes("|")) return null;
+/** The workflow file `word` names, or null when it is a pipeline. */
+async function workflowFileNamed(word: string) {
+	if (word.includes("|")) return null;
 	try {
-		return await resolveWorkflowFile(candidate);
+		return await resolveWorkflowFile(word);
 	} catch (err) {
-		if (isWorkflowPathLike(candidate)) throw err;
+		if (isWorkflowPathLike(word)) throw err;
 		return null;
 	}
 }
@@ -764,17 +626,7 @@ function isWorkflowPathLike(token: string) {
 	return /[\\/]/.test(token) || WORKFLOW_FILE_EXTENSIONS.some((ext) => lower.endsWith(ext));
 }
 
-async function handleResume({
-	argv,
-	registry,
-	signal,
-	forceTerminationSignal,
-}: {
-	argv: string[];
-	registry: CommandRegistry;
-	signal: AbortSignal;
-	forceTerminationSignal: AbortSignal;
-}) {
+async function handleResume({ argv, registry, signal }: RunOptions) {
 	let parsed;
 	try {
 		parsed = parseResumeArgs(argv);
@@ -791,41 +643,34 @@ async function handleResume({
 	try {
 		// A wait ID without --expected-revision answers the question as it stands now, as a
 		// token or a short approval ID does; --expected-revision adds the stale-question guard.
+		const parsedTarget = parsed.target;
 		let target: ResumeTarget;
-		if (parsed.waitId) {
-			let expectedRevision = parsed.expectedRevision;
-			if (expectedRevision == null) {
-				const wait = await getWait({ waitId: parsed.waitId, ctx: { env: process.env } });
-				if (!wait) throw new Error(`Wait ${parsed.waitId} not found`);
+		if ("waitId" in parsedTarget) {
+			let expectedRevision = parsedTarget.expectedRevision;
+			if (expectedRevision === undefined) {
+				const wait = await getWait({ waitId: parsedTarget.waitId, ctx: { env: process.env } });
+				// Gone (answered, withdrawn) or not this caller's: the same conflict as a stale revision.
+				if (!wait) throw new WaitConflictError();
 				expectedRevision = wait.revision;
 			}
-			target = { waitId: parsed.waitId, expectedRevision };
-		} else if (parsed.token) target = { token: parsed.token };
-		else target = { approvalId: parsed.approvalId! };
+			target = { waitId: parsedTarget.waitId, expectedRevision };
+		} else target = parsedTarget;
 		envelope = await resumeToolRequest({
 			...target,
-			...(parsed.cancel
-				? { cancel: true as const }
-				: parsed.response !== undefined
-					? { response: parsed.response }
-					: { approved: parsed.approved === true }),
+			...parsed.decision,
 			ctx: {
 				cwd: process.cwd(),
 				env: process.env,
-				mode: "tool",
 				stdin: process.stdin,
 				stdout: process.stdout,
 				stderr: process.stderr,
 				registry,
 				signal,
-				forceTerminationSignal,
+				forceTerminationSignal: signal,
 			},
 		});
 	} catch (err) {
-		envelope = {
-			ok: false,
-			error: runtimeErrorDetails(err),
-		};
+		envelope = errorEnvelope("runtime_error", err);
 	}
 	writeToolEnvelope(envelope);
 	if (!envelope.ok) {
@@ -839,45 +684,23 @@ async function readVersion() {
 	return pkg.version ?? "0.0.0";
 }
 
-async function handleDoctor({
-	argv,
-	registry,
-	signal,
-	forceTerminationSignal,
-}: {
-	argv: string[];
-	registry: CommandRegistry;
-	signal: AbortSignal;
-	forceTerminationSignal: AbortSignal;
-}) {
-	const mode = "tool";
-	const pipeline = "exec --json --shell 'echo [1]'";
-	const output: any = await (async () => {
-		try {
-			const parsed = parsePipeline(pipeline, registry);
-			return await runPipeline({
-				pipeline: parsed,
-				registry,
-				input: [],
-				stdin: process.stdin,
-				stdout: process.stdout,
-				stderr: process.stderr,
-				env: process.env,
-				mode,
-				signal,
-				forceTerminationSignal,
-				haltAfterStageOnAbort: true,
-			});
-		} catch (err) {
-			return { error: err };
-		}
-	})();
-
-	if (output?.error) {
-		writeToolEnvelope({
-			ok: false,
-			error: { type: "doctor_error", message: messageOf(output.error) },
+async function handleDoctor({ argv, registry, signal }: RunOptions) {
+	try {
+		await runPipeline({
+			pipeline: parsePipeline("exec --json --shell 'echo [1]'", registry),
+			registry,
+			input: [],
+			stdin: process.stdin,
+			stdout: process.stdout,
+			stderr: process.stderr,
+			env: process.env,
+			mode: "tool",
+			signal,
+			forceTerminationSignal: signal,
+			haltAfterStageOnAbort: true,
 		});
+	} catch (error) {
+		writeToolEnvelope({ ok: false, error: { type: "doctor_error", message: messageOf(error) } });
 		process.exitCode = 1;
 		return;
 	}
@@ -898,7 +721,7 @@ async function handleDoctor({
 	});
 }
 
-function writeToolEnvelope(payload: object) {
+function writeToolEnvelope(payload: ToolPayload) {
 	const envelope = {
 		protocolVersion: 1,
 		...payload,
@@ -924,7 +747,7 @@ function helpText(registry: CommandRegistry) {
 		`Manage runs:\n` +
 		`  lobster runs list [--status waiting] [--limit 20] [--after <cursor>]\n` +
 		`  lobster runs show <runId>\n` +
-		`  lobster runs advance <runId>                       continue after a crash\n` +
+		`  lobster runs advance <runId>                       continue a stopped run, or retry a failed one\n` +
 		`  lobster runs advance --due [--limit n] [--concurrency n] [--dry-run]  advance every run that is due\n` +
 		`  lobster runs abandon <runId>                       stop a run for good\n` +
 		`  lobster waits show <waitId>\n\n` +
@@ -963,33 +786,52 @@ function graphHelpText() {
 	);
 }
 
+/** The usage of each `history` and `storage` command, so an error names the one typed. */
+const PERSISTENCE_USAGE: Record<string, string> = {
+	"history list": "history list [after]",
+	"history show": "history show <runId> [afterSequence]",
+	"history prune": "history prune <before> [--apply]",
+	"storage export": "storage export",
+};
+
 async function handlePersistence(argv: string[]) {
-	const usage =
-		"history list [after]|show <runId> [afterSequence]|prune <before> [--apply]; storage export";
 	const [command, action = "list"] = argv;
-	const { flags, positional } = parseArgv(argv.slice(2), { apply: { type: "boolean" } }, { usage });
+	const usage =
+		PERSISTENCE_USAGE[`${command} ${action}`] ?? Object.values(PERSISTENCE_USAGE).join(" | ");
+	const prune = command === "history" && action === "prune";
+	const { flags, positional } = parseArgv(
+		argv.slice(2),
+		prune ? { apply: { type: "boolean" } } : {},
+		{ usage },
+	);
 	const known =
 		(command === "history" && action === "list" && positional.length <= 1) ||
 		(command === "history" &&
 			action === "show" &&
 			positional.length >= 1 &&
 			positional.length <= 2) ||
-		(command === "history" && action === "prune" && positional.length === 1) ||
+		(prune && positional.length === 1) ||
 		(command === "storage" && action === "export" && positional.length === 0);
-	if (!known || (flags.apply !== undefined && action !== "prune")) throw new UsageError(usage);
+	if (!known) throw new UsageError(`Usage: ${usage}`);
+	// The same run-ID rules as `runs show` and `runs list --after`.
+	if (action === "show") checkRunId(positional[0]);
+	if (action === "list" && positional[0] !== undefined && !isRunId(positional[0]))
+		throw new Error("Invalid run cursor");
 	const afterSequence = positional[1] === undefined ? 0 : Number(positional[1]);
 	if (!Number.isSafeInteger(afterSequence) || afterSequence < 0)
 		throw new UsageError(`history show afterSequence must be a whole number. Usage: ${usage}`);
 	const session = await openStoreSession({
 		env: process.env,
-		readOnly: !(command === "history" && action === "prune" && flags.apply === true),
+		readOnly: !(prune && flags.apply === true),
 	});
 	try {
 		let result: unknown;
 		if (command === "storage") result = await session.backend.export();
 		else if (action === "list") result = await session.listRuns({ after: positional[0] ?? "" });
-		else if (action === "show") result = await session.inspect(positional[0], { afterSequence });
-		else result = await session.retain({ before: positional[0], dryRun: flags.apply !== true });
+		else if (action === "show") {
+			result = await session.inspect(positional[0], { afterSequence });
+			if (result === null) throw new Error(`Run ${positional[0]} not found`);
+		} else result = await session.retain({ before: positional[0], dryRun: flags.apply !== true });
 		process.stdout.write(JSON.stringify(result) + "\n");
 	} finally {
 		await session.close();
@@ -1017,9 +859,7 @@ async function handleRuns(argv: string[], signal: AbortSignal) {
 			ctx,
 			...(flags.status !== undefined
 				? {
-						status: flags.status as NonNullable<
-							NonNullable<Parameters<typeof listRuns>[0]>["status"]
-						>,
+						status: flags.status as RunStatus,
 					}
 				: {}),
 			...(flags.limit !== undefined ? { limit: flags.limit as number } : {}),
@@ -1047,17 +887,15 @@ async function offerUpgrade(argv: string[], signal: AbortSignal) {
 	const directory = defaultStateDir(process.env);
 	const pending = await pendingUpgrade(directory);
 	if (!pending.length) return;
-	const toolMode = argv.some(
-		(arg, index) => arg === "--mode=tool" || (arg === "--mode" && argv[index + 1] === "tool"),
-	);
 	const what = `Found ${pending.length} saved item${pending.length === 1 ? "" : "s"} (paused runs, approval IDs, stored values) from an older version of Lobster. ${pending.length === 1 ? "It" : "They"} must be imported once before ${pending.length === 1 ? "it" : "they"} can be used.`;
-	if (toolMode || argv[0] === "resume" || !process.stdin.isTTY || !process.stderr.isTTY) {
+	if (isToolMode(argv) || argv[0] === "resume" || !process.stdin.isTTY || !process.stderr.isTTY) {
 		process.stderr.write(`lobster: ${what} Run \`lobster upgrade\`.\n`);
 		return;
 	}
 	process.stderr.write(`${what}\nImport now? [y/N] `);
-	const answer = String((await readLineFromStream(process.stdin, { signal })) ?? "").trim();
-	if (!/^y(es)?$/i.test(answer)) {
+	const answer = (await readLineFromStream(process.stdin, { signal })).trim();
+	// Anything but yes declines: nothing is lost, and `lobster upgrade` imports later.
+	if (yesOrNoPrompt(answer) !== true) {
 		process.stderr.write("Not imported. Run `lobster upgrade` when ready.\n");
 		return;
 	}
@@ -1094,17 +932,23 @@ async function handleUpgrade(argv: string[]) {
 
 function formatUpgradeReport(report: UpgradeReport): string {
 	const count = (n: number, what: string) => `${n} ${what}${n === 1 ? "" : "s"}`;
-	if (!report.converted.length && !report.imported.length && !report.skipped.length)
+	// A file an interrupted upgrade had already imported is only moved: the report has its backup.
+	if (
+		!report.converted.length &&
+		!report.imported.length &&
+		!report.skipped.length &&
+		!report.backup
+	)
 		return "Nothing to upgrade.\n";
 	const would = (done: string, planned: string) => (report.dryRun ? planned : done);
 	const lines: string[] = [];
 	if (report.converted.length)
 		lines.push(
-			`${would("Converted", "Would convert")} ${count(report.converted.length, "paused workflow")}.`,
+			`${would("Converted", "Would convert")} ${count(report.converted.length, "paused run")} (workflows and pipelines).`,
 		);
 	if (report.imported.length)
 		lines.push(
-			`${would("Imported", "Would import")} ${count(report.imported.length, "other saved item")} (paused pipelines, approval IDs, stored values).`,
+			`${would("Imported", "Would import")} ${count(report.imported.length, "other saved item")} (paused SDK steps, approval IDs, stored values).`,
 		);
 	if (!report.dryRun && (report.converted.length || report.imported.length))
 		lines.push("Existing resume tokens and approval IDs still work.");
@@ -1121,6 +965,49 @@ function formatUpgradeReport(report: UpgradeReport): string {
 	}
 	if (report.backup) lines.push(`The original files were moved to ${report.backup}`);
 	return lines.join("\n") + "\n";
+}
+
+/** `runs advance <runId>` continues one run; `runs advance --due`, every run whose time has come. */
+async function handleAdvance(argv: string[], signal: AbortSignal) {
+	const usage =
+		"runs advance <runId> | runs advance --due [--limit <n>] [--concurrency <n>] [--dry-run]";
+	const { flags, positional } = parseArgv(
+		argv,
+		{
+			due: { type: "boolean" },
+			limit: { type: "integer", min: 1 },
+			concurrency: { type: "integer", min: 1 },
+			"dry-run": { type: "boolean" },
+		},
+		{ usage },
+	);
+	const ctx = createToolContext({ signal, forceTerminationSignal: signal });
+	if (flags.due === true) {
+		if (positional.length) throw new UsageError("runs advance --due takes no run ID");
+		try {
+			const result = await advanceDueRuns({
+				ctx,
+				limit: flags.limit as number | undefined,
+				concurrency: flags.concurrency as number | undefined,
+				dryRun: flags["dry-run"] === true,
+			});
+			process.stdout.write(JSON.stringify(result) + "\n");
+		} catch (error) {
+			process.stderr.write(`runs advance --due: ${messageOf(error)}\n`);
+			process.exitCode = 1;
+		}
+		return;
+	}
+	for (const flag of ["limit", "concurrency", "dry-run"])
+		if (flags[flag] !== undefined)
+			throw new UsageError(`runs advance --${flag} applies only with --due`);
+	if (positional.length !== 1) throw new UsageError(`Usage: ${usage}`);
+	try {
+		writeToolEnvelope(runEnvelope(await advanceWorkflowRun({ runId: positional[0], ctx })));
+	} catch (error) {
+		writeToolEnvelope(errorEnvelope("runtime_error", error));
+		process.exitCode = 1;
+	}
 }
 
 /** The one ID a command takes, or a UsageError naming its usage. */

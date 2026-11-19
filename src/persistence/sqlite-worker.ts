@@ -268,7 +268,8 @@ function saveRun(run: RunRecord): void {
 			"INSERT INTO state(key,text,run_id) VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET text=excluded.text,run_id=excluded.run_id",
 		).run(key, text, run.id);
 	}
-	// Only an import carries records; a checkpoint save changes them through applyRecords.
+	// Only a created run (a converted pause) or an import carries records; a checkpoint save
+	// changes them through applyRecords.
 	for (const [key, text] of Object.entries(records ?? {}))
 		prepare(
 			"INSERT INTO execution_records(run_id,key,text) VALUES(?,?,?) ON CONFLICT(run_id,key) DO UPDATE SET text=excluded.text",
@@ -350,12 +351,11 @@ function handle(request: WorkerRequest): WorkerResult<WorkerMethod> {
 	switch (method) {
 		case "listState": {
 			const values: Record<string, string> = {};
-			const rows = prepare("SELECT key,text FROM state WHERE run_id IS NULL").all() as StateRow[];
-			for (const row of rows) {
-				if (row.key.startsWith(args.prefix) && row.text !== null) {
-					values[row.key] = row.text;
-				}
-			}
+			// Filtered by the store, not after reading every value it holds.
+			const rows = prepare(
+				"SELECT key,text FROM state WHERE run_id IS NULL AND substr(key,1,length(?))=?",
+			).all(args.prefix, args.prefix) as StateRow[];
+			for (const row of rows) if (row.text !== null) values[row.key] = row.text;
 			return values;
 		}
 		case "read": {

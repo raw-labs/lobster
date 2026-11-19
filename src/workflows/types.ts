@@ -19,6 +19,7 @@ export type ParallelBranch = {
 	env?: Record<string, string>;
 	cwd?: string;
 	stdin?: unknown;
+	recovery?: "repeat" | "manual";
 };
 
 export type SwitchCase = { when: string | boolean; steps: WorkflowStep[] };
@@ -47,8 +48,8 @@ export type WorkflowStep = {
 	stdin?: unknown;
 	approval?: WorkflowApproval;
 	input?: WorkflowInputRequest;
-	condition?: unknown;
-	when?: unknown;
+	condition?: string | boolean | null;
+	when?: string | boolean | null;
 	parallel?: ParallelConfig;
 	for_each?: string;
 	/** Run the steps of the first case whose `when` holds, or `else`. */
@@ -111,7 +112,7 @@ export type WorkflowApprovalIdentity = {
 
 export type WorkflowInputRequest = {
 	prompt: string;
-	responseSchema: unknown;
+	responseSchema: Record<string, unknown>;
 	defaults?: unknown;
 } & WorkflowWaitTimeout;
 
@@ -159,8 +160,11 @@ export type WorkflowRunResult = {
 		initiatedBy?: string;
 		requiredApprover?: string;
 		requireDifferentApprover?: boolean;
-		resumeToken?: string;
-		approvalId?: string;
+		/** A "no" completes the step with `approved: false` instead of cancelling the run. */
+		onReject?: "continue";
+		/** Answers it (`lobster resume <token>`); so does the short `approvalId`. */
+		resumeToken: string;
+		approvalId: string;
 	};
 	requiresInput?: {
 		type: "input_request";
@@ -168,7 +172,7 @@ export type WorkflowRunResult = {
 		responseSchema: unknown;
 		defaults?: unknown;
 		subject?: unknown;
-		resumeToken?: string;
+		resumeToken: string;
 	};
 	_meta?: {
 		cost?: CostSummary;

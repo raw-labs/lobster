@@ -1,6 +1,6 @@
-import { resolveArgsTemplate } from "./expressions.js";
+import { resolveArgsTemplate, stepRefIds } from "./expressions.js";
 import type { WorkflowFile, WorkflowStep } from "./types.js";
-import { isApprovalStep, isInputStep, stepKind } from "./steps.js";
+import { getStepExecution, isApprovalStep, isInputStep, stepIds, stepKind } from "./steps.js";
 
 export type WorkflowGraphFormat = "mermaid" | "dot" | "ascii";
 
@@ -38,16 +38,10 @@ function stepDetails(step: WorkflowStep, args: Record<string, unknown>) {
 		const atOnce = (step.concurrency ?? 1) > 1 ? ` (${step.concurrency} at once)` : "";
 		return `for_each: ${resolveArgsTemplate(step.for_each, args)}${atOnce}`;
 	}
-	if (typeof step.workflow === "string" && step.workflow.trim()) {
-		return `workflow: ${resolveArgsTemplate(step.workflow, args)}`;
-	}
-	if (typeof step.pipeline === "string" && step.pipeline.trim()) {
-		return `pipeline: ${resolveArgsTemplate(step.pipeline, args)}`;
-	}
-	const shell = typeof step.run === "string" ? step.run : step.command;
-	if (typeof shell === "string" && shell.trim()) {
-		return `run: ${resolveArgsTemplate(shell, args)}`;
-	}
+	const execution = getStepExecution(step);
+	if (execution.kind === "workflow" || execution.kind === "pipeline")
+		return `${execution.kind}: ${resolveArgsTemplate(execution.value, args)}`;
+	if (execution.kind === "shell") return `run: ${resolveArgsTemplate(execution.value, args)}`;
 	if (step.sleep !== undefined) return `sleep: ${step.sleep}`;
 	if (step.wait) return `wait for event: ${step.wait.event}`;
 	if (isApprovalStep(step.approval)) return "approval gate";
@@ -55,17 +49,8 @@ function stepDetails(step: WorkflowStep, args: Record<string, unknown>) {
 	return "";
 }
 
-function extractStepRefsFromString(value: string): string[] {
-	const refs = new Set<string>();
-	const rx = /\$([A-Za-z0-9_-]+)\.[A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)*/g;
-	for (const m of value.matchAll(rx)) {
-		if (m[1]) refs.add(m[1]);
-	}
-	return [...refs];
-}
-
 function extractStepRefs(value: unknown): string[] {
-	if (typeof value === "string") return extractStepRefsFromString(value);
+	if (typeof value === "string") return stepRefIds(value);
 	if (Array.isArray(value)) {
 		const refs = new Set<string>();
 		for (const item of value) {
@@ -83,6 +68,48 @@ function extractStepRefs(value: unknown): string[] {
 	return [];
 }
 
+type Read = { value: unknown; label: string };
+
+/**
+ * What the parts of `step` drawn inside its node read (its branches' stdin, a repeat's steps
+ * and `until`, a loop's body, nested to any depth), and the names defined in there (step ids,
+ * loop variables), which are local to the node. A switch's cases are nodes of their own.
+ */
+function insideReads(step: WorkflowStep) {
+	const reads: Read[] = [];
+	const names = new Set<string>();
+	const condition = (value: unknown, label: string) => {
+		if (typeof value === "string" && value.trim())
+			reads.push({ value, label: `${label}: ${value.trim()}` });
+	};
+	const walkParts = (s: WorkflowStep, nested: boolean) => {
+		for (const branch of s.parallel?.branches ?? []) {
+			names.add(branch.id);
+			reads.push({ value: branch.stdin, label: "stdin" });
+		}
+		if (s.repeat) condition(String(s.repeat.until), "until");
+		if (typeof s.for_each === "string") {
+			names.add(s.item_var ?? "item");
+			names.add(s.index_var ?? "index");
+		}
+		for (const inner of s.steps ?? []) walkStep(inner);
+		if (!nested) return;
+		for (const entry of s.switch?.cases ?? []) {
+			condition(entry.when, "when");
+			entry.steps.forEach(walkStep);
+		}
+		(s.switch?.else ?? []).forEach(walkStep);
+	};
+	const walkStep = (s: WorkflowStep) => {
+		names.add(s.id);
+		reads.push({ value: s.stdin, label: "stdin" }, { value: s.for_each, label: "for_each" });
+		condition(s.when ?? s.condition, "when");
+		walkParts(s, true);
+	};
+	walkParts(step, false);
+	return { reads, names };
+}
+
 function truncate(value: string, max = 80) {
 	if (value.length <= max) return value;
 	return `${value.slice(0, max - 1)}…`;
@@ -91,10 +118,12 @@ function truncate(value: string, max = 80) {
 function collectGraph(workflow: WorkflowFile, args: Record<string, unknown>) {
 	const nodes: GraphNode[] = [];
 	const edges: GraphEdge[] = [];
-	const knownStepIds = new Set<string>();
+	// The node that draws each readable step id: a repeat's steps and a parallel step's
+	// branches are drawn as that step; a switch's case steps as nodes of their own.
+	const nodeOf = new Map<string, string>();
 	const collectIds = (steps: WorkflowStep[]) => {
 		for (const step of steps) {
-			knownStepIds.add(step.id);
+			for (const id of stepIds([step])) nodeOf.set(id, step.id);
 			for (const entry of step.switch?.cases ?? []) collectIds(entry.steps);
 			collectIds(step.switch?.else ?? []);
 		}
@@ -108,11 +137,16 @@ function collectGraph(workflow: WorkflowFile, args: Record<string, unknown>) {
 		seenEdgeKeys.add(key);
 		edges.push(edge);
 	};
-	const conditionEdges = (condition: unknown, to: string, label: string) => {
-		if (typeof condition !== "string" || !condition.trim()) return;
-		for (const ref of extractStepRefs(condition)) {
-			if (knownStepIds.has(ref)) addEdge({ from: ref, to, label });
+	/** Edges from the steps `value` reads to `to` (none from a node to itself, or `local` names). */
+	const refEdges = (value: unknown, to: string, label: string, local?: Set<string>) => {
+		for (const ref of extractStepRefs(value)) {
+			if (local?.has(ref)) continue;
+			const from = nodeOf.get(ref);
+			if (from && from !== to) addEdge({ from, to, label });
 		}
+	};
+	const conditionEdges = (condition: unknown, to: string, label: string) => {
+		if (typeof condition === "string" && condition.trim()) refEdges(condition, to, label);
 	};
 
 	/**
@@ -133,14 +167,11 @@ function collectGraph(workflow: WorkflowFile, args: Record<string, unknown>) {
 			});
 			for (const edge of incoming) addEdge({ ...edge, to: step.id });
 
-			for (const ref of extractStepRefs(step.stdin)) {
-				if (knownStepIds.has(ref)) addEdge({ from: ref, to: step.id, label: "stdin" });
-			}
-			if (typeof step.for_each === "string") {
-				for (const ref of extractStepRefs(step.for_each)) {
-					if (knownStepIds.has(ref)) addEdge({ from: ref, to: step.id, label: "for_each" });
-				}
-			}
+			refEdges(step.stdin, step.id, "stdin");
+			refEdges(step.for_each, step.id, "for_each");
+			const inside = insideReads(step);
+			for (const read of inside.reads)
+				refEdges(read.value, step.id, truncate(read.label, 70), inside.names);
 			const condition = step.when ?? step.condition;
 			if (typeof condition === "string")
 				conditionEdges(condition, step.id, truncate(`when: ${condition.trim()}`, 70));

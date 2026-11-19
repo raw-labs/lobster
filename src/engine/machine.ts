@@ -6,11 +6,7 @@ import { messageOf } from "../util/errors.js";
 import type { WorkflowStep, WorkflowStepResult, WorkflowRunResult } from "../workflows/types.js";
 import { isApprovalStep } from "../workflows/steps.js";
 import { computeDelay, resolveRetryConfig } from "../workflows/retry.js";
-import {
-	createLlmSpendLedger,
-	restoreLlmProvenance,
-	type LlmSpendLedger,
-} from "../llm/accounting.js";
+import { createLlmSpendLedger, type LlmSpendLedger } from "../llm/accounting.js";
 import { CostTracker } from "../llm/cost_tracker.js";
 import { combineSignals } from "../process/owner_signal.js";
 import { sleepUntil } from "../util/duration.js";
@@ -27,13 +23,14 @@ import {
 import type { RunContext } from "./context.js";
 import { ExecutionStore } from "./store.js";
 import { CheckpointRecords } from "./records.js";
-import { StepClock } from "./step_clock.js";
+import { deliberateWait, StepClock } from "./step_clock.js";
 import type { Scope } from "./scope.js";
 import { chargeStep, settleUnbilledCharges } from "./accounting.js";
 import { pausedResult } from "./outcome.js";
 import { withdrawWaits } from "./waits.js";
-import { toOutputItems } from "./results.js";
+import { skippedInside, toOutputItems } from "./results.js";
 import {
+	GateRefusedError,
 	InterruptedActivityError,
 	InvocationRetiredError,
 	RunCancelledError,
@@ -52,19 +49,36 @@ export class Machine {
 	readonly ledger: LlmSpendLedger;
 	readonly records: CheckpointRecords;
 
-	constructor(
+	/**
+	 * The machine for a run's checkpoint, with the outputs it keeps as records put back in place
+	 * (and their model-call marks): before anything can save it, since a save of a checkpoint
+	 * still holding references would keep the references themselves.
+	 */
+	static async load(state: ExecutionState, store: ExecutionStore, ctx: RunContext) {
+		const machine = new Machine(state, store, ctx);
+		await machine.records.hydrate(state);
+		return machine;
+	}
+
+	private constructor(
 		readonly state: ExecutionState,
 		readonly store: ExecutionStore,
 		ctx: RunContext,
 	) {
-		this.ctx = { ...ctx, cwd: state.cwd, signal: combineSignals(ctx.signal, store.lost.signal) };
+		// The run's directory; a run converted from an older version has none, and runs in the
+		// directory of whoever continues it (the host's `ctx.cwd`).
+		this.ctx = {
+			...ctx,
+			cwd: state.cwd ?? ctx.cwd,
+			signal: combineSignals(ctx.signal, store.lost.signal),
+		};
 		this.cost = new CostTracker(CostTracker.parsePricingFromEnv(ctx.env, ctx.stderr), ctx.stderr);
 		this.cost.restore(state.cost?.byStep);
 		this.ledger = createLlmSpendLedger();
 		this.ledger.restore(state.llmSpend);
-		this.ledger.restoreSettled(state.llmBilled);
-		restoreLlmProvenance(state.activations, state.llmBilled);
-		this.records = new CheckpointRecords(store.session, store.runId);
+		this.records = new CheckpointRecords(store.session, store.runId, (key) =>
+			this.ledger.isOpen(key),
+		);
 	}
 
 	/** Run the workflow from where it stands until it finishes, pauses or stops. */
@@ -82,7 +96,6 @@ export class Machine {
 		state.status = "running";
 		delete state.error;
 		try {
-			await this.records.hydrate(state);
 			const result = await sequence(this, state.definition.workflow.steps, "root", {
 				definition: state.definition,
 				args: state.args,
@@ -108,7 +121,11 @@ export class Machine {
 			};
 		} catch (error) {
 			if (error instanceof RunSuspendedError)
-				return pausedResult(state.activations[error.key], this.ctx.env, error.fresh);
+				return pausedResult(state.activations[error.key], {
+					env: this.ctx.env,
+					fresh: error.fresh,
+					standalone: state.definition.standalone,
+				});
 			// A rejection or a deadline cancelled the run; it was saved as cancelled already.
 			if (error instanceof RunCancelledError)
 				return { status: "cancelled", output: [], reason: error.message };
@@ -139,11 +156,16 @@ export class Machine {
 		const node = nodeFor(step);
 		// Refused before dispatch: the command of a gated step must not run when nobody can be asked.
 		if (scope.gatesRefused && (isApprovalStep(step.approval) || node.role === "gate"))
-			throw new Error(`Workflow step ${step.id}: ${scope.gatesRefused}`);
+			throw new GateRefusedError(`Workflow step ${step.id}: ${scope.gatesRefused}`);
 		frame.attempt ??= 1;
 		while (true) {
-			if (frame.retryAt) {
-				await sleepUntil(frame.retryAt, scope.ctx.signal);
+			const retryAt = frame.retryAt;
+			if (retryAt) {
+				// Saved first (the failed attempt, and when to try again), inside the hold.
+				await deliberateWait(scope.holdClocks, async () => {
+					await this.save();
+					await sleepUntil(retryAt, scope.ctx.signal);
+				});
 				delete frame.retryAt;
 			}
 			const attemptKey = keys.attempt(key, frame.attempt);
@@ -183,7 +205,7 @@ export class Machine {
 		scope: Scope,
 		account: boolean,
 	) {
-		const clock = new StepClock(step, frame);
+		const clock = new StepClock(step, frame, scope.ctx.hooks?.heartbeat, scope.holdClocks);
 		let result: WorkflowStepResult;
 		try {
 			// Control nodes are timed as a whole; activities from dispatch; gates not at all.
@@ -229,7 +251,9 @@ export class Machine {
 			frame.attempt = attempt + 1;
 			frame.retryAt = Date.now() + delay;
 			delete frame.timeoutAt;
-			await this.save();
+			// The next attempt starts a new subtree: what the failed one left (a command its
+			// timeout stopped) is not running and must not block the run.
+			this.forgetBelow(attemptKey, true, frame);
 			return "retry";
 		}
 		frame.error = message;
@@ -238,6 +262,9 @@ export class Machine {
 			await this.save();
 			throw error;
 		}
+		// Tolerated: the steps inside it did not finish, and count as skipped.
+		const inside = skippedInside(step);
+		if (inside) frame.results = inside;
 		return this.#complete(key, frame, { id: step.id, error: true, errorMessage: message });
 	}
 
@@ -275,7 +302,7 @@ export class Machine {
 		for (const path of deepest)
 			if (this.#actedBelow(path))
 				throw new Error(
-					`Step ${keys.describe(path)} may have acted before it failed (it ran a command that may not be repeated); Lobster will not run it again. Run \`lobster runs abandon ${this.store.runId}\` to close the run.`,
+					`Step ${keys.describe(path)} may have acted before it failed (it ran a command that may not be repeated); Lobster will not run it again; the run stays failed.`,
 				);
 		for (const path of deepest) {
 			for (const item of below(path)) delete activations[item];
@@ -308,30 +335,34 @@ export class Machine {
 	}
 
 	/**
-	 * End the run. A completed or cancelled run never runs again, so its activations (every
-	 * intermediate output) are dropped; status, error, final output, cost and definition remain.
-	 * A failed run keeps them: it can be retried from the step that failed.
+	 * End the run for good. A completed or cancelled run never runs again, so its activations
+	 * (every intermediate output) are dropped; status, error, final output, cost and definition
+	 * remain.
 	 */
-	finish(status: "completed" | "failed" | "cancelled") {
+	finish(status: "completed" | "cancelled") {
 		this.state.status = status;
-		if (status !== "failed") this.state.activations = {};
+		this.state.activations = {};
 	}
 
 	/**
 	 * Save the checkpoint. Bookkeeping that is recomputed from saved results after a restart
 	 * (cursors, completion markers, evaluated conditions) is not saved on its own: it is
 	 * written with the next save, which writes the whole snapshot. Saves that guard an effect
-	 * (before dispatch, results, waits) are made at once.
+	 * (before dispatch, results, waits) are made at once. What was spent and the charges still
+	 * open are taken when the save's turn comes, with the activations and records they go with:
+	 * taken earlier, a queued save could write a branch's paid result beside a ledger from
+	 * before its call.
 	 */
 	save(extras: Parameters<ExecutionStore["save"]>[1] = {}) {
-		this.state.cost = this.cost.hasUsage() ? this.cost.getSummary() : undefined;
-		this.state.llmSpend = this.ledger.outstanding();
-		this.state.llmBilled = this.ledger.settled();
 		return this.store.save(
 			this.state,
 			extras,
 			extras.publish || extras.consume ? () => this.checkAuthority() : undefined,
-			(state) => this.records.prepare(state),
+			(state) => {
+				state.cost = this.cost.hasUsage() ? this.cost.getSummary() : undefined;
+				state.llmSpend = this.ledger.outstanding();
+				return this.records.prepare(state);
+			},
 		);
 	}
 
@@ -365,12 +396,16 @@ export class Machine {
 		if (error instanceof InterruptedActivityError || running) state.status = "blocked";
 		else if (!stopped) state.status = "failed";
 		else state.status = Object.values(state.activations).some(isPending) ? "waiting" : "running";
+		const id = this.store.runId;
+		// An SDK run continues only on an instance with its stages, not from the CLI.
+		const advance =
+			this.ctx.mode === "sdk" ? `Lobster.advance("${id}")` : `\`lobster runs advance ${id}\``;
 		state.error = running
-			? `Interrupted while ${keys.describe(running)} was running; its outcome is unknown. Check it, then run \`lobster runs advance ${this.store.runId}\` to continue or \`lobster runs abandon ${this.store.runId}\` to stop the run.`
+			? `Interrupted while ${keys.describe(running)} was running; its outcome is unknown. Check it, then continue with ${advance} or run \`lobster runs abandon ${id}\` to stop the run.`
 			: messageOf(error);
 		if (state.status !== "failed") return this.save();
-		this.finish("failed");
-		// A failed run is not answered any more: withdraw what it asked (it asks again on retry).
+		// A failed run keeps its activations, to be retried, but is not answered any more:
+		// withdraw what it asked (it asks again on retry).
 		await withdrawWaits(this);
 		await this.save();
 	}
@@ -386,6 +421,7 @@ function timedScope(scope: Scope, clock: StepClock): Scope {
 		...scope,
 		timeoutSignal: clock.signal,
 		startTimeout: clock.start,
+		holdClocks: clock.hold,
 		ctx: {
 			...ctx,
 			signal: combineSignals(ctx.signal, clock.signal),

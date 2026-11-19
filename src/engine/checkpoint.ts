@@ -4,7 +4,7 @@
 import type { WorkflowApprovalIdentity, WorkflowStepResult } from "../workflows/types.js";
 import type { Definition } from "../workflows/definition.js";
 import type { CostSummary } from "../llm/cost_tracker.js";
-import type { LlmOutstandingCharge } from "../llm/accounting.js";
+import type { LlmMarks, LlmOutstandingCharge } from "../llm/accounting.js";
 import type { CommandInputState } from "../pipeline/input_request.js";
 
 /** When a question or event wait stops waiting, and what happens then. */
@@ -50,9 +50,6 @@ export type ActivityInput = {
 	cwd?: string;
 };
 
-/** A pipeline stage as parsed: what a paused pipeline saves so it continues the same stages. */
-export type PipelineStage = { name: string; args: Record<string, unknown>; raw: string };
-
 /**
  * Where a paused pipeline continues. `same_stage`: a command asked mid-run
  * (`ctx.requestInput`), and that stage runs again with its saved `commandInput`.
@@ -60,7 +57,8 @@ export type PipelineStage = { name: string; args: Record<string, unknown>; raw: 
  * gets `items` after an approval, or `[response]` after an input (the question says which).
  */
 export type PipelinePause = {
-	pipeline: PipelineStage[];
+	/** The text of each stage: the pipeline continues only if it still has these stages. */
+	stages: string[];
 	resumeAtIndex: number;
 	items: unknown[];
 } & ({ mode: "same_stage"; commandInput: CommandInputState } | { mode: "next_stage" });
@@ -133,6 +131,15 @@ export type Activation = {
 	wait?: { request: WaitRequest; stepId: string; key?: string };
 };
 
+/** Every status a run can have. `blocked`: interrupted while a step was running; its outcome is unknown. */
+const RUN_STATUSES = ["running", "waiting", "blocked", "completed", "failed", "cancelled"] as const;
+export type RunStatus = (typeof RUN_STATUSES)[number];
+
+/** Whether `value` is a run status. */
+export function isRunStatus(value: unknown): value is RunStatus {
+	return (RUN_STATUSES as readonly unknown[]).includes(value);
+}
+
 export type ExecutionState = {
 	version: 1;
 	revision: number;
@@ -140,7 +147,7 @@ export type ExecutionState = {
 	args: Record<string, unknown>;
 	cwd?: string;
 	activations: Record<string, Activation>;
-	status: "running" | "waiting" | "completed" | "failed" | "cancelled" | "blocked";
+	status: RunStatus;
 	/** When the run started (epoch ms): event waits match events from then on. */
 	startedAt?: number;
 	/** Inbox events this run has consumed; each is consumed at most once. */
@@ -149,10 +156,9 @@ export type ExecutionState = {
 	error?: string;
 	cost?: CostSummary;
 	llmSpend?: LlmOutstandingCharge[];
-	llmBilled?: LlmOutstandingCharge[];
+	/** Where the marks of model calls sit in `activations`, as saved (records.ts). */
+	llmMarks?: LlmMarks;
 };
-
-export type ExecutionLease = { owner: string; epoch: number; expiresAt: number };
 
 /** The activation at `key`, created ready on first use. */
 export function activation(state: ExecutionState, key: string): Activation {
@@ -171,13 +177,20 @@ export const keys = {
 	describe: (key: string) => key.split("/").map(decodeURIComponent).slice(1).join("/"),
 	/** The step an attempt belongs to. */
 	stepOf: (attempt: string) => attempt.slice(0, attempt.lastIndexOf("/attempt-")),
+	/**
+	 * A parallel step's branch, under the attempt's `branches`: a branch id is the author's, and
+	 * directly under the attempt one named `approval` or `activity` would take that key.
+	 */
+	branch: (attempt: string, id: string) => keys.occurrence(attempt + "/branches", id),
 	activity: (attempt: string) => attempt + "/activity",
 	approval: (attempt: string) => attempt + "/approval",
+	// A pipeline's questions sit under the attempt's activity: when a failed run is retried and
+	// the activity is cleared to run again, their answers go with it, and are asked again.
 	/** A question a pipeline asked after the stage at `index` (`approve`, `ask --emit`). */
-	pipelineGate: (attempt: string, index: number) => `${attempt}/pipeline-gate-${index}`,
+	pipelineGate: (attempt: string, index: number) => `${attempt}/activity/pipeline-gate-${index}`,
 	/** The `request`th question a command asked mid-run in the stage at `index`. */
 	pipelineInput: (attempt: string, index: number, request: number) =>
-		`${attempt}/pipeline-input-${index}-${request}`,
+		`${attempt}/activity/pipeline-input-${index}-${request}`,
 };
 
 /**
@@ -201,9 +214,9 @@ export function activationsBelow(
 	);
 }
 
-/** Whether the run has finished: completed, failed or cancelled. */
-export function isFinished(execution: ExecutionState): boolean {
-	return ["completed", "failed", "cancelled"].includes(execution.status);
+/** Whether the run (its checkpoint, or its record) has finished: completed, failed or cancelled. */
+export function isFinished(run: { status: RunStatus }): boolean {
+	return run.status === "completed" || run.status === "failed" || run.status === "cancelled";
 }
 
 /** When a wait is due: a timer's time, or a question's or event wait's deadline. */

@@ -7,6 +7,8 @@ import { spawnSync } from "node:child_process";
 import { access, mkdir, mkdtemp, realpath, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { Readable } from "node:stream";
+import { discardStream } from "../src/io/streams.js";
 
 import { Lobster } from "../src/sdk/Lobster.js";
 import { exec } from "../src/sdk/primitives.js";
@@ -218,8 +220,8 @@ for (const useShell of [false, true]) {
 			assert.match(
 				missing.error.message,
 				useShell
-					? /exec shell not found; check LOBSTER_SHELL or ComSpec/
-					: /exec command not found: lobster-nonexistent-executable-for-test/,
+					? /exec shell or working directory \(.*\) not found; check LOBSTER_SHELL or ComSpec/
+					: /exec command or working directory \(.*\) not found: lobster-nonexistent-executable-for-test/,
 			);
 			assert.equal(getEventListeners(controller.signal, "abort").length, 0);
 		} finally {
@@ -260,17 +262,45 @@ test("exported SDK runPipeline keeps signal optional and forwards supplied signa
 	const controller = new AbortController();
 	for (const options of [{}, { signal: controller.signal }]) {
 		const result = await runPipeline({
-			pipeline: [{ name: "signal", args: {} }],
+			pipeline: [{ name: "signal", args: { _: [] }, raw: "signal" }],
 			registry: {
-				get: () => ({ run: ({ ctx }: any) => ({ output: [ctx.signal === options.signal] }) }),
+				get: () => ({
+					run: async ({ ctx }: any) => ({ output: [ctx.signal === options.signal] }),
+				}),
 			},
-			stdin: { isTTY: false },
-			stdout: { write() {} },
-			stderr: { write() {} },
+			stdin: Readable.from([]),
+			stdout: discardStream(),
+			stderr: discardStream(),
 			env: process.env,
 			input: [],
 			...options,
 		});
 		assert.deepEqual(result.items, [true]);
+	}
+});
+
+test("exec's relative cwd is the run's directory, even when resumed from another", async () => {
+	const dir = await realpath(await mkdtemp(join(tmpdir(), "lobster-sdk-cwd-")));
+	const elsewhere = await realpath(await mkdtemp(join(tmpdir(), "lobster-sdk-elsewhere-")));
+	const started = process.cwd();
+	try {
+		await mkdir(join(dir, "sub"));
+		const workflow = () =>
+			new Lobster({ stateDir: join(dir, "state") })
+				.pipe(approve({ prompt: "Go?" }))
+				.pipe(exec("pwd", { cwd: "sub", json: false }));
+		process.chdir(dir);
+		const first = await workflow().run([1]);
+		assert.equal(first.status, "needs_approval", JSON.stringify(first));
+		process.chdir(elsewhere);
+		const resumed = await workflow().resume(first.requiresApproval!.resumeToken, {
+			approved: true,
+		});
+		assert.equal(resumed.ok, true, JSON.stringify(resumed));
+		assert.deepEqual(resumed.output, [join(dir, "sub")]);
+	} finally {
+		process.chdir(started);
+		await rm(dir, { recursive: true, force: true });
+		await rm(elsewhere, { recursive: true, force: true });
 	}
 });

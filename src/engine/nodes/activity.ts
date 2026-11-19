@@ -12,7 +12,7 @@ import {
 } from "../../workflows/values.js";
 import { bindRecorder, recorderFromEnv } from "../../persistence/context.js";
 import { activation, keys, type Activation, type ActivityInput } from "../checkpoint.js";
-import type { RunContext } from "../context.js";
+import { inRunDirectory, type RunContext } from "../context.js";
 import type { Machine } from "../machine.js";
 import type { Scope } from "../scope.js";
 import { InterruptedActivityError, lostRun } from "../errors.js";
@@ -69,7 +69,7 @@ function resolveActivityInput(step: WorkflowStep, scope: Scope): ActivityInput {
 				: resolveInputValue(step.stdin, scope.args, scope.results),
 		// Do not persist the host environment or credentials. Resolve only explicit workflow values.
 		env: mergeEnv(scope.baseEnv ?? {}, scope.env, step.env, scope.args, scope.results),
-		cwd: resolveCwd(step.cwd ?? scope.cwd, scope.args) ?? scope.ctx.cwd,
+		cwd: inRunDirectory(scope.ctx, resolveCwd(step.cwd ?? scope.cwd, scope.args)),
 	};
 }
 
@@ -82,7 +82,7 @@ async function dispatch(
 ) {
 	const { input: saved, dispatch: count } = record.activity!;
 	const activityId = keys.stepOf(key);
-	const history = recorderFromEnv(scope.ctx.env)?.child(key + "/");
+	const history = recorderFromEnv(scope.ctx.env)?.child(key);
 	const historyId = await history?.start("activity", step.id);
 	record.phase = "started";
 	await machine.save();
@@ -94,7 +94,6 @@ async function dispatch(
 		scope.ctx.signal?.throwIfAborted();
 		machine.checkAuthority(scope.ctx);
 		const hooks = scope.ctx.hooks;
-		await hooks?.onExecutionStarted?.();
 		const ctx: RunContext = {
 			...scope.ctx,
 			hooks: {
@@ -116,11 +115,13 @@ async function dispatch(
 		let result;
 		if (saved.kind === "shell") {
 			dispatched = true;
+			// A pipeline reports its own command starts (onExecutionStart below).
+			await hooks?.onExecutionStarted?.();
 			const { stdout } = await runShellCommand({
 				command: saved.text!,
 				stdin: encodeShellInput(saved.input),
 				env,
-				cwd: saved.cwd,
+				cwd: inRunDirectory(scope.ctx, saved.cwd),
 				signal: ctx.signal,
 				forceTerminationSignal: ctx.forceTerminationSignal,
 				assertInvocationCurrent: ctx.assertInvocationCurrent,
@@ -135,12 +136,13 @@ async function dispatch(
 				);
 			result = await runPipelineStep({
 				stepId: step.id,
+				chargeAs: scope.accountAs ?? scope.costPrefix + step.id,
 				pipelineText: saved.text!,
 				inputValue: saved.input,
 				ctx,
 				llmSpendLedger: scope.ledger,
 				env,
-				cwd: saved.cwd,
+				cwd: inRunDirectory(scope.ctx, saved.cwd),
 				gatesRefused: scope.gatesRefused,
 				resume: resumeOf(record.activity!),
 				onExecutionStart: () => {
@@ -230,7 +232,11 @@ async function answerPipelineQuestion(
 		pause.mode === "next_stage"
 			? keys.pipelineGate(key, pause.resumeAtIndex)
 			: keys.pipelineInput(key, pause.resumeAtIndex, pause.commandInput.pending.requestIndex);
-	await inputStep(machine, step, gateKey, scope, question);
+	// A question asked after a stage is `ask`'s, which takes a typed answer as text too.
+	await inputStep(machine, step, gateKey, scope, {
+		request: question,
+		acceptsText: pause.mode === "next_stage",
+	});
 	record.activity!.response = activation(machine.state, gateKey).result!.response;
 }
 

@@ -8,9 +8,20 @@ export type {
 	NamedWorkflow,
 } from "../commands/types.js";
 export { parsePipeline } from "./parse.js";
-export { runPipeline } from "../pipeline/runtime.js";
-export { runWorkflowFile, advanceWorkflowRun, abandonWorkflowRun } from "../engine/runner.js";
-export { advanceDueRuns, signalEvent, type DueRunOutcome } from "../engine/due.js";
+// The typed one-shot runner, as the SDK exports it (the runtime's own types are loose).
+export {
+	runPipeline,
+	type RunPipelineOptions,
+	type RunPipelineResult,
+} from "../pipeline/run_once.js";
+export type { DueRunOutcome } from "../engine/due.js";
+export {
+	runWorkflowFile,
+	advanceWorkflowRun,
+	abandonWorkflowRun,
+	advanceDueRuns,
+	signalEvent,
+} from "./host_runs.js";
 export { decodeResumeToken } from "../resume/resume.js";
 export { runToolRequest, resumeToolRequest, createToolContext } from "./tool_runtime.js";
 // Hosts that bring their own JSON Schema validator (OpenClaw's Lobster plugin) keep it.
@@ -28,7 +39,12 @@ export {
 	WaitConflictError,
 } from "../persistence/backend.js";
 
-export type { ToolRunContext, ResumeToolOptions, ToolEnvelope } from "./tool_runtime.js";
+export type {
+	ToolRunContext,
+	RunToolOptions,
+	ResumeToolOptions,
+	ToolEnvelope,
+} from "./tool_runtime.js";
 
 export { listRuns, getRun, getWait, type RunQuery, type RunPage } from "./runs.js";
 export type { RunView, WaitView, WaitSummary, WaitRequest } from "../persistence/waits.js";
@@ -47,5 +63,11 @@ export type {
 	OperationReceipt,
 } from "../persistence/model.js";
 
-export { InterruptedActivityError, ExecutionConflictError } from "../engine/errors.js";
-export type { WorkflowRunOptions } from "../engine/runner.js";
+export {
+	InterruptedActivityError,
+	ExecutionConflictError,
+	InvalidAnswerError,
+	ResumeRefusedError,
+} from "../engine/errors.js";
+export type { WorkflowRunOptions } from "./host_runs.js";
+export type { RunHooks } from "../engine/context.js";

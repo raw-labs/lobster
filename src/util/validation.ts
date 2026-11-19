@@ -77,13 +77,24 @@ export function prepareSchema(schema: unknown): SchemaValidator {
 	return validator;
 }
 
-/** Prepares `schema` and validates `value` against it. */
-export function validateValue(
-	schema: unknown,
-	value: unknown,
-	options?: { allErrors?: boolean },
-): ValidationResult {
-	return prepareSchema(schema).validate(value, options);
+/**
+ * The check of a person's answer to a question asked by `subject` ("ask", "requestInput", a
+ * workflow input step), one rule for every asker. The schema is prepared now, so a schema
+ * that cannot be used ("<subject> response schema is invalid") is refused before anyone is
+ * asked; the check throws "<subject> response failed schema validation at ..." for an answer
+ * that does not fit.
+ */
+export function responseChecker(schema: unknown, subject: string) {
+	let validator: SchemaValidator;
+	try {
+		validator = prepareSchema(schema);
+	} catch {
+		throw new Error(`${subject} response schema is invalid`);
+	}
+	return (response: unknown) => {
+		const result = validator.validate(response);
+		if (!result.ok) throw new Error(schemaValidationMessage(`${subject} response`, result.errors));
+	};
 }
 
 // ------------------------------------------------------------------

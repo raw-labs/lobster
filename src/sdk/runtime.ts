@@ -1,6 +1,6 @@
 // SDK stages as commands: each stage of a `Lobster` instance becomes the command
-// `sdk.stage.<n>`, so an SDK pipeline runs, pauses and resumes on the engine like any other.
-import { runPipeline as runCorePipeline } from "../pipeline/runtime.js";
+// `sdk.stage.<n>`, so an SDK pipeline runs, pauses and resumes on the engine like any other;
+// and the items a run starts from.
 import type { CommandMeta, LobsterCommand } from "../commands/types.js";
 import { isPlainObject } from "../util/objects.js";
 
@@ -106,54 +106,12 @@ export function sdkStageRegistry(stages: SdkStage[]) {
 	};
 }
 
-/** SDK input as the items a run saves: iterables are read once, a single value is one item. */
+/**
+ * SDK input as the items a run saves: an iterable is read once (a string by character), null
+ * or undefined is no items, any other value is one item.
+ */
 export async function sdkInputItems(input: unknown): Promise<unknown[]> {
 	const normalized = normalizeSdkOutput(input);
 	if (Array.isArray(normalized)) return normalized;
 	return collectItems(normalized);
-}
-
-/**
- * Run a parsed pipeline once, without saving it as a run: part of the SDK's public API
- * (`@clawdbot/lobster` exports it). `Lobster` instances run pipelines as saved runs.
- */
-export async function runPipeline({
-	pipeline,
-	registry,
-	stdin,
-	stdout,
-	stderr,
-	env,
-	mode = "human",
-	input,
-	signal = undefined,
-	requestInputResume = undefined,
-	requestInputEnabled = true,
-}: Pick<
-	Parameters<typeof runCorePipeline>[0],
-	| "pipeline"
-	| "registry"
-	| "stdin"
-	| "stdout"
-	| "stderr"
-	| "env"
-	| "mode"
-	| "input"
-	| "signal"
-	| "requestInputResume"
-	| "requestInputEnabled"
->) {
-	return runCorePipeline({
-		pipeline,
-		registry,
-		stdin,
-		stdout,
-		stderr,
-		env,
-		mode,
-		input,
-		signal,
-		requestInputResume,
-		requestInputEnabled,
-	});
 }

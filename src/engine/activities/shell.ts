@@ -16,7 +16,7 @@ export async function runShellCommand({
 	command: string;
 	stdin: string | null;
 	env: Record<string, string | undefined>;
-	cwd?: string;
+	cwd: string;
 	signal?: AbortSignal;
 	forceTerminationSignal?: AbortSignal;
 	assertInvocationCurrent?: () => void;
@@ -34,7 +34,8 @@ export async function runShellCommand({
 		onEffectDispatch,
 		forceTerminationSignal,
 		killSignal,
-		notFoundMessage: "workflow shell not found; check LOBSTER_SHELL or ComSpec",
+		// Spawning reports a missing working directory as a missing shell: name both.
+		notFoundMessage: `workflow shell or working directory (${cwd}) not found; check LOBSTER_SHELL or ComSpec, or the step's cwd`,
 	});
 	if (code === 0) return { stdout, stderr };
 	throw new Error(

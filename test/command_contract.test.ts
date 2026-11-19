@@ -8,6 +8,7 @@ import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { PassThrough } from "node:stream";
 import { fileURLToPath } from "node:url";
 import { builtinPacks, createDefaultRegistry, createRegistry } from "../src/commands/registry.js";
 import { defineCommand } from "../src/commands/define.js";
@@ -328,3 +329,45 @@ test("lobster help <cli command> shows the usage instead of failing", () => {
 		assert.match(help.stdout, /Manage runs:/);
 	}
 });
+
+test(
+	"a question a stage asks at a terminal waits only as long as LOBSTER_APPROVAL_INPUT_TIMEOUT_MS",
+	{ timeout: 10_000 },
+	async (t) => {
+		const asking = defineCommand({
+			name: "test.asks",
+			meta: {
+				description: "Asks for input",
+				argsSchema: { type: "object", properties: {} },
+				sideEffects: [],
+				repeatable: true,
+			},
+			help: () => "test.asks",
+			async run({ ctx }) {
+				await ctx.requestInput!({ prompt: "Name?", responseSchema: { type: "string" } });
+				return { output: empty() };
+			},
+		});
+		const registry = createRegistry({
+			packs: [...builtinPacks, { name: "test", description: "Test", commands: [asking] }],
+		});
+		for (const pipeline of ["ask --prompt Decide?", "test.asks"]) {
+			const stdin = Object.assign(new PassThrough(), { isTTY: true });
+			t.after(() => stdin.destroy());
+			await assert.rejects(
+				runPipeline({
+					pipeline: parsePipeline(pipeline, registry),
+					registry,
+					input: empty(),
+					stdin,
+					stdout: new PassThrough(),
+					stderr: process.stderr,
+					env: { ...process.env, LOBSTER_APPROVAL_INPUT_TIMEOUT_MS: "50" },
+					mode: "human",
+				} as any),
+				/Timed out waiting for input \(50ms\)/,
+				pipeline,
+			);
+		}
+	},
+);

@@ -1,19 +1,51 @@
 import {
 	asContinuation,
 	earliestWaitDue,
+	isFinished,
+	isRunStatus,
 	unresolvedActivities,
 	type ExecutionState,
-	type ExecutionLease,
+	type RunStatus,
 } from "../engine/checkpoint.js";
-import { createHash } from "node:crypto";
+import { fingerprint } from "../util/serialization.js";
+
+/** What a run ID may be: letters, digits, `_` and `-`, at most 128 (a wait ID starts with one). */
+const RUN_ID_PATTERN = "[a-zA-Z0-9_-]{1,128}";
+const RUN_ID = new RegExp(`^${RUN_ID_PATTERN}$`);
+
+const WAIT_ID = new RegExp(`^${RUN_ID_PATTERN}\\.[a-f0-9]{64}$`);
+
+/** A wait ID: `<run id>.<64 hex>`. */
+export function isWaitId(value: unknown): value is string {
+	return typeof value === "string" && WAIT_ID.test(value);
+}
+
+export function isRunId(value: unknown): value is string {
+	return typeof value === "string" && RUN_ID.test(value);
+}
+
+/** Refuse a malformed run ID: checked before any store is opened. */
+export function checkRunId(id: unknown): asserts id is string {
+	if (!isRunId(id)) throw new Error("Invalid run ID");
+}
+
+/** Who executes a run: the owner holding its lease, and until when (renewed while it runs). */
+type ExecutionLease = { owner: string; epoch: number; expiresAt: number };
 
 export const SCHEMA_VERSION = 1;
 const CAPTURE_BYTES = 4096;
 
-/** `blocked`: interrupted while a step was running; its outcome is unknown. */
-export type RunStatus = "running" | "waiting" | "blocked" | "completed" | "failed" | "cancelled";
+export type { RunStatus };
 
-export type AttemptStatus = "started" | "completed" | "failed" | "closed" | "waiting" | "skipped";
+const ATTEMPT_STATUSES = [
+	"started",
+	"completed",
+	"failed",
+	"closed",
+	"waiting",
+	"skipped",
+] as const;
+export type AttemptStatus = (typeof ATTEMPT_STATUSES)[number];
 
 export type StateRecord = { text: string | null; runId?: string };
 
@@ -49,13 +81,13 @@ export function captureRunMetadata(metadata?: RunMetadata): RunMetadata | undefi
 	);
 }
 
+const WAIT_STATUSES = ["pending", "consumed", "retired"] as const;
+
 export type WaitRecord = {
 	revision?: number;
-	status: "pending" | "consumed" | "retired";
+	status: (typeof WAIT_STATUSES)[number];
 	kind: string;
-	prompt?: unknown;
 	claimId?: string;
-	decision?: unknown;
 };
 
 export type OperationReceipt = {
@@ -72,6 +104,7 @@ export type RunEvent = {
 		id?: string;
 		path?: string;
 		key?: string;
+		/** A wait the same transition consumed, when it published another (`key`). */
 		previousKey?: string;
 		status?: AttemptStatus | RunStatus | WaitRecord["status"];
 		summary?: unknown;
@@ -80,6 +113,9 @@ export type RunEvent = {
 	};
 };
 
+/** What a new run is: a workflow file, a pipeline, or an SDK pipeline. */
+export type RunKind = "workflow" | "pipeline" | "sdk";
+
 export type RunRecord = {
 	execution?: ExecutionState;
 	executionLease?: ExecutionLease;
@@ -87,6 +123,7 @@ export type RunRecord = {
 	wakeAt?: number;
 	version: 1;
 	id: string;
+	/** A RunKind; stores written by older versions also hold "cli". */
 	kind: string;
 	status: RunStatus;
 	revision: number;
@@ -170,24 +207,11 @@ export type RunSummary = Pick<
 
 export type HistoryPage = Omit<
 	RunRecord,
-	"states" | "receipts" | "execution" | "executionLease"
+	"states" | "receipts" | "records" | "execution" | "executionLease"
 > & {
 	definitionCount: number;
 	nextCursor: number;
 };
-
-export function fingerprint(value: unknown): string {
-	const text = JSON.stringify(value, (_key, item: unknown) => {
-		if (!item || typeof item !== "object" || Array.isArray(item)) {
-			return item;
-		}
-
-		const record = item as Record<string, unknown>;
-		const keys = Object.keys(record).sort();
-		return Object.fromEntries(keys.map((key) => [key, record[key]]));
-	});
-	return createHash("sha256").update(text).digest("hex");
-}
 
 // Default history contains shape/counts, never arbitrary output, arguments, environment,
 // prompts or credentials. Explicit diagnostic capture remains bounded and opt-in.
@@ -207,7 +231,7 @@ export function summarize(value: unknown): unknown {
 	return { type: typeof value };
 }
 
-export function capture(value: unknown): unknown {
+function capture(value: unknown): unknown {
 	const text = JSON.stringify(value);
 	if (text === undefined) {
 		return null;
@@ -218,22 +242,11 @@ export function capture(value: unknown): unknown {
 	return { truncated: true, bytes: Buffer.byteLength(text) };
 }
 
-/**
- * The kind of wait a saved value publishes: a continuation says so; a pause an older version
- * saved is told by its fields.
- */
-function savedWaitKind(value: any): string {
-	const continuation = asContinuation(value);
-	if (continuation) {
-		const { kind } = continuation.wait;
-		return kind === "input" ? "input_request" : kind === "approval" ? "approval_request" : kind;
-	}
-	if (value.haltType) return value.haltType;
-	return value.inputStepId ||
-		value.inputSchema !== undefined ||
-		value.payload?.inputSchema !== undefined
-		? "input_request"
-		: "approval_request";
+/** The kind of wait a saved continuation publishes ("legacy" for anything else). */
+function savedWaitKind(value: unknown): string {
+	const kind = asContinuation(value)?.wait.kind;
+	if (kind === undefined) return "legacy";
+	return kind === "input" ? "input_request" : kind === "approval" ? "approval_request" : kind;
 }
 
 export function applyTransition(
@@ -241,10 +254,7 @@ export function applyTransition(
 	request: Transition,
 	projection: { previousAttempts?: number } = {},
 ): TransitionApplication {
-	if (
-		!/^[a-zA-Z0-9._-]{1,128}$/.test(request.operationId) ||
-		!/^[a-zA-Z0-9_-]{1,128}$/.test(request.runId)
-	) {
+	if (!/^[a-zA-Z0-9._-]{1,128}$/.test(request.operationId) || !isRunId(request.runId)) {
 		throw new Error("Invalid persistence operation identity");
 	}
 	if (
@@ -350,6 +360,15 @@ export function applyTransition(
 		if (action.consume) setCheckpoint(run, action.consume.key, null);
 		if (action.publish) setCheckpoint(run, action.publish.key, action.publish.text);
 		run.status = action.execution.status;
+		// The waits it published or consumed, so history can show them: one save can consume a
+		// wait (`previousKey`) and publish the next (`key`).
+		const key = action.publish?.key ?? action.consume?.key;
+		if (key)
+			payload = {
+				key,
+				status: run.waits[key]?.status,
+				...(action.publish && action.consume ? { previousKey: action.consume.key } : {}),
+			};
 	} else if (action.kind === "create" && action.checkpoint) {
 		setCheckpoint(run, action.checkpoint.key, action.checkpoint.text);
 	} else if (action.kind === "definition") {
@@ -376,7 +395,6 @@ export function applyTransition(
 		});
 		payload = { id: action.id, status: action.status };
 	} else if (action.kind === "settle") {
-		// A stale/rejected resume must never settle another caller's run.
 		run.status = action.status;
 		payload = { status: action.status, summary: capture(action.summary) };
 	} else if (action.kind === "state") {
@@ -450,11 +468,11 @@ export function validateArchive(value: unknown): asserts value is LogicalArchive
 		if (
 			!run ||
 			run.version !== 1 ||
-			!/^[a-zA-Z0-9_-]+$/.test(run.id) ||
+			!isRunId(run.id) ||
 			ids.has(run.id) ||
 			!Number.isInteger(run.revision) ||
 			run.revision < 1 ||
-			!["running", "waiting", "blocked", "completed", "failed", "cancelled"].includes(run.status) ||
+			!isRunStatus(run.status) ||
 			!Array.isArray(run.events) ||
 			!Array.isArray(run.attempts) ||
 			!Array.isArray(run.definitions) ||
@@ -487,9 +505,7 @@ export function validateArchive(value: unknown): asserts value is LogicalArchive
 				typeof execution.definition.filePath !== "string" ||
 				!execution.activations ||
 				!execution.args ||
-				!["running", "waiting", "completed", "failed", "cancelled", "blocked"].includes(
-					execution.status,
-				)
+				!isRunStatus(execution.status)
 			)
 				throw new Error("Invalid workflow execution snapshot");
 		}
@@ -508,7 +524,7 @@ export function validateArchive(value: unknown): asserts value is LogicalArchive
 				typeof attempt.name !== "string" ||
 				!Number.isInteger(attempt.attempt) ||
 				attempt.attempt < 1 ||
-				!["started", "completed", "failed", "closed", "waiting", "skipped"].includes(attempt.status)
+				!(ATTEMPT_STATUSES as readonly string[]).includes(attempt.status)
 			) {
 				throw new Error("Invalid attempt archive entry");
 			}
@@ -517,7 +533,7 @@ export function validateArchive(value: unknown): asserts value is LogicalArchive
 			if (
 				!Object.hasOwn(run.states, key) ||
 				!wait ||
-				!["pending", "consumed", "retired"].includes(wait.status) ||
+				!(WAIT_STATUSES as readonly string[]).includes(wait.status) ||
 				(wait.revision !== undefined &&
 					(!Number.isSafeInteger(wait.revision) ||
 						wait.revision < 0 ||
@@ -581,7 +597,7 @@ function isRetiredCheckpoint(text: string | null): boolean {
 export function canRetain(run: RunRecord, before: string): boolean {
 	if (run.execution && unresolvedActivities(run.execution).length) return false;
 	return (
-		["completed", "failed", "cancelled"].includes(run.status) &&
+		isFinished(run) &&
 		Date.parse(run.updatedAt) < Date.parse(before) &&
 		Object.values(run.states).every(isRetiredCheckpoint) &&
 		!Object.values(run.waits).some((wait) => wait.status === "pending") &&
@@ -599,6 +615,7 @@ export function historyPage(run: RunRecord, afterSequence: number, limit: number
 	const {
 		states: _states,
 		receipts: _receipts,
+		records: _records,
 		execution: _execution,
 		executionLease: _executionLease,
 		events,

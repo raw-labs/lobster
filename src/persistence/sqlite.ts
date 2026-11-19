@@ -30,7 +30,6 @@ type PendingRequest = {
 };
 
 export class SqliteBackend implements Backend {
-	readonly kind = "sqlite" as const;
 	private worker!: Worker;
 	private pending = new Map<string, PendingRequest>();
 	private ready!: Promise<void>;
@@ -190,7 +189,7 @@ export class SqliteBackend implements Backend {
 			this.worker.postMessage({
 				id,
 				method,
-				args: { ...args, ...(method === "write" ? { operationId } : {}) },
+				args,
 			});
 		} catch (error) {
 			this.pending.delete(id);
@@ -240,12 +239,8 @@ export class SqliteBackend implements Backend {
 		};
 	}
 
-	transition(
-		request: Transition,
-		signal?: AbortSignal,
-		assertInvocationCurrent?: () => void,
-	): Promise<TransitionResult> {
-		return this.request("transition", request, signal, assertInvocationCurrent);
+	transition(request: Transition, assertInvocationCurrent?: () => void): Promise<TransitionResult> {
+		return this.request("transition", request, undefined, assertInvocationCurrent);
 	}
 
 	acknowledge(runId: string, operationId: string): Promise<void> {

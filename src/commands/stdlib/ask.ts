@@ -1,36 +1,14 @@
 import { defineCommand } from "../define.js";
+import { responseChecker } from "../../util/validation.js";
+import { readLineFromStream } from "../../io/read_line.js";
 import {
-	prepareSchema,
-	schemaValidationMessage,
-	type SchemaValidator,
-} from "../../util/validation.js";
-import { isInteractive, PREVIEW_CHARS, streamOf } from "../../io/terminal.js";
-
-function compileAskValidator(schema: unknown) {
-	try {
-		return prepareSchema(schema);
-	} catch {
-		throw new Error("ask response schema is invalid");
-	}
-}
-
-function validateAskResponse(validator: SchemaValidator, response: unknown) {
-	const result = validator.validate(response);
-	if (!result.ok) throw new Error(schemaValidationMessage("ask response", result.errors));
-}
-
-function parseInteractiveCandidates(text: string) {
-	let parsed;
-	try {
-		parsed = JSON.parse(text);
-	} catch {
-		return [text, { decision: text }];
-	}
-	if (typeof parsed === "string") {
-		return [parsed, { decision: parsed }];
-	}
-	return [parsed];
-}
+	approvalInputTimeoutMs,
+	firstAccepted,
+	isInteractive,
+	PREVIEW_CHARS,
+	textAnswerCandidates,
+} from "../../io/terminal.js";
+import { streamOf } from "../../io/streams.js";
 
 export const askCommand = defineCommand({
 	name: "ask",
@@ -102,7 +80,7 @@ export const askCommand = defineCommand({
 			}
 			responseSchema = parsedSchema;
 		}
-		const responseValidator = compileAskValidator(responseSchema);
+		const checkResponse = responseChecker(responseSchema, "ask");
 
 		const forceEmit = Boolean(args.emit);
 		const emit = forceEmit || ctx.mode === "tool" || !isInteractive(ctx.stdin);
@@ -155,23 +133,13 @@ export const askCommand = defineCommand({
 		}
 
 		ctx.stdout.write(`${prompt}\n> `);
-		const { readLineFromStream } = await import("../../io/read_line.js");
-		const raw = await readLineFromStream(ctx.stdin, { timeoutMs: 0, signal: ctx.signal });
-		const text = String(raw ?? "").trim();
+		const raw = await readLineFromStream(ctx.stdin, {
+			timeoutMs: approvalInputTimeoutMs(ctx.env),
+			signal: ctx.signal,
+		});
+		const text = raw.trim();
 
-		let lastError;
-		for (const candidate of parseInteractiveCandidates(text)) {
-			try {
-				validateAskResponse(responseValidator, candidate);
-				return {
-					output: (async function* () {
-						yield candidate;
-					})(),
-				};
-			} catch (err) {
-				lastError = err;
-			}
-		}
-		throw lastError ?? new Error("ask response failed schema validation");
+		const response = firstAccepted(textAnswerCandidates(text), checkResponse);
+		return { output: streamOf([response]) };
 	},
 });

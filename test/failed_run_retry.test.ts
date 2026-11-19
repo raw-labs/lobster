@@ -79,6 +79,37 @@ test("a failed workflow run continues from the step that failed", async (t) => {
 	assert.equal(await ran("three"), 1);
 });
 
+test("a retried pipeline step asks its approval again: the items may differ", async (t) => {
+	const { dir, env, ran, advance } = await fixture(t);
+	const filePath = path.join(dir, "flow.lobster");
+	await fs.writeFile(
+		filePath,
+		JSON.stringify({
+			steps: [
+				{
+					id: "send",
+					pipeline: `exec --json --shell 'echo x >> "$RETRY_DIR/count"; wc -l < "$RETRY_DIR/count"' | approve --prompt Send? | exec --shell 'test -f "$RETRY_DIR/fixed"'`,
+				},
+			],
+		}),
+	);
+	const paused = await runToolRequest({ filePath, ctx: { env } });
+	assert.equal(paused.status, "needs_approval", JSON.stringify(paused));
+	assert.deepEqual(paused.requiresApproval!.items, [1]);
+	const failed = await resumeToolRequest({
+		token: paused.requiresApproval!.resumeToken,
+		approved: true,
+		ctx: { env },
+	});
+	assert.equal(failed.ok, false);
+
+	await fs.writeFile(path.join(dir, "fixed"), "");
+	const retried = await advance(paused.runId!);
+	assert.equal(retried.status, "needs_approval", JSON.stringify(retried));
+	assert.deepEqual(retried.requiresApproval!.items, [2], "the new items are asked about");
+	assert.equal(await ran("count"), 2);
+});
+
 test("retrying a failed child workflow reruns only its failed step", async (t) => {
 	const { dir, env, ran, advance } = await fixture(t);
 	await fs.writeFile(
@@ -153,7 +184,7 @@ test("a resume that fails names its run, so the caller can retry it", async (t) 
 	);
 	const paused = await runToolRequest({ filePath, ctx: { env } });
 	assert.equal(paused.status, "needs_approval");
-	const token = paused.requiresApproval!.resumeToken!;
+	const token = paused.requiresApproval!.resumeToken;
 	const failed = await resumeToolRequest({ token, approved: true, ctx: { env } });
 	assert.equal(failed.ok, false);
 	assert.equal(failed.runId, paused.runId);
@@ -195,7 +226,7 @@ test("a command cannot name another run in its failure", async (t) => {
 	);
 	const paused = await runToolRequest({ filePath, ctx: { env, registry } });
 	const failed = await resumeToolRequest({
-		token: paused.requiresApproval!.resumeToken!,
+		token: paused.requiresApproval!.resumeToken,
 		approved: true,
 		ctx: { env, registry },
 	});

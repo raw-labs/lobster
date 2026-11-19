@@ -8,7 +8,6 @@ export type StoreHandle = Pick<
 	StoreSession,
 	| "directory"
 	| "history"
-	| "trackRuns"
 	| "readOnly"
 	| "listRuns"
 	| "inspect"
@@ -26,7 +25,6 @@ export type PublicStoreSession = StoreHandle & {
 export type PersistenceOptions = {
 	storeSession?: StoreHandle;
 	history?: boolean;
-	trackRuns?: boolean;
 	runMetadata?: RunMetadata;
 };
 
@@ -45,7 +43,7 @@ export function resolveStoreSession(handle: StoreHandle): StoreSession {
 	throw new Error("Invalid persistence session");
 }
 
-type ResumeGuard = { key: string; expectedRevision: number; admitted: boolean };
+type ResumeGuard = { key: string; expectedRevision: number };
 
 type PersistenceContext = {
 	session: StoreSession;

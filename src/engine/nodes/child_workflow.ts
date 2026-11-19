@@ -7,6 +7,7 @@ import {
 	createRecord,
 	mergeEnv,
 	resolveCwd,
+	withoutArgEnv,
 } from "../../workflows/values.js";
 import { resolveWorkflowArgs } from "../../workflows/args.js";
 import { snapshotDefinition } from "../../workflows/definition.js";
@@ -42,7 +43,10 @@ export async function childWorkflowStep(
 		frame.child = {
 			definition,
 			args: resolveWorkflowArgs(definition.workflow.args, args),
-			env: mergeEnv(scope.baseEnv ?? {}, scope.env, step.env, scope.args, scope.results),
+			env: withoutArgEnv(
+				mergeEnv(scope.baseEnv ?? {}, scope.env, step.env, scope.args, scope.results),
+				scope.args,
+			),
 			costStart: machine.cost.getSummary().estimatedCostUsd,
 		};
 		await machine.save();

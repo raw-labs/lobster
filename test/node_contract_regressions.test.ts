@@ -151,6 +151,34 @@ test("an approval gate in a child workflow is refused before its command runs", 
 	assert.equal((await fx.execution()).status, "failed");
 });
 
+test("a refused gate in a child stops the run: retry and on_error do not apply to it", async (t) => {
+	for (const gate of [
+		{ id: "ask", approval: true },
+		{ id: "ask", pipeline: "approve --emit --prompt Go?" },
+	]) {
+		const fx = await workflowFixture(t);
+		await fx.write("child.lobster", {
+			steps: [{ id: "first", pipeline: "fake --name first" }, gate],
+		});
+		await assert.rejects(
+			fx.run({
+				steps: [
+					{
+						id: "child",
+						workflow: "child.lobster",
+						retry: { max: 2, delay_ms: 0 },
+						on_error: "continue",
+					},
+					{ id: "after", pipeline: "fake --name after" },
+				],
+			}),
+			/not supported inside a child workflow/,
+		);
+		assert.equal(fx.fake.calls("first"), 1, "the child was not run again");
+		assert.equal(fx.fake.calls("after"), 0, "the run did not go on");
+	}
+});
+
 test("dry-run treats skipped/approved of a step with an undecided condition as undecided", async (t) => {
 	const fx = await workflowFixture(t);
 	await fx.run(
@@ -178,4 +206,26 @@ test("dry-run treats skipped/approved of a step with an undecided condition as u
 	);
 	// A step whose own condition is decided is still modelled.
 	assert.match(plan, /6\. notSkipped {2}\[skipped — condition: false\]/);
+});
+
+test("a child workflow sees only the args it takes, not its parent's", async (t) => {
+	const fx = await workflowFixture(t);
+	await fx.write("child.lobster", {
+		args: { x: {} },
+		steps: [
+			{
+				id: "show",
+				run: 'printf "secret=%s x=%s json=%s" "$LOBSTER_ARG_SECRET" "$LOBSTER_ARG_X" "$LOBSTER_ARGS_JSON"',
+			},
+		],
+	});
+	const result = await fx.run(
+		{
+			args: { secret: { default: "parent-only" }, x: { default: "px" } },
+			steps: [{ id: "kid", workflow: "child.lobster", workflow_args: { x: "cx" } }],
+		},
+		{},
+	);
+	assert.equal(result.status, "ok", JSON.stringify(result));
+	assert.deepEqual(result.output, ['secret= x=cx json={"x":"cx"}']);
 });

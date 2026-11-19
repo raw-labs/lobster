@@ -4,7 +4,7 @@ import { evaluateCondition } from "../../workflows/conditions.js";
 import { createRecord } from "../../workflows/values.js";
 import { activation, keys } from "../checkpoint.js";
 import type { Machine } from "../machine.js";
-import { bodyGatesRefused, type Scope } from "../scope.js";
+import { bodyGatesRefused, innerSettings, type Scope } from "../scope.js";
 import { markSkipped, resultOfLastStep } from "../results.js";
 import { sequence } from "./sequence.js";
 
@@ -29,6 +29,7 @@ export async function switchStep(machine: Machine, step: WorkflowStep, key: stri
 	const bodyKey = keys.occurrence(key, chosen === "else" ? "else" : `case-${chosen}`);
 	const last = await sequence(machine, steps, bodyKey, {
 		...scope,
+		...innerSettings(step, scope),
 		gatesRefused: bodyGatesRefused(step, scope),
 	});
 	const body = activation(machine.state, bodyKey);

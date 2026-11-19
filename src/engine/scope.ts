@@ -6,6 +6,7 @@ import { resolveRetryConfig } from "../workflows/retry.js";
 import type { LlmSpendLedger } from "../llm/accounting.js";
 import type { CostLimit } from "../llm/cost_tracker.js";
 import type { RunContext } from "./context.js";
+import type { HoldClocks } from "./step_clock.js";
 
 export type Scope = {
 	definition: Definition;
@@ -38,7 +39,14 @@ export type Scope = {
 	timeoutSignal?: AbortSignal;
 	/** Start the enclosing step's timeout; activities call it right before dispatch. */
 	startTimeout?: () => void;
+	/** Hold the clocks of the enclosing steps during a deliberate wait (see deliberateWait). */
+	holdClocks?: HoldClocks;
 };
+
+/** The env and cwd of a compound step's inner steps: the step's own settings over the scope's. */
+export function innerSettings(step: WorkflowStep, scope: Scope): Pick<Scope, "env" | "cwd"> {
+	return { env: { ...scope.env, ...step.env }, cwd: step.cwd ?? scope.cwd };
+}
 
 const GATES = "approvals, input, sleeps and waits are not supported";
 

@@ -2,6 +2,7 @@
 // results compound steps build from the steps inside them.
 import type { WorkflowStep, WorkflowStepResult } from "../workflows/types.js";
 import { stepIds } from "../workflows/steps.js";
+import { createRecord } from "../workflows/values.js";
 
 export function parseJson(stdout: string) {
 	const trimmed = stdout.trim();
@@ -62,7 +63,7 @@ export function createSyntheticStepResult(stepId: string, value: unknown): Workf
 export function resultOfLastStep(
 	stepId: string,
 	last: WorkflowStepResult | undefined,
-	fields: Partial<WorkflowStepResult> = {},
+	fields: Partial<WorkflowStepResult>,
 ): WorkflowStepResult {
 	const result: WorkflowStepResult = { id: stepId, ...fields };
 	if (!last) return result;
@@ -74,6 +75,18 @@ export function resultOfLastStep(
 /** Every step `steps` could have run (see stepIds), as skipped. */
 export function markSkipped(steps: WorkflowStep[], into: Record<string, WorkflowStepResult>) {
 	for (const id of stepIds(steps)) into[id] = { id, skipped: true };
+}
+
+/**
+ * The steps inside `step` (a switch's cases, a repeat's steps, parallel branches) as skipped,
+ * for a step whose body did not run (its condition was false, or `on_error` tolerated its
+ * failure). Later steps may read them, so each needs a result. Undefined when it has none.
+ */
+export function skippedInside(step: WorkflowStep): Record<string, WorkflowStepResult> | undefined {
+	const inside = createRecord<WorkflowStepResult>();
+	markSkipped([step], inside);
+	delete inside[step.id];
+	return Object.keys(inside).length ? inside : undefined;
 }
 
 /** A step's stdin value as pipeline input items: none, each array element, or the value. */

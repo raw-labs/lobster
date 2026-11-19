@@ -19,7 +19,59 @@ type DeferredCharge = {
 	usage: Record<string, unknown>;
 };
 
-export type BranchSpendBuffer = LlmSpendLedger & { release: () => void };
+/**
+ * The run ledger seen by one of several branches or items running at once: it settles only the
+ * charges opened through it, as many under each cache key as it opened. Without this, the first
+ * to finish settles a call a sibling has made and not yet accounted for -- billed as unclaimed --
+ * and the sibling then bills it again. What is left open is settled when the enclosing step
+ * completes.
+ */
+export function concurrentLedger(ledger: LlmSpendLedger): LlmSpendLedger {
+	const own = new Map<string, number>();
+	const openCount = () => {
+		const counts = new Map<string, number>();
+		for (const { cacheKey } of ledger.outstanding())
+			counts.set(cacheKey, (counts.get(cacheKey) ?? 0) + 1);
+		return counts;
+	};
+	// Settled through this view: as many fewer of its own as were settled under each key.
+	const settledThrough = (before: Map<string, number>) => {
+		const after = openCount();
+		for (const [key, count] of before) {
+			const settled = count - (after.get(key) ?? 0);
+			if (settled > 0 && own.has(key)) own.set(key, Math.max(0, own.get(key)! - settled));
+		}
+	};
+	return {
+		...ledger,
+		record: (cacheKey, charge) => {
+			own.set(cacheKey, (own.get(cacheKey) ?? 0) + 1);
+			ledger.record(cacheKey, charge);
+		},
+		claim: (cacheKey, cost) => {
+			const before = openCount();
+			const claimed = ledger.claim(cacheKey, cost);
+			settledThrough(before);
+			return claimed;
+		},
+		settleCopy: (cacheKey, model, usage) => {
+			const before = openCount();
+			ledger.settleCopy(cacheKey, model, usage);
+			settledThrough(before);
+		},
+		outstanding: () => {
+			const left = new Map(own);
+			return ledger.outstanding().filter(({ cacheKey }) => {
+				const count = left.get(cacheKey) ?? 0;
+				if (count < 1) return false;
+				left.set(cacheKey, count - 1);
+				return true;
+			});
+		},
+	};
+}
+
+type BranchSpendBuffer = LlmSpendLedger & { release: () => void };
 
 /**
  * One `wait: "any"` branch's view of the run ledger. The race returns as soon as a branch
@@ -52,15 +104,14 @@ export function branchSpendBuffer(ledger: LlmSpendLedger): BranchSpendBuffer {
 }
 
 /**
- * The run ledger seen by one step, so a charge opened inside it knows where it came from. A
- * composed run's charges reach the composing run through this too, which is why the step id is
- * overwritten rather than kept: in the parent's totals the spend belongs to the `workflow:`
- * step, not to whatever the child called its own.
+ * The run ledger seen by one step, so a charge opened inside it is billed under `chargeAs`,
+ * the step's name in the run's costs (see chargeStep), even when it ends unclaimed: a step in a
+ * child workflow bills as the `workflow:` step, one in a loop under the loop's prefix.
  */
-export function stepScopedLedger(ledger: LlmSpendLedger, stepId: string): LlmSpendLedger {
+export function stepScopedLedger(ledger: LlmSpendLedger, chargeAs: string): LlmSpendLedger {
 	return {
 		...ledger,
-		record: (cacheKey, charge) => ledger.record(cacheKey, { ...charge, stepId }),
+		record: (cacheKey, charge) => ledger.record(cacheKey, { ...charge, stepId: chargeAs }),
 	};
 }
 
@@ -220,9 +271,8 @@ function settleDeferredCosts(
 	}
 	for (const copy of deferred) {
 		if (copy.kind !== "copy") continue;
-		if (ledger.billCopy(copy.cacheKey, copy.model, copy.usage)) {
-			cost.recordUsage(copy.stepId, copy.model, copy.usage);
-		}
+		ledger.settleCopy(copy.cacheKey, copy.model, copy.usage);
+		cost.recordUsage(copy.stepId, copy.model, copy.usage);
 	}
 	deferred.length = 0;
 }

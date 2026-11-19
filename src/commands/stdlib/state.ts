@@ -6,7 +6,7 @@ import {
 	writeStateJson,
 	readStateTextWithLock,
 } from "../../state/store.js";
-import { streamOf } from "../../io/terminal.js";
+import { streamOf } from "../../io/streams.js";
 
 // What this process last wrote to each state key. A value read straight back is the same value
 // rebuilt from its own JSON, and the marks a command attached in-process are not in that JSON:
@@ -94,8 +94,7 @@ export const stateSetCommand = defineCommand({
 
 		const value = items.length === 1 ? items[0] : items;
 
-		const text = JSON.stringify(value, null, 2) + "\n";
-		await writeStateJson({
+		const { text } = await writeStateJson({
 			env: ctx.env,
 			key,
 			value,

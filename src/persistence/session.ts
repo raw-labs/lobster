@@ -5,7 +5,7 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import { ensureDirectory } from "../state/atomic_file.js";
 import { withFileLock } from "../state/file_lock.js";
-import { normalizeStateKey, resolveStateDirectory } from "../state/paths.js";
+import { keyToPath, normalizeStateKey, resolveStateDirectory } from "../state/paths.js";
 import {
 	PersistenceError,
 	PersistenceOutcomeUnknown,
@@ -15,10 +15,11 @@ import {
 	type StateWriteResult,
 } from "./backend.js";
 import { sessionFromEnv } from "./context.js";
+import { callerId } from "./waits.js";
+import { fingerprint } from "../util/serialization.js";
 import {
 	canRetain,
 	captureRunMetadata,
-	fingerprint,
 	summarize,
 	type AttemptStatus,
 	type HistoryPage,
@@ -43,20 +44,11 @@ export class CheckpointTakenError extends Error {
 	}
 }
 
-export {
-	bindRecorder,
-	bindStoreSession,
-	recorderFromEnv,
-	sessionFromEnv,
-	type StoreEnvironment,
-} from "./context.js";
-
 export type StoreOptions = {
 	directory?: string;
 	env?: Record<string, string | undefined>;
 	readOnly?: boolean;
 	history?: boolean;
-	trackRuns?: boolean;
 	maxPending?: number;
 	signal?: AbortSignal;
 	/**
@@ -73,8 +65,10 @@ function retentionDays(options: StoreOptions, env: Record<string, string | undef
 	if (raw === undefined || raw === "") return DEFAULT_RETENTION_DAYS;
 	const days = Number(raw);
 	if (!Number.isFinite(days) || days < 0) {
+		const source =
+			options.retentionDays !== undefined ? "retentionDays" : "LOBSTER_RUN_RETENTION_DAYS";
 		throw new Error(
-			`LOBSTER_RUN_RETENTION_DAYS must be a number of days (0 keeps finished runs), got ${JSON.stringify(raw)}`,
+			`${source} must be a number of days (0 keeps finished runs), got ${JSON.stringify(raw)}`,
 		);
 	}
 	return days;
@@ -91,7 +85,6 @@ export class StoreSession {
 		readonly backend: Backend,
 		history: boolean,
 		readonly readOnly = false,
-		readonly trackRuns = history,
 	) {
 		this.history = history;
 	}
@@ -165,34 +158,28 @@ export class StoreSession {
 		}, true);
 	}
 
-	async createRun(
-		kind: string,
-		metadata?: RunMetadata,
-		partialHistory = false,
-	): Promise<ExecutionRecorder> {
-		return this.createRecorder({ kind, metadata, partialHistory });
+	async createRun(kind: string, metadata?: RunMetadata): Promise<ExecutionRecorder> {
+		return this.createRecorder({ kind, metadata });
 	}
 
 	private async createRecorder({
 		id = randomUUID(),
 		kind,
 		metadata,
-		partialHistory = false,
 		checkpoint,
 		execution,
-		signal,
-		assertInvocationCurrent,
+		records,
 	}: {
 		id?: string;
 		kind: string;
 		metadata?: RunMetadata;
-		partialHistory?: boolean;
 		checkpoint?: { key: string; text: string };
 		execution?: ExecutionState;
-		signal?: AbortSignal;
-		assertInvocationCurrent?: () => void;
+		records?: Record<string, string>;
 	}): Promise<ExecutionRecorder> {
 		this.assertOpen(true);
+		// Refused before anything is written: a run its caller could not see would be stranded.
+		callerId(metadata);
 		const at = new Date().toISOString();
 		const run: RunRecord = {
 			version: 1,
@@ -202,7 +189,7 @@ export class StoreSession {
 			revision: 0,
 			createdAt: at,
 			updatedAt: at,
-			partialHistory,
+			partialHistory: false,
 			historyEnabled: this.history,
 			definitions: [],
 			metadata: captureRunMetadata(metadata),
@@ -212,58 +199,46 @@ export class StoreSession {
 			states: {},
 			receipts: {},
 			...(execution ? { execution } : {}),
+			...(records && Object.keys(records).length ? { records } : {}),
 		};
 		const recorder = new ExecutionRecorder(this, id);
-		await recorder.action(
-			{ kind: "create", run, ...(checkpoint ? { checkpoint } : {}) },
-			signal,
-			assertInvocationCurrent,
-		);
+		await recorder.action({ kind: "create", run, ...(checkpoint ? { checkpoint } : {}) });
 		return recorder;
 	}
 
-	/** The recorder of the run that owns this continuation key, if a run owns it. */
-	async recorderForState(
-		key: string,
-		signal?: AbortSignal,
-	): Promise<ExecutionRecorder | undefined> {
-		signal?.throwIfAborted();
-		const record = await this.read(normalizeStateKey(key));
-		if (!record.runId) return undefined;
-		const run = await this.getRunState(record.runId);
-		if (!run) return undefined;
-		return new ExecutionRecorder(this, run.id, "", run.historyEnabled !== false);
-	}
-
 	/**
-	 * Upgrade only: register a converted workflow or pipeline pause as a run, with its execution
-	 * state and continuation, in one transition. The key keeps its old token valid.
-	 */
-	/**
-	 * Create a run waiting at `key`. With `once`, a key that marks the conversion done for good
+	 * Create a run waiting at `key` (a pause an older version saved, converted by `lobster
+	 * upgrade` or by the SDK for an old token), with its execution state and continuation, in
+	 * one transition. The key keeps its old token valid. With `once`, a key that marks the conversion done for good
 	 * is checked and written under the same lock, just before the run: a second conversion waits
 	 * for the first and finds it, and one that already happened is never repeated.
 	 * Returns undefined when `once` was already written.
 	 */
 	async createWaitingRun({
-		id,
-		kind = "workflow",
+		kind,
 		key,
 		execution,
+		records,
 		continuation,
 		once,
+		metadata,
 	}: {
-		id: string;
-		kind?: string;
+		kind: string;
+		/** The values the execution keeps beside it (records), written with the run. */
+		records?: Record<string, string>;
+		/** Who the run belongs to (a converting SDK host's `callerId`). */
+		metadata?: RunMetadata;
 		key: string;
 		execution: ExecutionState;
 		continuation: (runId: string) => string;
 		once?: string;
 	}): Promise<string | undefined> {
 		this.assertOpen(true);
+		// Before `once` is written: a refused conversion must not use the old token up.
+		callerId(metadata);
 		key = normalizeStateKey(key);
 		return withFileLock({
-			filePath: path.join(this.directory, `${key}.json`),
+			filePath: keyToPath(this.directory, key),
 			task: async () => {
 				if (once && (await this.read(once)).text !== null) return undefined;
 				if ((await this.read(key)).runId) throw new CheckpointTakenError();
@@ -271,11 +246,14 @@ export class StoreSession {
 					await this.write(once, JSON.stringify({ usedAt: new Date().toISOString() }) + "\n", {
 						exclusive: true,
 					});
+				const id = randomUUID();
 				const recorder = await this.createRecorder({
 					id,
 					kind,
 					checkpoint: { key, text: continuation(id) },
 					execution,
+					records,
+					metadata,
 				});
 				return recorder.runId;
 			},
@@ -291,19 +269,15 @@ export class StoreSession {
 	}
 
 	/** Runs whose wake time has passed: a lapsed lease, a timer, a question's deadline. */
-	async dueRuns({
-		now = Date.now(),
-		limit = 100,
-		callerId,
-	}: { now?: number; limit?: number; callerId?: string } = {}): Promise<string[]> {
-		return this.request(() => this.backend.dueRuns(now, limit, callerId));
+	async dueRuns({ limit, callerId }: { limit: number; callerId?: string }): Promise<string[]> {
+		return this.request(() => this.backend.dueRuns(Date.now(), limit, callerId));
 	}
 
 	async appendEvent(event: InboxEvent): Promise<{ inserted: boolean }> {
 		return this.request(() => this.backend.appendEvent(event), true);
 	}
 
-	async findEvents(name: string, since: number, owner = ""): Promise<InboxEvent[]> {
+	async findEvents(name: string, since: number, owner: string): Promise<InboxEvent[]> {
 		return this.request(() => this.backend.findEvents(name, since, owner));
 	}
 
@@ -388,13 +362,12 @@ export class StoreSession {
 
 	async transition(
 		request: Transition,
-		signal?: AbortSignal,
 		assertInvocationCurrent?: () => void,
 	): Promise<TransitionResult> {
 		return this.request(async () => {
 			let result: TransitionResult;
 			try {
-				result = await this.backend.transition(request, signal, assertInvocationCurrent);
+				result = await this.backend.transition(request, assertInvocationCurrent);
 			} catch (error) {
 				result = await this.reconcileUnknown(error, async () => {
 					if (!request.action.kind.startsWith("execution-")) return;
@@ -460,19 +433,11 @@ export class ExecutionRecorder {
 		);
 	}
 
-	async action(
-		action: RunAction,
-		signal?: AbortSignal,
-		assertInvocationCurrent?: () => void,
-	): Promise<TransitionResult> {
+	async action(action: RunAction): Promise<TransitionResult> {
 		const operationId = randomUUID();
 		let result: TransitionResult;
 		try {
-			result = await this.session.transition(
-				{ operationId, runId: this.runId, action },
-				signal,
-				assertInvocationCurrent,
-			);
+			result = await this.session.transition({ operationId, runId: this.runId, action });
 		} catch (error) {
 			if (error instanceof PersistenceError) {
 				throw error;
@@ -525,7 +490,6 @@ export async function openStoreSession(options: StoreOptions = {}): Promise<Stor
 	options.signal?.throwIfAborted();
 	assertSqliteNodeSupport();
 	const history = options.history ?? env.LOBSTER_HISTORY === "1";
-	const trackRuns = history || (options.trackRuns ?? env.LOBSTER_RUNS === "1");
 	const keepDays = retentionDays(options, env);
 	const databasePath = path.join(directory, "lobster.sqlite");
 	const { SqliteBackend } = await import("./sqlite.js");
@@ -551,7 +515,7 @@ export async function openStoreSession(options: StoreOptions = {}): Promise<Stor
 			await backend.pruneFinished(before, new Date(now).toISOString()).catch(() => {});
 		}
 		options.signal?.throwIfAborted();
-		return new StoreSession(directory, backend, history, options.readOnly, trackRuns);
+		return new StoreSession(directory, backend, history, options.readOnly);
 	} catch (error) {
 		await backend?.close();
 		if (options.signal?.aborted) options.signal.throwIfAborted();

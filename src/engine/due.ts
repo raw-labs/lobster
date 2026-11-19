@@ -6,14 +6,17 @@ import { withStoreContext } from "../persistence/execution.js";
 import { sessionFromEnv } from "../persistence/context.js";
 import { callerId } from "../persistence/waits.js";
 import type { WorkflowRunResult } from "../workflows/types.js";
-import { waitsForEvent } from "./checkpoint.js";
+import { EVENT_NAME, EVENT_NAME_CHARS } from "../workflows/load.js";
+import { waitsForEvent, type RunStatus } from "./checkpoint.js";
 import type { RunContext } from "./context.js";
 import { ExecutionConflictError } from "./errors.js";
 import { advanceWorkflowRun } from "./runner.js";
+import { checkLeaseMs } from "./store.js";
 
 export type DueRunOutcome = {
 	runId: string;
-	status: WorkflowRunResult["status"] | "blocked" | "failed" | "busy";
+	/** What the advance returned, or the run's saved status when it threw ("busy": leased). */
+	status: WorkflowRunResult["status"] | RunStatus | "busy";
 	waitingFor?: WorkflowRunResult["waitingFor"];
 	error?: string;
 };
@@ -37,11 +40,8 @@ async function advanceReporting(
 		const session = sessionFromEnv(ctx.env);
 		// Reporting must not fail the batch: the other runs' outcomes would be lost.
 		const run = session ? await session.getRunState(runId).catch(() => null) : null;
-		return {
-			runId,
-			status: run?.execution?.status === "blocked" ? "blocked" : "failed",
-			error: messageOf(error),
-		};
+		// A run stopped mid-advance is still waiting or running (due again), not failed.
+		return { runId, status: run?.execution?.status ?? "failed", error: messageOf(error) };
 	}
 }
 
@@ -60,15 +60,22 @@ export async function advanceDueRuns(options: {
 	leaseMs?: number;
 }): Promise<{ due: string[]; advanced: DueRunOutcome[] }> {
 	const concurrency = options.concurrency ?? 4;
-	if (!Number.isSafeInteger(concurrency) || concurrency < 1)
-		throw new Error("concurrency must be a positive integer");
-	return withStoreContext({ ...options.ctx, trackRuns: true }, async (ctx) => {
+	const limit = options.limit ?? 100;
+	for (const [name, value] of [
+		["concurrency", concurrency],
+		["limit", limit],
+	] as const)
+		if (!Number.isSafeInteger(value) || value < 1)
+			throw new Error(`${name} must be a positive integer`);
+	if (options.leaseMs !== undefined) checkLeaseMs(options.leaseMs);
+	return withStoreContext(options.ctx, async (ctx) => {
 		const session = sessionFromEnv(ctx.env)!;
 		const due = await session.dueRuns({
-			limit: options.limit ?? 100,
+			limit,
 			callerId: callerId(ctx.runMetadata),
 		});
-		if (options.dryRun) return { due, advanced: [] };
+		// A dry run (asked here or by the context) lists what is due and advances nothing.
+		if (options.dryRun || options.ctx.dryRun) return { due, advanced: [] };
 		// Runs share nothing but the store, whose writes are serialized: a slow run no longer
 		// delays the others beyond the number of runs advanced at once.
 		const advanced: DueRunOutcome[] = Array.from({ length: due.length });
@@ -96,9 +103,19 @@ export async function signalEvent(options: {
 	ctx: RunContext;
 	leaseMs?: number;
 }): Promise<{ event: { id: string; name: string; inserted: boolean }; advanced: DueRunOutcome[] }> {
-	if (!/^[A-Za-z0-9_.:/-]+$/.test(options.name))
-		throw new Error("Event names use letters, digits and . _ : / -");
-	return withStoreContext({ ...options.ctx, trackRuns: true }, async (ctx) => {
+	if (typeof options.name !== "string" || !EVENT_NAME.test(options.name))
+		throw new Error(`Event names use ${EVENT_NAME_CHARS}`);
+	// Checked before the event is stored: a bad lease must not leave a delivered event behind.
+	if (options.leaseMs !== undefined) checkLeaseMs(options.leaseMs);
+	// Signalling stores the event for real: a dry run is refused, never ignored.
+	if (options.ctx.dryRun) throw new Error("A dry run applies to starting a workflow file");
+	// The delivery ID makes delivery idempotent: a blank one would swallow every later event.
+	if (
+		options.id !== undefined &&
+		(typeof options.id !== "string" || !options.id.trim() || options.id.length > 256)
+	)
+		throw new Error("Event ID must be a non-empty string of at most 256 characters");
+	return withStoreContext(options.ctx, async (ctx) => {
 		const session = sessionFromEnv(ctx.env)!;
 		const id = options.id ?? randomUUID();
 		const owner = callerId(ctx.runMetadata);

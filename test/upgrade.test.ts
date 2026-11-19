@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { createDefaultRegistry, resumeToolRequest, runToolRequest } from "../src/core/index.js";
 import { openStoreSession } from "../src/persistence/session.js";
+import { convertPipelinePause } from "../src/engine/legacy_pauses.js";
 import { withFileLock } from "../src/state/file_lock.js";
 import { encodeToken } from "../src/resume/token.js";
 import { pendingUpgrade, savedByOlderVersion, upgradeStore } from "../src/engine/upgrade.js";
@@ -339,4 +340,86 @@ test("CLI: run reminds about the upgrade off a terminal; `lobster upgrade` impor
 	assert.equal(report.converted.length + report.imported.length, 9);
 	const after = await exec(process.execPath, hello, { env });
 	assert.doesNotMatch(after.stderr, /older version/);
+});
+
+test("CLI: an upgrade that finds only files it already imported says where it moved them", async (t) => {
+	const { state, saved } = await setup(t);
+	const bin = path.join(repoRoot, "bin", "lobster.js");
+	const env = { ...process.env, LOBSTER_STATE_DIR: state };
+	const first = await upgradeStore({ directory: state });
+	// An upgrade interrupted after converting this pause, before moving its file.
+	const name = `${saved.approval}.json`;
+	await fs.copyFile(path.join(first.backup!, name), path.join(state, name));
+	const upgrade = await exec(process.execPath, [bin, "upgrade"], { env });
+	assert.doesNotMatch(upgrade.stdout, /Nothing to upgrade/);
+	assert.match(upgrade.stdout, /The original files were moved to /);
+	await assert.rejects(fs.access(path.join(state, name)));
+});
+
+test("an older pipeline pause inside a stage that is not in its pipeline is not converted", () => {
+	const pause = (resumeAtIndex: number) => ({
+		pipeline: [{ name: "exec", args: {}, raw: "exec --json --shell 'echo [1]'" }],
+		resumeAtIndex,
+		items: [],
+		haltType: "input_request" as const,
+		resumeMode: "same_stage" as const,
+		inputSchema: { type: "object" },
+		prompt: "Pick",
+		commandInput: {
+			pending: {
+				requestIndex: 0,
+				metadata: {
+					prompt: "Pick",
+					responseSchema: { type: "object" },
+					signature: JSON.stringify({ prompt: "Pick", responseSchema: { type: "object" } }),
+				},
+			},
+			history: [],
+		},
+	});
+	// It runs its stage again: stage 0 exists, stage 1 does not.
+	convertPipelinePause("pipeline_resume_x", pause(0));
+	assert.throws(() => convertPipelinePause("pipeline_resume_x", pause(1)), /Unrecognized saved/);
+});
+
+test("a workflow paused inside a pipeline stage that is not in its pipeline is skipped", async (t) => {
+	const { state, saved } = await setup(t);
+	const file = path.join(state, `${saved.command}.json`);
+	const old = JSON.parse(await fs.readFile(file, "utf8"));
+	old.pipelineInput.resumeAtIndex = old.pipelineInput.pipeline.length;
+	await fs.writeFile(file, JSON.stringify(old));
+	const report = await upgradeStore({ directory: state, dryRun: true });
+	assert.deepEqual(
+		report.skipped.map((entry) => [entry.checkpointId, entry.reason]),
+		[[saved.command, "Unrecognized saved workflow state"]],
+	);
+});
+
+test("an old step output shaped like a saved-record reference comes through an upgrade as it was", async (t) => {
+	const { state, ctx, saved, token } = await setup(t);
+	const file = path.join(state, `${saved.approval}.json`);
+	const old = JSON.parse(await fs.readFile(file, "utf8"));
+	const shaped = { "$lobster.record": "value/abc" };
+	old.steps.before.json = shaped;
+	await fs.writeFile(file, JSON.stringify(old));
+	await upgradeStore({ directory: state });
+	const resumed = await resumeToolRequest({ token: token(saved.approval), approved: true, ctx });
+	assert.equal(resumed.status, "ok", JSON.stringify(resumed));
+});
+
+test("an old pipeline pause resumes though today's parser reads its flags differently", async (t) => {
+	const { state, ctx, saved } = await setup(t);
+	const file = path.join(state, `${saved.pipeline}.json`);
+	const old = JSON.parse(await fs.readFile(file, "utf8"));
+	// The released parser left `--json=true` as the string "true"; today it is a boolean.
+	old.pipeline[0].raw = old.pipeline[0].raw.replace("exec --json ", "exec --json=true ");
+	old.pipeline[0].args.json = "true";
+	await fs.writeFile(file, JSON.stringify(old));
+	await upgradeStore({ directory: state });
+	const resumed = await resumeToolRequest({
+		approvalId: saved.pipelineApprovalId,
+		approved: true,
+		ctx,
+	});
+	assert.equal(resumed.status, "ok", JSON.stringify(resumed));
 });

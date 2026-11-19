@@ -1,5 +1,5 @@
 import { tokenizeCommand } from "./command_tokens.js";
-import { booleanFlags } from "../commands/define.js";
+import { assertKnownFlags, booleanFlags } from "../commands/define.js";
 import type { CommandLookup } from "../commands/types.js";
 
 function splitPipes(input: string) {
@@ -88,6 +88,20 @@ function parseArgs(tokens: string[], booleanFlags: readonly string[] = []) {
 	}
 
 	return args;
+}
+
+/**
+ * Refuse a stage that names no known command, or a flag its command does not take. Checked
+ * before any stage runs (a typo in a later stage must not fail the pipeline after an earlier
+ * one has acted), and by `lobster run` and tool requests before a run is created.
+ */
+export function checkStages(stages: ReturnType<typeof parsePipeline>, registry: CommandLookup) {
+	return stages.map((stage) => {
+		const command = registry.get(stage.name);
+		if (!command) throw new Error(`Unknown command: ${stage.name}`);
+		assertKnownFlags(command, stage.name, stage.args ?? {});
+		return command;
+	});
 }
 
 /**

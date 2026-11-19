@@ -1,6 +1,6 @@
 import { runAbortableProcess } from "../../process/abortable_process.js";
 import { defineCommand } from "../../commands/define.js";
-import { streamOf } from "../../io/terminal.js";
+import { streamOf } from "../../io/streams.js";
 
 const OPENCLAW_AGENT_MAX_OUTPUT_BYTES = 10 * 1024 * 1024;
 

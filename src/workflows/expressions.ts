@@ -1,5 +1,18 @@
 import type { WorkflowStepResult } from "./types.js";
 
+/** A step reference, `$id.path`: only a run, which has that step's result, can fill it in. */
+export const STEP_REF = /\$([A-Za-z0-9_-]+)\.([A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)*)/;
+
+/** Whether `text` holds a step reference, which only a run can fill in. */
+export function hasStepRef(text: string) {
+	return STEP_REF.test(text);
+}
+
+/** The ids of the steps `text` refers to, each once. */
+export function stepRefIds(text: string) {
+	return [...new Set([...text.matchAll(new RegExp(STEP_REF.source, "g"))].map((m) => m[1]!))];
+}
+
 export function resolveTemplate(
 	input: string,
 	args: Record<string, unknown>,
@@ -17,24 +30,21 @@ export function resolveArgsTemplate(input: string, args: Record<string, unknown>
 }
 
 function resolveStepRefs(input: string, results: Record<string, WorkflowStepResult>) {
-	return input.replace(
-		/\$([A-Za-z0-9_-]+)\.([A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)*)/g,
-		(match, id, pathValue) => {
-			if (!(id in results)) {
-				return match;
-			}
-			const refValue = getStepRefValue({ id, path: pathValue }, results, false);
-			if (refValue === undefined) {
-				if (pathValue === "approved" || pathValue === "skipped") return "false";
-				return "";
-			}
-			return renderTemplateValue(refValue);
-		},
-	);
+	return input.replace(new RegExp(STEP_REF.source, "g"), (match, id, pathValue) => {
+		if (!(id in results)) {
+			return match;
+		}
+		const refValue = getStepRefValue({ id, path: pathValue }, results, false);
+		if (refValue === undefined) {
+			if (pathValue === "approved" || pathValue === "skipped") return "false";
+			return "";
+		}
+		return renderTemplateValue(refValue);
+	});
 }
 
 export function parseStepRef(value: string) {
-	const match = value.match(/^\$([A-Za-z0-9_-]+)\.([A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)*)$/);
+	const match = value.match(new RegExp(`^${STEP_REF.source}$`));
 	if (!match) return null;
 	return { id: match[1], path: match[2] };
 }
