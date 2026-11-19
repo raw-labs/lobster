@@ -8,6 +8,7 @@ import { Lobster } from "../src/sdk/Lobster.js";
 import { approve, diffLast, exec, stateGet, stateSet } from "../src/sdk/primitives.js";
 import { sdkStageRegistry } from "../src/sdk/runtime.js";
 import { approveCommand } from "../src/commands/stdlib/approve.js";
+import { execCommand } from "../src/commands/stdlib/exec.js";
 
 async function tempDir(t: test.TestContext, prefix: string) {
 	const dir = await mkdtemp(path.join(os.tmpdir(), prefix));
@@ -50,7 +51,7 @@ test("SDK stages carry the meta the engine acts on", () => {
 	]);
 	const meta = (index: number) => registry.get(`sdk.stage.${index}`)!.meta;
 	assert.equal(meta(0).resumeSafeBeforeInput, approveCommand.meta.resumeSafeBeforeInput);
-	assert.deepEqual(meta(1).sideEffects, ["local_exec"]);
+	assert.equal(meta(1).repeatable, execCommand.meta.repeatable);
 	assert.equal(meta(2).repeatable, false);
 	assert.equal(meta(3).repeatable, undefined);
 	// The stage's own name and flags stay out of the registry entry.

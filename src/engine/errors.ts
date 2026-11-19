@@ -133,3 +133,15 @@ export function stopsRun(error: unknown): boolean {
 		error instanceof CostLimitExceededError
 	);
 }
+
+/**
+ * A stop that a retry would meet again: a gate or a halt where the run cannot pause (the
+ * workflow as written), or a `stop` cost limit already spent (the spend is kept).
+ */
+export function stopsForGood(error: unknown): boolean {
+	return (
+		error instanceof GateRefusedError ||
+		error instanceof PipelineHaltError ||
+		error instanceof CostLimitExceededError
+	);
+}

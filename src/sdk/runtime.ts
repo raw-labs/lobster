@@ -53,8 +53,8 @@ export function sdkPipelineText(count: number) {
 /** The parts of a stage's meta the engine acts on (recovery and resume safety). */
 function engineMeta(meta: CommandMeta | undefined) {
 	if (!meta) return {};
-	const { sideEffects, repeatable, resumeSafeBeforeInput, resumeSafeAfterInput } = meta;
-	return { sideEffects, repeatable, resumeSafeBeforeInput, resumeSafeAfterInput };
+	const { repeatable, resumeSafeBeforeInput, resumeSafeAfterInput } = meta;
+	return { repeatable, resumeSafeBeforeInput, resumeSafeAfterInput };
 }
 
 /**

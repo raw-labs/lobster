@@ -410,3 +410,74 @@ test("a when: that fails at run time fails its step: on_error applies, and runs 
 	// The step failed, so the run continues from it: its condition is decided again.
 	await assert.rejects(advance(failed.runId!), /cannot compare/);
 });
+
+test("a run that stopped on what a retry would meet again leaves no step to retry from", async (t) => {
+	const { dir, env, ran } = await fixture(t);
+	let calls = 0;
+	const llmAdapters = {
+		paid: async () => {
+			calls++;
+			return {
+				ok: true,
+				result: {
+					model: "gpt-4o",
+					output: { text: "paid" },
+					usage: { inputTokens: 1000, outputTokens: 1000 },
+				},
+			};
+		},
+	};
+	const advance = (runId: string) =>
+		advanceWorkflowRun({
+			runId,
+			ctx: {
+				env,
+				registry: createDefaultRegistry(),
+				llmAdapters,
+				mode: "tool",
+				stdin: process.stdin,
+				stdout: process.stdout,
+				stderr: process.stderr,
+			},
+		});
+	// A pipeline in a child workflow that acts, then asks where the run cannot pause.
+	await fs.writeFile(
+		path.join(dir, "child.lobster"),
+		JSON.stringify({
+			steps: [
+				{ id: "ask", pipeline: `exec --shell 'echo x >> "$RETRY_DIR/acted"' | approve --emit` },
+			],
+		}),
+	);
+	const gated = path.join(dir, "gated.lobster");
+	await fs.writeFile(
+		gated,
+		JSON.stringify({ steps: [{ id: "child", workflow: "child.lobster" }] }),
+	);
+	// A paid call, then a failure, past a cost limit that stops the run.
+	const spent = path.join(dir, "spent.lobster");
+	await fs.writeFile(
+		spent,
+		JSON.stringify({
+			cost_limit: { max_usd: 0.001, action: "stop" },
+			steps: [
+				{
+					id: "spend",
+					pipeline:
+						'llm.invoke --provider paid --model gpt-4o --prompt hi --disable-cache | exec --shell "exit 3"',
+				},
+			],
+		}),
+	);
+	for (const [filePath, stop] of [
+		[gated, /cannot|not supported|approval/i],
+		[spent, /Cost limit exceeded/],
+	] as const) {
+		const first = await runToolRequest({ filePath, ctx: { env, llmAdapters } });
+		assert.equal(first.ok, false);
+		assert.match(first.ok ? "" : first.error.message, stop);
+		await assert.rejects(advance(first.runId!), /No step of this run failed/);
+	}
+	assert.equal(await ran("acted"), 1, "the command before the refused gate did not run again");
+	assert.equal(calls, 1, "the paid call was not made again");
+});

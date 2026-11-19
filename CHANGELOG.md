@@ -4,6 +4,7 @@ All notable changes to Lobster will be documented in this file.
 
 ## Unreleased
 
+- A run that stopped on something a retry would meet again (a pipeline asking for approval or input where the run cannot pause, such as in a child workflow, or a `cost_limit` with `action: stop` already spent) has no step for `runs advance` to retry: it says to start the run again. It ran the step's commands, and made its model calls, again each time, only to stop the same way.
 - A step whose `when:` fails at run time (comparing a string with `>`) fails as any step does: its `on_error` applies, and `runs advance` retries it. The run failed past `on_error: continue`, and `runs advance` said no step had failed.
 - Resuming a token whose pause an older Lobster saved asks for `lobster upgrade` from core's `runWorkflowFile` and the SDK's `Lobster.resume` too, not only from the tool runtime (they said the resume state was not found).
 - `lobster history prune` and the store handle's `retain` read only the finished runs old enough to remove: they read every run in full, with its attempts, events and saved outputs.

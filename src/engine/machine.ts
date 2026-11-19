@@ -34,6 +34,7 @@ import {
 	RunCancelledError,
 	RunSuspendedError,
 	lostRun,
+	stopsForGood,
 	stopsRun,
 } from "./errors.js";
 import { nodeFor, type NodeHandler } from "./nodes/index.js";
@@ -397,6 +398,11 @@ export class Machine {
 		// A failed run keeps its activations, to be retried, but is not answered any more:
 		// withdraw what it asked (it asks again on retry).
 		await withdrawWaits(this);
+		// Nothing to retry from: a retry would run the step's commands (and calls) again only to
+		// stop the same way. `runs advance` then says to start the run again.
+		if (stopsForGood(error))
+			for (const [path, frame] of Object.entries(state.activations))
+				if (frame.phase === "failed") delete state.activations[path];
 		await this.save();
 	}
 }

@@ -35,15 +35,16 @@ export type CommandMeta = {
 	/** Other names the command answers to. `ctx.commandName` holds the name that was used. */
 	aliases?: string[];
 	/**
-	 * The command may create an input/approval gate before it begins execution.
-	 * Commands that omit this are treated conservatively when a resumed pipeline
-	 * is cancelled: its original capability cannot be replayed after dispatch.
+	 * Starting the command does not act (it asks first, as `approve` and `ask` do), so it is not
+	 * counted as dispatch: a stop before a later stage dispatches leaves the step to start again
+	 * rather than blocked with an unknown outcome, and `onExecutionStarted`/`onUnsafeDispatch`
+	 * do not fire for it. Without it, every start of the command is a dispatch.
 	 */
 	resumeSafeBeforeInput?: boolean;
 	/**
-	 * The command remains side-effect-free after returning a resumed input until
-	 * the next pipeline stage dispatches. This is intentionally opt-in so a
-	 * command that acts on a resumed response consumes its capability first.
+	 * Receiving a resumed answer does not act either, until the next stage dispatches. Without
+	 * it, handing the command its answer counts as dispatch (and fires the hooks), so a command
+	 * that acts on the answer is never started twice unseen.
 	 */
 	resumeSafeAfterInput?: boolean;
 };

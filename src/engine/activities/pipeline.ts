@@ -171,7 +171,7 @@ export async function runPipelineStep({
 		}
 		if (item?.type === "approval_request") {
 			throw new GateRefusedError(
-				`Workflow step ${stepId} halted for approval inside pipeline stage ${haltedName}; ${gatesRefused ?? "approvals are not supported here"}.`,
+				`Workflow step ${stepId} halted for approval inside pipeline stage ${haltedName}; ${gatesRefused}.`,
 			);
 		}
 		// A command that asked mid-run (ctx.requestInput) halted "in place": it runs again with
@@ -201,7 +201,7 @@ export async function runPipelineStep({
 		}
 		if (request) {
 			throw new GateRefusedError(
-				`Workflow step ${stepId} halted for input inside pipeline stage ${haltedName}; ${gatesRefused ?? "input requests are not supported here"}.`,
+				`Workflow step ${stepId} halted for input inside pipeline stage ${haltedName}; ${gatesRefused}.`,
 			);
 		}
 		throw new PipelineHaltError(
