@@ -50,12 +50,11 @@ export async function childWorkflowStep(
 				mergeEnv(scope.baseEnv ?? {}, scope.env, step.env, scope.args, scope.results),
 				scope.args,
 			),
-			costStart: machine.cost.getSummary().estimatedCostUsd,
+			spentUsd: 0,
 		};
 		await machine.save();
 	}
 	const child = frame.child;
-	const ownLimit = scope.definition.workflow.cost_limit;
 	const result = await sequence(machine, child.definition.workflow.steps, key + "/child", {
 		...scope,
 		gatesRefused: GATES_REFUSED.child,
@@ -65,12 +64,8 @@ export async function childWorkflowStep(
 		args: child.args,
 		results: createRecord(),
 		baseEnv: child.env,
-		costStart: child.costStart,
 		env: child.definition.workflow.env,
-		parentLimits: [
-			...(scope.parentLimits ?? []),
-			...(ownLimit ? [{ limit: ownLimit, start: scope.costStart ?? 0 }] : []),
-		],
+		children: [...(scope.children ?? []), child],
 		cwd:
 			step.cwd !== undefined
 				? resolveCwd(step.cwd, scope.args)

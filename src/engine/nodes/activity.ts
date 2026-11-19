@@ -142,8 +142,11 @@ async function dispatch(
 				pipelineText: saved.text!,
 				inputValue: saved.input,
 				ctx,
-				recordModelCall: ({ model, usage }) =>
-					machine.cost.recordUsage(scope.accountAs ?? scope.costPrefix + step.id, model, usage),
+				recordModelCall: ({ model, usage }) => {
+					const name = scope.accountAs ?? scope.costPrefix + step.id;
+					const costUsd = machine.cost.recordUsage(name, model, usage);
+					for (const child of scope.children ?? []) child.spentUsd += costUsd;
+				},
 				env,
 				cwd: inRunDirectory(scope.ctx, saved.cwd),
 				gatesRefused: scope.gatesRefused,

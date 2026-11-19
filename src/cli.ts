@@ -80,6 +80,14 @@ export async function runCli(argv: string[]) {
 }
 
 /**
+ * The context of a run the CLI continues, abandons or signals: the run's messages (retries,
+ * cost warnings) reach stderr, as they do for `lobster run`.
+ */
+function cliRunContext(signal: AbortSignal) {
+	return createToolContext({ signal, forceTerminationSignal: signal, stderr: process.stderr });
+}
+
+/**
  * `signal` is the CLI's cancellation. Every context also passes it as `forceTerminationSignal`:
  * a step's process watches a narrower signal of its own, and a second Ctrl-C must reach it.
  */
@@ -167,7 +175,7 @@ async function runCliWithSignal(argv: string[], signal: AbortSignal) {
 				name,
 				data,
 				id,
-				ctx: createToolContext({ signal, forceTerminationSignal: signal }),
+				ctx: cliRunContext(signal),
 			});
 			process.stdout.write(JSON.stringify(result) + "\n");
 		} catch (error) {
@@ -183,7 +191,7 @@ async function runCliWithSignal(argv: string[], signal: AbortSignal) {
 			const runId = oneId(argv.slice(2), "runs abandon <runId>");
 			const result = await abandonWorkflowRun({
 				runId,
-				ctx: createToolContext({ signal, forceTerminationSignal: signal }),
+				ctx: cliRunContext(signal),
 			});
 			process.stdout.write(JSON.stringify(result) + "\n");
 		} catch (error) {
@@ -983,7 +991,7 @@ async function handleAdvance(argv: string[], signal: AbortSignal) {
 		},
 		{ usage },
 	);
-	const ctx = createToolContext({ signal, forceTerminationSignal: signal });
+	const ctx = cliRunContext(signal);
 	if (flags.due === true) {
 		if (positional.length) throw new UsageError("runs advance --due takes no run ID");
 		try {

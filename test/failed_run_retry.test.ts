@@ -544,3 +544,22 @@ test("a child workflow named at run time is checked before any of its steps acts
 	assert.equal(retried.status, "ok");
 	assert.equal(await ran("acted"), 1);
 });
+
+test("runs advance at the command line shows the run's retry messages, as run does", async (t) => {
+	const { dir, env } = await fixture(t);
+	const filePath = path.join(dir, "flow.lobster");
+	await fs.writeFile(
+		filePath,
+		JSON.stringify({
+			steps: [{ id: "flaky", run: flaky("flaky", "fixed"), retry: { max: 2, delay_ms: 1 } }],
+		}),
+	);
+	const first = await runToolRequest({ filePath, ctx: { env } });
+	assert.equal(first.ok, false);
+	const advanced = spawnSync(process.execPath, [cli, "runs", "advance", first.runId!], {
+		encoding: "utf8",
+		env,
+	});
+	assert.equal(advanced.status, 1);
+	assert.match(advanced.stderr, /\[RETRY\] Step 'flaky' failed \(attempt 1\/2\)/);
+});

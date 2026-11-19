@@ -4,6 +4,8 @@ All notable changes to Lobster will be documented in this file.
 
 ## Unreleased
 
+- A child workflow's `cost_limit` counts only the model calls its own steps made: with `concurrency`, calls that other loop items made while it ran counted against it, so a child within its limit stopped the run.
+- `lobster runs advance`, `runs abandon` and `signal` show the run's messages on stderr (retries, `cost_limit` warnings, pricing warnings), as `lobster run` does: they were dropped.
 - A child workflow that cannot be loaded (missing, invalid, a cycle, args it does not take) is reported with the step that names it and its file, and a missing one as "Workflow file not found": the error was the raw file-system message, or named a step of the child as if it were in the file being run.
 - An approval that a step's output asks for with two spellings of a setting (`initiated_by` and `initiatedBy`) names the step and says the output is at fault.
 - Cost limit messages show the limit as written: a limit under a cent read as 0.00.

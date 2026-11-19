@@ -525,6 +525,34 @@ test("what a run spent before an approval is still counted after the resume", as
 	});
 });
 
+test("a child workflow's cost_limit counts only its own calls, with siblings running at once", async () => {
+	// Each call costs $0.00035; each child is allowed $0.0005, so only another child's call
+	// could take it over. Both calls are made before either child's step ends.
+	const provider = await startFakeProvider(1, () => ({ inputTokens: 100, outputTokens: 10 }));
+	await withProvider(async (env) => {
+		const { result } = await runComposedWorkflow(
+			{
+				steps: [
+					{ id: "items", run: "echo '[1, 2]'" },
+					{
+						id: "loop",
+						for_each: "$items.json",
+						concurrency: 2,
+						steps: [{ id: "kid", workflow: "child.lobster" }],
+					},
+				],
+			},
+			{
+				cost_limit: { max_usd: 0.0005, action: "stop" },
+				steps: [{ id: "call", pipeline: `${invoke()} --refresh | test.hold --ms 300` }],
+			},
+			env,
+		);
+		assert.equal(result.status, "ok", JSON.stringify(result));
+		assert.equal(provider.requests(), 2);
+	}, provider);
+});
+
 test("a child workflow's calls count under its workflow step, a loop's as loop.step", async () => {
 	await withProvider(async (env, provider) => {
 		const { result } = await runComposedWorkflow(

@@ -3,7 +3,7 @@
 import type { WorkflowStep, WorkflowStepResult } from "../workflows/types.js";
 import type { Definition } from "../workflows/definition.js";
 import { resolveRetryConfig } from "../workflows/retry.js";
-import type { CostLimit } from "../llm/cost_tracker.js";
+import type { Activation } from "./checkpoint.js";
 import type { RunContext } from "./context.js";
 import type { HoldClocks } from "./step_clock.js";
 
@@ -23,10 +23,11 @@ export type Scope = {
 	/** The workflow files above this one, to refuse a child workflow that calls itself. */
 	ancestors: string[];
 	ctx: RunContext;
-	/** Cost limits of the workflows above, with the spend each started from. */
-	parentLimits?: Array<{ limit: CostLimit; start: number }>;
-	/** The spend this workflow started from, for its own cost limit. */
-	costStart?: number;
+	/**
+	 * The child workflows this scope is inside, outermost first: each call made here is added to
+	 * what each of them spent, and checked against each one's `cost_limit`.
+	 */
+	children?: Array<NonNullable<Activation["child"]>>;
 	/** Prefix of the names steps' model calls are counted under (`loop.` inside a loop). */
 	costPrefix: string;
 	/** Count every step's model calls here under this name instead (a child workflow's steps). */

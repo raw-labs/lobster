@@ -138,8 +138,9 @@ export type RunRecord = {
 	states: Record<string, string | null>;
 	receipts: Record<string, OperationReceipt>;
 	/**
-	 * Large parts of a running execution kept beside its checkpoint (a loop's items and each
-	 * item's output), so a save does not rewrite them. Only in full reads and exports.
+	 * Large parts of a running execution kept beside its checkpoint, so a save does not rewrite
+	 * them: a loop's items, each item's output, and step outputs over 1 KB (engine/records.ts).
+	 * Only in full reads and exports.
 	 */
 	records?: Record<string, string>;
 };

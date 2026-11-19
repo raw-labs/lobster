@@ -111,7 +111,8 @@ export type Activation = {
 		definition: Definition;
 		args: Record<string, unknown>;
 		env: Record<string, string | undefined>;
-		costStart: number;
+		/** What the child's own steps spent, for its `cost_limit`. */
+		spentUsd: number;
 	};
 	/**
 	 * An activity: what it runs, and its dispatch number. A pipeline that paused to ask keeps

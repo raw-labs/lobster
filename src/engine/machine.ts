@@ -389,12 +389,18 @@ export class Machine {
 		}
 	}
 
-	/** Throw once spend passes this workflow's `cost_limit`, or one of the workflows above it. */
+	/**
+	 * Throw once the run's spend passes its `cost_limit`, or a child workflow's own spend passes
+	 * the child's (see Scope.children).
+	 */
 	checkCost(scope: Scope) {
-		for (const { limit, start } of scope.parentLimits ?? [])
-			this.cost.checkLimit(limit, scope.ctx.stderr, start);
-		const own = scope.definition.workflow.cost_limit;
-		if (own) this.cost.checkLimit(own, scope.ctx.stderr, scope.costStart);
+		const { stderr } = scope.ctx;
+		const root = this.state.definition.workflow.cost_limit;
+		if (root) this.cost.checkLimit(root, stderr);
+		for (const child of scope.children ?? []) {
+			const limit = child.definition.workflow.cost_limit;
+			if (limit) this.cost.checkLimit(limit, stderr, child.spentUsd);
+		}
 	}
 
 	/**

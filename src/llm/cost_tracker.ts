@@ -94,6 +94,7 @@ export class CostTracker {
 		const costUsd =
 			(inputTokens * effectivePricing.input + outputTokens * effectivePricing.output) / 1_000_000;
 		this.steps.push({ stepId, model, inputTokens, outputTokens, costUsd });
+		return costUsd;
 	}
 
 	/**
@@ -142,8 +143,12 @@ export class CostTracker {
 		return this.steps.length > 0;
 	}
 
-	checkLimit(limit: CostLimit, stderr?: NodeJS.WritableStream, startCostUsd = 0) {
-		const costUsd = Math.max(0, this.getSummary().estimatedCostUsd - startCostUsd);
+	/** Throw (or warn) once `costUsd`, what a workflow spent (the whole run's by default), passes `limit`. */
+	checkLimit(
+		limit: CostLimit,
+		stderr?: NodeJS.WritableStream,
+		costUsd = this.getSummary().estimatedCostUsd,
+	) {
 		if (costUsd <= limit.max_usd) return;
 
 		if (limit.action === "stop") {
