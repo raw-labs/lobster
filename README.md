@@ -58,6 +58,7 @@ steps:
     pipeline: >
       llm.invoke --prompt "Classify this email as refund, spam or other, with a score"
       --output-schema '{"type":"object","properties":{"label":{"type":"string"},"score":{"type":"number"}}}'
+      | map --unwrap output | map --unwrap data
     stdin: $fetch.json
 
   - id: route
@@ -96,6 +97,9 @@ lobster resume <approval ID or token> --approve yes
 
 The run pauses at `confirm` until someone answers, then at `follow_up` for two days. A
 scheduled `lobster runs advance --due` wakes it, and `survey` runs.
+
+[examples/](examples/) has workflows that run as they are, one or two features each:
+approvals, loops, parallel steps, waiting for events, calling other workflows, and the SDK.
 
 `lobster run --dry-run <file>` prints the plan without running anything, and
 `lobster graph <file>` draws it. A file with a typo in a key, a condition that reads a

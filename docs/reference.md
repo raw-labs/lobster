@@ -1,6 +1,6 @@
 # Lobster reference
 
-The full reference for Lobster. Start with the [README](../README.md) for what Lobster is and a first workflow.
+The full reference for Lobster. Start with the [README](../README.md) for what Lobster is and a first workflow, and see [examples/](../examples/) for workflows that run as they are.
 
 - **Workflows**
   - [Workflow files](#workflow-files)
@@ -117,7 +117,9 @@ A `switch` step runs the steps of its first case whose `when` holds, or its `els
 ```yaml
 steps:
   - id: classify
-    pipeline: llm.invoke --prompt "Classify this email" --output-schema '{"type":"object"}'
+    pipeline: >
+      llm.invoke --prompt "Classify this email" --output-schema '{"type":"object"}'
+      | map --unwrap output | map --unwrap data
 
   - id: route
     switch:
@@ -156,7 +158,9 @@ steps:
 ```yaml
 steps:
   - id: drafts
-    pipeline: llm.invoke --prompt "Draft a reply to each email" --output-schema '{"type":"array"}'
+    pipeline: >
+      llm.invoke --prompt "Draft a reply to each email" --output-schema '{"type":"array"}'
+      | map --unwrap output | map --unwrap data
 
   - id: each
     for_each: $drafts.json          # item_var (default item), index_var (default index)
@@ -201,6 +205,7 @@ steps:
     pipeline: >
       llm.invoke --prompt "Classify this email"
       --output-schema '{"type":"object","properties":{"label":{"enum":["refund","spam","other"]},"confidence":{"type":"number"}},"required":["label","confidence"]}'
+      | map --unwrap output | map --unwrap data
     stdin: $email.json
   - id: label
     switch:
@@ -994,6 +999,14 @@ Use `llm.invoke` from a native `pipeline:` step for model-backed work:
 llm.invoke --prompt 'Summarize this diff'
 llm.invoke --provider openclaw --prompt 'Summarize this diff'
 llm.invoke --provider pi --prompt 'Summarize this diff'
+```
+
+`llm.invoke` yields one record per call: the model's answer is its `output.data` (with
+`--output-schema`) or `output.text`, beside the model, usage and cache details. To branch on the
+answer, take it out in the pipeline, so `$step.json` is the answer itself:
+
+```
+llm.invoke --prompt '...' --output-schema '...' | map --unwrap output | map --unwrap data
 ```
 
 Provider resolution order:

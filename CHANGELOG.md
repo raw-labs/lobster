@@ -4,6 +4,8 @@ All notable changes to Lobster will be documented in this file.
 
 ## Unreleased
 
+- `examples/` has workflows that run as they are (approvals, a classifier that asks a person, loops, parallel steps, polling, waiting for events, calling another workflow) and an SDK example, each checked by the tests.
+- The documented classifier and loop examples take the model's answer out of `llm.invoke`'s record (`| map --unwrap output | map --unwrap data`) before reading it: they read `$classify.json.label` from the record, where it is not.
 - A child workflow's `cost_limit` counts only the model calls its own steps made: with `concurrency`, calls that other loop items made while it ran counted against it, so a child within its limit stopped the run.
 - `lobster runs advance`, `runs abandon` and `signal` show the run's messages on stderr (retries, `cost_limit` warnings, pricing warnings), as `lobster run` does: they were dropped.
 - A child workflow that cannot be loaded (missing, invalid, a cycle, args it does not take) is reported with the step that names it and its file, and a missing one as "Workflow file not found": the error was the raw file-system message, or named a step of the child as if it were in the file being run.

@@ -1,8 +1,11 @@
 {
 	"extends": "./tsconfig.build.json",
 	"compilerOptions": {
-		"noEmit": true
+		"noEmit": true,
+		"paths": {
+			"@clawdbot/lobster": ["./src/sdk/index.ts"]
+		}
 	},
-	"include": ["src/**/*.ts", "test/api_types.ts"],
+	"include": ["src/**/*.ts", "test/api_types.ts", "examples/**/*.ts"],
 	"exclude": ["dist", "node_modules"]
 }
