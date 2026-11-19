@@ -36,12 +36,15 @@ test("a run stopped mid-command is listed as blocked and can be abandoned and pr
 	const session = await openStoreSession({ env: f.env, readOnly: true });
 	const state = (await session.getRunState(runId))!;
 	await session.close();
-	assert.match(state.execution!.error!, /outcome is unknown.*runs abandon/);
+	const reason = state.execution!.error!;
+	assert.match(reason, /Interrupted while slow\/attempt-1\/activity was running/);
+	assert.match(reason, /outcome is unknown.*runs abandon.*recovery: repeat/);
 
-	// Advancing a manual-recovery step keeps it blocked rather than running it again.
+	// Advancing a manual-recovery step keeps it blocked rather than running it again, and says so
+	// as the stop did.
 	await assert.rejects(
 		advanceWorkflowRun({ runId, ctx: createToolContext({ env: f.env }) }),
-		/interrupted without a saved result/,
+		(error: Error) => error.message === reason,
 	);
 	const abandoned = await abandonWorkflowRun({ runId, ctx: createToolContext({ env: f.env }) });
 	assert.equal(abandoned.status, "cancelled");
@@ -214,4 +217,16 @@ test("retention moves past finished runs it cannot delete yet", async (t) => {
 	check.close();
 	assert.equal(ids.length, 500, "the stuck runs stay");
 	assert.ok(!ids.includes(done.id), "the deletable run after them is reached on the next open");
+});
+
+test("a lease too short is refused by every entry point before the store is opened", async (t) => {
+	const f = await fixture(t, [{ id: "a", run: "echo a" }]);
+	const ctx = createToolContext({ env: f.env });
+	for (const call of [
+		() => runWorkflowFile({ filePath: f.filePath, ctx, leaseMs: 5 }),
+		() => advanceWorkflowRun({ runId: "abc", ctx, leaseMs: 5 }),
+		() => abandonWorkflowRun({ runId: "abc", ctx, leaseMs: 5 }),
+	])
+		await assert.rejects(call, /Execution lease must be at least 100ms/);
+	await assert.rejects(fs.access(f.env.LOBSTER_STATE_DIR), { code: "ENOENT" });
 });

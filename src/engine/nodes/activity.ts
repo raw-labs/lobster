@@ -40,7 +40,10 @@ export async function activityStep(
 	if (record.phase === "waiting") await answerPipelineQuestion(machine, step, key, scope, record);
 	else if (record.phase === "started") {
 		if (record.activity?.input.kind !== "none" && !mayRepeat(step, record, scope.ctx))
-			throw new InterruptedActivityError(key);
+			throw new InterruptedActivityError(
+				keys.activity(key),
+				machine.blockedReason(keys.activity(key)),
+			);
 		record.phase = "ready";
 	}
 	if (record.phase !== "waiting") {

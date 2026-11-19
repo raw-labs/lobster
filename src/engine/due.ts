@@ -67,7 +67,7 @@ export async function advanceDueRuns(options: {
 	] as const)
 		if (!Number.isSafeInteger(value) || value < 1)
 			throw new Error(`${name} must be a positive integer`);
-	if (options.leaseMs !== undefined) checkLeaseMs(options.leaseMs);
+	checkLeaseMs(options.leaseMs);
 	return withStoreContext(options.ctx, async (ctx) => {
 		const session = sessionFromEnv(ctx.env)!;
 		const due = await session.dueRuns({
@@ -106,7 +106,7 @@ export async function signalEvent(options: {
 	if (typeof options.name !== "string" || !EVENT_NAME.test(options.name))
 		throw new Error(`Event names use ${EVENT_NAME_CHARS}`);
 	// Checked before the event is stored: a bad lease must not leave a delivered event behind.
-	if (options.leaseMs !== undefined) checkLeaseMs(options.leaseMs);
+	checkLeaseMs(options.leaseMs);
 	// Signalling stores the event for real: a dry run is refused, never ignored.
 	if (options.ctx.dryRun) throw new Error("A dry run applies to starting a workflow file");
 	// The delivery ID makes delivery idempotent: a blank one would swallow every later event.

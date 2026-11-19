@@ -78,6 +78,7 @@ export async function runPipelineText(options: {
 export async function runWorkflowFile(
 	options: WorkflowRunOptions,
 ): Promise<WorkflowRunResult & { runId?: string }> {
+	checkLeaseMs(options.leaseMs);
 	// A decision answers a paused run; args or a definition start a new one. Mixed, one half
 	// would be dropped without a word. (A resumed run keeps its own definition: a `filePath`
 	// given with a resume names it and changes nothing.)
@@ -127,7 +128,6 @@ export async function runWorkflowFile(
 				if (!recorder) {
 					// Refused before the run exists, so a refusal leaves no run behind either.
 					assertRunnableHere(options.kind ?? "workflow", options.sdk);
-					if (options.leaseMs !== undefined) checkLeaseMs(options.leaseMs);
 					recorder = await session.createRun(options.kind ?? "workflow", ctx.runMetadata);
 				}
 				runId = recorder.runId;
@@ -172,6 +172,7 @@ export async function advanceWorkflowRun(options: {
 	sdk?: { pipeline: string };
 }): Promise<WorkflowRunResult & { runId: string }> {
 	checkRunId(options.runId);
+	checkLeaseMs(options.leaseMs);
 	// Advancing runs steps for real: a dry run is refused, never ignored.
 	if (options.ctx.dryRun) throw new Error("A dry run applies to starting a workflow file");
 	return ownFailure((label) =>
@@ -214,6 +215,7 @@ export async function abandonWorkflowRun(options: {
 	leaseMs?: number;
 }): Promise<{ runId: string; status: RunStatus; abandoned: string[] }> {
 	checkRunId(options.runId);
+	checkLeaseMs(options.leaseMs);
 	// Abandoning cancels the run for real: a dry run is refused, never ignored.
 	if (options.ctx.dryRun) throw new Error("A dry run applies to starting a workflow file");
 	return withStoreContext(options.ctx, async (ctx) => {

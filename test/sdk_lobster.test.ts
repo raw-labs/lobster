@@ -609,7 +609,7 @@ test("input or output a run cannot save is refused or fails the step, leaving no
 	}
 });
 
-test("an SDK run stopped mid-stage tells how to continue it from the SDK", async (t) => {
+test("an SDK run stopped mid-stage says to abandon it, since continuing would only block again", async (t) => {
 	const stateDir = await sdkStateDir(t);
 	const controller = new AbortController();
 	const result = await new Lobster({ stateDir, signal: controller.signal })
@@ -624,8 +624,8 @@ test("an SDK run stopped mid-stage tells how to continue it from the SDK", async
 	try {
 		const [run] = (await store.listRuns()).runs;
 		const error = (await store.getRunState(run.id))?.execution?.error ?? "";
-		assert.match(error, /continue with Lobster\.advance\("/);
-		assert.doesNotMatch(error, /lobster runs advance/);
+		assert.match(error, /outcome is unknown.*lobster runs abandon/);
+		assert.doesNotMatch(error, /advance/);
 	} finally {
 		await store.close();
 	}

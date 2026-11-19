@@ -300,8 +300,18 @@ export class Machine {
 				);
 		for (const path of deepest) {
 			for (const item of below(path)) delete activations[item];
-			delete activations[path];
 			clearTimeoutsAbove(this.state, path);
+			const { attempt, dispatches } = activations[path];
+			// A step that failed on its own (a loop's timeout, a repeat out of rounds) runs as its
+			// next attempt, so what runs inside it gets ids of its own. A step whose condition
+			// failed never started, and decides it again.
+			if (attempt === undefined) delete activations[path];
+			else
+				activations[path] = {
+					phase: "started",
+					attempt: attempt + 1,
+					...(dispatches ? { dispatches } : {}),
+				};
 		}
 		for (const path of failed) {
 			const frame = activations[path];
@@ -357,6 +367,19 @@ export class Machine {
 		);
 	}
 
+	/**
+	 * Why the run is blocked on the activity at `key`, and what can be done. Continuing runs the
+	 * step again only when it allows that (`recovery: repeat`, which only workflow files have);
+	 * otherwise the run blocks again, so stopping it is what is left.
+	 */
+	blockedReason(key: string) {
+		const id = this.store.runId;
+		const repeat = this.state.definition.standalone
+			? ""
+			: ` If its step has \`recovery: repeat\`, \`lobster runs advance ${id}\` runs it again.`;
+		return `Interrupted while ${keys.describe(key)} was running; its outcome is unknown. Check it, then stop the run with \`lobster runs abandon ${id}\` (core abandonWorkflowRun).${repeat}`;
+	}
+
 	/** Throw InvocationRetiredError once the host has retired this invocation. */
 	checkAuthority(ctx = this.ctx) {
 		try {
@@ -387,13 +410,7 @@ export class Machine {
 		if (error instanceof InterruptedActivityError || running) state.status = "blocked";
 		else if (!stopped) state.status = "failed";
 		else state.status = Object.values(state.activations).some(isPending) ? "waiting" : "running";
-		const id = this.store.runId;
-		// An SDK run continues only on an instance with its stages, not from the CLI.
-		const advance =
-			this.ctx.mode === "sdk" ? `Lobster.advance("${id}")` : `\`lobster runs advance ${id}\``;
-		state.error = running
-			? `Interrupted while ${keys.describe(running)} was running; its outcome is unknown. Check it, then continue with ${advance} or run \`lobster runs abandon ${id}\` to stop the run.`
-			: messageOf(error);
+		state.error = running ? this.blockedReason(running) : messageOf(error);
 		if (state.status !== "failed") return this.save();
 		// A failed run keeps its activations, to be retried, but is not answered any more:
 		// withdraw what it asked (it asks again on retry).

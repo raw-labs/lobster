@@ -3,7 +3,6 @@
 import { PersistenceError, WaitConflictError } from "../persistence/backend.js";
 import { RequestInputResumeError } from "../pipeline/input_request.js";
 import { CostLimitExceededError } from "../llm/cost_tracker.js";
-import { keys } from "./checkpoint.js";
 import { messageOf } from "../util/errors.js";
 
 /** An error that stops the run where it is, instead of failing one step. */
@@ -33,10 +32,12 @@ export class RunCancelledError extends RunStopError {
 /** A command was dispatched and no result was saved: its outcome is unknown. */
 export class InterruptedActivityError extends RunStopError {
 	readonly code = "LOBSTER_ACTIVITY_OUTCOME_UNKNOWN";
-	constructor(readonly path: string) {
-		super(
-			`Activity ${keys.describe(path)} was interrupted without a saved result; inspect its outcome before continuing`,
-		);
+	/** `message`: why the run is blocked and what can be done (Machine.blockedReason). */
+	constructor(
+		readonly path: string,
+		message: string,
+	) {
+		super(message);
 		this.name = "InterruptedActivityError";
 	}
 }

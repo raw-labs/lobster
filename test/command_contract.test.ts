@@ -264,7 +264,10 @@ test("crash recovery does not re-run a step whose pipeline sends email", async (
 		killWhen: () => sends() === 1,
 	});
 	assert.equal(outcome.killed, true);
-	assert.match(outcome.recovered.error?.message ?? "", /interrupted without a saved result/);
+	assert.match(
+		outcome.recovered.error?.message ?? "",
+		/outcome is unknown.*runs abandon.*recovery: repeat/,
+	);
 	assert.equal(sends(), 1, "the email is not sent a second time");
 });
 

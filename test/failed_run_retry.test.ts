@@ -481,3 +481,31 @@ test("a run that stopped on what a retry would meet again leaves no step to retr
 	assert.equal(await ran("acted"), 1, "the command before the refused gate did not run again");
 	assert.equal(calls, 1, "the paid call was not made again");
 });
+
+test("a control step that failed on its own runs again as a new attempt: what runs inside gets new ids", async (t) => {
+	const { dir, env, advance } = await fixture(t);
+	const filePath = path.join(dir, "flow.lobster");
+	await fs.writeFile(
+		filePath,
+		JSON.stringify({
+			steps: [
+				{
+					id: "poll",
+					repeat: { until: "$check.json.done", max: 2 },
+					steps: [
+						{
+							id: "check",
+							run: `echo "$LOBSTER_ACTIVITY_ID $LOBSTER_ACTIVITY_ATTEMPT" >> "$RETRY_DIR/ids"; echo '{"done":false}'`,
+						},
+					],
+				},
+			],
+		}),
+	);
+	const first = await runToolRequest({ filePath, ctx: { env } });
+	assert.equal(first.ok, false);
+	await assert.rejects(advance(first.runId!));
+	const ids = (await fs.readFile(path.join(dir, "ids"), "utf8")).split("\n").filter(Boolean);
+	assert.equal(ids.length, 4);
+	assert.equal(new Set(ids).size, 4, ids.join("\n"));
+});

@@ -11,8 +11,9 @@ import type { PreparedSave } from "./records.js";
 /** What a save publishes or consumes with the checkpoint: a wait's continuation. */
 type SaveExtras = Pick<Extract<RunAction, { kind: "execution-save" }>, "publish" | "consume">;
 
-/** Refuse a lease shorter than 100 ms: checked before a run is created, and by the store. */
-export function checkLeaseMs(leaseMs: number) {
+/** Refuse a lease shorter than 100 ms: checked by every entry point first, and by the store. */
+export function checkLeaseMs(leaseMs: number | undefined) {
+	if (leaseMs === undefined) return;
 	if (!Number.isSafeInteger(leaseMs) || leaseMs < 100)
 		throw new Error("Execution lease must be at least 100ms");
 }
