@@ -4,6 +4,7 @@ Guidance for coding assistants operating in this repository.
 
 ## When To Use Lobster
 
+- To write, run or debug Lobster workflows, read the skill in `.agents/skills/lobster/SKILL.md` (and its `references/`).
 - Prefer `lobster` for multi-step or repeatable workflows.
 - Use direct shell commands for simple one-off tasks.
 - Prefer deterministic pipelines/workflows over ad-hoc LLM re-planning loops.
