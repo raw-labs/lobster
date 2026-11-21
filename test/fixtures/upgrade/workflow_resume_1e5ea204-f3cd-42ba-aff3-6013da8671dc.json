@@ -1,0 +1,52 @@
+{
+	"filePath": "__DIR__/pcmd.lobster",
+	"resumeAtIndex": 1,
+	"steps": {
+		"prep": {
+			"id": "prep",
+			"stdout": "{\"v\":3}\n",
+			"json": {
+				"v": 3
+			}
+		}
+	},
+	"args": {},
+	"inputStepId": "pick",
+	"inputKind": "pipeline_command",
+	"inputSchema": {
+		"type": "integer"
+	},
+	"pipelineInput": {
+		"pipeline": [
+			{
+				"name": "ask",
+				"args": {
+					"_": [],
+					"prompt": "Pick a number",
+					"schema": "{\"type\":\"integer\"}"
+				},
+				"raw": "ask --prompt 'Pick a number' --schema '{\"type\":\"integer\"}'"
+			}
+		],
+		"resumeAtIndex": 0,
+		"items": [],
+		"commandInput": {
+			"pending": {
+				"requestIndex": 0,
+				"metadata": {
+					"prompt": "Pick a number",
+					"responseSchema": {
+						"type": "integer"
+					},
+					"signature": "{\"prompt\":\"Pick a number\",\"responseSchema\":{\"type\":\"integer\"}}"
+				},
+				"suspendedState": {
+					"type": "ask"
+				}
+			},
+			"history": []
+		}
+	},
+	"supersededResumeStateKeys": [],
+	"createdAt": "2026-11-16T13:27:45.816Z"
+}

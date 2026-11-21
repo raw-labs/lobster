@@ -5,7 +5,18 @@ import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 
+import { openStoreSession } from "../src/persistence/session.js";
 import { findStateKeyByApprovalId, writeApprovalIndex } from "../src/state/store.js";
+
+/** Short approval IDs currently stored in the run store. */
+async function approvalIndexes(stateDir: string): Promise<string[]> {
+	const store = await openStoreSession({ directory: stateDir, readOnly: true });
+	try {
+		return Object.keys(await store.backend.listState("approval_"));
+	} finally {
+		await store.close();
+	}
+}
 
 function runCli(args: string[], env: Record<string, string | undefined>) {
 	const bin = path.join(process.cwd(), "bin", "lobster.js");
@@ -31,10 +42,10 @@ test("approval gate returns approvalId alongside resumeToken", async () => {
 	assert.equal(json.requiresApproval.approvalId.length, 8, "approvalId should be 8 hex chars");
 	assert.match(json.requiresApproval.approvalId, /^[a-f0-9]{8}$/, "approvalId should be hex");
 
-	// Verify index file was written
-	const files = await fsp.readdir(stateDir);
-	const indexFiles = files.filter((name) => name.startsWith("approval_"));
-	assert.equal(indexFiles.length, 1, "should have one approval index file");
+	// Verify the index was written
+	assert.deepEqual(await approvalIndexes(stateDir), [
+		`approval_${json.requiresApproval.approvalId}`,
+	]);
 });
 
 test("resume with --id works as alternative to --token", async () => {
@@ -62,9 +73,11 @@ test("resume with --id works as alternative to --token", async () => {
 	assert.deepEqual(resumedJson.output, [{ b: 2 }]);
 
 	// Step 3: Verify cleanup — approval index should be deleted
-	const files = await fsp.readdir(stateDir);
-	const indexFiles = files.filter((name) => name.startsWith("approval_"));
-	assert.equal(indexFiles.length, 0, "approval index should be cleaned up after resume");
+	assert.deepEqual(
+		await approvalIndexes(stateDir),
+		[],
+		"approval index should be cleaned up after resume",
+	);
 });
 
 test("resume with --id cancellation works", async () => {
@@ -100,7 +113,8 @@ test("resume with invalid --id returns clear error", async () => {
 		ok: false,
 		error: {
 			type: "parse_error",
-			message: 'Approval ID "deadbeef" not found or expired',
+			message:
+				'Approval ID "deadbeef" not found or expired: it was answered or withdrawn, or never existed',
 		},
 	});
 });
@@ -118,10 +132,12 @@ test("--token resume cleans up orphaned approval index", async () => {
 	assert.ok(firstJson.requiresApproval?.approvalId);
 	assert.ok(firstJson.requiresApproval?.resumeToken);
 
-	// Verify index file exists
-	let files = await fsp.readdir(stateDir);
-	let indexFiles = files.filter((name) => name.startsWith("approval_"));
-	assert.equal(indexFiles.length, 1, "approval index should exist before resume");
+	// Verify the index exists
+	assert.equal(
+		(await approvalIndexes(stateDir)).length,
+		1,
+		"approval index should exist before resume",
+	);
 
 	// Step 2: Resume using --token (NOT --id)
 	const resumed = runCli(
@@ -133,9 +149,11 @@ test("--token resume cleans up orphaned approval index", async () => {
 	assert.equal(resumedJson.status, "ok");
 
 	// Step 3: Verify approval index was cleaned up despite using --token
-	files = await fsp.readdir(stateDir);
-	indexFiles = files.filter((name) => name.startsWith("approval_"));
-	assert.equal(indexFiles.length, 0, "approval index should be cleaned up even when using --token");
+	assert.deepEqual(
+		await approvalIndexes(stateDir),
+		[],
+		"approval index should be cleaned up even when using --token",
+	);
 });
 
 test("double-resume with same --id returns clear error", async () => {
@@ -210,7 +228,7 @@ test("approval index writes never overwrite an existing approval ID mapping", as
 				stateKey: "workflow_resume_replacement",
 				approvalId: "deadbeef",
 			}),
-		(err: NodeJS.ErrnoException) => err?.code === "EEXIST",
+		(err: NodeJS.ErrnoException) => err?.code === "LOBSTER_STATE_EXISTS",
 	);
 
 	const resolved = await findStateKeyByApprovalId({ env, approvalId: "deadbeef" });
@@ -221,8 +239,12 @@ test("corrupt approval index is treated as expired instead of crashing (#113)", 
 	const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-aid-corrupt-"));
 	const stateDir = path.join(tmpDir, "state");
 	const env = { LOBSTER_STATE_DIR: stateDir };
-	await fsp.mkdir(stateDir, { recursive: true });
-	await fsp.writeFile(path.join(stateDir, "approval_deadbeef.json"), '{"stateKey"', "utf8");
+	const store = await openStoreSession({ directory: stateDir });
+	try {
+		await store.write("approval_deadbeef", '{"stateKey"');
+	} finally {
+		await store.close();
+	}
 
 	const resolved = await findStateKeyByApprovalId({ env, approvalId: "deadbeef" });
 	assert.equal(resolved, null);

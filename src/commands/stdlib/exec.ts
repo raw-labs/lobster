@@ -1,6 +1,14 @@
-import { runAbortableProcess } from "../../abortable_process.js";
+import { defineCommand } from "../define.js";
+import { runAbortableProcess } from "../../process/abortable_process.js";
+import { streamOf } from "../../io/streams.js";
+import type { RunAbortableOptions } from "../../process/abortable_process.js";
+import { messageOf } from "../../util/errors.js";
 
-export const execCommand = {
+/** The formats `--stdin` writes the stage's input in. */
+const STDIN_FORMATS = ["raw", "json", "jsonl"] as const;
+export type StdinFormat = (typeof STDIN_FORMATS)[number];
+
+export const execCommand = defineCommand({
 	name: "exec",
 	meta: {
 		description: "Run an OS command",
@@ -9,18 +17,24 @@ export const execCommand = {
 			properties: {
 				json: { type: "boolean", description: "Parse stdout as JSON (single value)." },
 				shell: { type: "string", description: "Run via the system shell with this command line." },
+				stdin: {
+					type: "string",
+					enum: STDIN_FORMATS,
+					description: "Write pipeline input to the command's stdin in this format.",
+				},
 				_: { type: "array", items: { type: "string" }, description: "Command + args." },
 			},
 			required: ["_"],
 		},
 		sideEffects: ["local_exec"],
+		repeatable: true,
 	},
 	help() {
 		return (
 			`exec — run an OS command\n\n` +
 			`Usage:\n` +
 			`  exec <command...>\n` +
-			`  exec --stdin raw|json|jsonl <command...>\n` +
+			`  exec --stdin ${STDIN_FORMATS.join("|")} <command...>\n` +
 			`  exec --json <command...>\n` +
 			`  exec --shell "<command line>"\n\n` +
 			`Notes:\n` +
@@ -30,115 +44,126 @@ export const execCommand = {
 		);
 	},
 	async run({ input, args, ctx }) {
-		const cmd = args._;
-		const cwd = ctx?.cwd ?? process.cwd();
-
-		const shellLine = typeof args.shell === "string" ? args.shell : null;
-		const useShell = Boolean(args.shell) || (cmd.length === 1 && /\s/.test(cmd[0]));
-		const stdinMode = typeof args.stdin === "string" ? String(args.stdin).toLowerCase() : null;
-
+		const cmd: string[] = args._;
+		// A bare `--shell` would run only the first word as the shell line.
+		if (args.shell !== undefined && typeof args.shell !== "string")
+			throw new Error(
+				'exec --shell takes the command line as its value: exec --shell "<command line>"',
+			);
+		const shellLine: string | null = args.shell ?? null;
+		// A bare `--stdin` would drop the input instead of writing it.
+		if (args.stdin !== undefined && typeof args.stdin !== "string")
+			throw new Error(`exec --stdin takes a format: ${STDIN_FORMATS.join(", ")}`);
 		if (!cmd.length && !shellLine) throw new Error("exec requires a command");
-
-		let stdinPayload = null;
-		if (stdinMode) {
-			const items = [];
-			for await (const item of input) items.push(item);
-			stdinPayload = encodeStdin(items, stdinMode);
-		} else {
-			// Drain input to avoid dangling streams.
-			for await (const _item of input) {
-				// no-op
-			}
-		}
-
-		const result = useShell
-			? await runShellLine(shellLine ?? cmd[0] ?? "", {
-					env: ctx.env,
-					cwd,
-					stdin: stdinPayload,
-					signal: ctx.signal,
-					assertInvocationCurrent: ctx.assertInvocationCurrent,
-					forceTerminationSignal: ctx.forceTerminationSignal,
-				})
-			: await runProcess(cmd[0], cmd.slice(1), {
-					env: ctx.env,
-					cwd,
-					stdin: stdinPayload,
-					signal: ctx.signal,
-					assertInvocationCurrent: ctx.assertInvocationCurrent,
-					forceTerminationSignal: ctx.forceTerminationSignal,
-				});
-
-		if (args.json) {
-			let parsed;
-			try {
-				parsed = JSON.parse(result.stdout.trim() || "null");
-			} catch (err) {
-				throw new Error(
-					`exec --json could not parse stdout as JSON: ${err?.message ?? String(err)}`,
-				);
-			}
-
-			return {
-				output: asStream(Array.isArray(parsed) ? parsed : [parsed]),
-			};
-		}
-
-		const lines = result.stdout.split(/\r?\n/).filter(Boolean);
-		return { output: asStream(lines) };
+		// The whole command line is --shell's value: words after it would be dropped.
+		if (shellLine !== null && cmd.length)
+			throw new Error(
+				`exec --shell takes the whole command line as its value; got extra words: ${cmd.join(" ")}`,
+			);
+		// `exec "ls -la"` is one word with a space: it runs as a shell line, like --shell.
+		const useShell = shellLine !== null || (cmd.length === 1 && /\s/.test(cmd[0]));
+		const target: ExecTarget = useShell ? { shellLine: shellLine ?? cmd[0] } : { argv: cmd };
+		return runExec(target, { json: Boolean(args.json), stdin: args.stdin }, input, ctx);
 	},
-};
+});
 
-async function runProcess(
-	command,
-	argv,
-	{ env, cwd, stdin, signal, assertInvocationCurrent, forceTerminationSignal },
+/** What exec runs: an executable with its arguments, or a line for the system shell. */
+export type ExecTarget = { argv: string[] } | { shellLine: string };
+
+/**
+ * Run `target` as the exec command does: pipeline input goes to stdin in the `stdin` format (or
+ * is drained), and stdout becomes items, parsed as one JSON value with `json` or else one item
+ * per line. The SDK's `exec()` runs through here too.
+ */
+export async function runExec(
+	target: ExecTarget,
+	options: { json?: boolean; stdin?: string },
+	input: AsyncIterable<unknown>,
+	ctx: Omit<ProcessContext, "stdin" | "cwd"> & { cwd?: string },
 ) {
-	const { stdout, stderr, code } = await runAbortableProcess({
-		command,
-		argv,
-		env,
-		cwd,
-		stdin,
-		signal,
-		assertInvocationCurrent,
-		forceTerminationSignal,
-		notFoundMessage: `exec command not found: ${command}`,
+	// Checked before the input is read: reading it runs the stages before this one.
+	const stdinMode = stdinFormat(options.stdin);
+	let stdinPayload = null;
+	if (stdinMode !== null) {
+		const items = [];
+		for await (const item of input) items.push(item);
+		stdinPayload = encodeStdin(items, stdinMode);
+	} else {
+		// Drain input to avoid dangling streams.
+		for await (const _item of input) {
+			// no-op
+		}
+	}
+
+	const stdout = await spawnExec(target, {
+		env: ctx.env,
+		cwd: ctx.cwd ?? process.cwd(),
+		stdin: stdinPayload,
+		signal: ctx.signal,
+		assertInvocationCurrent: ctx.assertInvocationCurrent,
+		forceTerminationSignal: ctx.forceTerminationSignal,
 	});
-	if (code === 0) return { stdout, stderr };
-	throw new Error(`exec failed (${code}): ${stderr.trim() || stdout.trim() || command}`);
+
+	if (options.json) {
+		let parsed;
+		try {
+			parsed = JSON.parse(stdout.trim() || "null");
+		} catch (err) {
+			throw new Error(`exec --json could not parse stdout as JSON: ${messageOf(err)}`);
+		}
+		return { output: streamOf(Array.isArray(parsed) ? parsed : [parsed]) };
+	}
+
+	const lines = stdout.split(/\r?\n/).filter(Boolean);
+	return { output: streamOf(lines) };
 }
 
-function runShellLine(
-	commandLine,
-	{ env, cwd, stdin, signal, assertInvocationCurrent, forceTerminationSignal },
-) {
-	return runAbortableProcess({
-		shellCommand: commandLine,
-		env,
-		cwd,
-		stdin,
-		signal,
-		assertInvocationCurrent,
-		forceTerminationSignal,
-		notFoundMessage: "exec shell not found; check LOBSTER_SHELL or ComSpec",
-	}).then(({ stdout, stderr, code }) => {
-		if (code === 0) return { stdout, stderr };
-		throw new Error(`exec failed (${code}): ${stderr.trim() || stdout.trim() || commandLine}`);
-	});
+/** What a spawned command gets from the stage that runs it. */
+type ProcessContext = Pick<
+	RunAbortableOptions,
+	"env" | "stdin" | "signal" | "assertInvocationCurrent" | "forceTerminationSignal"
+> & { cwd: string };
+
+/** Run `target` with `ctx` and return its stdout; a non-zero exit is an error. */
+async function spawnExec(target: ExecTarget, ctx: ProcessContext) {
+	// Spawning reports a missing working directory as a missing command or shell: name both.
+	const { stdout, stderr, code } = await runAbortableProcess(
+		"shellLine" in target
+			? {
+					...ctx,
+					shellCommand: target.shellLine,
+					notFoundMessage: `exec shell or working directory (${ctx.cwd}) not found; check LOBSTER_SHELL or ComSpec, or the cwd`,
+				}
+			: {
+					...ctx,
+					command: target.argv[0],
+					argv: target.argv.slice(1),
+					notFoundMessage: `exec command or working directory (${ctx.cwd}) not found: ${target.argv[0]}`,
+				},
+	);
+	if (code === 0) return stdout;
+	const what = "shellLine" in target ? target.shellLine : target.argv[0];
+	throw new Error(`exec failed (${code}): ${stderr.trim() || stdout.trim() || what}`);
 }
 
-function encodeStdin(items, mode) {
+/**
+ * `--stdin`'s format, or null without it. Pipelines refuse another value before any stage runs
+ * (the flag's declared choices); this guards direct callers too.
+ */
+function stdinFormat(value: string | undefined): StdinFormat | null {
+	if (value === undefined) return null;
+	if (!isStdinFormat(value))
+		throw new Error(`exec --stdin must be one of ${STDIN_FORMATS.join(", ")} (got "${value}")`);
+	return value;
+}
+
+function isStdinFormat(mode: string): mode is StdinFormat {
+	return (STDIN_FORMATS as readonly string[]).includes(mode);
+}
+
+function encodeStdin(items: unknown[], mode: StdinFormat) {
 	if (mode === "json") return JSON.stringify(items);
-	if (mode === "jsonl") {
+	if (mode === "jsonl")
 		return items.map((item) => JSON.stringify(item)).join("\n") + (items.length ? "\n" : "");
-	}
-	if (mode === "raw") {
-		return items.map((item) => (typeof item === "string" ? item : JSON.stringify(item))).join("\n");
-	}
-	throw new Error(`exec --stdin must be raw, json, or jsonl (got ${mode})`);
-}
-
-async function* asStream(items) {
-	for (const item of items) yield item;
+	return items.map((item) => (typeof item === "string" ? item : JSON.stringify(item))).join("\n");
 }

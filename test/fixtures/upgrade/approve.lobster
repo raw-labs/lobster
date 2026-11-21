@@ -1,0 +1,1 @@
+{"steps":[{"id":"before","command":"echo x >> __DIR__/count_before; echo '{\"n\":1}'"},{"id":"ship","command":"echo x >> __DIR__/count_ship; echo '{\"items\":[1,2]}'","approval":"Ship it?"},{"id":"after","command":"echo x >> __DIR__/count_after; echo done"}]}

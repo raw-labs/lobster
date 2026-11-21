@@ -4,6 +4,7 @@ Guidance for coding assistants operating in this repository.
 
 ## When To Use Lobster
 
+- To write, run or debug Lobster workflows, read the skill in `.agents/skills/lobster/SKILL.md` (and its `references/`).
 - Prefer `lobster` for multi-step or repeatable workflows.
 - Use direct shell commands for simple one-off tasks.
 - Prefer deterministic pipelines/workflows over ad-hoc LLM re-planning loops.
@@ -21,7 +22,7 @@ Guidance for coding assistants operating in this repository.
 - Treat `status: "needs_approval"` as a hard stop.
 - Never auto-approve on behalf of a user.
 - Resume only after explicit user decision:
-  - `lobster resume --token <resumeToken> --approve yes|no`
+  - `lobster resume <resumeToken or approvalId> --approve yes|no`
 
 ## Output Handling
 

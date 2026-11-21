@@ -1,152 +1,117 @@
-/**
- * SDK Runtime - Executes Lobster pipelines
- *
- * This adapts SDK stages to the core runtime so command-level suspension rules
- * stay identical across CLI, tool mode, and SDK entry points.
- */
-
-import { runPipeline as runCorePipeline } from "../runtime.js";
+// SDK stages as commands: each stage of a `Lobster` instance becomes the command
+// `sdk.stage.<n>`, so an SDK pipeline runs, pauses and resumes on the engine like any other;
+// and the items a run starts from.
+import type { CommandMeta, LobsterCommand } from "../commands/types.js";
+import { isPlainObject } from "../util/objects.js";
 
 /**
- * Collect async iterable to array
- * @param {AsyncIterable} iterable
- * @returns {Promise<any[]>}
+ * What a stage object's `run` gets: the stream of items, and the command context (the same
+ * one built-in commands get, with `requestInput`, `env`, `signal` and the rest).
  */
-async function collectItems(iterable) {
-	const items = [];
+export type SdkStageArgs = { input: AsyncIterable<unknown>; ctx: any };
+
+/**
+ * A stage object: a command-like `run`, and the `meta` of the command it runs, if any (the
+ * SDK's own stages set it, so a resumed run treats them as it treats the command).
+ */
+export type SdkStageObject = { run(args: SdkStageArgs): unknown; meta?: CommandMeta };
+
+/**
+ * A stage of an SDK pipeline: a function of the stage's items (a generator function gets the
+ * stream instead), or a stage object.
+ */
+export type SdkStage = ((items: any, ctx: any) => unknown) | SdkStageObject;
+
+async function collectItems(iterable: AsyncIterable<unknown> | Iterable<unknown>) {
+	const items: unknown[] = [];
 	for await (const item of iterable) {
 		items.push(item);
 	}
 	return items;
 }
 
-function normalizeSdkOutput(output) {
+/** A stage's output as items: nothing, an array or iterable as it is, or one value. */
+function normalizeSdkOutput(
+	output: unknown,
+): unknown[] | AsyncIterable<unknown> | Iterable<unknown> {
 	if (output === null || output === undefined) return [];
 	if (Array.isArray(output)) return output;
+	const iterable = output as Partial<AsyncIterable<unknown> & Iterable<unknown>>;
 	if (
-		typeof output?.[Symbol.asyncIterator] === "function" ||
-		typeof output?.[Symbol.iterator] === "function"
-	) {
-		return output;
-	}
+		typeof iterable[Symbol.asyncIterator] === "function" ||
+		typeof iterable[Symbol.iterator] === "function"
+	)
+		return iterable as AsyncIterable<unknown> | Iterable<unknown>;
 	return [output];
 }
 
-function createNullWritable() {
-	return {
-		write() {
-			return true;
-		},
-		end() {
-			return undefined;
-		},
-	};
+/** The pipeline text naming SDK stages: `sdk.stage.0 | sdk.stage.1 | ...`. */
+export function sdkPipelineText(count: number) {
+	return Array.from({ length: count }, (_stage, index) => `sdk.stage.${index}`).join(" | ");
+}
+
+/** The parts of a stage's meta the engine acts on (recovery and resume safety). */
+function engineMeta(meta: CommandMeta | undefined) {
+	if (!meta) return {};
+	const { repeatable, resumeSafeBeforeInput, resumeSafeAfterInput } = meta;
+	return { repeatable, resumeSafeBeforeInput, resumeSafeAfterInput };
 }
 
 /**
- * Run a pipeline of stages
- *
- * @param {Object} options
- * @param {Array<Function|Object>} options.stages - Pipeline stages
- * @param {Object} options.ctx - Execution context
- * @param {any[]} [options.input] - Initial input items
- * @returns {Promise<PipelineResult>}
+ * Commands named `sdk.stage.<n>` that run an SDK instance's stages. A run saves only these
+ * names, so the instance that resumes it supplies the stages again.
  */
-export async function runPipelineInternal({
-	stages,
-	ctx,
-	input = [],
-	requestInputResume = undefined,
-}) {
-	const runtimeCtx = ctx ?? {};
-	const pipeline = stages.map((_stage, index) => ({
-		name: `sdk.stage.${index}`,
-		args: {},
-		raw: `sdk.stage.${index}`,
-	}));
-	const commands = new Map(
+export function sdkStageRegistry(stages: SdkStage[]) {
+	const commands = new Map<string, LobsterCommand>(
 		stages.map((stage, index) => [
 			`sdk.stage.${index}`,
 			{
-				async run({ input, ctx }) {
-					const stageCtx = { ...runtimeCtx, ...ctx };
+				name: `sdk.stage.${index}`,
+				help: () => `SDK stage ${index}`,
+				meta: {
+					...engineMeta(typeof stage === "function" ? undefined : stage?.meta),
+					description: `SDK stage ${index}`,
+					argsSchema: { type: "object" },
+				},
+				async run({ input, ctx }: SdkStageArgs) {
 					if (typeof stage === "function") {
 						const isGenerator =
 							stage.constructor?.name === "AsyncGeneratorFunction" ||
 							stage.constructor?.name === "GeneratorFunction";
 
 						if (isGenerator) {
-							return { output: normalizeSdkOutput(stage(input, stageCtx)) };
+							return { output: normalizeSdkOutput(stage(input, ctx)) };
 						}
 
 						const items = await collectItems(input);
-						return { output: normalizeSdkOutput(await stage(items, stageCtx)) };
+						return { output: normalizeSdkOutput(await stage(items, ctx)) };
 					}
 
-					if (typeof stage?.run === "function") {
-						const result = await stage.run({ input, ctx: stageCtx });
-						return result && "output" in result
-							? { ...result, output: normalizeSdkOutput(result.output) }
-							: result;
-					}
-
-					throw new Error(
-						`Invalid stage at index ${index}: must be a function or have run() method`,
-					);
+					// A stage object (`pipe` accepts nothing else).
+					const result = await stage.run({ input, ctx });
+					return isPlainObject(result) && "output" in result
+						? { ...result, output: normalizeSdkOutput(result.output) }
+						: result;
 				},
 			},
 		]),
 	);
-	const stdout = runtimeCtx.stdout ?? createNullWritable();
-	const stderr = runtimeCtx.stderr ?? createNullWritable();
-
-	return runCorePipeline({
-		pipeline,
-		registry: {
-			get(name) {
-				return commands.get(name);
-			},
+	return {
+		get(name: string) {
+			return commands.get(name);
 		},
-		stdin: runtimeCtx.stdin ?? { isTTY: false },
-		stdout,
-		stderr,
-		env: runtimeCtx.env ?? process.env,
-		mode: runtimeCtx.mode ?? "sdk",
-		cwd: runtimeCtx.cwd,
-		llmAdapters: runtimeCtx.llmAdapters,
-		signal: runtimeCtx.signal,
-		input: normalizeSdkOutput(input),
-		requestInputResume,
-	});
+		list() {
+			return [...commands.keys()];
+		},
+	};
 }
 
 /**
- * Re-export for compatibility with CLI runtime
+ * SDK input as the items a run saves: an iterable is read once (a string by character), null
+ * or undefined is no items, any other value is one item.
  */
-export async function runPipeline({
-	pipeline,
-	registry,
-	stdin,
-	stdout,
-	stderr,
-	env,
-	mode = "human",
-	input,
-	signal = undefined,
-	requestInputResume = undefined,
-	requestInputEnabled = true,
-}) {
-	return runCorePipeline({
-		pipeline,
-		registry,
-		stdin,
-		stdout,
-		stderr,
-		env,
-		mode,
-		input,
-		signal,
-		requestInputResume,
-		requestInputEnabled,
-	});
+export async function sdkInputItems(input: unknown): Promise<unknown[]> {
+	const normalized = normalizeSdkOutput(input);
+	if (Array.isArray(normalized)) return normalized;
+	return collectItems(normalized);
 }

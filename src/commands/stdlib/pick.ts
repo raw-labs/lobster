@@ -1,4 +1,5 @@
-export const pickCommand = {
+import { defineCommand } from "../define.js";
+export const pickCommand = defineCommand({
 	name: "pick",
 	meta: {
 		description: "Project fields from objects",
@@ -14,6 +15,7 @@ export const pickCommand = {
 			required: ["_"],
 		},
 		sideEffects: [],
+		repeatable: true,
 	},
 	help() {
 		return `pick — project fields from objects\n\nUsage:\n  ... | pick id,subject,from\n`;
@@ -23,7 +25,7 @@ export const pickCommand = {
 		if (!spec) throw new Error("pick requires a comma-separated field list");
 		const fields = spec
 			.split(",")
-			.map((s) => s.trim())
+			.map((s: string) => s.trim())
 			.filter(Boolean);
 
 		return {
@@ -33,9 +35,11 @@ export const pickCommand = {
 						yield item;
 						continue;
 					}
-					yield Object.fromEntries(fields.map((field) => [field, item[field]]));
+					yield Object.fromEntries(
+						fields.map((field: string) => [field, (item as Record<string, unknown>)[field]]),
+					);
 				}
 			})(),
 		};
 	},
-};
+});

@@ -1,6 +1,7 @@
-import { getByPath } from "../../core/value_path.js";
+import { defineCommand } from "../define.js";
+import { getByPath } from "../../util/value_path.js";
 
-export const groupByCommand = {
+export const groupByCommand = defineCommand({
 	name: "groupBy",
 	meta: {
 		description: "Group items by a key (stable group order)",
@@ -13,6 +14,7 @@ export const groupByCommand = {
 			required: ["key"],
 		},
 		sideEffects: [],
+		repeatable: true,
 	},
 	help() {
 		return (
@@ -48,4 +50,4 @@ export const groupByCommand = {
 			})(),
 		};
 	},
-};
+});

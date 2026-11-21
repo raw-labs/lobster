@@ -1,4 +1,5 @@
-import type { CostLimit, CostSummary } from "../core/cost_tracker.js";
+import type { RetryConfig } from "./retry.js";
+import type { CostLimit, CostSummary } from "../llm/cost_tracker.js";
 
 export type WorkflowFile = {
 	name?: string;
@@ -18,7 +19,15 @@ export type ParallelBranch = {
 	env?: Record<string, string>;
 	cwd?: string;
 	stdin?: unknown;
+	recovery?: "repeat" | "manual";
 };
+
+export type SwitchCase = { when: string | boolean; steps: WorkflowStep[] };
+
+export type SwitchConfig = { cases: SwitchCase[]; else?: WorkflowStep[] };
+
+/** Run `steps` in rounds until `until` holds after one, at most `max` rounds. */
+export type RepeatConfig = { until: string | boolean; max: number; on_max?: "fail" | "continue" };
 
 export type ParallelConfig = {
 	wait?: "all" | "any";
@@ -27,6 +36,7 @@ export type ParallelConfig = {
 };
 
 export type WorkflowStep = {
+	recovery?: "repeat" | "manual";
 	id: string;
 	command?: string;
 	run?: string;
@@ -38,31 +48,49 @@ export type WorkflowStep = {
 	stdin?: unknown;
 	approval?: WorkflowApproval;
 	input?: WorkflowInputRequest;
-	condition?: unknown;
-	when?: unknown;
+	condition?: string | boolean | null;
+	when?: string | boolean | null;
 	parallel?: ParallelConfig;
 	for_each?: string;
+	/** Run the steps of the first case whose `when` holds, or `else`. */
+	switch?: SwitchConfig;
+	/** Run `steps` again and again until a condition holds. */
+	repeat?: RepeatConfig;
+	/** How many items of a for_each run at once (default 1). */
+	concurrency?: number;
 	item_var?: string;
 	index_var?: string;
 	batch_size?: number;
 	pause_ms?: number;
 	steps?: WorkflowStep[];
 	timeout_ms?: number;
+	/** Abort the step when it shows no progress for this long (see LOBSTER_HEARTBEAT_FILE). */
+	heartbeat_timeout_ms?: number;
+	/** Pause the run for a duration ("30s", "2h", "3d", or ms). */
+	sleep?: string | number;
+	/** Pause the run until an external event arrives (`lobster signal`). */
+	wait?: WorkflowEventWait;
 	on_error?: "stop" | "continue" | "skip_rest";
-	retry?: {
-		max?: number;
-		backoff?: "fixed" | "exponential";
-		delay_ms?: number;
-		max_delay_ms?: number;
-		jitter?: boolean;
-	};
+	retry?: RetryConfig;
 };
+
+/** How long a question or event wait may take, and what happens after that. */
+export type WorkflowWaitTimeout = {
+	timeout?: string | number;
+	on_timeout?: "cancel" | "continue";
+};
+
+export type WorkflowEventWait = {
+	event: string;
+	/** Fields the event's data must contain (nested objects match as subsets). */
+	match?: Record<string, unknown>;
+} & WorkflowWaitTimeout;
 
 export type WorkflowApproval =
 	| boolean
 	| "required"
 	| string
-	| {
+	| ({
 			prompt?: string;
 			items?: unknown[];
 			preview?: string;
@@ -72,7 +100,9 @@ export type WorkflowApproval =
 			requiredApprover?: string;
 			require_different_approver?: boolean;
 			requireDifferentApprover?: boolean;
-	  };
+			/** `continue`: a rejection completes the step with `approved: false` instead of cancelling the run. */
+			on_reject?: "cancel" | "continue";
+	  } & WorkflowWaitTimeout);
 
 export type WorkflowApprovalIdentity = {
 	initiatedBy?: string;
@@ -82,9 +112,9 @@ export type WorkflowApprovalIdentity = {
 
 export type WorkflowInputRequest = {
 	prompt: string;
-	responseSchema: unknown;
+	responseSchema: Record<string, unknown>;
 	defaults?: unknown;
-};
+} & WorkflowWaitTimeout;
 
 export type WorkflowStepResult = {
 	id: string;
@@ -96,13 +126,34 @@ export type WorkflowStepResult = {
 	subject?: unknown;
 	response?: unknown;
 	skipped?: boolean;
+	/** For a switch: the case that ran, from 1, or "else". */
+	case?: number | "else";
+	/** How many rounds a repeat step ran. */
+	rounds?: number;
+	/** A question or event wait reached its timeout with `on_timeout: continue`. */
+	timedOut?: boolean;
+	/** A standalone pipeline's items as they are, and whether a renderer already showed them. */
+	items?: unknown[];
+	rendered?: boolean;
 	error?: boolean;
 	errorMessage?: string;
 };
 
+/** What a run with `status: "waiting"` waits for; `runs advance --due` or `signal` continue it. */
+export type WorkflowWaitingFor =
+	| { kind: "timer"; stepId: string; until: string }
+	| { kind: "event"; stepId: string; event: string; until?: string };
+
 export type WorkflowRunResult = {
-	status: "ok" | "needs_approval" | "needs_input" | "cancelled";
+	status: "ok" | "needs_approval" | "needs_input" | "waiting" | "cancelled";
 	output: unknown[];
+	/** Why a cancelled run was cancelled ("Not approved", a deadline). */
+	reason?: string;
+	/** A standalone pipeline whose renderer (`table`, `json`) already wrote its output. */
+	rendered?: boolean;
+	/** A dry run's plan: what would run, step by step (also written to stderr). */
+	plan?: string;
+	waitingFor?: WorkflowWaitingFor;
 	requiresApproval?: {
 		type: "approval_request";
 		prompt: string;
@@ -111,8 +162,11 @@ export type WorkflowRunResult = {
 		initiatedBy?: string;
 		requiredApprover?: string;
 		requireDifferentApprover?: boolean;
-		resumeToken?: string;
-		approvalId?: string;
+		/** A "no" completes the step with `approved: false` instead of cancelling the run. */
+		onReject?: "continue";
+		/** Answers it (`lobster resume <token>`); so does the short `approvalId`. */
+		resumeToken: string;
+		approvalId: string;
 	};
 	requiresInput?: {
 		type: "input_request";
@@ -120,7 +174,7 @@ export type WorkflowRunResult = {
 		responseSchema: unknown;
 		defaults?: unknown;
 		subject?: unknown;
-		resumeToken?: string;
+		resumeToken: string;
 	};
 	_meta?: {
 		cost?: CostSummary;

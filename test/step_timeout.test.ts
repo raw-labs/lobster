@@ -6,8 +6,10 @@ import os from "node:os";
 import path from "node:path";
 import { PassThrough } from "node:stream";
 
-import { loadWorkflowFile, runWorkflowFile } from "../src/workflows/file.js";
+import { runWorkflowFile } from "../src/engine/runner.js";
+import { loadWorkflowFile } from "../src/workflows/load.js";
 import { createDefaultRegistry } from "../src/commands/registry.js";
+import { decodeResumeToken } from "../src/resume/resume.js";
 
 async function runWorkflow(
 	workflow: unknown,
@@ -192,7 +194,7 @@ test("external abort still propagates when timeout is configured", async () => {
 	);
 });
 
-test("timed-out llm.invoke step stops waiting for the adapter", { timeout: 20_000 }, async () => {
+test("timed-out llm.invoke step stops waiting for the adapter", { timeout: 20_000 }, async (t) => {
 	const sockets = new Set<import("node:net").Socket>();
 	let markClosed = () => {};
 	const requestClosed = new Promise<void>((resolve) => (markClosed = resolve));
@@ -208,10 +210,16 @@ test("timed-out llm.invoke step stops waiting for the adapter", { timeout: 20_00
 	});
 
 	await new Promise<void>((resolve) => server.listen(0, resolve));
+	// Cleanup must run even if the test stalls; an open server keeps the process alive.
+	server.unref();
+	t.after(async () => {
+		for (const socket of sockets) socket.destroy();
+		await new Promise<void>((resolve) => server.close(() => resolve()));
+	});
 	const addr = server.address();
 	const port = typeof addr === "object" && addr ? addr.port : 0;
 
-	try {
+	{
 		const started = Date.now();
 		await assert.rejects(
 			() =>
@@ -230,10 +238,16 @@ test("timed-out llm.invoke step stops waiting for the adapter", { timeout: 20_00
 			/timed out after 300ms/,
 		);
 		assert.ok(Date.now() - started < 10_000, "the step must not wait for the adapter");
-		await requestClosed;
-	} finally {
-		for (const socket of sockets) socket.destroy();
-		await new Promise<void>((resolve) => server.close(() => resolve()));
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		await Promise.race([
+			requestClosed,
+			new Promise((_, reject) => {
+				timer = setTimeout(
+					() => reject(new Error("the adapter request was never sent or never closed")),
+					5_000,
+				);
+			}),
+		]).finally(() => clearTimeout(timer));
 	}
 });
 
@@ -297,3 +311,54 @@ test(
 		);
 	},
 );
+
+test("a step's timeout does not count the time a person takes to answer it", async (t) => {
+	const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-step-timeout-wait-"));
+	t.after(() => fsp.rm(tmpDir, { recursive: true, force: true }));
+	const filePath = path.join(tmpDir, "workflow.lobster");
+	await fsp.writeFile(
+		filePath,
+		JSON.stringify({
+			steps: [
+				{ id: "review", pipeline: "choose", timeout_ms: 400 },
+				{ id: "after", command: "echo after" },
+			],
+		}),
+	);
+	const schema = { type: "object", properties: { decision: { type: "string" } } };
+	let calls = 0;
+	const choose = {
+		name: "choose",
+		async run({ ctx }: any) {
+			calls++;
+			const answer = await ctx.requestInput({ prompt: "Review?", responseSchema: schema });
+			return {
+				output: (async function* () {
+					yield answer;
+				})(),
+			};
+		},
+	};
+	const defaults = createDefaultRegistry();
+	const registry = { get: (name: string) => (name === "choose" ? choose : defaults.get(name)) };
+	const ctx = {
+		stdin: process.stdin,
+		stdout: process.stdout,
+		stderr: new PassThrough(),
+		env: { ...process.env, LOBSTER_STATE_DIR: path.join(tmpDir, "state") },
+		mode: "tool" as const,
+		registry: registry as any,
+	};
+	const first = await runWorkflowFile({ filePath, ctx });
+	assert.equal(first.status, "needs_input");
+	await new Promise((resolve) => setTimeout(resolve, 700)); // longer than timeout_ms
+	const resumed = await runWorkflowFile({
+		filePath,
+		ctx,
+		resume: decodeResumeToken(first.requiresInput!.resumeToken) as any,
+		response: { decision: "ok" },
+	});
+	assert.equal(resumed.status, "ok");
+	assert.deepEqual(resumed.output, ["after\n"]);
+	assert.equal(calls, 2, "the command resumes with the answer");
+});

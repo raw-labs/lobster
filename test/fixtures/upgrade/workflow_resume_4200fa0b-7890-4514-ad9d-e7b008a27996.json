@@ -1,0 +1,25 @@
+{
+	"filePath": "__DIR__/approve.lobster",
+	"resumeAtIndex": 2,
+	"steps": {
+		"before": {
+			"id": "before",
+			"stdout": "{\"n\":1}\n",
+			"json": {
+				"n": 1
+			}
+		},
+		"ship": {
+			"id": "ship",
+			"stdout": "{\"items\":[1,2]}\n",
+			"json": {
+				"items": [1, 2]
+			}
+		}
+	},
+	"args": {},
+	"approvalStepId": "ship",
+	"approvalIdentity": {},
+	"supersededResumeStateKeys": [],
+	"createdAt": "2026-11-16T13:27:45.590Z"
+}

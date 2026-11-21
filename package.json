@@ -29,27 +29,43 @@
 		"bin",
 		"dist/src",
 		"README.md",
+		"docs/reference.md",
+		"docs/execution-machine.md",
 		"LICENSE",
 		"VISION.md"
 	],
 	"type": "module",
 	"main": "./dist/src/sdk/index.js",
+	"types": "./dist/src/sdk/index.d.ts",
 	"exports": {
-		".": "./dist/src/sdk/index.js",
-		"./sdk": "./dist/src/sdk/index.js",
-		"./core": "./dist/src/core/index.js",
-		"./recipes/github": "./dist/src/recipes/github/index.js"
+		".": {
+			"types": "./dist/src/sdk/index.d.ts",
+			"default": "./dist/src/sdk/index.js"
+		},
+		"./sdk": {
+			"types": "./dist/src/sdk/index.d.ts",
+			"default": "./dist/src/sdk/index.js"
+		},
+		"./core": {
+			"types": "./dist/src/core/index.d.ts",
+			"default": "./dist/src/core/index.js"
+		},
+		"./recipes/github": {
+			"types": "./dist/src/packs/github/recipes.d.ts",
+			"default": "./dist/src/packs/github/recipes.js"
+		}
 	},
 	"scripts": {
 		"clean": "node -e \"require('fs').rmSync('dist', { recursive: true, force: true })\"",
-		"build": "pnpm clean && tsc -p tsconfig.build.json",
+		"build": "pnpm clean && tsc -p tsconfig.build.json && tsc -p tsconfig.api.json",
 		"prepack": "pnpm build",
-		"typecheck": "tsc -p tsconfig.json --noEmit",
-		"format": "oxfmt --write package.json tsconfig.json tsconfig.build.json bin src test",
-		"format:check": "oxfmt --check package.json tsconfig.json tsconfig.build.json bin src test",
-		"lint": "pnpm format:check && oxlint --tsconfig tsconfig.json bin src test",
+		"typecheck": "tsc -p tsconfig.api.json && tsc -p tsconfig.json --noEmit",
+		"format": "oxfmt --write package.json tsconfig.json tsconfig.build.json tsconfig.api.json bin src test examples",
+		"format:check": "oxfmt --check package.json tsconfig.json tsconfig.build.json tsconfig.api.json bin src test examples",
+		"lint": "pnpm format:check && oxlint --tsconfig tsconfig.json bin src test examples",
 		"fmt": "pnpm format",
-		"test": "pnpm clean && tsc -p tsconfig.json && node -e \"if (!require('fs').existsSync('dist/test')) process.exit(1)\" && node --test dist/test/*.test.js",
+		"test": "pnpm clean && tsc -p tsconfig.json && node -e \"if (!require('fs').existsSync('dist/test')) process.exit(1)\" && node --import ./dist/test/helpers/isolate_state.js --test dist/test/*.test.js",
+		"test:campaign": "pnpm clean && tsc -p tsconfig.json && node --import ./dist/test/helpers/isolate_state.js --test --test-concurrency=1 dist/test/campaign/*.test.js",
 		"check:changed": "pnpm run test",
 		"test:changed": "pnpm run test",
 		"crabbox:hydrate": "crabbox actions hydrate",
@@ -58,17 +74,17 @@
 		"crabbox:warmup": "crabbox warmup"
 	},
 	"dependencies": {
-		"ajv": "^8.20.0",
+		"typebox": "^1.4.7",
 		"yaml": "^2.9.1"
 	},
 	"devDependencies": {
-		"@types/node": "^22.20.5",
+		"@types/node": "^24.19.2",
 		"oxfmt": "^0.78.0",
 		"oxlint": "^1.93.0",
 		"typescript": "^7.0.2"
 	},
 	"engines": {
-		"node": ">=22"
+		"node": ">=24.16.0 <25 || >=26.1.0"
 	},
 	"packageManager": "pnpm@12.18.0"
 }

@@ -6,9 +6,23 @@ import path from "node:path";
 import os from "node:os";
 
 import { createDefaultRegistry } from "../src/commands/registry.js";
-import { runWorkflowFile } from "../src/workflows/file.js";
-import { decodeResumeToken } from "../src/resume.js";
-import { keyToPath, readStateJsonWithLock as readStateJson } from "../src/state/store.js";
+import { runWorkflowFile, advanceWorkflowRun } from "../src/engine/runner.js";
+import { openStoreSession } from "../src/persistence/session.js";
+import { decodeResumeToken } from "../src/resume/resume.js";
+import { readStateJsonWithLock as readStateJson } from "../src/state/store.js";
+import { keyToPath } from "../src/state/paths.js";
+
+async function savedPipelineInput(env: Record<string, string | undefined>, key: string) {
+	const store = await openStoreSession({ env, readOnly: true });
+	try {
+		const pointer = JSON.parse((await store.read(key)).text!);
+		const run = await store.getRunState(pointer.runId);
+		return Object.values(run!.execution!.activations).find((frame) => frame.activity?.pause)!
+			.activity!.pause!;
+	} finally {
+		await store.close();
+	}
+}
 
 function streamOf(items: unknown[]) {
 	return (async function* () {
@@ -192,7 +206,7 @@ test("workflow resume cancellation cleans up resume state", async () => {
 	assert.equal(payload.kind, "workflow-file");
 	assert.ok(payload.stateKey);
 
-	await fsp.access(path.join(stateDir, `${payload.stateKey}.json`));
+	assert.notEqual(await readStateJson({ env, key: payload.stateKey! }), null);
 
 	const cancelled = await runWorkflowFile({
 		filePath,
@@ -305,12 +319,12 @@ test("direct workflow resume consumes its capability after cancellation starts a
 				resume: payload,
 				approved: true,
 			}),
-		/Workflow resume state not found/,
+		/Resume state not found/,
 	);
 	assert.equal((await fsp.readFile(effectPath, "utf8")).trim().split(/\r?\n/).length, 1);
 });
 
-test("workflow template setup failure preserves an unstarted approval capability", async () => {
+test("workflow setup failure keeps the saved definition and consumes the accepted decision", async () => {
 	const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-workflow-template-resume-"));
 	try {
 		const stateDir = path.join(tmpDir, "state");
@@ -319,10 +333,11 @@ test("workflow template setup failure preserves an unstarted approval capability
 		const broken = {
 			steps: [
 				{ id: "approve", approval: "Continue?" },
+				// Loads, but fails once the approval's result is there: it is not a list.
 				{
 					id: "effect",
-					run: "node -e \"process.stdout.write('should not run')\"",
-					stdin: "$missing.stdout",
+					for_each: "$approve.approved",
+					steps: [{ id: "w", run: "node -e \"process.stdout.write('should not run')\"" }],
 				},
 			],
 		};
@@ -357,9 +372,9 @@ test("workflow template setup failure preserves an unstarted approval capability
 					resume: payload,
 					approved: true,
 				}),
-			/Unknown step reference: missing\.stdout/,
+			/for_each: expected array/,
 		);
-		assert.notEqual(await readStateJson({ env, key: payload.stateKey! }), null);
+		assert.equal(await readStateJson({ env, key: payload.stateKey! }), null);
 
 		await fsp.writeFile(
 			filePath,
@@ -371,6 +386,32 @@ test("workflow template setup failure preserves an unstarted approval capability
 			}),
 			"utf8",
 		);
+		await assert.rejects(
+			() =>
+				advanceWorkflowRun({
+					runId: first.runId!,
+					ctx: {
+						stdin: process.stdin,
+						stdout: process.stdout,
+						stderr: process.stderr,
+						env,
+						mode: "tool",
+					},
+				}),
+			/for_each: expected array/,
+		);
+		const restarted = await runWorkflowFile({
+			filePath,
+			ctx: {
+				stdin: process.stdin,
+				stdout: process.stdout,
+				stderr: process.stderr,
+				env,
+				mode: "tool",
+			},
+		});
+		const restartedPayload = decodeResumeToken(restarted.requiresApproval!.resumeToken);
+		assert.equal(restartedPayload.kind, "workflow-file");
 		const retried = await runWorkflowFile({
 			filePath,
 			ctx: {
@@ -380,7 +421,7 @@ test("workflow template setup failure preserves an unstarted approval capability
 				env,
 				mode: "tool",
 			},
-			resume: payload,
+			resume: restartedPayload,
 			approved: true,
 		});
 		assert.equal(retried.status, "ok");
@@ -464,7 +505,7 @@ test("workflow resume consumes its capability after a step timeout starts an eff
 				resume: payload,
 				approved: true,
 			}),
-		/Workflow resume state not found/,
+		/Resume state not found/,
 	);
 	assert.equal((await fsp.readFile(effectPath, "utf8")).trim().split(/\r?\n/).length, 1);
 });
@@ -592,102 +633,45 @@ test("workflow resume retries a timed-out effect before consuming its capability
 	assert.equal(await readStateJson({ env, key: payload.stateKey! }), null);
 });
 
-test("workflow resume retries a claim blocked by a state lock before dispatch", async () => {
-	const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-workflow-claim-retry-"));
+test("workflow resume can cancel a blocked checkpoint read without consuming the question", async () => {
+	const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-workflow-read-lock-"));
 	try {
-		const stateDir = path.join(tmpDir, "state");
+		const env = { ...process.env, LOBSTER_STATE_DIR: path.join(tmpDir, "state") };
 		const filePath = path.join(tmpDir, "workflow.lobster");
 		await fsp.writeFile(
 			filePath,
 			JSON.stringify({
 				steps: [
 					{ id: "approve", approval: "Proceed?" },
-					{
-						id: "effect",
-						run: "printf ran",
-						condition: "$approve.approved",
-						timeout_ms: 1000,
-						retry: { max: 2, delay_ms: 250 },
-					},
+					{ id: "effect", run: "printf ran" },
 				],
 			}),
-			"utf8",
 		);
-		const env = { ...process.env, LOBSTER_STATE_DIR: stateDir };
-		const first = await runWorkflowFile({
-			filePath,
-			ctx: {
-				stdin: process.stdin,
-				stdout: process.stdout,
-				stderr: process.stderr,
-				env,
-				mode: "tool",
-			},
-		});
-		assert.equal(first.status, "needs_approval");
-		const payload = decodeResumeToken(first.requiresApproval?.resumeToken ?? "");
+		const ctx = {
+			stdin: process.stdin,
+			stdout: process.stdout,
+			stderr: process.stderr,
+			env,
+			mode: "tool" as const,
+		};
+		const first = await runWorkflowFile({ filePath, ctx });
+		const payload = decodeResumeToken(first.requiresApproval!.resumeToken);
 		assert.equal(payload.kind, "workflow-file");
-		assert.ok(payload.stateKey);
-
-		const lockPath = `${keyToPath(stateDir, payload.stateKey!)}.lock`;
-		const originalRename = fsp.rename;
-		const originalRm = fsp.rm;
-		let releasedInitialReadLocks = 0;
-		let lockReplaced!: () => void;
-		const replacedInitialReadLocks = new Promise<void>((resolve) => {
-			lockReplaced = resolve;
+		const lockPath = keyToPath(env.LOBSTER_STATE_DIR, payload.stateKey!) + ".lock";
+		await fsp.mkdir(lockPath);
+		await fsp.writeFile(path.join(lockPath, "owner"), process.pid + "::test-owner\n");
+		const controller = new AbortController();
+		const blocked = runWorkflowFile({
+			ctx: { ...ctx, signal: controller.signal },
+			resume: payload,
+			approved: true,
 		});
-		Object.defineProperty(fsp, "rename", {
-			configurable: true,
-			writable: true,
-			async value(
-				oldPath: Parameters<typeof fsp.rename>[0],
-				newPath: Parameters<typeof fsp.rename>[1],
-			) {
-				const result = await originalRename(oldPath, newPath);
-				if (String(oldPath) === lockPath && ++releasedInitialReadLocks === 2) {
-					await fsp.mkdir(lockPath);
-					await fsp.writeFile(
-						path.join(lockPath, "owner"),
-						`${process.pid}::live-writer\n`,
-						"utf8",
-					);
-					lockReplaced();
-				}
-				return result;
-			},
-		});
-		try {
-			const resumedRun = runWorkflowFile({
-				filePath,
-				ctx: {
-					stdin: process.stdin,
-					stdout: process.stdout,
-					stderr: process.stderr,
-					env,
-					mode: "tool",
-				},
-				resume: payload,
-				approved: true,
-			});
-			await replacedInitialReadLocks;
-			const release = setTimeout(
-				() => void originalRm(lockPath, { recursive: true, force: true }),
-				1200,
-			);
-			const resumed = await resumedRun;
-			clearTimeout(release);
-			assert.equal(resumed.status, "ok");
-			assert.deepEqual(resumed.output, ["ran"]);
-			assert.equal(await readStateJson({ env, key: payload.stateKey! }), null);
-		} finally {
-			Object.defineProperty(fsp, "rename", {
-				configurable: true,
-				writable: true,
-				value: originalRename,
-			});
-			await fsp.rm(lockPath, { recursive: true, force: true });
-		}
+		controller.abort(new Error("cancel blocked read"));
+		await assert.rejects(blocked, /cancel blocked read/);
+		await fsp.rm(lockPath, { recursive: true });
+		assert.notEqual(await readStateJson({ env, key: payload.stateKey! }), null);
+		const resumed = await runWorkflowFile({ ctx, resume: payload, approved: true });
+		assert.deepEqual(resumed.output, ["ran"]);
 	} finally {
 		await fsp.rm(tmpDir, { recursive: true, force: true });
 	}
@@ -774,12 +758,12 @@ test("workflow resume consumes its capability after a parallel timeout starts an
 				resume: payload,
 				approved: true,
 			}),
-		/Workflow resume state not found/,
+		/Resume state not found/,
 	);
 	assert.equal((await fsp.readFile(effectPath, "utf8")).trim().split(/\r?\n/).length, 1);
 });
 
-test("workflow resume accepts workflow-resume_ state key aliases and cleans up state", async () => {
+test("rewriting a new workflow token key does not create another continuation", async () => {
 	const workflow = {
 		steps: [
 			{
@@ -824,8 +808,22 @@ test("workflow resume accepts workflow-resume_ state key aliases and cleans up s
 	};
 	assert.ok(aliasedPayload.stateKey.startsWith("workflow-resume_"));
 
+	await assert.rejects(
+		() =>
+			runWorkflowFile({
+				ctx: {
+					stdin: process.stdin,
+					stdout: process.stdout,
+					stderr: process.stderr,
+					env,
+					mode: "tool",
+				},
+				resume: aliasedPayload,
+				approved: true,
+			}),
+		/Resume state not found/,
+	);
 	const resumed = await runWorkflowFile({
-		filePath,
 		ctx: {
 			stdin: process.stdin,
 			stdout: process.stdout,
@@ -833,7 +831,7 @@ test("workflow resume accepts workflow-resume_ state key aliases and cleans up s
 			env,
 			mode: "tool",
 		},
-		resume: aliasedPayload,
+		resume: payload,
 		approved: true,
 	});
 	assert.equal(resumed.status, "ok");
@@ -1028,15 +1026,18 @@ test("workflow pipeline command input pauses and resumes the same pipeline step"
 	const payload = decodeResumeToken(first.requiresInput?.resumeToken ?? "");
 	assert.equal(payload.kind, "workflow-file");
 	const state = (await readStateJson({ env, key: payload.stateKey! })) as any;
-	assert.equal(state.resumeAtIndex, 1);
-	assert.equal(state.inputKind, "pipeline_command");
-	assert.equal(state.inputStepId, "review");
-	assert.equal(state.pipelineInput.resumeAtIndex, 0);
-	assert.deepEqual(state.pipelineInput.items, [{ text: "hello" }]);
-	assert.deepEqual(state.pipelineInput.commandInput.pending.suspendedState, {
-		type: "ask",
-		subject: { text: '{"text":"hello"}' },
-	});
+	assert.equal(state.machineVersion, 1);
+	const pipelineInput = await savedPipelineInput(env, payload.stateKey!);
+	assert.equal(pipelineInput.resumeAtIndex, 0);
+	assert.deepEqual(pipelineInput.items, [{ text: "hello" }]);
+	assert.equal(pipelineInput.mode, "same_stage");
+	assert.deepEqual(
+		pipelineInput.mode === "same_stage" && pipelineInput.commandInput.pending.suspendedState,
+		{
+			type: "ask",
+			subject: { text: '{"text":"hello"}' },
+		},
+	);
 
 	const resumed = await runWorkflowFile({
 		filePath,
@@ -1142,10 +1143,10 @@ test("workflow pipeline requestInput resume invariant bypasses on_error", async 
 		/not consumed/,
 	);
 	assert.equal(sideEffects, 0);
-	await fsp.access(path.join(stateDir, `${payload.stateKey}.json`));
+	assert.equal(await readStateJson({ env, key: payload.stateKey! }), null);
 });
 
-test("workflow pipeline requestInput resume rejects changed pipeline", async () => {
+test("workflow pipeline resume uses its saved pipeline despite source edits", async () => {
 	const schema = {
 		type: "object",
 		properties: { decision: { type: "string" } },
@@ -1208,24 +1209,22 @@ test("workflow pipeline requestInput resume rejects changed pipeline", async () 
 	workflow.steps[0].pipeline = "choose";
 	await fsp.writeFile(filePath, JSON.stringify(workflow, null, 2), "utf8");
 
-	await assert.rejects(
-		runWorkflowFile({
-			filePath,
-			ctx: {
-				stdin: process.stdin,
-				stdout: process.stdout,
-				stderr: process.stderr,
-				env,
-				mode: "tool",
-				registry,
-			},
-			resume: payload,
-			response: { decision: "approve" },
-		}),
-		/pipeline changed/,
-	);
-	assert.equal(sideEffects, 0);
-	await fsp.access(path.join(stateDir, `${payload.stateKey}.json`));
+	const resumed = await runWorkflowFile({
+		filePath,
+		ctx: {
+			stdin: process.stdin,
+			stdout: process.stdout,
+			stderr: process.stderr,
+			env,
+			mode: "tool",
+			registry,
+		},
+		resume: payload,
+		response: { decision: "approve" },
+	});
+	assert.equal(resumed.status, "ok");
+	assert.equal(sideEffects, 1);
+	assert.equal(await readStateJson({ env, key: payload.stateKey! }), null);
 });
 
 test("workflow pipeline requestInput keeps full pipeline across repeated suspensions", async () => {
@@ -1311,9 +1310,9 @@ test("workflow pipeline requestInput keeps full pipeline across repeated suspens
 	assert.equal(second.status, "needs_input");
 	const secondPayload = decodeResumeToken(second.requiresInput?.resumeToken ?? "");
 	assert.equal(secondPayload.kind, "workflow-file");
-	const state = (await readStateJson({ env, key: secondPayload.stateKey! })) as any;
-	assert.equal(state.pipelineInput.resumeAtIndex, 1);
-	assert.equal(state.pipelineInput.pipeline.length, 2);
+	const pipelineInput = await savedPipelineInput(env, secondPayload.stateKey!);
+	assert.equal(pipelineInput.resumeAtIndex, 1);
+	assert.equal(pipelineInput.stages.length, 2);
 
 	const done = await runWorkflowFile({
 		filePath,
@@ -1332,7 +1331,7 @@ test("workflow pipeline requestInput keeps full pipeline across repeated suspens
 	assert.deepEqual(done.output, [{ first: "approve", second: "ship" }]);
 });
 
-test("workflow pipeline requestInput resume rejects condition bypass", async () => {
+test("workflow pipeline resume uses its saved condition despite source edits", async () => {
 	const schema = {
 		type: "object",
 		properties: { decision: { type: "string" } },
@@ -1404,24 +1403,22 @@ test("workflow pipeline requestInput resume rejects condition bypass", async () 
 	workflow.steps[1].condition = "$gate.json.missing";
 	await fsp.writeFile(filePath, JSON.stringify(workflow, null, 2), "utf8");
 
-	await assert.rejects(
-		runWorkflowFile({
-			filePath,
-			ctx: {
-				stdin: process.stdin,
-				stdout: process.stdout,
-				stderr: process.stderr,
-				env,
-				mode: "tool",
-				registry,
-			},
-			resume: payload,
-			response: { decision: "approve" },
-		}),
-		/condition changed/,
-	);
-	assert.equal(sideEffects, 0);
-	await fsp.access(path.join(stateDir, `${payload.stateKey}.json`));
+	const resumed = await runWorkflowFile({
+		filePath,
+		ctx: {
+			stdin: process.stdin,
+			stdout: process.stdout,
+			stderr: process.stderr,
+			env,
+			mode: "tool",
+			registry,
+		},
+		resume: payload,
+		response: { decision: "approve" },
+	});
+	assert.equal(resumed.status, "ok");
+	assert.equal(sideEffects, 1);
+	assert.equal(await readStateJson({ env, key: payload.stateKey! }), null);
 });
 
 test("workflow pipeline command input preserves replayable stdin without suspended state", async () => {
@@ -1486,7 +1483,7 @@ test("workflow pipeline command input preserves replayable stdin without suspend
 
 		const payload = decodeResumeToken(first.requiresInput?.resumeToken ?? "");
 		assert.equal(payload.kind, "workflow-file");
-		const state = (await readStateJson({ env, key: payload.stateKey! })) as any;
+		const state = { pipelineInput: await savedPipelineInput(env, payload.stateKey!) };
 		const resumed = await runWorkflowFile({
 			filePath,
 			ctx: {
@@ -1651,7 +1648,7 @@ test("workflow approval resumes require an explicit decision", async () => {
 				},
 				resume: payload,
 			}),
-		/requires --approve yes\|no/i,
+		/needs an approval: approved true or false \(`--approve yes\|no`\)/,
 	);
 });
 
@@ -1984,13 +1981,14 @@ test("parallel wait:any fails promptly when a registered loser ignores cancellat
 						stdin: process.stdin,
 						stdout: process.stdout,
 						stderr: process.stderr,
-						env: { ...process.env },
+						env: { ...process.env, LOBSTER_STATE_DIR: path.join(tmpDir, "state") },
 						mode: "tool",
 						registry,
 					},
 				}),
 				new Promise<never>((_resolve, reject) =>
-					setTimeout(() => reject(new Error("workflow did not finish")), 1_000),
+					// The point is "fails instead of hanging": allow for checkpoint writes under load.
+					setTimeout(() => reject(new Error("workflow did not finish")), 5_000),
 				),
 			]),
 			/Parallel branches did not settle after cancellation/,
@@ -2024,7 +2022,7 @@ test("workflow conditions reject unknown step refs even under negation", async (
 					mode: "tool",
 				},
 			}),
-		/Unknown step reference: aprove\.approved/,
+		/reads \$aprove\.approved, but no step "aprove" runs before it/,
 	);
 });
 
@@ -2326,3 +2324,43 @@ async function closeServer(server: http.Server) {
 	if (!server.listening) return;
 	await new Promise<void>((resolve) => server.close(() => resolve()));
 }
+
+test("a step's output cannot replace the approval rules its workflow sets", async () => {
+	const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-workflow-"));
+	const stateDir = path.join(tmpDir, "state");
+	const filePath = path.join(tmpDir, "workflow.lobster");
+	await fsp.writeFile(
+		filePath,
+		JSON.stringify({
+			steps: [
+				{
+					id: "deploy",
+					command: `node -e "process.stdout.write(JSON.stringify({prompt:'Ship it?',requiredApprover:'mallory'}))"`,
+					approval: { prompt: "Deploy?", required_approver: "alice" },
+				},
+			],
+		}),
+		"utf8",
+	);
+	const env = { ...process.env, LOBSTER_STATE_DIR: stateDir };
+	const ctx = (extra: Record<string, string> = {}) => ({
+		stdin: process.stdin,
+		stdout: process.stdout,
+		stderr: process.stderr,
+		env: { ...env, ...extra },
+		mode: "tool" as const,
+	});
+	const paused = await runWorkflowFile({ filePath, ctx: ctx() });
+	assert.equal(paused.status, "needs_approval");
+	assert.equal(paused.requiresApproval?.prompt, "Deploy?");
+	assert.equal(paused.requiresApproval?.requiredApprover, "alice");
+	await assert.rejects(
+		runWorkflowFile({
+			filePath,
+			ctx: ctx({ LOBSTER_APPROVAL_APPROVED_BY: "mallory" }),
+			resume: decodeResumeToken(paused.requiresApproval?.resumeToken ?? ""),
+			approved: true,
+		}),
+		/requires approver 'alice', got 'mallory'/,
+	);
+});

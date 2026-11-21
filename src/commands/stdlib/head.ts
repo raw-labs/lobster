@@ -1,4 +1,5 @@
-export const headCommand = {
+import { defineCommand } from "../define.js";
+export const headCommand = defineCommand({
 	name: "head",
 	meta: {
 		description: "Take first N items",
@@ -11,6 +12,7 @@ export const headCommand = {
 			required: [],
 		},
 		sideEffects: [],
+		repeatable: true,
 	},
 	help() {
 		return `head — take first N items\n\nUsage:\n  head --n 10\n`;
@@ -30,4 +32,4 @@ export const headCommand = {
 			})(),
 		};
 	},
-};
+});

@@ -1,10 +1,9 @@
-import { readLineFromStream } from "../../read_line.js";
+import { defineCommand } from "../define.js";
+import { readLineFromStream } from "../../io/read_line.js";
+import { approvalInputTimeoutMs, isInteractive, yesOrNoPrompt } from "../../io/terminal.js";
+import { streamOf } from "../../io/streams.js";
 
-function isInteractive(stdin) {
-	return Boolean(stdin.isTTY);
-}
-
-export const approveCommand = {
+export const approveCommand = defineCommand({
 	name: "approve",
 	meta: {
 		description: "Require confirmation to continue",
@@ -13,11 +12,24 @@ export const approveCommand = {
 			properties: {
 				prompt: { type: "string", description: "Approval prompt text", default: "Approve?" },
 				emit: { type: "boolean", description: "Force emit approval request + halt" },
+				"preview-from-stdin": {
+					type: "boolean",
+					description: "Include a preview of the input items in the request",
+				},
+				previewFromStdin: {
+					type: "boolean",
+					aliasOf: "preview-from-stdin",
+					description: "Alias for preview-from-stdin",
+				},
+				limit: { type: "number", description: "Items in the preview (default 5)" },
+				"preview-limit": { type: "number", aliasOf: "limit", description: "Alias for limit" },
+				previewLimit: { type: "number", aliasOf: "limit", description: "Alias for limit" },
 				_: { type: "array", items: { type: "string" } },
 			},
 			required: [],
 		},
 		sideEffects: [],
+		repeatable: true,
 		resumeSafeBeforeInput: true,
 	},
 	help() {
@@ -25,8 +37,9 @@ export const approveCommand = {
 	},
 	async run({ input, args, ctx }) {
 		const prompt = args.prompt ?? "Approve?";
-		const previewFromStdin = Boolean(args.previewFromStdin ?? args["preview-from-stdin"]);
-		const previewLimitRaw = args.limit ?? args.previewLimit ?? args["preview-limit"];
+		// One spelling of each at most: the others are refused with the stage's flags.
+		const previewFromStdin = Boolean(args["preview-from-stdin"] ?? args.previewFromStdin);
+		const previewLimitRaw = args.limit ?? args["preview-limit"] ?? args.previewLimit;
 		const previewLimit = Number.isFinite(Number(previewLimitRaw)) ? Number(previewLimitRaw) : 5;
 
 		const items = [];
@@ -53,33 +66,23 @@ export const approveCommand = {
 
 		ctx.stdout.write(`${prompt} [y/N] `);
 		const answer = await readLineFromStream(ctx.stdin, {
-			timeoutMs: parseApprovalTimeoutMs(ctx.env),
+			timeoutMs: approvalInputTimeoutMs(ctx.env),
 			signal: ctx.signal,
 		});
 
-		if (!/^y(es)?$/i.test(String(answer).trim())) {
-			throw new Error("Not approved");
-		}
+		const text = answer.trim();
+		const approved = yesOrNoPrompt(text);
+		if (approved === undefined) throw new Error(`Answer yes or no (got ${JSON.stringify(text)})`);
+		if (!approved) throw new Error("Not approved");
 
-		return { output: asStream(items) };
+		return { output: streamOf(items) };
 	},
-};
+});
 
-function buildPreview(items) {
+function buildPreview(items: unknown[]) {
 	if (!items.length) return "";
 	if (items.every((item) => typeof item === "string")) {
 		return items.join("\n");
 	}
 	return JSON.stringify(items, null, 2);
-}
-
-function parseApprovalTimeoutMs(env) {
-	const raw = env?.LOBSTER_APPROVAL_INPUT_TIMEOUT_MS;
-	const value = Number(raw);
-	if (!Number.isFinite(value) || value <= 0) return 0;
-	return Math.floor(value);
-}
-
-async function* asStream(items) {
-	for (const item of items) yield item;
 }

@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
 import { createDefaultRegistry } from "../src/commands/registry.js";
-import { runPipeline } from "../src/runtime.js";
+import { runPipeline } from "../src/pipeline/runtime.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);

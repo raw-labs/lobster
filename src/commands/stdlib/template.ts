@@ -1,6 +1,7 @@
-import { getByPath } from "../../core/value_path.js";
+import { defineCommand } from "../define.js";
+import { getByPath } from "../../util/value_path.js";
 import fs from "node:fs/promises";
-import { applyFilters } from "../../core/filters.js";
+import { applyFilters } from "./template_filters.js";
 
 function splitFilterChain(expr: string): string[] {
 	const parts: string[] = [];
@@ -54,7 +55,7 @@ function renderTemplate(tpl: string, ctx: any): string {
 	});
 }
 
-export const templateCommand = {
+export const templateCommand = defineCommand({
 	name: "template",
 	meta: {
 		description: "Render a simple {{path}} template against each input item",
@@ -72,6 +73,7 @@ export const templateCommand = {
 			required: [],
 		},
 		sideEffects: [],
+		repeatable: true,
 	},
 	help() {
 		return (
@@ -113,4 +115,4 @@ export const templateCommand = {
 			})(),
 		};
 	},
-};
+});

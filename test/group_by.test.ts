@@ -1,9 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { runPipeline } from "../src/runtime.js";
+import { runPipeline } from "../src/pipeline/runtime.js";
 import { createDefaultRegistry } from "../src/commands/registry.js";
-import { parsePipeline } from "../src/parser.js";
+import { parsePipeline } from "../src/pipeline/parser.js";
 
 async function run(pipelineText: string, input: any[]) {
 	const pipeline = parsePipeline(pipelineText);

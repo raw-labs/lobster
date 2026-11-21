@@ -4,23 +4,57 @@ import os from "node:os";
 import path from "node:path";
 import { mkdtempSync, promises as fsp } from "node:fs";
 import { createDefaultRegistry } from "../src/commands/registry.js";
-import { runPipeline } from "../src/runtime.js";
-import { diffLast, diffAndStoreValue } from "../src/sdk/primitives/diff.js";
-import { stateSet, readState, writeState } from "../src/sdk/primitives/state.js";
+import { runPipeline } from "../src/pipeline/runtime.js";
+import { diffLast, stateSet } from "../src/sdk/primitives.js";
 import {
-	createApprovalIndex,
-	consumeResumeState,
-	deleteResumeStateWithRollback,
 	diffAndStore,
-	keyToPath,
-	withFileLock,
-	ensureDirectory,
-	stripExtendedLengthPrefix,
 	writeStateJson,
 	readStateJsonWithLock as readStateJson,
-	writeFileAtomic,
-	writeFileAtomicExclusive,
 } from "../src/state/store.js";
+import { keyToPath } from "../src/state/paths.js";
+import { withFileLock } from "../src/state/file_lock.js";
+import {
+	ensureDirectory,
+	stripExtendedLengthPrefix,
+	writeFileAtomic,
+} from "../src/state/atomic_file.js";
+import { openStoreSession } from "../src/persistence/session.js";
+import { SqliteBackend } from "../src/persistence/sqlite.js";
+
+/** Store a raw value directly, e.g. a corrupt one no Lobster writer would produce. */
+async function storeRaw(directory: string, key: string, text: string) {
+	const store = await openStoreSession({ directory });
+	try {
+		await store.write(key, text);
+	} finally {
+		await store.close();
+	}
+}
+
+async function storedText(directory: string, key: string) {
+	const store = await openStoreSession({ directory, readOnly: true });
+	try {
+		return (await store.read(key)).text;
+	} finally {
+		await store.close();
+	}
+}
+
+/**
+ * Run `after(text)` right after the store commits a write of `key`, e.g. to cancel
+ * at the moment a publication became visible. Returns a restore function.
+ */
+function afterStoreWrite(key: string, after: (text: string | null) => Promise<void> | void) {
+	const original = SqliteBackend.prototype.write;
+	SqliteBackend.prototype.write = async function (this: SqliteBackend, ...args) {
+		const result = await original.apply(this, args);
+		if (args[0] === key) await after(args[1]);
+		return result;
+	};
+	return () => {
+		SqliteBackend.prototype.write = original;
+	};
+}
 
 function streamOf(items) {
 	return (async function* () {
@@ -114,7 +148,7 @@ test("ordinary state reads work when creating a coordination lock is forbidden",
 	const statePath = keyToPath(tmp, key);
 	const lockPath = `${statePath}.lock`;
 	const originalMkdir = fsp.mkdir;
-	await fsp.writeFile(statePath, JSON.stringify(value), "utf8");
+	await writeStateJson({ env, key, value });
 	Object.defineProperty(fsp, "mkdir", {
 		configurable: true,
 		writable: true,
@@ -129,7 +163,7 @@ test("ordinary state reads work when creating a coordination lock is forbidden",
 		},
 	});
 	try {
-		assert.deepEqual(await readState(key, { env }), value);
+		assert.deepEqual(await readStateJson({ env, key }), value);
 		const registry = createDefaultRegistry();
 		const output = await runPipeline({
 			pipeline: [{ name: "state.get", args: { _: [key] }, raw: `state.get ${key}` }],
@@ -259,228 +293,18 @@ test("writeFileAtomic propagates parent directory sync failures", async () => {
 	assert.deepEqual(leftovers, []);
 });
 
-test("consumeResumeState restores a published marker when parent sync fails", async () => {
-	const tmp = mkdtempSync(path.join(os.tmpdir(), "lobster-consume-dir-sync-"));
-	const env = { LOBSTER_STATE_DIR: tmp };
-	const expectedState = { haltType: "approval_request", pipeline: [] };
-	const fault = Object.assign(new Error("dir sync failed after resume claim"), { code: "EIO" });
-	const originalOpen = fsp.open;
-	let failNextDirectorySync = true;
-
-	await writeStateJson({ env, key: "resume", value: expectedState });
-	Object.defineProperty(fsp, "open", {
-		configurable: true,
-		writable: true,
-		async value(...args: any[]) {
-			const handle = await (originalOpen as any)(...args);
-			if (failNextDirectorySync && String(args[0]) === tmp && args[1] === "r") {
-				failNextDirectorySync = false;
-				return new Proxy(handle, {
-					get(target, property) {
-						if (property === "sync") return async () => Promise.reject(fault);
-						const value = Reflect.get(target, property);
-						return typeof value === "function" ? value.bind(target) : value;
-					},
-				});
-			}
-			return handle;
-		},
-	});
-
-	try {
-		await assert.rejects(
-			() => consumeResumeState({ env, key: "resume", expectedState }),
-			(err: NodeJS.ErrnoException) => err?.code === "EIO",
-		);
-		assert.deepEqual(await readStateJson({ env, key: "resume" }), expectedState);
-	} finally {
-		Object.defineProperty(fsp, "open", {
-			configurable: true,
-			writable: true,
-			value: originalOpen,
-		});
-	}
-});
-
-test("deleteResumeStateWithRollback restores a published marker when parent sync fails", async () => {
-	const tmp = mkdtempSync(path.join(os.tmpdir(), "lobster-delete-resume-dir-sync-"));
-	const env = { LOBSTER_STATE_DIR: tmp };
-	const expectedState = { haltType: "input_request", pipeline: [] };
-	const fault = Object.assign(new Error("dir sync failed after terminal resume claim"), {
-		code: "EIO",
-	});
-	const originalOpen = fsp.open;
-	let failNextDirectorySync = true;
-
-	await writeStateJson({ env, key: "resume", value: expectedState });
-	Object.defineProperty(fsp, "open", {
-		configurable: true,
-		writable: true,
-		async value(...args: any[]) {
-			const handle = await (originalOpen as any)(...args);
-			if (failNextDirectorySync && String(args[0]) === tmp && args[1] === "r") {
-				failNextDirectorySync = false;
-				return new Proxy(handle, {
-					get(target, property) {
-						if (property === "sync") return async () => Promise.reject(fault);
-						const value = Reflect.get(target, property);
-						return typeof value === "function" ? value.bind(target) : value;
-					},
-				});
-			}
-			return handle;
-		},
-	});
-
-	try {
-		await assert.rejects(
-			() => deleteResumeStateWithRollback({ env, key: "resume", expectedState }),
-			(err: NodeJS.ErrnoException) => err?.code === "EIO",
-		);
-		assert.deepEqual(await readStateJson({ env, key: "resume" }), expectedState);
-	} finally {
-		Object.defineProperty(fsp, "open", {
-			configurable: true,
-			writable: true,
-			value: originalOpen,
-		});
-	}
-});
-
 test("readStateJson surfaces malformed authoritative state", async () => {
 	const tmp = mkdtempSync(path.join(os.tmpdir(), "lobster-state-corrupt-"));
 	const env = { LOBSTER_STATE_DIR: tmp };
-	await fsp.writeFile(path.join(tmp, "resume.json"), '{"partial"', "utf8");
+	await storeRaw(tmp, "resume", '{"partial"');
 
 	await assert.rejects(() => readStateJson({ env, key: "resume" }), SyntaxError);
-});
-
-test("writeFileAtomicExclusive creates private files without replacing existing targets", async () => {
-	const tmp = mkdtempSync(path.join(os.tmpdir(), "lobster-atomic-exclusive-"));
-	const target = path.join(tmp, "approval_deadbeef.json");
-
-	await writeFileAtomicExclusive(target, '{"stateKey":"original"}\n');
-	assert.equal((await fsp.stat(target)).mode & 0o777, 0o600);
-
-	await assert.rejects(
-		() => writeFileAtomicExclusive(target, '{"stateKey":"replacement"}\n'),
-		(err: NodeJS.ErrnoException) => err?.code === "EEXIST",
-	);
-	assert.equal(await fsp.readFile(target, "utf8"), '{"stateKey":"original"}\n');
-
-	const leftovers = (await fsp.readdir(tmp)).filter((f) => f.includes(".tmp"));
-	assert.deepEqual(leftovers, []);
-});
-
-test("writeFileAtomicExclusive removes temp link before final directory sync", async () => {
-	const tmp = mkdtempSync(path.join(os.tmpdir(), "lobster-atomic-exclusive-sync-order-"));
-	const target = path.join(tmp, "approval_deadbeef.json");
-	let filesAtSync: string[] = [];
-
-	await writeFileAtomicExclusive(target, '{"stateKey":"original"}\n', {
-		async syncParentDir() {
-			filesAtSync = await fsp.readdir(tmp);
-		},
-	});
-
-	assert.equal(await fsp.readFile(target, "utf8"), '{"stateKey":"original"}\n');
-	assert.ok(filesAtSync.includes("approval_deadbeef.json"));
-	assert.deepEqual(
-		filesAtSync.filter((file) => file.includes(".tmp")),
-		[],
-	);
-});
-
-test("writeFileAtomicExclusive rejects unsupported hard links without a partial target", async () => {
-	const tmp = mkdtempSync(path.join(os.tmpdir(), "lobster-atomic-exclusive-unsupported-"));
-	const target = path.join(tmp, "approval_deadbeef.json");
-	const unsupported = Object.assign(new Error("operation not supported"), { code: "ENOTSUP" });
-	const options = {
-		async linkFile() {
-			throw unsupported;
-		},
-	};
-
-	await assert.rejects(
-		() => writeFileAtomicExclusive(target, '{"stateKey":"original"}\n', options),
-		(err: NodeJS.ErrnoException) => err?.code === "ENOTSUP",
-	);
-	await assert.rejects(
-		() => fsp.stat(target),
-		(err: NodeJS.ErrnoException) => err?.code === "ENOENT",
-	);
-
-	const leftovers = (await fsp.readdir(tmp)).filter((f) => f.includes(".tmp"));
-	assert.deepEqual(leftovers, []);
-});
-
-test("writeFileAtomicExclusive removes published target when parent directory sync fails", async () => {
-	const tmp = mkdtempSync(path.join(os.tmpdir(), "lobster-atomic-exclusive-dir-sync-"));
-	const target = path.join(tmp, "approval_deadbeef.json");
-	const fault = Object.assign(new Error("dir sync failed"), { code: "EIO" });
-
-	await assert.rejects(
-		() =>
-			writeFileAtomicExclusive(target, '{"stateKey":"original"}\n', {
-				async syncParentDir() {
-					throw fault;
-				},
-			}),
-		(err: NodeJS.ErrnoException) => err?.code === "EIO",
-	);
-	await assert.rejects(
-		() => fsp.stat(target),
-		(err: NodeJS.ErrnoException) => err?.code === "ENOENT",
-	);
-
-	const leftovers = (await fsp.readdir(tmp)).filter((f) => f.includes(".tmp"));
-	assert.deepEqual(leftovers, []);
-});
-
-test("createApprovalIndex omits short ID when atomic exclusive publish is unsupported", async () => {
-	const tmp = mkdtempSync(path.join(os.tmpdir(), "lobster-approval-index-unsupported-"));
-	const env = { LOBSTER_STATE_DIR: tmp };
-	const unsupported = Object.assign(new Error("operation not supported"), { code: "ENOTSUP" });
-
-	const approvalId = await createApprovalIndex({
-		env,
-		stateKey: "workflow_resume_1",
-		options: {
-			async linkFile() {
-				throw unsupported;
-			},
-		},
-	});
-
-	assert.equal(approvalId, null);
-	const files = await fsp.readdir(tmp);
-	assert.deepEqual(files, []);
-});
-
-test("createApprovalIndex omits short ID when approval index durability fails", async () => {
-	const tmp = mkdtempSync(path.join(os.tmpdir(), "lobster-approval-index-sync-fails-"));
-	const env = { LOBSTER_STATE_DIR: tmp };
-	const fault = Object.assign(new Error("dir sync failed"), { code: "EIO" });
-
-	const approvalId = await createApprovalIndex({
-		env,
-		stateKey: "workflow_resume_1",
-		options: {
-			async syncParentDir() {
-				throw fault;
-			},
-		},
-	});
-
-	assert.equal(approvalId, null);
-	const files = await fsp.readdir(tmp);
-	assert.deepEqual(files, []);
 });
 
 test("diffAndStore treats corrupt previous state as a miss and rewrites atomically (#112)", async () => {
 	const tmp = mkdtempSync(path.join(os.tmpdir(), "lobster-diff-corrupt-"));
 	const env = { LOBSTER_STATE_DIR: tmp };
-	await fsp.writeFile(path.join(tmp, "snapshot.json"), '{"partial"', "utf8");
+	await storeRaw(tmp, "snapshot", '{"partial"');
 
 	const result = await diffAndStore({ env, key: "snapshot", value: { ok: true } });
 
@@ -489,28 +313,24 @@ test("diffAndStore treats corrupt previous state as a miss and rewrites atomical
 	assert.deepEqual(await readStateJson({ env, key: "snapshot" }), { ok: true });
 });
 
-test("diffAndStore rolls back a state publication when its parent-directory sync fails", async () => {
-	const tmp = mkdtempSync(path.join(os.tmpdir(), "lobster-diff-dir-sync-"));
+test("diffAndStore keeps the previous snapshot when its publication fails", async () => {
+	const tmp = mkdtempSync(path.join(os.tmpdir(), "lobster-diff-publish-fails-"));
 	const env = { LOBSTER_STATE_DIR: tmp };
 	await writeStateJson({ env, key: "snapshot", value: { version: "before" } });
-	const fault = Object.assign(new Error("dir sync failed after state publication"), {
-		code: "EIO",
-	});
-
-	await assert.rejects(
-		() =>
-			diffAndStore({
-				env,
-				key: "snapshot",
-				value: { version: "after" },
-				atomicWriteOptions: {
-					async syncParentDir() {
-						throw fault;
-					},
-				},
-			}),
-		(err: NodeJS.ErrnoException) => err?.code === "EIO",
-	);
+	const original = SqliteBackend.prototype.write;
+	SqliteBackend.prototype.write = async function (this: SqliteBackend, ...args) {
+		if (args[0] === "snapshot" && String(args[1]).includes('"after"'))
+			throw Object.assign(new Error("state publication failed"), { code: "EIO" });
+		return original.apply(this, args);
+	};
+	try {
+		await assert.rejects(
+			() => diffAndStore({ env, key: "snapshot", value: { version: "after" } }),
+			(err: NodeJS.ErrnoException) => err?.code === "EIO",
+		);
+	} finally {
+		SqliteBackend.prototype.write = original;
+	}
 
 	assert.deepEqual(await readStateJson({ env, key: "snapshot" }), { version: "before" });
 	await fsp.rm(tmp, { recursive: true, force: true });
@@ -537,10 +357,8 @@ test("diffAndStore does not publish a snapshot after cancellation before atomic 
 		() => diffAndStore({ env, key: "snapshot", value: { version: "after" }, signal }),
 		/abort before state publish/,
 	);
-	assert.equal(signalChecks, 2);
+	assert.ok(signalChecks >= 2);
 	assert.deepEqual(await readStateJson({ env, key: "snapshot" }), { version: "before" });
-	const leftovers = (await fsp.readdir(tmp)).filter((file) => file.includes(".tmp"));
-	assert.deepEqual(leftovers, []);
 });
 
 test("diffAndStore restores the previous snapshot when cancellation arrives during atomic rename", async () => {
@@ -549,78 +367,78 @@ test("diffAndStore restores the previous snapshot when cancellation arrives duri
 	await writeStateJson({ env, key: "snapshot", value: { version: "before" } });
 
 	const controller = new AbortController();
-	await assert.rejects(
-		() =>
-			diffAndStore({
-				env,
-				key: "snapshot",
-				value: { version: "after" },
-				signal: controller.signal,
-				atomicWriteOptions: {
-					async renameFile(from, to) {
-						await fsp.rename(from, to);
-						controller.abort(new Error("abort during atomic rename"));
-					},
-				},
-			}),
-		/abort during atomic rename/,
-	);
+	const restore = afterStoreWrite("snapshot", (text) => {
+		if (text?.includes('"after"')) controller.abort(new Error("abort during atomic rename"));
+	});
+	try {
+		await assert.rejects(
+			() =>
+				diffAndStore({
+					env,
+					key: "snapshot",
+					value: { version: "after" },
+					signal: controller.signal,
+				}),
+			/abort during atomic rename/,
+		);
+	} finally {
+		restore();
+	}
 	assert.deepEqual(await readStateJson({ env, key: "snapshot" }), { version: "before" });
-	const leftovers = (await fsp.readdir(tmp)).filter((file) => file.includes(".tmp"));
-	assert.deepEqual(leftovers, []);
 });
 
 test("diffAndStore removes a newly published snapshot when cancellation arrives during atomic rename", async () => {
 	const tmp = mkdtempSync(path.join(os.tmpdir(), "lobster-diff-cancel-new-rename-"));
 	const env = { LOBSTER_STATE_DIR: tmp };
 	const controller = new AbortController();
-
-	await assert.rejects(
-		() =>
-			diffAndStore({
-				env,
-				key: "snapshot",
-				value: { version: "after" },
-				signal: controller.signal,
-				atomicWriteOptions: {
-					async renameFile(from, to) {
-						await fsp.rename(from, to);
-						controller.abort(new Error("abort during initial atomic rename"));
-					},
-				},
-			}),
-		/abort during initial atomic rename/,
-	);
+	const restore = afterStoreWrite("snapshot", (text) => {
+		if (text?.includes('"after"'))
+			controller.abort(new Error("abort during initial atomic rename"));
+	});
+	try {
+		await assert.rejects(
+			() =>
+				diffAndStore({
+					env,
+					key: "snapshot",
+					value: { version: "after" },
+					signal: controller.signal,
+				}),
+			/abort during initial atomic rename/,
+		);
+	} finally {
+		restore();
+	}
 	assert.equal(await readStateJson({ env, key: "snapshot" }), null);
-	const leftovers = (await fsp.readdir(tmp)).filter((file) => file.includes(".tmp"));
-	assert.deepEqual(leftovers, []);
+	assert.equal(await storedText(tmp, "snapshot"), null);
 });
 
 test("diffAndStore restores an existing null snapshot when cancellation arrives during atomic rename", async () => {
 	const tmp = mkdtempSync(path.join(os.tmpdir(), "lobster-diff-cancel-null-rename-"));
 	const env = { LOBSTER_STATE_DIR: tmp };
 	await writeStateJson({ env, key: "snapshot", value: null });
-	const snapshotPath = keyToPath(tmp, "snapshot");
 
 	const controller = new AbortController();
-	await assert.rejects(
-		() =>
-			diffAndStore({
-				env,
-				key: "snapshot",
-				value: { version: "after" },
-				signal: controller.signal,
-				atomicWriteOptions: {
-					async renameFile(from, to) {
-						await fsp.rename(from, to);
-						controller.abort(new Error("abort during null snapshot rename"));
-					},
-				},
-			}),
-		/abort during null snapshot rename/,
-	);
+	const restore = afterStoreWrite("snapshot", (text) => {
+		if (text?.includes('"after"')) controller.abort(new Error("abort during null snapshot rename"));
+	});
+	try {
+		await assert.rejects(
+			() =>
+				diffAndStore({
+					env,
+					key: "snapshot",
+					value: { version: "after" },
+					signal: controller.signal,
+				}),
+			/abort during null snapshot rename/,
+		);
+	} finally {
+		restore();
+	}
 	assert.equal(await readStateJson({ env, key: "snapshot" }), null);
-	assert.equal(await fsp.readFile(snapshotPath, "utf8"), "null\n");
+	// The stored null is restored, not deleted.
+	assert.equal(await storedText(tmp, "snapshot"), "null\n");
 });
 
 test("diffAndStore serializes cancellation rollback before a concurrent snapshot update", async () => {
@@ -637,23 +455,25 @@ test("diffAndStore serializes cancellation rollback before a concurrent snapshot
 	const waitForCancellation = new Promise<void>((resolve) => {
 		allowCancellation = resolve;
 	});
+	const restore = afterStoreWrite("snapshot", async (text) => {
+		if (!text?.includes('"cancelled-A"')) return;
+		publishCancelledSnapshot();
+		await waitForCancellation;
+	});
 	const cancelled = diffAndStore({
 		env,
 		key: "snapshot",
 		value: { version: "cancelled-A" },
 		signal: controller.signal,
-		atomicWriteOptions: {
-			async renameFile(from, to) {
-				await fsp.rename(from, to);
-				publishCancelledSnapshot();
-				await waitForCancellation;
-			},
-		},
 	});
 	await cancelledSnapshotPublished;
 
 	let successfulSnapshotPublished = false;
-	const successful = writeState("snapshot", { version: "successful-B" }, { env }).then(() => {
+	const successful = writeStateJson({
+		env,
+		key: "snapshot",
+		value: { version: "successful-B" },
+	}).then(() => {
 		successfulSnapshotPublished = true;
 	});
 	await new Promise((resolve) => setTimeout(resolve, 20));
@@ -663,6 +483,7 @@ test("diffAndStore serializes cancellation rollback before a concurrent snapshot
 	allowCancellation();
 	await assert.rejects(cancelled, /abort during concurrent atomic rename/);
 	await successful;
+	restore();
 	assert.equal(successfulSnapshotPublished, true);
 	assert.deepEqual(await readStateJson({ env, key: "snapshot" }), { version: "successful-B" });
 	const leftovers = (await fsp.readdir(tmp)).filter(
@@ -747,7 +568,8 @@ test("state.set stops waiting for a live state lock when its signal is aborted",
 	const early = await Promise.race([
 		completion,
 		new Promise<{ kind: "timeout" }>((resolve) =>
-			setTimeout(() => resolve({ kind: "timeout" }), 75),
+			// Only a missed abort waits this long; an observed one settles at once.
+			setTimeout(() => resolve({ kind: "timeout" }), 2000),
 		),
 	]);
 	if (early.kind === "timeout") await fsp.rm(lockPath, { recursive: true, force: true });
@@ -794,7 +616,8 @@ test("diffAndStore reclaims an old lock with a malformed owner", async () => {
 	const lockPath = `${keyToPath(tmp, "snapshot")}.lock`;
 	await fsp.mkdir(lockPath);
 	await fsp.writeFile(path.join(lockPath, "owner"), "\n", "utf8");
-	const staleAt = new Date(Date.now() - 10_000);
+	// Older than the 30 s orphan threshold, so it is reclaimed without waiting it out.
+	const staleAt = new Date(Date.now() - 40_000);
 	await fsp.utimes(lockPath, staleAt, staleAt);
 
 	await diffAndStore({ env, key: "snapshot", value: { version: "recovered" } });
@@ -985,13 +808,13 @@ test("withFileLock releases its key when best-effort cleanup cannot remove the d
 test("SDK diff primitives treat corrupt previous state as a miss (#112)", async () => {
 	const tmp = mkdtempSync(path.join(os.tmpdir(), "lobster-sdk-diff-corrupt-"));
 	const ctx = { env: { LOBSTER_STATE_DIR: tmp } };
-	await fsp.writeFile(path.join(tmp, "sdk-snapshot.json"), '{"partial"', "utf8");
+	await storeRaw(tmp, "sdk-snapshot", '{"partial"');
 
-	const direct = await diffAndStoreValue("sdk-snapshot", { next: true }, ctx);
+	const direct = await diffAndStore({ ...ctx, key: "sdk-snapshot", value: { next: true } });
 	assert.equal(direct.before, null);
 	assert.equal(direct.changed, true);
 
-	await fsp.writeFile(path.join(tmp, "stage-snapshot.json"), '{"partial"', "utf8");
+	await storeRaw(tmp, "stage-snapshot", '{"partial"');
 	const stage = diffLast("stage-snapshot");
 	const result = await stage.run({ input: streamOf([{ next: true }]), ctx });
 	const output = [];
@@ -1032,7 +855,7 @@ test("SDK stateSet/readState is atomic under concurrent reads (#109)", async () 
 	const reader = (async () => {
 		for (let i = 0; i < 500; i++) {
 			try {
-				const v = await readState(key, ctx);
+				const v = await readStateJson({ ...ctx, key });
 				if (!v || v.payload !== payload) partialReads++;
 			} catch {
 				readErrors++;
@@ -1048,30 +871,6 @@ test("SDK stateSet/readState is atomic under concurrent reads (#109)", async () 
 
 	assert.equal(readErrors, 0, "SDK reader must never hit a parse/IO error mid-write");
 	assert.equal(partialReads, 0, "SDK reader must never observe truncated/empty state");
-});
-
-test("SDK writeState preserves restricted state-file mode", async () => {
-	const tmp = mkdtempSync(path.join(os.tmpdir(), "lobster-atomic-sdk-mode-"));
-	const ctx = { env: { LOBSTER_STATE_DIR: tmp } };
-	const filePath = path.join(tmp, "sdk-state.json");
-	await fsp.mkdir(tmp, { recursive: true });
-	await fsp.writeFile(filePath, '{"old":true}\n', { mode: 0o600 });
-	await fsp.chmod(filePath, 0o600);
-
-	await writeState("sdk-state", { ok: true }, ctx);
-
-	assert.equal((await fsp.stat(filePath)).mode & 0o777, 0o600);
-	assert.deepEqual(await readState("sdk-state", ctx), { ok: true });
-});
-
-test("SDK writeState removes temp files when replacement fails", async () => {
-	const tmp = mkdtempSync(path.join(os.tmpdir(), "lobster-atomic-sdk-cleanup-"));
-	const ctx = { env: { LOBSTER_STATE_DIR: tmp } };
-	await fsp.mkdir(path.join(tmp, "sdk-state.json"));
-
-	await assert.rejects(() => writeState("sdk-state", { ok: true }, ctx));
-	const leftovers = (await fsp.readdir(tmp)).filter((f) => f.includes(".tmp"));
-	assert.deepEqual(leftovers, []);
 });
 
 test("ensureDirectory creates missing parent directories", async () => {

@@ -7,7 +7,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { gogGmailSendCommand } from "../src/commands/stdlib/gog_gmail_send.js";
+import { gogGmailSendCommand } from "../src/packs/google/gmail_send.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);

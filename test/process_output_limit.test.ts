@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import { Lobster, exec } from "../src/sdk/index.js";
-import { runAbortableProcess } from "../src/abortable_process.js";
+import { runAbortableProcess } from "../src/process/abortable_process.js";
 import { waitForPid } from "./helpers/wait_for_pid.js";
 import { nodeShellFixture } from "./helpers/node_shell_fixture.js";
 
@@ -29,7 +29,12 @@ for (const stream of ["stdout", "stderr"]) {
 					.run();
 				assert.equal(result.ok, limit === "");
 				if (limit) assert.match(result.error.message, /Process output exceeded 1024 bytes/);
-				else assert.equal(result.output[0].length, stream === "stdout" ? large : 0);
+				// One item per output line: the stdout line, and nothing for stderr.
+				else
+					assert.deepEqual(
+						result.output.map((line: string) => line.length),
+						stream === "stdout" ? [large] : [],
+					);
 			}
 		} finally {
 			await rm(dir, { recursive: true, force: true });

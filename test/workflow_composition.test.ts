@@ -5,7 +5,8 @@ import os from "node:os";
 import path from "node:path";
 import { PassThrough } from "node:stream";
 
-import { loadWorkflowFile, runWorkflowFile } from "../src/workflows/file.js";
+import { runWorkflowFile } from "../src/engine/runner.js";
+import { loadWorkflowFile } from "../src/workflows/load.js";
 
 async function setupWorkflows(files: Record<string, unknown>) {
 	const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-compose-"));
@@ -122,7 +123,7 @@ test("workflow validation rejects workflow combined with run", async () => {
 	);
 	await assert.rejects(
 		() => loadWorkflowFile(filePath),
-		/can only define one of run, command, pipeline, workflow, parallel, or for_each/,
+		/can only define one of run, command, pipeline, workflow, parallel, for_each, repeat, switch, sleep, or wait/,
 	);
 });
 
@@ -138,7 +139,7 @@ test("workflow validation rejects workflow combined with pipeline", async () => 
 	);
 	await assert.rejects(
 		() => loadWorkflowFile(filePath),
-		/can only define one of run, command, pipeline, workflow, parallel, or for_each/,
+		/can only define one of run, command, pipeline, workflow, parallel, for_each, repeat, switch, sleep, or wait/,
 	);
 });
 
@@ -195,6 +196,41 @@ test("indirect cycle is detected", async () => {
 	});
 	await assert.rejects(() => runWorkflow(paths["a.lobster"], stateDir), /creates a cycle/);
 });
+
+test("a cycle through a child named at run time is detected", async () => {
+	const { stateDir, paths } = await setupWorkflows({
+		"self.lobster": {
+			steps: [
+				{ id: "name", run: "printf self.lobster" },
+				{ id: "loop", workflow: "$name.stdout" },
+			],
+		},
+	});
+	await assert.rejects(
+		() => runWorkflow(paths["self.lobster"], stateDir),
+		/Workflow step loop \(.*self\.lobster\): Workflow creates a cycle/,
+	);
+});
+
+for (const named of ["in the file", "at run time"]) {
+	test(`a child workflow that cannot load, named ${named}, is reported with its step and file`, async () => {
+		const { stateDir, paths } = await setupWorkflows({
+			"parent.lobster": {
+				steps:
+					named === "in the file"
+						? [{ id: "kid", workflow: "missing.lobster" }]
+						: [
+								{ id: "name", run: "printf missing.lobster" },
+								{ id: "kid", workflow: "$name.stdout" },
+							],
+			},
+		});
+		await assert.rejects(
+			() => runWorkflow(paths["parent.lobster"], stateDir),
+			/^Error: Workflow step kid \(.*missing\.lobster\): Workflow file not found: .*missing\.lobster$/,
+		);
+	});
+}
 
 test("sub-workflow string output remains raw in stdout", async () => {
 	const { stateDir, paths } = await setupWorkflows({
@@ -294,6 +330,6 @@ test("sub-workflow approval gates are rejected in composition", async () => {
 
 	await assert.rejects(
 		() => runWorkflow(paths["parent.lobster"], stateDir),
-		/Sub-workflow approval\/input gates are not supported in composition/,
+		/approvals, input, sleeps and waits are not supported inside a child workflow/,
 	);
 });

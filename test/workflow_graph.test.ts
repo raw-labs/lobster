@@ -38,12 +38,27 @@ test("workflow graph renderer outputs mermaid nodes and labeled edges", () => {
 		output,
 		/advice\["advice\\npipeline: llm\.invoke --prompt &quot;Summarize this weather&quot;"\]/,
 	);
-	assert.match(output, /fetch -->\|stdin\| confirm/);
-	assert.match(output, /fetch -->\|stdin\| advice/);
+	assert.match(output, /s_fetch -->\|stdin\| s_confirm/);
+	assert.match(output, /s_fetch -->\|stdin\| s_advice/);
 	assert.match(
 		output,
-		/confirm -->\|when: \$confirm\.approved &amp;&amp; \$fetch\.json\.temp &gt; 70\| advice/,
+		/s_confirm -->\|when: \$confirm\.approved &amp;&amp; \$fetch\.json\.temp &gt; 70\| s_advice/,
 	);
+});
+
+test("a step named like a Mermaid keyword still makes a graph Mermaid reads", () => {
+	const output = renderWorkflowGraph({
+		workflow: {
+			steps: [
+				{ id: "end", run: "echo a" },
+				{ id: "style", run: "echo b", stdin: "$end.stdout" },
+			],
+		},
+		format: "mermaid",
+	});
+	assert.match(output, /^  s_end\["end/m);
+	assert.match(output, /s_end -->\|stdin\| s_style/);
+	assert.doesNotMatch(output, /^  (end|style)\[/m);
 });
 
 test("workflow graph renderer contains Mermaid metacharacters in labels", () => {
@@ -96,6 +111,26 @@ test("cli graph defaults to mermaid and resolves --args-json values", async () =
 	assert.match(result.stdout, /confirm\{"confirm\\napproval gate"\}/);
 });
 
+test("cli graph refuses an arg the workflow does not declare, as run does", async () => {
+	const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-graph-args-"));
+	const filePath = path.join(tmpDir, "workflow.lobster");
+	await fsp.writeFile(
+		filePath,
+		[
+			"args:",
+			"  location:",
+			"    default: here",
+			"steps:",
+			"  - id: a",
+			"    run: echo ${location}",
+		].join("\n"),
+		"utf8",
+	);
+	const result = runCli(["graph", "--file", filePath, "--args-json", '{"locaton":"x"}']);
+	assert.equal(result.status, 1);
+	assert.match(result.stderr, /takes no arg "locaton" \(did you mean "location"\?\)/);
+});
+
 test("cli graph supports --format dot", async () => {
 	const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "lobster-graph-dot-"));
 	const filePath = path.join(tmpDir, "workflow.lobster");
@@ -123,4 +158,49 @@ test("cli graph rejects unsupported formats", async () => {
 	const result = runCli(["graph", "--file", filePath, "--format", "svg"]);
 	assert.equal(result.status, 2);
 	assert.match(result.stderr, /graph --format must be one of: mermaid, dot, ascii/);
+});
+
+test("an edge from a step inside a repeat or a parallel step starts at that step's node", () => {
+	const workflow = {
+		steps: [
+			{
+				id: "poll",
+				repeat: { until: "$check.json.done", max: 3 },
+				steps: [{ id: "check", run: "echo '{\"done\":true}'" }],
+			},
+			{ id: "fan", parallel: { branches: [{ id: "a", run: "echo a" }] } },
+			{ id: "report", run: "cat", stdin: "$check.json", when: "$a.stdout == a" },
+		],
+	};
+	const output = renderWorkflowGraph({ workflow: workflow as any, format: "dot" });
+	assert.match(output, /"poll" -> "report" \[label="stdin"\]/);
+	assert.match(output, /"fan" -> "report" \[label="when: \$a\.stdout == a"\]/);
+	assert.doesNotMatch(output, /"poll" -> "poll"/, "a repeat reading its own step draws no loop");
+});
+
+test("what a compound step's inside reads is drawn as edges into that step", () => {
+	const workflow = {
+		steps: [
+			{ id: "fetch", run: "echo '[1]'" },
+			{ id: "par", parallel: { branches: [{ id: "b", run: "cat", stdin: "$fetch.stdout" }] } },
+			{
+				id: "poll",
+				repeat: { until: "$check.json.done", max: 2 },
+				steps: [{ id: "check", run: "cat", stdin: "$fetch.json" }],
+			},
+			{
+				id: "each",
+				for_each: "[1]",
+				steps: [
+					{ id: "use", run: "cat", stdin: "$item.json" },
+					{ id: "again", run: "cat", stdin: "$use.stdout", when: "$fetch.json" },
+				],
+			},
+		],
+	};
+	const output = renderWorkflowGraph({ workflow: workflow as any, format: "dot" });
+	assert.match(output, /"fetch" -> "par" \[label="stdin"\]/);
+	assert.match(output, /"fetch" -> "poll" \[label="stdin"\]/);
+	assert.match(output, /"fetch" -> "each" \[label="when: \$fetch\.json"\]/);
+	assert.doesNotMatch(output, /"(use|item|check)" ->/, "names local to a node draw no edge");
 });
