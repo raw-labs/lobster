@@ -38,8 +38,9 @@ don't scrape text.
 5. **Inspect** when unsure: `lobster runs list --status waiting`, `lobster runs show <runId>`
    (status and pending questions), `lobster waits show <waitId>` (a question in full).
 
-The dry run assumes every approval is granted and every condition on unknown output may
-hold, so it shows what can run, not what will.
+The plan shows what can run, not what will: a condition on output the plan does not have is
+marked "depends on step output". A plain approval is planned as granted (a "no" cancels the
+run); one with `on_reject` or `on_timeout: continue` leaves both paths open.
 
 **Never answer an approval or a question on the person's behalf.** A `needs_approval` is a
 hard stop: ask the human, and resume only with what they decided. An approval exists because

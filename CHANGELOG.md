@@ -4,6 +4,7 @@ All notable changes to Lobster will be documented in this file.
 
 ## Unreleased
 
+- The dry-run plan leaves open the steps that depend on an approval with `on_reject` or `on_timeout: continue` (either answer goes on), showing their `when:`: it planned the approval as granted, so a step for the "no" path read "skipped — condition: false". An approval-only step is labelled `[approval]`, not `[no-op]`.
 - `.agents/skills/lobster/` is a skill that teaches an agent to build, run and debug Lobster workflows with the CLI: the run loop and the envelope (`SKILL.md`), and references for the workflow syntax, the CLI, the pipeline commands, and recipes and pitfalls. Every YAML example in it is checked to load and plan.
 - Every CLI command answers with one JSON envelope on stdout, `{ protocolVersion, ok, ... }` or `{ ok: false, error: { type, message } }`, with exit code 2 for a mistake in the command line and 1 otherwise; stderr carries only messages for a person. `runs`, `waits`, `signal`, `history`, `storage`, `upgrade` and `runs advance --due` printed bare JSON or text, with errors as text on stderr. `run` and `resume` are unchanged (the envelope with `--mode tool`, as before). See "CLI output" in the reference.
 - Every command accepts `--mode tool` (and `--mode human`): `resume`, `runs`, `signal` and the others refused it, though agents pass it everywhere and earlier versions ignored it.

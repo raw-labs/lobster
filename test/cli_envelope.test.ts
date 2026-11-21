@@ -144,3 +144,34 @@ test("a bad flag value is a mistake in the command line that says what is expect
 	const pruned = run("history", "prune", "2000-01-01").envelope;
 	assert.deepEqual(pruned, { protocolVersion: 1, ok: true, dryRun: true, runs: [] });
 });
+
+test("a dry run leaves open what an approval that may continue without a yes decides", async (t) => {
+	const { dir, run } = await cli(t);
+	const file = path.join(dir, "flow.lobster");
+	await fs.writeFile(
+		file,
+		JSON.stringify({
+			steps: [
+				{ id: "gate", approval: "Go?" },
+				{ id: "after_gate", run: "echo go", when: "$gate.approved" },
+				{ id: "ask", approval: { prompt: "Post?", on_reject: "continue" } },
+				{ id: "post", run: "echo post", when: "$ask.approved" },
+				{ id: "declined", run: "echo no", when: "!$ask.approved" },
+			],
+		}),
+	);
+	const { plan } = run("run", "--mode", "tool", "--dry-run", file).envelope;
+	assert.match(plan, /1\. gate {2}\[approval\]/);
+	// A plain gate: a "no" cancels the run, so the step after it runs only after a yes.
+	assert.match(plan, /2\. after_gate {2}\[shell\]\n {5}run: echo go\n/);
+	// With on_reject: continue, either answer goes on: both branches may run.
+	assert.match(
+		plan,
+		/4\. post {2}\[shell\]\n {5}when: \$ask\.approved {2}\[depends on step output/,
+	);
+	assert.match(
+		plan,
+		/5\. declined {2}\[shell\]\n {5}when: !\$ask\.approved {2}\[depends on step output/,
+	);
+	assert.doesNotMatch(plan, /skipped/);
+});

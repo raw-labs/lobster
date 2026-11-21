@@ -39,9 +39,19 @@ function resolveDryRunTemplate(
 	});
 }
 
+/** Whether an approval may complete without a yes, so the run goes on either way. */
+function mayContinueUnapproved(approval: WorkflowStep["approval"]) {
+	return (
+		typeof approval === "object" &&
+		approval !== null &&
+		(approval.on_reject === "continue" || approval.on_timeout === "continue")
+	);
+}
+
 // A plan has no step outputs: a condition that reads one is neither true nor false yet.
-// Only `approved` (gates are assumed granted) and `skipped` are modelled by the plan, and
-// only for steps whose own condition was decided (`undecided` holds the others).
+// Only `approved` and `skipped` are modelled by the plan, and only for steps whose outcome
+// was decided (`undecided` holds the others). A gate is planned as granted: a "no" cancels
+// the run, so the steps after it run only after a yes, unless the gate continues without one.
 function dependsOnStepOutput(condition: unknown, undecided: Set<string>) {
 	return conditionRefs(condition).some(({ id, path }) => {
 		const field = path.split(".")[0];
@@ -236,7 +246,7 @@ function planSteps(
 				lines.push("     [command validation deferred — stage name depends on step output]");
 			}
 		} else {
-			lines.push(`  ${num}. ${step.id}  [no-op]`);
+			lines.push(`  ${num}. ${step.id}  [${isApprovalStep(step.approval) ? "approval" : "no-op"}]`);
 		}
 
 		if (stdinNote) lines.push(`     stdin: ${stdinNote}`);
@@ -254,6 +264,9 @@ function planSteps(
 		results[step.id] = isApprovalStep(step.approval)
 			? { id: step.id, approved: true }
 			: { id: step.id };
+		// A "no" or a timeout that lets the run go on (`on_reject` / `on_timeout: continue`)
+		// leaves the answer open: conditions on it are decided only when the run gets there.
+		if (mayContinueUnapproved(step.approval)) undecided.add(step.id);
 	}
 	return lines;
 }
